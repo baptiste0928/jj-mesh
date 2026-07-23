@@ -1,5 +1,6 @@
 //! jj-mesh CLI. See `lib.rs` for the implementation.
 
-fn main() {
-    jj_mesh::cli::run();
+fn main() -> color_eyre::eyre::Result<()> {
+    color_eyre::install()?;
+    jj_mesh::cli::run()
 }
