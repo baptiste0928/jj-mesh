@@ -63,7 +63,11 @@ mod tests {
     async fn message_size_is_bounded() {
         let (mut client, mut server) = tokio::io::duplex(1024);
 
-        assert!(write_message(&mut client, &vec![0u8; 300], 256).await.is_err());
+        assert!(
+            write_message(&mut client, &vec![0u8; 300], 256)
+                .await
+                .is_err()
+        );
 
         // An oversized length prefix is rejected before allocating.
         client.write_all(&u32::MAX.to_le_bytes()).await.unwrap();

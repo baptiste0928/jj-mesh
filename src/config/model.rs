@@ -52,6 +52,14 @@ impl Config {
         Ok(ConfigEdit::from_config(dir)?.into_config())
     }
 
+    /// The name under which an endpoint is paired, if any.
+    pub fn peer_name(&self, endpoint: &EndpointId) -> Option<&str> {
+        self.peers
+            .iter()
+            .find(|(_, peer)| &peer.endpoint == endpoint)
+            .map(|(name, _)| name.as_str())
+    }
+
     /// Checks that a peer can be registered under this name and endpoint,
     /// rejecting invalid names and duplicates of either.
     pub fn validate_new_peer(&self, name: &str, endpoint: &EndpointId) -> Result<()> {
@@ -61,7 +69,7 @@ impl Config {
             "a peer named `{name}` already exists",
         );
 
-        if let Some((existing, _)) = self.peers.iter().find(|(_, p)| &p.endpoint == endpoint) {
+        if let Some(existing) = self.peer_name(endpoint) {
             bail!("endpoint {endpoint} is already paired as `{existing}`");
         }
 

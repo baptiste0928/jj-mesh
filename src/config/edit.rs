@@ -2,7 +2,7 @@
 
 use std::{fs, io, path::PathBuf};
 
-use color_eyre::eyre::{ContextCompat as _, Result, WrapErr as _};
+use color_eyre::eyre::{ContextCompat as _, Result, WrapErr as _, eyre};
 use serde::Serialize;
 use toml_edit::{DocumentMut, Item, Table};
 
@@ -58,6 +58,18 @@ impl ConfigEdit {
         Ok(())
     }
 
+    /// Removes a peer by name.
+    pub fn remove_peer(&mut self, name: &str) -> Result<Peer> {
+        let peer = self
+            .config
+            .peers
+            .remove(name)
+            .ok_or_else(|| eyre!("no peer named `{name}`"))?;
+        self.remove_entry("peers", name);
+
+        Ok(peer)
+    }
+
     /// Adds a repo, rejecting duplicate names and paths.
     pub fn add_repo(&mut self, name: String, repo: Repo) -> Result<()> {
         self.config.validate_new_repo(&name, &repo.path)?;
@@ -97,5 +109,40 @@ impl ConfigEdit {
         table.insert(name, item);
 
         Ok(())
+    }
+
+    /// Removes the `[<section>.<name>]` table from the document.
+    fn remove_entry(&mut self, section: &str, name: &str) {
+        if let Some(table) = self.doc.get_mut(section).and_then(Item::as_table_mut) {
+            table.remove(name);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use iroh::SecretKey;
+
+    use super::*;
+
+    #[test]
+    fn add_and_remove_peer_roundtrip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = ConfigDir::new(Some(tmp.path().to_owned())).unwrap();
+        let endpoint = SecretKey::generate().public();
+
+        let mut edit = ConfigEdit::from_config(&dir).unwrap();
+        edit.add_peer("laptop".to_owned(), Peer { endpoint })
+            .unwrap();
+        edit.save().unwrap();
+
+        let mut edit = ConfigEdit::from_config(&dir).unwrap();
+        assert!(edit.remove_peer("desktop").is_err());
+        let removed = edit.remove_peer("laptop").unwrap();
+        assert_eq!(removed.endpoint, endpoint);
+        edit.save().unwrap();
+
+        let config = Config::from_config(&dir).unwrap();
+        assert!(config.peers.is_empty());
     }
 }

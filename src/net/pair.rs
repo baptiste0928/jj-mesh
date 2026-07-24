@@ -18,8 +18,9 @@
 //! persists the peer before confirming with the `paired` close (the joiner's
 //! commit signal, see [`confirm_paired`]), so it can never confirm a peer it
 //! did not save. The joiner persists after that close: a failure there can
-//! still leave the host paired one-sidedly; removing the peer entry and
-//! re-pairing recovers.
+//! still leave the host paired one-sidedly. Pairing an already-registered
+//! endpoint is idempotent (identities are authenticated by the handshake),
+//! so a half-paired machine recovers by simply pairing again.
 
 use std::{fmt, str::FromStr, time::Duration};
 
@@ -174,16 +175,30 @@ pub async fn pair_with(
             name,
         }) if ticket.secret.verify(&proof) => name,
         Ok(_) | Err(_) => {
-            send_reject(conn, &mut send, "invalid pairing ticket", REJECT_LINGER_BRIEF).await;
+            send_reject(
+                conn,
+                &mut send,
+                "invalid pairing ticket",
+                REJECT_LINGER_BRIEF,
+            )
+            .await;
             return Ok(None);
         }
     };
 
     let endpoint = conn.remote_id();
-    if let Err(err) = config.validate_new_peer(&hello, &endpoint) {
-        send_reject(conn, &mut send, &err.to_string(), REJECT_LINGER).await;
-        return Err(err.wrap_err("cannot pair"));
-    }
+    // Re-pairing an already-registered machine is idempotent, keeping its
+    // stored name: accepting a peer we already trust gives an attacker
+    // nothing, and lets a half-paired joiner recover by retrying.
+    let name = if let Some(existing) = config.peer_name(&endpoint) {
+        existing.to_owned()
+    } else {
+        if let Err(err) = config.validate_new_peer(&hello, &endpoint) {
+            send_reject(conn, &mut send, &err.to_string(), REJECT_LINGER).await;
+            return Err(err.wrap_err("cannot pair"));
+        }
+        hello
+    };
 
     let welcome = Message::Welcome {
         name: local_name.to_owned(),
@@ -204,10 +219,7 @@ pub async fn pair_with(
         Err(_) => return Ok(None),
     }
 
-    Ok(Some(PairedPeer {
-        name: hello,
-        endpoint,
-    }))
+    Ok(Some(PairedPeer { name, endpoint }))
 }
 
 /// Confirms a successful pairing to the joiner.
@@ -253,10 +265,17 @@ pub async fn join(
         msg => bail!("unexpected message from host: {msg:?}"),
     };
 
-    if let Err(err) = config.validate_new_peer(&name, &host_endpoint) {
-        send_reject(&conn, &mut send, &err.to_string(), REJECT_LINGER).await;
-        return Err(err.wrap_err("cannot pair"));
-    }
+    // Mirror of the host's idempotent re-pairing: a host we already have
+    // registered keeps its stored name.
+    let name = if let Some(existing) = config.peer_name(&host_endpoint) {
+        existing.to_owned()
+    } else {
+        if let Err(err) = config.validate_new_peer(&name, &host_endpoint) {
+            send_reject(&conn, &mut send, &err.to_string(), REJECT_LINGER).await;
+            return Err(err.wrap_err("cannot pair"));
+        }
+        name
+    };
 
     write_message(&mut send, &Message::Done, MAX_MESSAGE_SIZE).await?;
     let _ = send.finish();
@@ -283,7 +302,11 @@ pub async fn join(
 /// Makes a peer-supplied reason safe to print: it arrives before any trust
 /// is established, so control characters (terminal escapes) are stripped.
 fn sanitize(reason: &str) -> String {
-    reason.chars().filter(|c| !c.is_control()).take(200).collect()
+    reason
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(200)
+        .collect()
 }
 
 /// Sends a rejection, waiting up to `linger` for the peer to see it before

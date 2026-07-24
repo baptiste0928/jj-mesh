@@ -73,7 +73,10 @@ pub enum Response {
     /// The pairing ticket to transmit to the other machine.
     PairTicket(String),
     /// Pairing succeeded and the peer is saved in the configuration.
-    Paired { name: String, endpoint: EndpointId },
+    Paired {
+        name: String,
+        endpoint: EndpointId,
+    },
     /// The request failed.
     Error(String),
 }
@@ -260,16 +263,14 @@ impl Drop for ControlServer {
 
 /// Answers one client connection.
 async fn handle_client(mut stream: UnixStream, ctx: Arc<ControlContext>) {
-    let request = match tokio::time::timeout(
-        CLIENT_TIMEOUT,
-        read_message(&mut stream, MAX_MESSAGE_SIZE),
-    )
-    .await
-    {
-        Ok(Ok(request)) => request,
-        Ok(Err(err)) => return debug!("control client error: {err}"),
-        Err(_) => return debug!("control client timed out"),
-    };
+    let request =
+        match tokio::time::timeout(CLIENT_TIMEOUT, read_message(&mut stream, MAX_MESSAGE_SIZE))
+            .await
+        {
+            Ok(Ok(request)) => request,
+            Ok(Err(err)) => return debug!("control client error: {err}"),
+            Err(_) => return debug!("control client timed out"),
+        };
 
     let served = match request {
         Request::Status => respond(&mut stream, &Response::Status(ctx.status())).await,
@@ -386,10 +387,15 @@ async fn pair_join(
     respond(&mut write_half, &response).await
 }
 
-/// Registers a paired peer in the configuration. The daemon's own config
+/// Registers a paired peer in the configuration; a no-op when the endpoint
+/// is already registered (idempotent re-pair). The daemon's own config
 /// watcher picks the change up and starts connecting to the new peer.
 fn persist_peer(dir: &ConfigDir, peer: &pair::PairedPeer) -> Result<()> {
     let mut edit = ConfigEdit::from_config(dir)?;
+    if edit.config().peer_name(&peer.endpoint).is_some() {
+        return Ok(());
+    }
+
     edit.add_peer(
         peer.name.clone(),
         Peer {

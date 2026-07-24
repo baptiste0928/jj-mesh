@@ -1,24 +1,56 @@
-//! `jj-mesh peers`: list paired peers.
+//! `jj-mesh peers`: list and manage paired peers.
 //!
-//! Shows live connection state (reachability, direct or relay path, rtt)
-//! when the daemon is running, and falls back to the static configuration
-//! otherwise.
+//! The listing shows live connection state (reachability, direct or relay
+//! path, rtt) when the daemon is running, and falls back to the static
+//! configuration otherwise.
 
-use clap::Args;
+use clap::{Args, Subcommand};
 use color_eyre::eyre::Result;
 
 use super::status::{connection_summary, name_width};
 use crate::{
-    config::{Config, ConfigDir, MachineKey},
+    config::{Config, ConfigDir, ConfigEdit, MachineKey},
     daemon::control,
 };
 
 /// List the paired machines
 #[derive(Debug, Args)]
-pub struct PeersArgs {}
+pub struct PeersArgs {
+    #[command(subcommand)]
+    command: Option<PeersCommand>,
+}
+
+#[derive(Debug, Subcommand)]
+enum PeersCommand {
+    /// Remove a paired machine
+    ///
+    /// A running daemon disconnects the peer when it picks up the change.
+    Remove {
+        /// Name of the peer to remove
+        name: String,
+    },
+}
 
 /// Runs the `peers` command.
-pub fn run(_args: PeersArgs, dir: &ConfigDir) -> Result<()> {
+pub fn run(args: PeersArgs, dir: &ConfigDir) -> Result<()> {
+    match args.command {
+        None => list(dir),
+        Some(PeersCommand::Remove { name }) => remove(dir, &name),
+    }
+}
+
+/// Removes a peer from the configuration.
+fn remove(dir: &ConfigDir, name: &str) -> Result<()> {
+    let mut edit = ConfigEdit::from_config(dir)?;
+    let peer = edit.remove_peer(name)?;
+    edit.save()?;
+
+    println!("Removed peer `{name}` ({})", peer.endpoint);
+    Ok(())
+}
+
+/// Lists the peers, live when the daemon answers.
+fn list(dir: &ConfigDir) -> Result<()> {
     let key = MachineKey::from_config(dir)?;
     let status = control::query_status_blocking(dir)?;
 
