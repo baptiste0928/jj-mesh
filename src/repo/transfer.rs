@@ -2,10 +2,12 @@
 //!
 //! Both sides run over any `AsyncRead`/`AsyncWrite` pair (QUIC streams in
 //! production, in-memory duplexes in tests) and follow the phase protocol
-//! described in [`crate::net::sync`]. Peer-supplied data is authenticated
-//! but untrusted: everything is validated structurally before use, git
-//! objects are hash-verified before writing, and op/view writes verify
-//! their content-addressed ids.
+//! described in [`crate::net::sync`]. Ops and views travel as raw stored
+//! bytes and keep their sender-side ids (see the `mesh` module docs for
+//! why re-hashing them is impossible). Peer-supplied data is authenticated
+//! but untrusted: op and view bytes are validated structurally before
+//! anything is written, git objects are hash-verified before writing, and
+//! replicated bytes can never replace already-stored objects.
 //!
 //! The apply side follows the crash-safe write order: git objects, anti-GC
 //! keep refs, views and ops (parents first), change-id extras, the
@@ -21,19 +23,22 @@ use color_eyre::eyre::{Result, WrapErr as _, bail, ensure, eyre};
 use jj_lib::{
     backend::CommitId,
     object_id::ObjectId as _,
-    op_store::{Operation, OperationId, RefTarget, View, ViewId},
+    op_store::{OperationId, RefTarget, View, ViewId},
 };
 use pollster::FutureExt as _;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tracing::{debug, info, warn};
 
-use super::{MeshRepo, codec};
+use super::{
+    MeshRepo,
+    codec::{self, OpMeta, ViewMeta},
+};
 use crate::{
     config::RepoId,
     net::{
         sync::{
-            FetchRequest, GitFrame, GitRequest, MAX_GIT_FRAME_SIZE, MAX_GIT_WANTS, MAX_HAVES,
-            MAX_OP_FRAME_SIZE, MAX_WANTS, OpFrame, WireObjectKind,
+            FetchRequest, GitFrame, GitRequest, MAX_GIT_FRAME_SIZE, MAX_GIT_HAVES, MAX_GIT_WANTS,
+            MAX_HAVES, MAX_OP_FRAME_SIZE, MAX_WANTS, OpFrame, WireObjectKind,
         },
         wire::{read_message, write_message},
     },
@@ -41,9 +46,6 @@ use crate::{
 
 /// Read budget when sampling have-ancestors for a fetch request.
 const SAMPLE_BUDGET: usize = 128;
-
-/// Cap on commit haves sent in the git phase (current view heads).
-const MAX_GIT_HAVES: usize = 4096;
 
 /// Git objects are written in chunks of this many to amortize the
 /// blocking-thread hops.
@@ -89,24 +91,27 @@ pub async fn serve(
     }
 
     // Collect the delta on a blocking thread: the walk is bulk store I/O.
+    // Ops and views are read back as their raw stored bytes, which is what
+    // replication transfers.
     let batch = {
         let repo = repo.clone();
         tokio::task::spawn_blocking(move || -> Result<_> {
             let ops = repo.ancestors_until(&wants, &haves).block_on()?;
-            let mut views = Vec::new();
-            let mut sent_views = HashSet::new();
-            for (_, op) in &ops {
-                if sent_views.insert(op.view_id.clone()) {
-                    let view = repo.read_view(&op.view_id).block_on()?;
-                    views.push((op.view_id.clone(), view));
+            let mut views: HashMap<ViewId, Vec<u8>> = HashMap::new();
+            let mut raw_ops: Vec<(OperationId, ViewId, Vec<u8>)> = Vec::new();
+            for (id, op) in ops {
+                if !views.contains_key(&op.view_id) {
+                    views.insert(op.view_id.clone(), repo.read_view_bytes(&op.view_id)?);
                 }
+                let bytes = repo.read_operation_bytes(&id)?;
+                raw_ops.push((id, op.view_id, bytes));
             }
-            Ok((ops, views))
+            Ok((raw_ops, views))
         })
         .await
         .wrap_err("fetch serve task failed")?
     };
-    let (ops, views) = match batch {
+    let (ops, mut views) = match batch {
         Ok(batch) => batch,
         Err(err) => {
             let message = format!("cannot collect operations: {err:#}");
@@ -117,19 +122,18 @@ pub async fn serve(
 
     // Views go out before the first op referencing them; ops are already
     // parents-first.
-    let mut views_by_id: HashMap<ViewId, View> = views.into_iter().collect();
     let op_count = ops.len();
-    for (id, op) in ops {
-        if let Some(view) = views_by_id.remove(&op.view_id) {
+    for (id, view_id, bytes) in ops {
+        if let Some(view) = views.remove(&view_id) {
             let frame = OpFrame::View {
-                id: op.view_id.as_bytes().to_vec(),
-                view: codec::encode_view(&view),
+                id: view_id.as_bytes().to_vec(),
+                view,
             };
             write_message(send, &frame, MAX_OP_FRAME_SIZE).await?;
         }
         let frame = OpFrame::Op {
             id: id.as_bytes().to_vec(),
-            op: codec::encode_operation(&op),
+            op: bytes,
         };
         write_message(send, &frame, MAX_OP_FRAME_SIZE).await?;
     }
@@ -289,7 +293,7 @@ fn walk_git_closure(
         let object = git
             .find_object(*commit)
             .wrap_err_with(|| format!("missing object {commit}"))?;
-        emit((*commit, WireObjectKind::Commit, object.data.clone()))?;
+        emit((*commit, WireObjectKind::Commit, object.detach().data))?;
     }
     for id in extras {
         walk_tree(&git, id, &mut seen, &mut emit)?;
@@ -312,7 +316,8 @@ fn walk_tree(
         let object = git
             .find_object(id)
             .wrap_err_with(|| format!("missing object {id}"))?;
-        let data = object.data.clone();
+        // `detach()` moves the object's buffer out instead of copying it,
+        // which matters for large blobs.
         match object.kind {
             gix::object::Kind::Tree => {
                 let tree = object.try_into_tree().map_err(|err| eyre!("{err}"))?;
@@ -325,9 +330,9 @@ fn walk_tree(
                     }
                     stack.push(entry.oid().to_owned());
                 }
-                emit((id, WireObjectKind::Tree, data))?;
+                emit((id, WireObjectKind::Tree, tree.detach().data))?;
             }
-            gix::object::Kind::Blob => emit((id, WireObjectKind::Blob, data))?,
+            gix::object::Kind::Blob => emit((id, WireObjectKind::Blob, object.detach().data))?,
             gix::object::Kind::Commit => {
                 // A tree entry cannot be a commit, but a tag can point at
                 // one; treat it as a boundary (it was either walked as a
@@ -337,7 +342,7 @@ fn walk_tree(
                 let tag = object.try_into_tag().map_err(|err| eyre!("{err}"))?;
                 let target = tag.target_id().map_err(|err| eyre!("{err}"))?.detach();
                 stack.push(target);
-                emit((id, WireObjectKind::Tag, data))?;
+                emit((id, WireObjectKind::Tag, tag.detach().data))?;
             }
         }
     }
@@ -430,39 +435,75 @@ pub async fn fetch(
     })
 }
 
+/// A replicated operation: raw bytes to store under `id`, plus the
+/// structural metadata extracted from them.
+struct StoredOp {
+    id: OperationId,
+    bytes: Vec<u8>,
+    meta: OpMeta,
+}
+
+/// A replicated view (see [`StoredOp`]).
+struct StoredView {
+    id: ViewId,
+    bytes: Vec<u8>,
+    meta: ViewMeta,
+}
+
 /// The validated result of a fetch's op phase.
 struct OpBatch {
     /// Parents-first, as received.
-    ops: Vec<(OperationId, Operation)>,
-    views: Vec<(ViewId, View)>,
+    ops: Vec<StoredOp>,
+    views: Vec<StoredView>,
 }
 
-/// Receives and validates the op phase: every op's parents and view must
-/// be part of the batch or already stored, and every want must be covered.
+impl OpBatch {
+    /// Indexes the batch ops' metadata by op id.
+    fn ops_by_id(&self) -> HashMap<&OperationId, &OpMeta> {
+        self.ops.iter().map(|op| (&op.id, &op.meta)).collect()
+    }
+}
+
+/// Receives and validates the op phase: every frame must decode as jj's
+/// proto schema, every op's parents and view must be part of the batch or
+/// already stored, and every want must be covered.
 async fn receive_ops(
     repo: &Arc<MeshRepo>,
     wants: &[OperationId],
     recv: &mut (impl AsyncRead + Unpin),
 ) -> Result<OpBatch> {
-    let mut ops: Vec<(OperationId, Operation)> = Vec::new();
-    let mut views: Vec<(ViewId, View)> = Vec::new();
+    let id_len = repo.root_operation_id().as_bytes().len();
+    let mut ops: Vec<StoredOp> = Vec::new();
+    let mut views: Vec<StoredView> = Vec::new();
     let mut op_ids: HashSet<OperationId> = HashSet::new();
     let mut view_ids: HashSet<ViewId> = HashSet::new();
 
     for _ in 0..MAX_OP_FRAMES {
         match read_message(recv, MAX_OP_FRAME_SIZE).await? {
             OpFrame::View { id, view } => {
+                ensure!(id.len() == id_len, "bad view id length ({})", id.len());
                 let id = ViewId::new(id);
-                let view = codec::decode_view(view)?;
+                let meta =
+                    codec::parse_view(&view).wrap_err_with(|| format!("view {}", id.hex()))?;
                 if view_ids.insert(id.clone()) {
-                    views.push((id, view));
+                    views.push(StoredView {
+                        id,
+                        bytes: view,
+                        meta,
+                    });
                 }
             }
             OpFrame::Op { id, op } => {
+                ensure!(id.len() == id_len, "bad op id length ({})", id.len());
                 let id = OperationId::new(id);
-                let op = codec::decode_operation(op);
+                ensure!(
+                    id != *repo.root_operation_id(),
+                    "peer sent an op claiming the root id",
+                );
+                let meta =
+                    codec::parse_operation(&op).wrap_err_with(|| format!("op {}", id.hex()))?;
                 ensure!(!op_ids.contains(&id), "op {} sent twice", id.hex());
-                for parent in &op.parents {
+                for parent in &meta.parents {
                     ensure!(
                         op_ids.contains(parent)
                             || parent == repo.root_operation_id()
@@ -473,12 +514,16 @@ async fn receive_ops(
                     );
                 }
                 ensure!(
-                    view_ids.contains(&op.view_id) || repo.has_view(&op.view_id).await?,
+                    view_ids.contains(&meta.view_id) || repo.has_view(&meta.view_id).await?,
                     "op {} references unknown view",
                     id.hex(),
                 );
                 op_ids.insert(id.clone());
-                ops.push((id, op));
+                ops.push(StoredOp {
+                    id,
+                    bytes: op,
+                    meta,
+                });
             }
             OpFrame::Done => {
                 for want in wants {
@@ -488,8 +533,9 @@ async fn receive_ops(
                         want.hex(),
                     );
                 }
-                ensure_batch_reachable(wants, &ops)?;
-                return Ok(OpBatch { ops, views });
+                let batch = OpBatch { ops, views };
+                ensure_batch_reachable(wants, &batch)?;
+                return Ok(batch);
             }
             OpFrame::Error { message } => bail!("peer refused fetch: {message}"),
         }
@@ -501,8 +547,8 @@ async fn receive_ops(
 /// server only sends ancestors of the wants; anything else has no business
 /// in the batch, and a fabricated op claiming a local head as its parent
 /// could otherwise poison the supersession computation in [`apply`].
-fn ensure_batch_reachable(wants: &[OperationId], ops: &[(OperationId, Operation)]) -> Result<()> {
-    let by_id: HashMap<&OperationId, &Operation> = ops.iter().map(|(id, op)| (id, op)).collect();
+fn ensure_batch_reachable(wants: &[OperationId], batch: &OpBatch) -> Result<()> {
+    let by_id = batch.ops_by_id();
     let mut reachable: HashSet<&OperationId> = HashSet::new();
     let mut stack: Vec<&OperationId> = wants
         .iter()
@@ -511,10 +557,10 @@ fn ensure_batch_reachable(wants: &[OperationId], ops: &[(OperationId, Operation)
 
     while let Some(id) = stack.pop() {
         if reachable.insert(id)
-            && let Some(op) = by_id.get(id)
+            && let Some(meta) = by_id.get(id)
         {
             stack.extend(
-                op.parents
+                meta.parents
                     .iter()
                     .filter(|parent| by_id.contains_key(*parent)),
             );
@@ -522,46 +568,23 @@ fn ensure_batch_reachable(wants: &[OperationId], ops: &[(OperationId, Operation)
     }
 
     ensure!(
-        reachable.len() == ops.len(),
+        reachable.len() == batch.ops.len(),
         "batch contains {} ops unreachable from the wants",
-        ops.len() - reachable.len(),
+        batch.ops.len() - reachable.len(),
     );
     Ok(())
 }
 
 /// Every commit id the batch references: view heads, all ref targets
-/// (including conflict sides), working copies, and predecessor records.
+/// (including conflict sides and legacy encodings), working copies, and
+/// predecessor records.
 fn referenced_commits(batch: &OpBatch) -> Vec<CommitId> {
-    fn add_target(ids: &mut HashSet<CommitId>, target: &RefTarget) {
-        ids.extend(target.as_merge().iter().flatten().cloned());
-    }
-
     let mut ids: HashSet<CommitId> = HashSet::new();
-    for (_, view) in &batch.views {
-        ids.extend(view.head_ids.iter().cloned());
-        let targets = view
-            .local_bookmarks
-            .values()
-            .chain(view.local_tags.values())
-            .chain(view.git_refs.values());
-        for target in targets {
-            add_target(&mut ids, target);
-        }
-        add_target(&mut ids, &view.git_head);
-        for remote in view.remote_views.values() {
-            for remote_ref in remote.bookmarks.values().chain(remote.tags.values()) {
-                add_target(&mut ids, &remote_ref.target);
-            }
-        }
-        ids.extend(view.wc_commit_ids.values().cloned());
+    for view in &batch.views {
+        ids.extend(view.meta.referenced_commits.iter().cloned());
     }
-    for (_, op) in &batch.ops {
-        if let Some(predecessors) = &op.commit_predecessors {
-            for (commit, preds) in predecessors {
-                ids.insert(commit.clone());
-                ids.extend(preds.iter().cloned());
-            }
-        }
+    for op in &batch.ops {
+        ids.extend(op.meta.referenced_commits.iter().cloned());
     }
     ids.into_iter().collect()
 }
@@ -575,6 +598,11 @@ async fn receive_git_objects(
     let hash_kind = repo.git_backend().git_repo().object_hash();
     let mut chunk: Vec<(gix::ObjectId, gix::object::Kind, Vec<u8>)> = Vec::new();
     let mut total = 0usize;
+
+    // The previous chunk writes to disk while the next one streams in;
+    // awaiting it only when the next chunk is full keeps the network and
+    // the blocking writer pipelined.
+    let mut pending: Option<tokio::task::JoinHandle<Result<()>>> = None;
 
     loop {
         match read_message(recv, MAX_GIT_FRAME_SIZE).await? {
@@ -591,11 +619,19 @@ async fn receive_git_objects(
                 chunk.push((id, kind, data));
                 total += 1;
                 if chunk.len() >= GIT_WRITE_CHUNK {
-                    write_git_chunk(repo, std::mem::take(&mut chunk)).await?;
+                    if let Some(write) = pending.take() {
+                        write.await.wrap_err("git write task failed")??;
+                    }
+                    pending = Some(write_git_chunk(repo, std::mem::take(&mut chunk)));
                 }
             }
             GitFrame::Done => {
-                write_git_chunk(repo, chunk).await?;
+                if let Some(write) = pending.take() {
+                    write.await.wrap_err("git write task failed")??;
+                }
+                write_git_chunk(repo, chunk)
+                    .await
+                    .wrap_err("git write task failed")??;
                 return Ok(total);
             }
             GitFrame::Error { message } => bail!("peer failed git phase: {message}"),
@@ -604,14 +640,13 @@ async fn receive_git_objects(
 }
 
 /// Writes a chunk of verified objects into the loose odb on a blocking
-/// thread, skipping objects already present.
-async fn write_git_chunk(
+/// thread, skipping objects already present. The ids were hash-verified
+/// against the data on receipt, so the write reuses them instead of
+/// hashing every object a second time.
+fn write_git_chunk(
     repo: &Arc<MeshRepo>,
     chunk: Vec<(gix::ObjectId, gix::object::Kind, Vec<u8>)>,
-) -> Result<()> {
-    if chunk.is_empty() {
-        return Ok(());
-    }
+) -> tokio::task::JoinHandle<Result<()>> {
     let repo = repo.clone();
     tokio::task::spawn_blocking(move || -> Result<()> {
         use gix::prelude::Write as _;
@@ -620,16 +655,12 @@ async fn write_git_chunk(
             if git.has_object(id) {
                 continue;
             }
-            let written = git
-                .objects
-                .write_buf(kind, &data)
+            git.objects
+                .write_buf_with_known_id(kind, &data, id)
                 .map_err(|err| eyre!("cannot write object {id}: {err}"))?;
-            ensure!(written == id, "object {id} stored as {written}");
         }
         Ok(())
     })
-    .await
-    .wrap_err("git write task failed")?
 }
 
 // --- Apply ---
@@ -647,15 +678,15 @@ fn apply(
     let new_commit_heads: HashSet<CommitId> = batch
         .views
         .iter()
-        .flat_map(|(_, view)| view.head_ids.iter().cloned())
+        .flat_map(|view| view.meta.head_ids.iter().cloned())
         .collect();
     write_keep_refs(repo, &new_commit_heads)?;
 
-    for (id, view) in &batch.views {
-        repo.write_view(id, view).block_on()?;
+    for view in &batch.views {
+        repo.write_view_bytes(&view.id, &view.bytes)?;
     }
-    for (id, op) in &batch.ops {
-        repo.write_operation(id, op).block_on()?;
+    for op in &batch.ops {
+        repo.write_operation_bytes(&op.id, &op.bytes)?;
     }
 
     // Materialize change-id extras for the new commits eagerly instead of
@@ -666,12 +697,11 @@ fn apply(
         .map_err(|err| eyre!("cannot import commit metadata: {err}"))?;
 
     // Which local heads each want supersedes, established by walking the
-    // want's ancestry through verified data only (the id-verified batch
-    // and the local store). Batch membership or parent claims alone are
-    // NOT proof of ancestry: a hostile batch op naming a local head as
-    // its parent must not unlist that head.
-    let by_id: HashMap<&OperationId, &Operation> =
-        batch.ops.iter().map(|(id, op)| (id, op)).collect();
+    // want's ancestry through validated data only (the parsed batch and
+    // the local store). Batch membership or parent claims alone are NOT
+    // proof of ancestry: a hostile batch op naming a local head as its
+    // parent must not unlist that head.
+    let by_id = batch.ops_by_id();
     let mut to_publish: Vec<(OperationId, Vec<OperationId>)> = Vec::new();
     let mut all_superseded: HashSet<OperationId> = HashSet::new();
     for want in wants {
@@ -683,6 +713,13 @@ fn apply(
         to_publish.push((want.clone(), superseded));
     }
 
+    // Before any head points at the replicated bytes, jj itself must be
+    // able to read the ops being published and their views.
+    for (want, _) in &to_publish {
+        let op = repo.read_operation(want).block_on()?;
+        repo.read_view(&op.view_id).block_on()?;
+    }
+
     // The colocated git mirror is only safe when the fetch fast-forwards
     // a single old head to a single new one; under divergence the merged
     // view decides, and with several old heads there is no single previous
@@ -691,17 +728,14 @@ fn apply(
         && local_heads.len() == 1
         && all_superseded.len() == local_heads.len();
     if repo.is_colocated() && !to_publish.is_empty() {
-        let head_view = to_publish
-            .first()
-            .and_then(|(want, _)| by_id.get(want))
-            .and_then(|op| batch.views.iter().find(|(id, _)| *id == op.view_id));
-        match head_view {
-            Some((_, view)) if fast_forward => {
-                let old_op = repo.read_operation(&local_heads[0]).block_on()?;
-                let old_view = repo.read_view(&old_op.view_id).block_on()?;
-                mirror_git_refs(repo, view, &old_view)?;
-            }
-            _ => warn!("divergent sync in colocated repo: git refs not mirrored"),
+        if fast_forward {
+            let new_op = repo.read_operation(&to_publish[0].0).block_on()?;
+            let new_view = repo.read_view(&new_op.view_id).block_on()?;
+            let old_op = repo.read_operation(&local_heads[0]).block_on()?;
+            let old_view = repo.read_view(&old_op.view_id).block_on()?;
+            mirror_git_refs(repo, &new_view, &old_view)?;
+        } else {
+            warn!("divergent sync in colocated repo: git refs not mirrored");
         }
     }
 
@@ -729,10 +763,10 @@ fn apply(
 const SUPERSEDE_WALK_BUDGET: usize = 1 << 16;
 
 /// The local heads that are ancestors of `want`, walking parent links of
-/// verified ops (batch first, local store as fallback).
+/// validated ops (batch first, local store as fallback).
 fn superseded_by(
     repo: &MeshRepo,
-    batch: &HashMap<&OperationId, &Operation>,
+    batch: &HashMap<&OperationId, &OpMeta>,
     want: &OperationId,
     local_heads: &[OperationId],
 ) -> Vec<OperationId> {
@@ -754,7 +788,7 @@ fn superseded_by(
             continue;
         }
         let parents = match batch.get(&id) {
-            Some(op) => op.parents.clone(),
+            Some(meta) => meta.parents.clone(),
             None => match repo.read_operation(&id).block_on() {
                 Ok(op) => op.parents,
                 // Boundary: without the op the ancestry below cannot be
@@ -1133,27 +1167,20 @@ mod tests {
         let local_head = repo.op_heads().await.unwrap().remove(0);
 
         let want = OperationId::new(vec![1; 64]);
-        let view_id = vec![9; 64];
         let make_op = move |parents: Vec<OperationId>| {
-            codec::encode_operation(&codec::decode_operation(crate::net::sync::WireOperation {
-                view_id: view_id.clone(),
+            use prost::Message as _;
+            jj_lib::protos::simple_op_store::Operation {
+                view_id: vec![9; 64],
                 parents: parents.iter().map(|id| id.as_bytes().to_vec()).collect(),
-                start_time: crate::net::sync::WireTimestamp {
-                    millis: 0,
-                    tz_offset: 0,
-                },
-                end_time: crate::net::sync::WireTimestamp {
-                    millis: 0,
-                    tz_offset: 0,
-                },
-                description: "crafted".to_owned(),
-                hostname: "evil".to_owned(),
-                username: "evil".to_owned(),
-                is_snapshot: false,
-                workspace_name: None,
-                attributes: Vec::new(),
-                commit_predecessors: None,
-            }))
+                metadata: Some(jj_lib::protos::simple_op_store::OperationMetadata {
+                    description: "crafted".to_owned(),
+                    hostname: "evil".to_owned(),
+                    username: "evil".to_owned(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }
+            .encode_to_vec()
         };
 
         let (client, remote) = tokio::io::duplex(1 << 20);
@@ -1162,18 +1189,11 @@ mod tests {
 
         let head_bytes = local_head.clone();
         let server = tokio::spawn(async move {
+            use prost::Message as _;
             let _request: FetchRequest = read_message(&mut server_rx, MAX_OP_FRAME_SIZE)
                 .await
                 .unwrap();
-            let view = crate::net::sync::WireView {
-                head_ids: Vec::new(),
-                local_bookmarks: Vec::new(),
-                local_tags: Vec::new(),
-                remote_views: Vec::new(),
-                git_refs: Vec::new(),
-                git_head: vec![None],
-                wc_commit_ids: Vec::new(),
-            };
+            let view = jj_lib::protos::simple_op_store::View::default().encode_to_vec();
             let frames = [
                 OpFrame::View {
                     id: vec![9; 64],

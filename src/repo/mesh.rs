@@ -5,18 +5,26 @@
 //! loads a full repo, so the commit index is never built or read.
 //!
 //! Invariants:
-//! - Writes preserve content-addressed ids: writing a replicated op or view
-//!   must produce the id it had on the sender, or the write fails. A failed
-//!   write may still have persisted the object under its true id; that is
-//!   harmless content-addressed garbage, but callers must not assume a
-//!   failed write left the store untouched.
+//! - Ops and views replicate as raw stored bytes under the sender's ids.
+//!   jj computes these ids from its in-memory structs at write time and
+//!   never re-verifies them, so ids written by older jj versions do not
+//!   survive a decode + re-encode round trip; only byte-verbatim copies
+//!   keep them identical across the mesh. Raw writes are atomic and never
+//!   overwrite an existing object: for a content-addressed store the first
+//!   write wins.
 //! - The root operation is never transferred; it is identical in every repo.
 //!
 //! jj's store traits are async in signature only: every call does blocking
 //! file I/O underneath (writes even fsync). Fine for single ops; bulk work
-//! (initial replication, catch-up) must run on a blocking thread.
+//! (initial replication, catch-up) must run on a blocking thread, and the
+//! raw byte reads/writes here are plain blocking I/O.
 
-use std::{collections::HashSet, path::Path, sync::LazyLock};
+use std::{
+    collections::HashSet,
+    io::Write as _,
+    path::{Path, PathBuf},
+    sync::LazyLock,
+};
 
 use color_eyre::eyre::{Result, WrapErr as _, ensure, eyre};
 use jj_lib::{
@@ -129,28 +137,51 @@ impl MeshRepo {
         }
     }
 
-    /// Writes a replicated operation, ensuring it keeps the id it had on the
-    /// sender. A mismatch means the op was corrupted in transfer or the
-    /// stores serialize incompatibly, and must abort the sync.
-    ///
-    /// Ops come from peers, so malformed ones must fail cleanly: a
-    /// parentless op is rejected here because the store `assert!`s on it.
-    pub async fn write_operation(&self, id: &OperationId, op: &Operation) -> Result<()> {
-        ensure!(
-            !op.parents.is_empty(),
-            "refusing parentless operation {}: only the root operation has \
-             no parents, and it is never replicated",
-            id.hex(),
-        );
-        let written = self.loader.op_store().write_operation(op).await?;
-        ensure_replicated_id("operation", id, &written)
+    /// Reads an operation's raw stored bytes, for byte-verbatim
+    /// replication to a peer.
+    pub fn read_operation_bytes(&self, id: &OperationId) -> Result<Vec<u8>> {
+        read_raw(&self.op_store_dir().join("operations"), id)
     }
 
-    /// Writes a replicated view, ensuring it keeps the id it had on the
-    /// sender (see [`Self::write_operation`]).
-    pub async fn write_view(&self, id: &ViewId, view: &View) -> Result<()> {
-        let written = self.loader.op_store().write_view(view).await?;
-        ensure_replicated_id("view", id, &written)
+    /// Reads a view's raw stored bytes (see
+    /// [`Self::read_operation_bytes`]).
+    pub fn read_view_bytes(&self, id: &ViewId) -> Result<Vec<u8>> {
+        read_raw(&self.op_store_dir().join("views"), id)
+    }
+
+    /// Writes a replicated operation's raw bytes under the id it has on
+    /// the sender. Callers must have validated the bytes structurally
+    /// (see [`super::codec`]); in particular jj `assert!`s on reading a
+    /// parentless non-root op.
+    pub fn write_operation_bytes(&self, id: &OperationId, bytes: &[u8]) -> Result<()> {
+        self.check_replicated_id("operation", id)?;
+        write_raw(&self.op_store_dir().join("operations"), id, bytes)
+    }
+
+    /// Writes a replicated view's raw bytes under the id it has on the
+    /// sender (see [`Self::write_operation_bytes`]).
+    pub fn write_view_bytes(&self, id: &ViewId, bytes: &[u8]) -> Result<()> {
+        self.check_replicated_id("view", id)?;
+        write_raw(&self.op_store_dir().join("views"), id, bytes)
+    }
+
+    /// Rejects replicated ids the store could never have produced: wrong
+    /// length, or the all-zeros root id, which jj synthesizes instead of
+    /// storing.
+    fn check_replicated_id(&self, kind: &str, id: &impl ObjectId) -> Result<()> {
+        let root = self.root_operation_id().as_bytes();
+        ensure!(
+            id.as_bytes().len() == root.len(),
+            "bad {kind} id length ({})",
+            id.as_bytes().len(),
+        );
+        ensure!(id.as_bytes() != root, "refusing to store the root {kind}");
+        Ok(())
+    }
+
+    /// The simple op store's storage directory.
+    fn op_store_dir(&self) -> PathBuf {
+        self.repo.repo_dir().join("op_store")
     }
 
     /// Publishes `new` as an op head, removing the `old` heads it
@@ -245,14 +276,27 @@ impl MeshRepo {
     }
 }
 
-/// Checks that a replicated object kept its content-addressed id.
-fn ensure_replicated_id<T: ObjectId + PartialEq>(kind: &str, sent: &T, written: &T) -> Result<()> {
-    ensure!(
-        written == sent,
-        "{kind} changed id when replicated: sent as {}, stored as {}",
-        sent.hex(),
-        written.hex(),
-    );
+/// Reads a raw object file from a simple op store directory.
+fn read_raw(dir: &Path, id: &impl ObjectId) -> Result<Vec<u8>> {
+    let path = dir.join(id.hex());
+    std::fs::read(&path).wrap_err_with(|| format!("cannot read {}", path.display()))
+}
+
+/// Atomically writes a raw object file, leaving any existing object
+/// untouched. The existence check races with concurrent writers (the
+/// rename would clobber), but colliding writers share a content-addressed
+/// id, so losing the race replaces the file with equivalent content.
+fn write_raw(dir: &Path, id: &impl ObjectId, bytes: &[u8]) -> Result<()> {
+    let path = dir.join(id.hex());
+    if path.exists() {
+        return Ok(());
+    }
+    let temp = tempfile::NamedTempFile::new_in(dir)
+        .wrap_err_with(|| format!("cannot create temp file in {}", dir.display()))?;
+    temp.as_file().write_all(bytes)?;
+    // Syncs the data before the rename, like jj's own store writes.
+    jj_lib::file_util::persist_content_addressed_temp_file(temp, &path)
+        .wrap_err_with(|| format!("cannot persist {}", path.display()))?;
     Ok(())
 }
 
@@ -309,8 +353,8 @@ mod tests {
         assert!(!repo.has_operation(&truncated).await.unwrap());
     }
 
-    /// Ops and views replicated to another repo must keep their ids, and jj
-    /// itself must accept the result.
+    /// Ops and views replicated as raw bytes keep their ids byte for byte,
+    /// and jj itself must accept the result.
     #[tokio::test]
     async fn replicates_ops_with_identical_ids() {
         let fx = Fixture::new();
@@ -344,9 +388,11 @@ mod tests {
         let missing = ra.ancestors_until(&a_heads, &b_heads).await.unwrap();
         assert!(!missing.is_empty());
         for (id, op) in &missing {
-            let view = ra.read_view(&op.view_id).await.unwrap();
-            rb.write_view(&op.view_id, &view).await.unwrap();
-            rb.write_operation(id, op).await.unwrap();
+            let view = ra.read_view_bytes(&op.view_id).unwrap();
+            rb.write_view_bytes(&op.view_id, &view).unwrap();
+            let bytes = ra.read_operation_bytes(id).unwrap();
+            rb.write_operation_bytes(id, &bytes).unwrap();
+            assert_eq!(rb.read_operation_bytes(id).unwrap(), bytes);
         }
         rb.update_op_heads(&b_heads, &a_heads[0]).await.unwrap();
 
@@ -355,34 +401,27 @@ mod tests {
         fx.jj(&b, &["op", "log"]);
     }
 
+    /// Raw writes never replace stored history: the first write wins, and
+    /// impossible ids (root, wrong length) are rejected outright.
     #[tokio::test]
-    async fn write_rejects_id_mismatch() {
+    async fn raw_writes_reject_bad_ids_and_never_clobber() {
         let fx = Fixture::new();
         let dir = fx.init_repo("a");
         let repo = open(&dir);
+        let head = repo.op_heads().await.unwrap().remove(0);
+        let stored = repo.read_operation_bytes(&head).unwrap();
 
-        let heads = repo.op_heads().await.unwrap();
-        let mut op = repo.read_operation(&heads[0]).await.unwrap();
-        op.metadata.description.push_str(" (tampered)");
+        let err = repo
+            .write_operation_bytes(repo.root_operation_id(), &stored)
+            .unwrap_err();
+        assert!(err.to_string().contains("root"), "{err:#}");
 
-        let err = repo.write_operation(&heads[0], &op).await.unwrap_err();
-        assert!(err.to_string().contains("changed id"));
-    }
+        let short = OperationId::new(vec![1; 8]);
+        let err = repo.write_operation_bytes(&short, &stored).unwrap_err();
+        assert!(err.to_string().contains("id length"), "{err:#}");
 
-    /// The store `assert!`s on parentless ops; peer-supplied ones must be
-    /// rejected as errors, not panics.
-    #[tokio::test]
-    async fn write_rejects_parentless_operation() {
-        let fx = Fixture::new();
-        let dir = fx.init_repo("a");
-        let repo = open(&dir);
-
-        let heads = repo.op_heads().await.unwrap();
-        let mut op = repo.read_operation(&heads[0]).await.unwrap();
-        op.parents.clear();
-
-        let err = repo.write_operation(&heads[0], &op).await.unwrap_err();
-        assert!(err.to_string().contains("parentless"));
+        repo.write_operation_bytes(&head, b"garbage").unwrap();
+        assert_eq!(repo.read_operation_bytes(&head).unwrap(), stored);
     }
 
     #[tokio::test]

@@ -78,6 +78,9 @@ pub const MAX_HAVES: usize = 256;
 /// views (heads, refs, working copies), not history.
 pub const MAX_GIT_WANTS: usize = 65_536;
 
+/// Cap on commit haves sent in the git phase (current view heads).
+pub const MAX_GIT_HAVES: usize = 4096;
+
 /// Opens a fetch: the op heads to obtain and a sample of ops the fetcher
 /// already has (its heads plus exponentially spaced ancestors), bounding
 /// what the server sends back.
@@ -89,12 +92,21 @@ pub struct FetchRequest {
 }
 
 /// Server-to-fetcher frame of the op phase.
+///
+/// Views and ops travel as the raw proto bytes stored in the server's op
+/// store, under their stored ids. jj computes op and view ids by hashing
+/// its in-memory structs at write time and never re-verifies them, so ids
+/// of objects written by older jj versions do not survive a decode +
+/// re-encode round trip; replicating the stored bytes verbatim is the only
+/// way to keep ids identical across the mesh. The receiver validates the
+/// bytes structurally (see `crate::repo::codec`) before storing them.
 #[derive(Debug, Serialize, Deserialize)]
 pub enum OpFrame {
-    /// A view, sent before any op referencing it.
-    View { id: Vec<u8>, view: WireView },
-    /// An operation; its parents (when sent at all) were sent before it.
-    Op { id: Vec<u8>, op: WireOperation },
+    /// A view's raw proto bytes, sent before any op referencing it.
+    View { id: Vec<u8>, view: Vec<u8> },
+    /// An operation's raw proto bytes; its parents (when sent at all) were
+    /// sent before it.
+    Op { id: Vec<u8>, op: Vec<u8> },
     /// End of the op phase.
     Done,
     /// The server cannot serve this fetch.
@@ -130,67 +142,4 @@ pub enum WireObjectKind {
     Tree,
     Blob,
     Tag,
-}
-
-// --- Wire forms of jj's operation log data ---
-//
-// jj's own types are not serializable, so they are mirrored field for
-// field (conversions live in `crate::repo::codec`, next to the jj
-// dependency). Fidelity failures cannot corrupt a repo: writes verify the
-// content-addressed id, so a drifted codec fails syncs loudly instead.
-
-/// A commit id and the ids it was rewritten from, in wire form.
-pub type WirePredecessors = Vec<(Vec<u8>, Vec<Vec<u8>>)>;
-
-/// Mirror of [`jj_lib::op_store::Operation`] plus its metadata, flattened.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WireOperation {
-    pub view_id: Vec<u8>,
-    pub parents: Vec<Vec<u8>>,
-    pub start_time: WireTimestamp,
-    pub end_time: WireTimestamp,
-    pub description: String,
-    pub hostname: String,
-    pub username: String,
-    pub is_snapshot: bool,
-    pub workspace_name: Option<String>,
-    pub attributes: Vec<(String, String)>,
-    pub commit_predecessors: Option<WirePredecessors>,
-}
-
-/// Mirror of [`jj_lib::backend::Timestamp`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WireTimestamp {
-    pub millis: i64,
-    pub tz_offset: i32,
-}
-
-/// Mirror of [`jj_lib::op_store::View`]. Maps become sorted pairs.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WireView {
-    pub head_ids: Vec<Vec<u8>>,
-    pub local_bookmarks: Vec<(String, WireRefTarget)>,
-    pub local_tags: Vec<(String, WireRefTarget)>,
-    pub remote_views: Vec<(String, WireRemoteView)>,
-    pub git_refs: Vec<(String, WireRefTarget)>,
-    pub git_head: WireRefTarget,
-    pub wc_commit_ids: Vec<(String, Vec<u8>)>,
-}
-
-/// Mirror of [`jj_lib::op_store::RefTarget`]: the interleaved values of
-/// its merge, which must have odd length (validated on decode).
-pub type WireRefTarget = Vec<Option<Vec<u8>>>;
-
-/// Mirror of [`jj_lib::op_store::RemoteView`].
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WireRemoteView {
-    pub bookmarks: Vec<(String, WireRemoteRef)>,
-    pub tags: Vec<(String, WireRemoteRef)>,
-}
-
-/// Mirror of [`jj_lib::op_store::RemoteRef`].
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WireRemoteRef {
-    pub target: WireRefTarget,
-    pub tracked: bool,
 }

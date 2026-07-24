@@ -2892,6 +2892,7 @@ dependencies = [
  "notify",
  "pollster",
  "postcard",
+ "prost",
  "rand",
  "serde",
  "service-manager",
