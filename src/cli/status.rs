@@ -69,16 +69,21 @@ fn watch_summary(watch: &control::WatchStatus) -> String {
         control::WatchStatus::Watching {
             op_heads,
             last_change_secs,
+            last_sync_secs,
         } => {
             let changed = match last_change_secs {
                 Some(secs) => format!(", changed {} ago", format_duration(*secs)),
+                None => String::new(),
+            };
+            let synced = match last_sync_secs {
+                Some(secs) => format!(", synced {} ago", format_duration(*secs)),
                 None => String::new(),
             };
             let divergent = match op_heads {
                 2.. => format!(", {op_heads} divergent heads"),
                 _ => String::new(),
             };
-            format!("watching{changed}{divergent}")
+            format!("watching{changed}{synced}{divergent}")
         }
         control::WatchStatus::Failed {
             error,

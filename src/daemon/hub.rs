@@ -21,13 +21,20 @@ use std::{
     time::Duration,
 };
 
-use iroh::{EndpointId, endpoint::Connection};
+use iroh::{
+    EndpointId,
+    endpoint::{Connection, RecvStream, SendStream},
+};
 use tokio::sync::Notify;
 use tracing::debug;
 
 use crate::{
     config::RepoId,
-    net::sync::{self, Announce},
+    net::{
+        sync::{self, Announce, FetchRequest, MAX_OP_FRAME_SIZE, OpFrame},
+        wire,
+    },
+    repo::{MeshRepo, transfer},
 };
 
 /// Budget for sending one announcement; a stalled peer connection kills
@@ -40,6 +47,13 @@ pub struct PeerAnnounce {
     pub peer: EndpointId,
     pub heads: Vec<Vec<u8>>,
 }
+
+/// Fetches served concurrently per repo (read-only on the repo).
+const MAX_SERVES: usize = 2;
+
+/// Hard budget on serving one fetch; QUIC flow control means a stalled
+/// fetcher could otherwise pin a serve task and its permit forever.
+const SERVE_TIMEOUT: Duration = Duration::from_mins(30);
 
 /// The router between peer connections and repo tasks.
 #[derive(Debug, Default)]
@@ -63,6 +77,18 @@ struct RepoEntry {
     /// until the repo task first publishes (repo not opened yet).
     published: Option<Vec<Vec<u8>>>,
     inbox: Arc<Inbox>,
+    /// Serve handle, present while the repo task has the repo open.
+    /// Serving is read-only and dispatched straight from the hub: it must
+    /// never depend on the repo task's loop, which may itself be blocked
+    /// fetching from the very peer whose fetch we are serving.
+    serving: Option<Serving>,
+}
+
+/// What the hub needs to serve fetches for an open repo.
+#[derive(Debug, Clone)]
+struct Serving {
+    repo: Arc<MeshRepo>,
+    permits: Arc<tokio::sync::Semaphore>,
 }
 
 /// Hub-side state of one connected peer.
@@ -88,9 +114,88 @@ impl SyncHub {
                 seq: 0,
                 published: None,
                 inbox: inbox.clone(),
+                serving: None,
             },
         );
         inbox
+    }
+
+    /// Makes an opened repo servable. Called by the repo task once its
+    /// stores are open; replaces the handle from a previous open.
+    pub fn repo_opened(&self, id: &RepoId, repo: Arc<MeshRepo>) {
+        if let Some(entry) = self.state.lock().unwrap().repos.get_mut(id) {
+            entry.serving = Some(Serving {
+                repo,
+                permits: Arc::new(tokio::sync::Semaphore::new(MAX_SERVES)),
+            });
+        }
+    }
+
+    /// Stops serving a repo (its watch failed; the stores may be stale).
+    pub fn repo_closed(&self, id: &RepoId) {
+        if let Some(entry) = self.state.lock().unwrap().repos.get_mut(id) {
+            entry.serving = None;
+        }
+    }
+
+    /// The live connection to a peer, for opening fetch streams.
+    pub fn connection(&self, peer: &EndpointId) -> Option<Connection> {
+        let state = self.state.lock().unwrap();
+        state.peers.get(peer).map(|sender| sender.conn.clone())
+    }
+
+    /// Serves an inbound fetch on a detached task, or refuses it when the
+    /// repo is not open here or too busy.
+    pub fn serve_fetch(
+        &self,
+        peer: EndpointId,
+        request: FetchRequest,
+        mut send: SendStream,
+        mut recv: RecvStream,
+    ) {
+        let serving = {
+            let state = self.state.lock().unwrap();
+            state
+                .repos
+                .get(&request.repo)
+                .and_then(|entry| entry.serving.clone())
+        };
+
+        let message = match serving {
+            None => {
+                debug!(repo = %request.repo, "refusing fetch: repo not open here");
+                "repo not available"
+            }
+            Some(serving) => match serving.permits.clone().try_acquire_owned() {
+                Err(_) => {
+                    debug!(repo = %request.repo, "refusing fetch: too many being served");
+                    "busy, retry later"
+                }
+                Ok(permit) => {
+                    tokio::spawn(async move {
+                        let _permit = permit;
+                        let serve = transfer::serve(&serving.repo, request, &mut send, &mut recv);
+                        match tokio::time::timeout(SERVE_TIMEOUT, serve).await {
+                            Ok(Ok(())) => {
+                                let _ = send.finish();
+                                debug!(peer = %peer, "served fetch");
+                            }
+                            Ok(Err(err)) => debug!(peer = %peer, "serve failed: {err:#}"),
+                            Err(_) => debug!(peer = %peer, "serve timed out"),
+                        }
+                    });
+                    return;
+                }
+            },
+        };
+
+        tokio::spawn(async move {
+            let frame = OpFrame::Error {
+                message: message.to_owned(),
+            };
+            let _ = wire::write_message(&mut send, &frame, MAX_OP_FRAME_SIZE).await;
+            let _ = send.finish();
+        });
     }
 
     /// Removes a repo registration.

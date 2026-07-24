@@ -157,6 +157,8 @@ pub enum WatchStatus {
         op_heads: u64,
         /// Seconds since the last observed change, if any since starting.
         last_change_secs: Option<u64>,
+        /// Seconds since operations were last fetched from a peer.
+        last_sync_secs: Option<u64>,
     },
     /// Opening or watching failed; waiting before retrying.
     Failed { error: String, retry_in_secs: u64 },

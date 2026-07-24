@@ -3,9 +3,9 @@
 //! One task per registered repo opens it and watches its op-heads directory:
 //! every mutating jj command atomically swaps head marker files there, so a
 //! change event means new operations to announce. The task publishes its
-//! head set through the sync hub (on change and on watch start) and handles
-//! peer announcements routed back to it; fetching the announced operations
-//! plugs in next.
+//! head set through the sync hub (on change and on watch start) and fetches
+//! operations peers announce; serving peer fetches is dispatched by the hub
+//! directly (never through this task's loop, which may itself be fetching).
 //!
 //! Change detection compares the head set against the last one seen, which
 //! also absorbs event bursts and spurious wakeups. The daemon's own future
@@ -19,7 +19,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use color_eyre::eyre::{Result, WrapErr as _, ensure};
+use color_eyre::eyre::{Result, WrapErr as _, ensure, eyre};
 use jj_lib::{object_id::ObjectId as _, op_store::OperationId};
 use tracing::{debug, info, warn};
 
@@ -29,7 +29,7 @@ use super::{
 };
 use crate::{
     config::{Config, RepoId},
-    repo::{JjRepo, MeshRepo},
+    repo::{JjRepo, MeshRepo, transfer},
     watch::DirWatcher,
 };
 
@@ -64,6 +64,11 @@ const MAX_ERROR_LEN: usize = 256;
 /// a few heads, anything more is a hostile or broken peer.
 const MAX_ANNOUNCED_HEADS: usize = 64;
 
+/// Hard budget on one fetch from a peer: a stalled or hostile server must
+/// not pin the repo task forever (announcement handling and local change
+/// publication pause while a fetch runs).
+const FETCH_TIMEOUT: Duration = Duration::from_mins(30);
+
 /// The set of managed repos, synced from the configuration.
 #[derive(Debug)]
 pub struct RepoSet {
@@ -88,6 +93,7 @@ enum RepoState {
     Watching {
         op_heads: usize,
         last_change: Option<Instant>,
+        last_sync: Option<Instant>,
     },
     Backoff {
         until: Instant,
@@ -171,9 +177,11 @@ impl RepoSet {
                     RepoState::Watching {
                         op_heads,
                         last_change,
+                        last_sync,
                     } => control::WatchStatus::Watching {
                         op_heads: *op_heads as u64,
                         last_change_secs: last_change.map(|at| at.elapsed().as_secs()),
+                        last_sync_secs: last_sync.map(|at| at.elapsed().as_secs()),
                     },
                     RepoState::Backoff { until, error } => control::WatchStatus::Failed {
                         error: error.clone(),
@@ -238,6 +246,9 @@ async fn run_repo(task: RepoTask) {
 
         let err = task.watch().await.unwrap_err();
         warn!(repo = %task.name, "repo watch failed: {err:#}");
+        // The stores may be stale (moved disk, replaced repo): stop
+        // serving fetches from them until the reopen succeeds.
+        task.hub.repo_closed(&task.id);
 
         if started.elapsed() >= STABLE_WATCH {
             backoff = BACKOFF_MIN;
@@ -253,7 +264,8 @@ async fn run_repo(task: RepoTask) {
 
 impl RepoTask {
     /// Watches the repo's op heads until something fails, announcing local
-    /// changes through the hub and receiving peer announcements from it.
+    /// changes through the hub, fetching announced changes from peers, and
+    /// serving peer fetches.
     ///
     /// The head reads here are cheap single-shot store calls (one readdir),
     /// safe from async context; see the `repo::mesh` module docs. Opening
@@ -268,6 +280,10 @@ impl RepoTask {
         })
         .await
         .wrap_err("repo open task failed")??;
+        let repo = Arc::new(repo);
+        // Fetch serving is dispatched by the hub, never by this loop: a
+        // fetch below may block on the very peer being served.
+        self.hub.repo_opened(&self.id, repo.clone());
 
         // Watch before the first read: changes racing the setup produce at
         // worst a no-change wakeup.
@@ -275,6 +291,7 @@ impl RepoTask {
         let mut watch = DirWatcher::new(&heads_dir, DEBOUNCE, DEBOUNCE_MAX, |_| true)?;
         let mut heads = sorted_heads(&repo).await?;
         let mut last_change = None;
+        let mut last_sync = None;
 
         info!(repo = %self.name, "watching repo");
         // Publishing on watch start doubles as anti-entropy: changes made
@@ -284,6 +301,7 @@ impl RepoTask {
         self.set_state(RepoState::Watching {
             op_heads: heads.len(),
             last_change,
+            last_sync,
         });
 
         loop {
@@ -298,6 +316,16 @@ impl RepoTask {
                 () = self.announcements.changed() => {}
             }
 
+            // Announcements are handled before the head re-read below:
+            // fetching updates the heads, so the re-read then picks the
+            // change up in this same iteration and the baseline update
+            // suppresses the watcher events our own writes caused.
+            for announce in self.announcements.drain() {
+                if self.handle_announce(&repo, &announce).await? == Some(true) {
+                    last_sync = Some(Instant::now());
+                }
+            }
+
             // Heads are re-read and the inbox drained on every wake: both
             // are cheap, wakes are debounced or rare, and the select above
             // can cancel a watch signal mid-debounce, so no single wake
@@ -306,49 +334,82 @@ impl RepoTask {
             if new != heads {
                 heads = new;
                 last_change = Some(Instant::now());
-
                 info!(repo = %self.name, op_heads = heads.len(), "op heads changed");
                 self.hub.publish(&self.id, wire_heads(&heads));
-                self.set_state(RepoState::Watching {
-                    op_heads: heads.len(),
-                    last_change,
-                });
             }
-
-            for announce in self.announcements.drain() {
-                self.handle_announce(&repo, &announce).await?;
-            }
+            self.set_state(RepoState::Watching {
+                op_heads: heads.len(),
+                last_change,
+                last_sync,
+            });
         }
     }
 
-    /// Handles a peer's head announcement: checks which announced heads
-    /// are missing locally. Fetching them lands with the sync pipeline;
-    /// for now the gap is only reported.
-    async fn handle_announce(&self, repo: &MeshRepo, announce: &PeerAnnounce) -> Result<()> {
+    /// Handles a peer's head announcement: fetches announced heads that
+    /// are missing locally. Returns whether anything was fetched (`None`
+    /// for malformed announcements).
+    async fn handle_announce(
+        &self,
+        repo: &Arc<MeshRepo>,
+        announce: &PeerAnnounce,
+    ) -> Result<Option<bool>> {
         let id_len = repo.root_operation_id().as_bytes().len();
         if announce.heads.len() > MAX_ANNOUNCED_HEADS
             || announce.heads.iter().any(|head| head.len() != id_len)
         {
             debug!(repo = %self.name, peer = %announce.peer, "ignoring malformed announcement");
-            return Ok(());
+            return Ok(None);
         }
 
-        let mut missing = 0usize;
+        let mut missing = Vec::new();
         for head in &announce.heads {
-            if !repo.has_operation(&OperationId::new(head.clone())).await? {
-                missing += 1;
+            let head = OperationId::new(head.clone());
+            if !repo.has_operation(&head).await? {
+                missing.push(head);
             }
         }
-
-        if missing > 0 {
-            debug!(
-                repo = %self.name, peer = %announce.peer, missing,
-                "peer announced unknown op heads",
-            );
-        } else {
+        if missing.is_empty() {
             debug!(repo = %self.name, peer = %announce.peer, "in sync with peer");
+            return Ok(Some(false));
         }
-        Ok(())
+
+        // Sync failures must not kill the watch: the repo is fine, the
+        // peer or network is not. The next announcement retries.
+        match self.fetch_missing(repo, announce.peer, &missing).await {
+            Ok(outcome) => {
+                info!(
+                    repo = %self.name, peer = %announce.peer,
+                    ops = outcome.ops, objects = outcome.git_objects,
+                    "synced from peer",
+                );
+                Ok(Some(true))
+            }
+            Err(err) => {
+                warn!(repo = %self.name, peer = %announce.peer, "sync failed: {err:#}");
+                Ok(Some(false))
+            }
+        }
+    }
+
+    /// Fetches missing op heads from the announcing peer over a fresh
+    /// bidirectional stream.
+    async fn fetch_missing(
+        &self,
+        repo: &Arc<MeshRepo>,
+        peer: iroh::EndpointId,
+        wants: &[OperationId],
+    ) -> Result<transfer::FetchOutcome> {
+        let conn = self
+            .hub
+            .connection(&peer)
+            .ok_or_else(|| eyre!("peer is no longer connected"))?;
+        let (mut send, mut recv) = conn.open_bi().await?;
+        let fetch = transfer::fetch(repo, &self.id, wants, &mut send, &mut recv);
+        let outcome = tokio::time::timeout(FETCH_TIMEOUT, fetch)
+            .await
+            .map_err(|_| eyre!("fetch timed out"))??;
+        let _ = send.finish();
+        Ok(outcome)
     }
 
     fn set_state(&self, state: RepoState) {
@@ -424,6 +485,7 @@ mod tests {
                     watch: control::WatchStatus::Watching {
                         op_heads: 1,
                         last_change_secs: None,
+                        ..
                     },
                     ..
                 }]

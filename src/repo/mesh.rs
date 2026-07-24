@@ -40,6 +40,14 @@ pub struct MeshRepo {
     loader: RepoLoader,
 }
 
+impl std::fmt::Debug for MeshRepo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MeshRepo")
+            .field("root", &self.repo.root())
+            .finish_non_exhaustive()
+    }
+}
+
 /// jj settings shared by every opened repo: jj's built-in defaults only.
 /// The daemon must not depend on the user's jj configuration; settings
 /// affect commit creation and merges, neither of which happens here.
@@ -109,6 +117,16 @@ impl MeshRepo {
     /// Reads a view.
     pub async fn read_view(&self, id: &ViewId) -> Result<View> {
         Ok(self.loader.op_store().read_view(id).await?)
+    }
+
+    /// Whether the op store contains the given view.
+    pub async fn has_view(&self, id: &ViewId) -> Result<bool> {
+        use jj_lib::op_store::OpStoreError;
+        match self.loader.op_store().read_view(id).await {
+            Ok(_) => Ok(true),
+            Err(OpStoreError::ObjectNotFound { .. }) => Ok(false),
+            Err(err) => Err(err.into()),
+        }
     }
 
     /// Writes a replicated operation, ensuring it keeps the id it had on the
@@ -218,6 +236,12 @@ impl MeshRepo {
     /// directory when colocated), for direct object access via gitoxide.
     pub fn git_repo_path(&self) -> &Path {
         self.git_backend().git_repo_path()
+    }
+
+    /// Whether the repo is colocated with a user-visible `.git`, which
+    /// then must be kept in sync when applying remote operations.
+    pub fn is_colocated(&self) -> bool {
+        self.git_repo_path() == self.repo.root().join(".git")
     }
 }
 

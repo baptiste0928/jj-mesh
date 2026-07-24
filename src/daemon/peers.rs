@@ -17,7 +17,10 @@ use tokio::sync::{Semaphore, mpsc};
 use tracing::{debug, info};
 
 use super::{control, hub::SyncHub};
-use crate::{config::Config, net::sync};
+use crate::{
+    config::Config,
+    net::{sync, wire},
+};
 
 /// Maximum announcement streams handled concurrently per peer connection.
 const MAX_ANNOUNCE_STREAMS: usize = 16;
@@ -25,6 +28,10 @@ const MAX_ANNOUNCE_STREAMS: usize = 16;
 /// Budget for reading one announcement stream, so a stalled stream cannot
 /// hold its permit indefinitely.
 const ANNOUNCE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Maximum fetch streams accepted concurrently per peer connection,
+/// pending their routing to repo tasks.
+const MAX_FETCH_STREAMS: usize = 4;
 
 /// Reconnect delay after a first failure; doubles up to [`BACKOFF_MAX`].
 const BACKOFF_MIN: Duration = Duration::from_secs(1);
@@ -311,6 +318,7 @@ impl PeerTask {
         let mut since = Instant::now();
         // The peer is authenticated but must not spawn unbounded work.
         let announce_permits = Arc::new(Semaphore::new(MAX_ANNOUNCE_STREAMS));
+        let fetch_permits = Arc::new(Semaphore::new(MAX_FETCH_STREAMS));
 
         self.hub.peer_connected(self.peer_id, &conn);
         loop {
@@ -347,9 +355,49 @@ impl PeerTask {
                     };
                     self.serve_announce(stream, &announce_permits);
                 }
+                stream = conn.accept_bi() => {
+                    let Ok((send, recv)) = stream else {
+                        debug!(peer = %self.name, "connection lost");
+                        break;
+                    };
+                    self.accept_fetch(send, recv, &fetch_permits);
+                }
             }
         }
         self.hub.peer_disconnected(&self.peer_id);
+    }
+
+    /// Reads a fetch request from a fresh bi stream and routes it to the
+    /// owning repo task; refused fetches get an error frame back.
+    fn accept_fetch(
+        &self,
+        send: iroh::endpoint::SendStream,
+        mut recv: iroh::endpoint::RecvStream,
+        permits: &Arc<Semaphore>,
+    ) {
+        let Ok(permit) = permits.clone().try_acquire_owned() else {
+            debug!(peer = %self.name, "dropping fetch: too many open streams");
+            return;
+        };
+
+        let hub = self.hub.clone();
+        let peer = self.peer_id;
+        let name = self.name.clone();
+        tokio::spawn(async move {
+            let _permit = permit;
+            let request = tokio::time::timeout(
+                ANNOUNCE_TIMEOUT,
+                wire::read_message(&mut recv, sync::MAX_OP_FRAME_SIZE),
+            )
+            .await;
+            let request: sync::FetchRequest = match request {
+                Ok(Ok(request)) => request,
+                Ok(Err(err)) => return debug!(peer = %name, "bad fetch request: {err:#}"),
+                Err(_) => return debug!(peer = %name, "fetch request timed out"),
+            };
+
+            hub.serve_fetch(peer, request, send, recv);
+        });
     }
 
     /// Reads one announcement stream in its own task and routes it.

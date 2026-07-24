@@ -4,7 +4,9 @@
 //! we verify its store `type` files match the backends this build supports
 //! (git commit backend, simple op store and op heads store).
 
+pub mod codec;
 mod mesh;
+pub mod transfer;
 
 use std::{
     fs,
