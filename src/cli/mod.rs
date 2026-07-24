@@ -6,6 +6,7 @@
 
 mod add;
 mod daemon;
+mod join;
 mod pair;
 mod peers;
 mod service;
@@ -40,6 +41,7 @@ pub struct Cli {
 enum Command {
     Add(add::AddArgs),
     Daemon(daemon::DaemonArgs),
+    Join(join::JoinArgs),
     Pair(pair::PairArgs),
     Peers(peers::PeersArgs),
     Service(service::ServiceArgs),
@@ -54,6 +56,7 @@ pub fn run() -> Result<()> {
     match cli.command {
         Command::Add(args) => add::run(args, &dir),
         Command::Daemon(args) => daemon::run(args, &dir),
+        Command::Join(args) => join::run(args, &dir),
         Command::Pair(args) => pair::run(args, &dir),
         Command::Peers(args) => peers::run(args, &dir),
         Command::Service(args) => service::run(args, &dir),

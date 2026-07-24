@@ -53,10 +53,11 @@ fn print_live(status: &control::Status) {
         let width = name_width(status.repos.iter().map(|r| r.name.as_str()));
         for repo in &status.repos {
             println!(
-                "  {:width$}  {}  ({})",
+                "  {:width$}  {}  ({})  id={}",
                 repo.name,
                 watch_summary(&repo.watch),
                 repo.path.display(),
+                repo.id,
             );
         }
     }

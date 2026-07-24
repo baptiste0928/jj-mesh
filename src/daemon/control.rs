@@ -25,13 +25,14 @@ use tokio::{
 };
 use tracing::{debug, info, warn};
 
-use super::{pairing::Pairing, peers::PeerSet, repos::RepoSet};
+use super::{hub::SyncHub, pairing::Pairing, peers::PeerSet, repos::RepoSet};
 use crate::{
-    config::{Config, ConfigDir, ConfigEdit, Peer},
+    config::{Config, ConfigDir, ConfigEdit, Peer, RepoId},
     net::{
         pair,
         wire::{read_message, write_message},
     },
+    repo::{JjRepo, transfer},
 };
 
 /// Maximum accepted size of a control message.
@@ -42,6 +43,10 @@ const CLIENT_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Time budget for a whole join exchange, from dialing to completion.
 const JOIN_TIMEOUT: Duration = Duration::from_mins(1);
+
+/// Time budget for a join's initial repo pull; it may transfer an entire
+/// repository.
+const JOIN_PULL_TIMEOUT: Duration = Duration::from_mins(30);
 
 /// Hard cap on a pairing window: bounds how long the unknown-endpoint pair
 /// ALPN stays exposed when a host CLI is left waiting unattended.
@@ -64,6 +69,10 @@ pub enum Request {
     /// Join a pairing hosted by another machine. Answered with
     /// [`Response::Paired`] or [`Response::Error`].
     PairJoin { ticket: String, name: String },
+    /// Pull a mesh repo's full state into a freshly initialized local repo
+    /// at `path` (see `jj-mesh join`). Answered with [`Response::Joined`]
+    /// or [`Response::Error`].
+    JoinRepo { repo: RepoId, path: PathBuf },
 }
 
 /// A daemon answer to a [`Request`].
@@ -76,6 +85,11 @@ pub enum Response {
     Paired {
         name: String,
         endpoint: EndpointId,
+    },
+    /// The join pull completed.
+    Joined {
+        ops: u64,
+        git_objects: u64,
     },
     /// The request failed.
     Error(String),
@@ -142,6 +156,7 @@ pub enum Route {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct RepoStatus {
     pub name: String,
+    pub id: RepoId,
     pub path: PathBuf,
     pub watch: WatchStatus,
 }
@@ -172,6 +187,7 @@ pub struct ControlContext {
     pub started: Instant,
     pub peers: Arc<PeerSet>,
     pub repos: Arc<RepoSet>,
+    pub hub: Arc<SyncHub>,
     pub config: Arc<Mutex<Config>>,
     pub pairing: Arc<Pairing>,
 }
@@ -286,6 +302,7 @@ async fn handle_client(mut stream: UnixStream, ctx: Arc<ControlContext>) {
         Request::Status => respond(&mut stream, &Response::Status(ctx.status())).await,
         Request::PairHost { name } => pair_host(&mut stream, &ctx, &name).await,
         Request::PairJoin { ticket, name } => pair_join(&mut stream, &ctx, &ticket, &name).await,
+        Request::JoinRepo { repo, path } => join_repo(&mut stream, &ctx, repo, &path).await,
     };
 
     if let Err(err) = served {
@@ -395,6 +412,82 @@ async fn pair_join(
     };
 
     respond(&mut write_half, &response).await
+}
+
+/// Pulls a mesh repo's full state into the freshly initialized repo at
+/// `path`, from a connected peer that announced the repo. The repo is not
+/// registered here yet (the CLI does that afterwards), so the pull runs on
+/// an ad-hoc repo handle in this connection's task.
+async fn join_repo(
+    stream: &mut UnixStream,
+    ctx: &ControlContext,
+    repo_id: RepoId,
+    path: &std::path::Path,
+) -> Result<()> {
+    let response = match join_pull(ctx, &repo_id, path).await {
+        Ok((ops, git_objects)) => Response::Joined { ops, git_objects },
+        Err(err) => Response::Error(format!("{err:#}")),
+    };
+    respond(stream, &response).await
+}
+
+async fn join_pull(
+    ctx: &ControlContext,
+    repo_id: &RepoId,
+    path: &std::path::Path,
+) -> Result<(u64, u64)> {
+    use jj_lib::op_store::OperationId;
+
+    let sources = ctx.hub.announced_by(repo_id);
+    if sources.is_empty() {
+        bail!(
+            "no connected peer announces repo {repo_id}; check that the \
+             other machine's daemon is running and the id is correct"
+        );
+    }
+
+    let path = path.to_owned();
+    let repo = tokio::task::spawn_blocking(move || -> Result<_> {
+        Ok(Arc::new(JjRepo::discover(&path)?.open()?))
+    })
+    .await
+    .wrap_err("repo open task failed")??;
+
+    let mut last_error = eyre!("no usable source peer");
+    for (peer, heads) in sources {
+        let wants: Vec<OperationId> = heads.into_iter().map(OperationId::new).collect();
+        let Some(conn) = ctx.hub.connection(&peer) else {
+            continue;
+        };
+
+        // The fresh repo's single head is the baseline for the ref mirror.
+        let local_heads = repo.op_heads().await?;
+
+        let pull = async {
+            let (mut send, mut recv) = conn.open_bi().await?;
+            let outcome = transfer::fetch(&repo, repo_id, &wants, &mut send, &mut recv).await?;
+            let _ = send.finish();
+            Ok::<_, color_eyre::Report>(outcome)
+        };
+        match tokio::time::timeout(JOIN_PULL_TIMEOUT, pull).await {
+            Err(_) => last_error = eyre!("pull from {peer} timed out"),
+            Ok(Err(err)) => last_error = err.wrap_err(format!("pull from {peer} failed")),
+            Ok(Ok(outcome)) => {
+                // Seed the colocated .git so the first jj command does not
+                // misread replicated refs as deletions. With several mesh
+                // heads there is no single view to mirror; jj's merge and
+                // the next fast-forward sync then converge the refs.
+                if let ([mesh_head], [old_head]) = (&outcome.published[..], &local_heads[..]) {
+                    transfer::mirror_after_join(&repo, mesh_head, old_head).await?;
+                } else {
+                    info!("joined with divergent mesh heads; git refs not seeded");
+                }
+                return Ok((outcome.ops as u64, outcome.git_objects as u64));
+            }
+        }
+        warn!("join pull attempt failed: {last_error:#}");
+    }
+    Err(last_error)
 }
 
 /// Registers a paired peer in the configuration; a no-op when the endpoint

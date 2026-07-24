@@ -80,6 +80,7 @@ pub struct RepoSet {
 #[derive(Debug)]
 struct RepoHandle {
     name: String,
+    id: RepoId,
     path: PathBuf,
     state: Arc<Mutex<RepoState>>,
     task: tokio::task::JoinHandle<()>,
@@ -191,6 +192,7 @@ impl RepoSet {
 
                 control::RepoStatus {
                     name: handle.name.clone(),
+                    id: handle.id.clone(),
                     path: handle.path.clone(),
                     watch,
                 }
@@ -210,7 +212,7 @@ fn spawn_repo(
     let state = Arc::new(Mutex::new(RepoState::Opening));
 
     let task = tokio::spawn(run_repo(RepoTask {
-        id,
+        id: id.clone(),
         name: name.clone(),
         path: path.clone(),
         state: state.clone(),
@@ -220,6 +222,7 @@ fn spawn_repo(
 
     RepoHandle {
         name,
+        id,
         path,
         state,
         task,

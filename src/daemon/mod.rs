@@ -66,7 +66,7 @@ pub async fn run(dir: &ConfigDir) -> Result<()> {
         hub.clone(),
     ));
     peers.sync(&config);
-    let repos = Arc::new(RepoSet::new(hub));
+    let repos = Arc::new(RepoSet::new(hub.clone()));
     repos.sync(&config);
     let config = Arc::new(Mutex::new(config));
     let pairing = Arc::new(Pairing::new(endpoint.clone()));
@@ -77,6 +77,7 @@ pub async fn run(dir: &ConfigDir) -> Result<()> {
         started: Instant::now(),
         peers: peers.clone(),
         repos: repos.clone(),
+        hub: hub.clone(),
         config: config.clone(),
         pairing: pairing.clone(),
     });

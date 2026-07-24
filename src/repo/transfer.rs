@@ -801,6 +801,33 @@ fn write_keep_refs(repo: &MeshRepo, commit_ids: &HashSet<CommitId>) -> Result<()
     Ok(())
 }
 
+/// Seeds a freshly joined repo's colocated `.git` with the fetched view's
+/// refs. Join pulls are divergent by construction (the fresh init ops are
+/// not ancestors of the mesh head), so [`apply`] skips its mirror; without
+/// this, the first jj command in the new repo would misread the
+/// replicated refs as git-side deletions.
+pub async fn mirror_after_join(
+    repo: &Arc<MeshRepo>,
+    mesh_head: &OperationId,
+    old_head: &OperationId,
+) -> Result<()> {
+    if !repo.is_colocated() {
+        return Ok(());
+    }
+    let repo = repo.clone();
+    let mesh_head = mesh_head.clone();
+    let old_head = old_head.clone();
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        let new_op = repo.read_operation(&mesh_head).block_on()?;
+        let new_view = repo.read_view(&new_op.view_id).block_on()?;
+        let old_op = repo.read_operation(&old_head).block_on()?;
+        let old_view = repo.read_view(&old_op.view_id).block_on()?;
+        mirror_git_refs(&repo, &new_view, &old_view)
+    })
+    .await
+    .wrap_err("mirror task failed")?
+}
+
 /// Mirrors the applied view's `git_refs` (all namespaces: heads, tags,
 /// remotes) into the colocated `.git`, so the next git import does not
 /// misread the replicated refs as local git changes.
@@ -1227,6 +1254,55 @@ mod tests {
             .output()
             .unwrap();
         assert!(!gone.status.success(), "deleted bookmark must propagate");
+    }
+
+    /// The join flow: a freshly initialized repo with a renamed workspace
+    /// pulls the full mesh state; jj then merges the fresh workspace into
+    /// the replicated history on the next command.
+    #[tokio::test]
+    async fn join_pull_into_fresh_repo() {
+        let fx = Fixture::new();
+        let a = fx.init_repo("a");
+        fx.jj(&a, &["bookmark", "create", "main", "-r", "@"]);
+        fx.jj(&a, &["new", "-m", "second"]);
+
+        let b = fx.path().join("b");
+        fx.jj(fx.path(), &["git", "init", "b"]);
+        fx.jj(&b, &["workspace", "rename", "machine-b"]);
+
+        let (ra, rb) = (open(&a), open(&b));
+        let wants = ra.op_heads().await.unwrap();
+        let init_head = rb.op_heads().await.unwrap();
+        let outcome = sync_once(&rb, &ra, &wants).await;
+        assert_eq!(outcome.published, wants);
+
+        // Divergent by construction: init ops are not mesh ancestors.
+        assert_eq!(rb.op_heads().await.unwrap().len(), 2);
+
+        // Seed the colocated git refs as the daemon's join handler does.
+        mirror_after_join(&rb, &wants[0], &init_head[0])
+            .await
+            .unwrap();
+        assert_eq!(
+            git_rev(&b, "refs/heads/main"),
+            git_rev(&a, "refs/heads/main")
+        );
+
+        // The next jj command merges: both workspaces coexist, and the
+        // mesh history is visible from the fresh machine.
+        fx.jj(&b, &["status"]);
+        let list = Command::new("jj")
+            .current_dir(&b)
+            .env("JJ_CONFIG", "/dev/null")
+            .env("JJ_USER", "Test User")
+            .env("JJ_EMAIL", "test@example.com")
+            .args(["workspace", "list"])
+            .output()
+            .unwrap();
+        let list = String::from_utf8(list.stdout).unwrap();
+        assert!(list.contains("machine-b:"), "{list}");
+        assert!(list.contains("default:"), "{list}");
+        assert_eq!(rb.op_heads().await.unwrap().len(), 1, "merged");
     }
 
     /// Repos containing gitlink (submodule) tree entries must sync: the

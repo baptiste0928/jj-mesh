@@ -65,7 +65,16 @@ pub struct SyncHub {
 struct HubState {
     repos: BTreeMap<RepoId, RepoEntry>,
     peers: BTreeMap<EndpointId, PeerSender>,
+    /// Latest announcement per peer for repos not registered here. Peers
+    /// replay all their repos on connect, so this is how `join` learns a
+    /// repo's heads and who serves it. Bounded; stale entries are healed
+    /// like any announcement.
+    orphans: BTreeMap<RepoId, BTreeMap<EndpointId, Vec<Vec<u8>>>>,
 }
+
+/// Cap on tracked unregistered repos; beyond it new ones are dropped
+/// (join for them recovers on the next announcement after space frees).
+const MAX_ORPHAN_REPOS: usize = 64;
 
 /// Hub-side state of one registered repo.
 #[derive(Debug)]
@@ -108,7 +117,9 @@ impl SyncHub {
     /// announcements from. Replaces any previous registration for the id.
     pub fn register_repo(&self, id: RepoId) -> Arc<Inbox> {
         let inbox = Arc::new(Inbox::default());
-        self.state.lock().unwrap().repos.insert(
+        let mut state = self.state.lock().unwrap();
+        state.orphans.remove(&id);
+        state.repos.insert(
             id,
             RepoEntry {
                 seq: 0,
@@ -277,14 +288,42 @@ impl SyncHub {
         }
     }
 
-    /// Routes an inbound announcement to its repo's inbox.
+    /// Routes an inbound announcement to its repo's inbox; announcements
+    /// for unregistered repos are remembered for `join`.
     pub fn route(&self, peer: EndpointId, announce: Announce) {
-        let state = self.state.lock().unwrap();
+        let mut state = self.state.lock().unwrap();
         let Some(entry) = state.repos.get(&announce.repo) else {
-            debug!(repo = %announce.repo, "ignoring announcement for unregistered repo");
+            if state.orphans.len() >= MAX_ORPHAN_REPOS
+                && !state.orphans.contains_key(&announce.repo)
+            {
+                debug!(repo = %announce.repo, "dropping announcement for unregistered repo");
+                return;
+            }
+            state
+                .orphans
+                .entry(announce.repo)
+                .or_default()
+                .insert(peer, announce.heads);
             return;
         };
         entry.inbox.offer(peer, announce.seq, announce.heads);
+    }
+
+    /// Peers announcing an unregistered repo, with the heads they claim.
+    /// Only currently connected peers are returned.
+    pub fn announced_by(&self, id: &RepoId) -> Vec<(EndpointId, Vec<Vec<u8>>)> {
+        let state = self.state.lock().unwrap();
+        state
+            .orphans
+            .get(id)
+            .map(|peers| {
+                peers
+                    .iter()
+                    .filter(|(peer, _)| state.peers.contains_key(*peer))
+                    .map(|(peer, heads)| (*peer, heads.clone()))
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 }
 
@@ -451,6 +490,23 @@ mod tests {
         let peer = iroh::SecretKey::generate().public();
         hub.route(peer, announce(&id, 1, vec![vec![1; 64]]));
         assert!(inbox.drain().is_empty());
+    }
+
+    #[tokio::test]
+    async fn remembers_unregistered_announcements_for_join() {
+        let hub = SyncHub::new();
+        let id = RepoId::generate();
+        let peer = iroh::SecretKey::generate().public();
+
+        // Not returned while the peer is not connected.
+        hub.route(peer, announce(&id, 1, vec![vec![1; 64]]));
+        assert!(hub.announced_by(&id).is_empty());
+
+        // Registering the repo claims the orphan entry.
+        let inbox = hub.register_repo(id.clone());
+        assert!(hub.announced_by(&id).is_empty());
+        hub.route(peer, announce(&id, 2, vec![vec![2; 64]]));
+        assert_eq!(inbox.drain().len(), 1);
     }
 
     #[test]
