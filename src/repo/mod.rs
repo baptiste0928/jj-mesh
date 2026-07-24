@@ -4,12 +4,16 @@
 //! we verify its store `type` files match the backends this build supports
 //! (git commit backend, simple op store and op heads store).
 
+mod mesh;
+
 use std::{
     fs,
     path::{Path, PathBuf},
 };
 
 use color_eyre::eyre::{Result, WrapErr as _, ensure, eyre};
+
+pub use self::mesh::MeshRepo;
 
 /// Store backends supported by jj-mesh, as `(<store dir>, <expected type>)`
 /// pairs relative to `.jj/repo`.
@@ -49,11 +53,21 @@ impl JjRepo {
         &self.root
     }
 
+    /// The repo storage directory (`.jj/repo`).
+    fn repo_dir(&self) -> PathBuf {
+        self.root.join(".jj").join("repo")
+    }
+
+    /// Opens the repo's stores through jj_lib for sync operations.
+    pub fn open(&self) -> Result<MeshRepo> {
+        MeshRepo::open(self.clone())
+    }
+
     /// Checks that the repo owns its storage and uses supported backends.
     fn validate(&self) -> Result<()> {
         // In workspaces created by `jj workspace add`, `.jj/repo` is a file
         // pointing to the main workspace's repo directory.
-        let repo_dir = self.root.join(".jj").join("repo");
+        let repo_dir = self.repo_dir();
         ensure!(
             repo_dir.is_dir(),
             "{} is a secondary workspace sharing another repo's storage; \

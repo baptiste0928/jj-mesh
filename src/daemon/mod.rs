@@ -1,8 +1,8 @@
 //! Long-running sync daemon.
 //!
-//! Phase 1 skeleton: maintains persistent connections to every paired peer
-//! (allowlisted at accept), watches the configuration for changes, and
-//! serves live state on the control socket. Repo syncing plugs in next.
+//! Maintains persistent connections to every paired peer (allowlisted at
+//! accept), watches the configuration for changes, and serves live state on
+//! the control socket. Repo syncing plugs in next.
 
 pub mod control;
 mod pairing;
