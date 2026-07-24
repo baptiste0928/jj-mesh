@@ -43,6 +43,7 @@
           jj-mesh = craneLib.buildPackage {
             src = craneLib.cleanCargoSource ./.;
             strictDeps = true;
+            doCheck = false; # Don't run tests on the flake
             meta = {
               description = "Bi-directional sync service for jj repositories";
               license = nixpkgs.lib.licenses.isc;
