@@ -258,7 +258,7 @@ async fn pair_with(
 
     match read_message(&mut recv, MAX_MESSAGE_SIZE).await {
         Ok(Message::Done) => {}
-        Ok(Message::Reject { reason }) => bail!("peer rejected pairing: {reason}"),
+        Ok(Message::Reject { reason }) => bail!("peer rejected pairing: {}", sanitize(&reason)),
         Ok(msg) => bail!("unexpected message from peer: {msg:?}"),
         // Connection lost mid-exchange: let the joiner retry with the same
         // ticket instead of tearing the window down.
@@ -314,7 +314,7 @@ async fn join_with(
         Message::Welcome { name } => name,
         Message::Reject { reason } => {
             conn.close(0u32.into(), b"rejected");
-            bail!("pairing rejected: {reason}");
+            bail!("pairing rejected: {}", sanitize(&reason));
         }
         msg => bail!("unexpected message from host: {msg:?}"),
     };
@@ -341,6 +341,12 @@ async fn join_with(
         name,
         endpoint: host_endpoint,
     })
+}
+
+/// Makes a peer-supplied reason safe to print: it arrives before any trust
+/// is established, so control characters (terminal escapes) are stripped.
+fn sanitize(reason: &str) -> String {
+    reason.chars().filter(|c| !c.is_control()).take(200).collect()
 }
 
 /// Sends a rejection, waiting for the peer to see it before closing: closing

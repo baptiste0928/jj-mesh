@@ -10,8 +10,10 @@ mod edit;
 mod key;
 mod model;
 mod resolve;
+mod watch;
 
 pub use edit::ConfigEdit;
 pub use key::MachineKey;
 pub use model::{Config, Peer, Repo, RepoId};
 pub use resolve::ConfigDir;
+pub use watch::ConfigWatcher;

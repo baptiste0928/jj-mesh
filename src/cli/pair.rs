@@ -3,10 +3,11 @@
 use std::time::Duration;
 
 use clap::Args;
-use color_eyre::eyre::{Result, eyre};
+use color_eyre::eyre::{Result, bail, eyre};
 
 use crate::{
     config::{Config, ConfigDir, ConfigEdit, MachineKey, Peer},
+    daemon::control,
     net::pair::{PairHost, PairTicket, PairedPeer},
 };
 
@@ -39,6 +40,13 @@ pub fn run(args: PairArgs, dir: &ConfigDir) -> Result<()> {
         .unwrap_or_else(|| gethostname::gethostname().to_string_lossy().into_owned());
 
     let runtime = tokio::runtime::Runtime::new()?;
+
+    // Pairing binds the machine-key endpoint, which the daemon already holds
+    // when running (daemon-managed pairing is a planned follow-up).
+    if runtime.block_on(control::query_status(dir))?.is_some() {
+        bail!("a jj-mesh daemon is running on this machine; stop it before pairing");
+    }
+
     let paired = match args.ticket {
         Some(ticket) => {
             let ticket: PairTicket = ticket.parse()?;

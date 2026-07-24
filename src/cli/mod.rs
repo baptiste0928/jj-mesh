@@ -5,8 +5,10 @@
 //! commands stay synchronous.
 
 mod add;
+mod daemon;
 mod pair;
 mod peers;
+mod status;
 
 use std::path::PathBuf;
 
@@ -36,8 +38,10 @@ pub struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     Add(add::AddArgs),
+    Daemon(daemon::DaemonArgs),
     Pair(pair::PairArgs),
     Peers(peers::PeersArgs),
+    Status(status::StatusArgs),
 }
 
 /// Entry point of the `jj-mesh` CLI
@@ -47,7 +51,9 @@ pub fn run() -> Result<()> {
 
     match cli.command {
         Command::Add(args) => add::run(args, &dir),
+        Command::Daemon(args) => daemon::run(args, &dir),
         Command::Pair(args) => pair::run(args, &dir),
         Command::Peers(args) => peers::run(args, &dir),
+        Command::Status(args) => status::run(args, &dir),
     }
 }
