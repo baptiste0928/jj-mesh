@@ -35,10 +35,17 @@ impl ConfigWatcher {
 
         let mut watcher = notify::recommended_watcher(move |event: notify::Result<Event>| {
             let Ok(event) = event else { return };
+
+            // Ignore acess events, otherwise we start an infinite reloading loop
+            if event.kind.is_access() {
+                return;
+            }
+
             let concerns_config = event
                 .paths
                 .iter()
                 .any(|path| path.file_name() == Some(OsStr::new("config.toml")));
+
             if concerns_config {
                 let _ = tx.send(());
             }
@@ -93,5 +100,20 @@ mod tests {
             .await
             .expect("no change detected")
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn ignores_reads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = ConfigDir::new(Some(tmp.path().to_owned())).unwrap();
+        fs::write(dir.config_file(), "[peers]\n").unwrap();
+        let mut watcher = ConfigWatcher::new(&dir).unwrap();
+
+        // Reading the config (as the daemon does on reload) must not count
+        // as a change, or reloading would re-trigger the watch forever.
+        fs::read(dir.config_file()).unwrap();
+
+        let woke = tokio::time::timeout(Duration::from_secs(1), watcher.changed()).await;
+        assert!(woke.is_err(), "read must not trigger the watcher");
     }
 }
