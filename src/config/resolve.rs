@@ -71,6 +71,11 @@ impl ConfigDir {
         &self.path
     }
 
+    /// Whether the directory was overridden on the command line.
+    pub fn is_custom(&self) -> bool {
+        self.custom
+    }
+
     /// Get the path to the machine key file.
     ///
     /// There is no guarantee that the file exists.

@@ -8,6 +8,7 @@ mod add;
 mod daemon;
 mod pair;
 mod peers;
+mod service;
 mod status;
 
 use std::path::PathBuf;
@@ -41,6 +42,7 @@ enum Command {
     Daemon(daemon::DaemonArgs),
     Pair(pair::PairArgs),
     Peers(peers::PeersArgs),
+    Service(service::ServiceArgs),
     Status(status::StatusArgs),
 }
 
@@ -54,6 +56,7 @@ pub fn run() -> Result<()> {
         Command::Daemon(args) => daemon::run(args, &dir),
         Command::Pair(args) => pair::run(args, &dir),
         Command::Peers(args) => peers::run(args, &dir),
+        Command::Service(args) => service::run(args, &dir),
         Command::Status(args) => status::run(args, &dir),
     }
 }

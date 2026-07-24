@@ -31,6 +31,16 @@ use crate::{
 /// Maximum in-flight handshakes of not-yet-authenticated connections.
 const MAX_PENDING_HANDSHAKES: usize = 32;
 
+/// Handshake budget, so stalled attempts release their permit quickly
+/// instead of waiting out the transport-level timeout.
+const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The ALPNs the daemon always serves. The pairing window adds the pair
+/// ALPN on top of these for its lifetime.
+pub(crate) fn base_alpns() -> Vec<Vec<u8>> {
+    vec![sync::ALPN.to_vec()]
+}
+
 /// Runs the daemon until SIGINT or SIGTERM.
 pub async fn run(dir: &ConfigDir) -> Result<()> {
     let key = MachineKey::from_config(dir)?;
@@ -40,7 +50,7 @@ pub async fn run(dir: &ConfigDir) -> Result<()> {
     // Binding the control socket first doubles as the single-daemon guard.
     let server = ControlServer::bind(dir)?;
 
-    let endpoint = bind_endpoint(&key, vec![sync::ALPN.to_vec()]).await?;
+    let endpoint = bind_endpoint(&key, base_alpns()).await?;
     info!("daemon started, endpoint id {}", key.endpoint_id());
 
     let peers = Arc::new(PeerSet::new(endpoint.clone(), key.endpoint_id()));
@@ -105,12 +115,15 @@ async fn accept_loop(endpoint: Endpoint, peers: Arc<PeerSet>, pairing: Arc<Pairi
         let pairing = pairing.clone();
         tokio::spawn(async move {
             let _permit = permit;
-            match connecting.await {
-                Ok(conn) if conn.alpn() == pair::ALPN => {
-                    pairing.route_inbound(conn);
+            match tokio::time::timeout(HANDSHAKE_TIMEOUT, connecting).await {
+                Ok(Ok(conn)) if conn.alpn() == sync::ALPN => peers.route_inbound(conn),
+                Ok(Ok(conn)) if conn.alpn() == pair::ALPN => pairing.route_inbound(conn),
+                Ok(Ok(conn)) => {
+                    debug!("closing connection with unexpected ALPN");
+                    conn.close(0u32.into(), b"unexpected alpn");
                 }
-                Ok(conn) => peers.route_inbound(conn),
-                Err(err) => debug!("incoming connection failed: {err}"),
+                Ok(Err(err)) => debug!("incoming connection failed: {err}"),
+                Err(_) => debug!("incoming handshake timed out"),
             }
         });
     }

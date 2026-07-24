@@ -43,6 +43,10 @@ const CLIENT_TIMEOUT: Duration = Duration::from_secs(2);
 /// Time budget for a whole join exchange, from dialing to completion.
 const JOIN_TIMEOUT: Duration = Duration::from_mins(1);
 
+/// Hard cap on a pairing window: bounds how long the unknown-endpoint pair
+/// ALPN stays exposed when a host CLI is left waiting unattended.
+const WINDOW_TIMEOUT: Duration = Duration::from_mins(15);
+
 /// Initial retry delay after an accept error, escalating to the max.
 const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
 const ACCEPT_ERROR_BACKOFF_MAX: Duration = Duration::from_secs(5);
@@ -268,16 +272,7 @@ async fn handle_client(mut stream: UnixStream, ctx: Arc<ControlContext>) {
     };
 
     let served = match request {
-        Request::Status => {
-            let response = Response::Status(ctx.status());
-            tokio::time::timeout(
-                CLIENT_TIMEOUT,
-                write_message(&mut stream, &response, MAX_MESSAGE_SIZE),
-            )
-            .await
-            .map_err(|_| eyre!("client timed out"))
-            .and_then(|res| res)
-        }
+        Request::Status => respond(&mut stream, &Response::Status(ctx.status())).await,
         Request::PairHost { name } => pair_host(&mut stream, &ctx, &name).await,
         Request::PairJoin { ticket, name } => pair_join(&mut stream, &ctx, &ticket, &name).await,
     };
@@ -287,60 +282,97 @@ async fn handle_client(mut stream: UnixStream, ctx: Arc<ControlContext>) {
     }
 }
 
+/// Writes a response, bounded so a client that stopped reading cannot park
+/// the daemon task.
+async fn respond(
+    stream: &mut (impl tokio::io::AsyncWrite + Unpin),
+    response: &Response,
+) -> Result<()> {
+    tokio::time::timeout(
+        CLIENT_TIMEOUT,
+        write_message(stream, response, MAX_MESSAGE_SIZE),
+    )
+    .await
+    .map_err(|_| eyre!("control client stopped reading"))?
+}
+
 /// Hosts a pairing: opens the window, reports the ticket, then the outcome.
-/// The window closes when this function returns, including when the client
-/// disconnects while we wait.
+/// The window closes when this function returns: on completion, expiry, or
+/// the client disconnecting.
 async fn pair_host(stream: &mut UnixStream, ctx: &ControlContext, name: &str) -> Result<()> {
     let mut window = match ctx.pairing.open().await {
         Ok(window) => window,
-        Err(err) => {
-            let response = Response::Error(format!("{err:#}"));
-            return write_message(stream, &response, MAX_MESSAGE_SIZE).await;
-        }
+        Err(err) => return respond(stream, &Response::Error(format!("{err:#}"))).await,
     };
 
-    let ticket = Response::PairTicket(window.ticket().to_string());
-    write_message(stream, &ticket, MAX_MESSAGE_SIZE).await?;
+    respond(stream, &Response::PairTicket(window.ticket().to_string())).await?;
 
     let (mut read_half, mut write_half) = stream.split();
-    let config = ctx.config();
     let result = tokio::select! {
-        result = window.wait_for_peer(name, &config) => result,
+        result = window.wait_for_peer(name, || ctx.config()) => result,
+        () = tokio::time::sleep(WINDOW_TIMEOUT) => Err(eyre!(
+            "the pairing window expired after {} minutes",
+            WINDOW_TIMEOUT.as_secs() / 60,
+        )),
         () = client_gone(&mut read_half) => {
             info!("pairing cancelled by the client");
             return Ok(());
         }
     };
 
-    let response = pairing_response(ctx, result);
-    write_message(&mut write_half, &response, MAX_MESSAGE_SIZE).await
+    // Persist before confirming: the `paired` close is the joiner's commit
+    // signal, so the host must never send it for a peer it did not save.
+    let response = match result {
+        Ok((peer, conn)) => match persist_peer(&ctx.dir, &peer) {
+            Ok(()) => {
+                pair::confirm_paired(&conn);
+                info!(peer = %peer.name, "paired");
+                Response::Paired {
+                    name: peer.name,
+                    endpoint: peer.endpoint,
+                }
+            }
+            Err(err) => {
+                conn.close(0u32.into(), b"failed");
+                Response::Error(format!("cannot save the peer: {err:#}"))
+            }
+        },
+        Err(err) => Response::Error(format!("{err:#}")),
+    };
+
+    respond(&mut write_half, &response).await
 }
 
-/// Joins a pairing hosted by another machine.
+/// Joins a pairing hosted by another machine. Aborts the exchange when the
+/// client disconnects, so a cancelled join cannot pair behind the user's
+/// back.
 async fn pair_join(
     stream: &mut UnixStream,
     ctx: &ControlContext,
     ticket: &str,
     name: &str,
 ) -> Result<()> {
+    let (mut read_half, mut write_half) = stream.split();
+
     let exchange = async {
         let ticket: pair::PairTicket = ticket.parse()?;
         pair::join(&ctx.endpoint, &ticket, name, &ctx.config()).await
     };
-    let result = tokio::time::timeout(JOIN_TIMEOUT, exchange)
-        .await
-        .unwrap_or_else(|_| Err(eyre!("pairing timed out after {}s", JOIN_TIMEOUT.as_secs())));
+    let result = tokio::select! {
+        result = tokio::time::timeout(JOIN_TIMEOUT, exchange) => result.unwrap_or_else(|_| {
+            Err(eyre!("pairing timed out after {}s", JOIN_TIMEOUT.as_secs()))
+        }),
+        () = client_gone(&mut read_half) => {
+            info!("pairing cancelled by the client");
+            return Ok(());
+        }
+    };
 
-    let response = pairing_response(ctx, result);
-    write_message(stream, &response, MAX_MESSAGE_SIZE).await
-}
-
-/// Persists a successful pairing and builds the outcome response.
-fn pairing_response(ctx: &ControlContext, result: Result<pair::PairedPeer>) -> Response {
-    match result.and_then(|peer| {
+    let persisted = result.and_then(|peer| {
         persist_peer(&ctx.dir, &peer)?;
         Ok(peer)
-    }) {
+    });
+    let response = match persisted {
         Ok(peer) => {
             info!(peer = %peer.name, "paired");
             Response::Paired {
@@ -349,7 +381,9 @@ fn pairing_response(ctx: &ControlContext, result: Result<pair::PairedPeer>) -> R
             }
         }
         Err(err) => Response::Error(format!("{err:#}")),
-    }
+    };
+
+    respond(&mut write_half, &response).await
 }
 
 /// Registers a paired peer in the configuration. The daemon's own config

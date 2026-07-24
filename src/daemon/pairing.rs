@@ -17,10 +17,7 @@ use iroh::{Endpoint, endpoint::Connection};
 use tokio::sync::mpsc;
 use tracing::{debug, info};
 
-use crate::{
-    config::Config,
-    net::{pair, sync},
-};
+use crate::{config::Config, net::pair};
 
 /// How long to wait for a relay connection when issuing a ticket.
 const ONLINE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -57,17 +54,20 @@ impl Pairing {
 
         let (tx, rx) = mpsc::channel(4);
         {
+            // The ALPN change happens under the window lock so a closing
+            // window's restore cannot interleave with our exposure.
             let mut window = self.window.lock().unwrap();
             if window.is_some() {
                 bail!("a pairing is already in progress");
             }
             *window = Some(tx);
+
+            let mut alpns = super::base_alpns();
+            alpns.push(pair::ALPN.to_vec());
+            self.endpoint.set_alpns(alpns);
         }
 
         info!("pairing window opened");
-        self.endpoint
-            .set_alpns(vec![sync::ALPN.to_vec(), pair::ALPN.to_vec()]);
-
         Ok(PairWindow {
             ticket: pair::PairTicket::generate(self.endpoint.addr()),
             conns: rx,
@@ -113,11 +113,15 @@ impl PairWindow {
     /// Waits for a machine holding the ticket and exchanges identities with
     /// it. Returns once one pairing succeeds; invalid or interrupted
     /// attempts are shed without ending the wait.
+    ///
+    /// The successful connection is returned still open: the caller must
+    /// persist the peer and then [`pair::confirm_paired`] it. `config` is
+    /// sampled per attempt, as a window can stay open for long.
     pub async fn wait_for_peer(
         &mut self,
         local_name: &str,
-        config: &Config,
-    ) -> Result<pair::PairedPeer> {
+        config: impl Fn() -> Config,
+    ) -> Result<(pair::PairedPeer, Connection)> {
         loop {
             let conn = self
                 .conns
@@ -125,9 +129,10 @@ impl PairWindow {
                 .await
                 .ok_or_else(|| eyre!("pairing window closed"))?;
 
-            let exchange = pair::pair_with(&conn, &self.ticket, local_name, config);
+            let snapshot = config();
+            let exchange = pair::pair_with(&conn, &self.ticket, local_name, &snapshot);
             match tokio::time::timeout(EXCHANGE_TIMEOUT, exchange).await {
-                Ok(Ok(Some(peer))) => return Ok(peer),
+                Ok(Ok(Some(peer))) => return Ok((peer, conn)),
                 // Invalid or interrupted attempt: keep waiting.
                 Ok(Ok(None)) => {}
                 Ok(Err(err)) => return Err(err),
@@ -139,8 +144,14 @@ impl PairWindow {
 
 impl Drop for PairWindow {
     fn drop(&mut self) {
-        *self.window.lock().unwrap() = None;
-        self.endpoint.set_alpns(vec![sync::ALPN.to_vec()]);
+        {
+            // Clearing the slot and restoring the ALPNs must be atomic with
+            // respect to `Pairing::open`, or the restore of a closing window
+            // could strip the pair ALPN from a freshly opened one.
+            let mut window = self.window.lock().unwrap();
+            *window = None;
+            self.endpoint.set_alpns(super::base_alpns());
+        }
         info!("pairing window closed");
     }
 }
