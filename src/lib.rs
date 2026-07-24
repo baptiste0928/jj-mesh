@@ -1,9 +1,9 @@
 //! jj-mesh is a peer-to-peer sync service for personal jj repositories. It
 //! syncs op log and git objects across machines to instantly replicate changes.
 //!
-//! Machines are connnected in peer-to-peer using `iroh`.
+//! Machines are connected peer-to-peer using `iroh`.
 //!
-//! This crate hosts both the management CLI and the sync deamon, both exposed
+//! This crate hosts both the management CLI and the sync daemon, both exposed
 //! as a single `jj-mesh` binary.
 
 #![warn(clippy::pedantic)]
@@ -14,3 +14,4 @@
 
 pub mod cli;
 pub mod config;
+pub mod net;

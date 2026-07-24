@@ -43,26 +43,14 @@ impl ConfigEdit {
         &self.config
     }
 
+    /// Consumes the editor, keeping only the typed configuration.
+    pub fn into_config(self) -> Config {
+        self.config
+    }
+
     /// Adds a peer, rejecting duplicate names and endpoints.
     pub fn add_peer(&mut self, name: String, peer: Peer) -> Result<()> {
-        // Ensure we don't already have a peer with the same name
-        ensure!(
-            !self.config.peers.contains_key(&name),
-            "a peer named `{name}` already exists",
-        );
-
-        // Ensure the peer endpoint id is not already paired
-        if let Some((existing, _)) = self
-            .config
-            .peers
-            .iter()
-            .find(|(_, p)| p.endpoint == peer.endpoint)
-        {
-            bail!(
-                "endpoint {} is already paired as `{existing}`",
-                peer.endpoint
-            );
-        }
+        self.config.validate_new_peer(&name, &peer.endpoint)?;
 
         self.insert_entry("peers", &name, &peer)?;
         self.config.peers.insert(name, peer);
@@ -78,7 +66,7 @@ impl ConfigEdit {
             "a repo named `{name}` already exists",
         );
 
-        // Ensure the path is not alredy registered
+        // Ensure the path is not already registered
         if let Some((existing, _)) = self.config.repos.iter().find(|(_, r)| r.path == repo.path) {
             bail!(
                 "{} is already registered as `{existing}`",
@@ -92,10 +80,12 @@ impl ConfigEdit {
         Ok(())
     }
 
-    /// Saves the document.
+    /// Saves the document, atomically so a crash cannot truncate the config.
     pub fn save(&self) -> Result<()> {
-        let content = self.doc.to_string();
-        fs::write(&self.path, &content)
+        let tmp = self.path.with_extension("toml.tmp");
+        fs::write(&tmp, self.doc.to_string())
+            .wrap_err_with(|| format!("cannot write {}", tmp.display()))?;
+        fs::rename(&tmp, &self.path)
             .wrap_err_with(|| format!("cannot write {}", self.path.display()))?;
 
         Ok(())

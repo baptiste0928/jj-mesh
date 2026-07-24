@@ -40,7 +40,16 @@ impl ConfigDir {
             .config_dir()
             .join("jj-mesh");
 
-        fs::create_dir_all(&config_dir)
+        // Created user-only: the directory holds the machine's private key.
+        let mut builder = fs::DirBuilder::new();
+        builder.recursive(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        builder
+            .create(&config_dir)
             .wrap_err_with(|| format!("cannot create {}", config_dir.display()))?;
 
         Ok(ConfigDir(config_dir))

@@ -3,14 +3,20 @@
 //! This file contains the paired peers and registered repos. This module
 //! contains only the read-only view, update methods are in the `edit` module.
 
-use std::{collections::BTreeMap, fmt, fs, io, path::PathBuf};
+use std::{collections::BTreeMap, fmt, path::PathBuf};
 
-use color_eyre::eyre::{Result, WrapErr as _};
+use color_eyre::eyre::{Result, bail, ensure};
 use data_encoding::HEXLOWER;
 use iroh::EndpointId;
 use serde::{Deserialize, Serialize};
 
-use super::ConfigDir;
+use super::{ConfigDir, ConfigEdit};
+
+/// Maximum length of a peer name, in bytes.
+///
+/// Names announced by remote machines end up as TOML keys and terminal
+/// output, so they are kept short and free of control characters.
+const MAX_PEER_NAME_LEN: usize = 64;
 
 /// Configuration of jj-mesh.
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -24,22 +30,36 @@ impl Config {
     /// Loads `config.toml` from the configuration directory, defaulting to an
     /// empty config if the file does not exist yet.
     pub fn from_config(dir: &ConfigDir) -> Result<Self> {
-        let path = dir.config_file();
-        let config = match fs::read_to_string(&path) {
-            Ok(content) => toml_edit::de::from_str(&content)
-                .wrap_err_with(|| format!("invalid config in {}", path.display()))?,
-            Err(err) if err.kind() == io::ErrorKind::NotFound => Self::default(),
-            Err(err) => {
-                return Err(err).wrap_err_with(|| format!("cannot read {}", path.display()));
-            }
-        };
+        Ok(ConfigEdit::from_config(dir)?.into_config())
+    }
 
-        Ok(config)
+    /// Checks that a peer can be registered under this name and endpoint,
+    /// rejecting invalid names and duplicates of either.
+    pub fn validate_new_peer(&self, name: &str, endpoint: &EndpointId) -> Result<()> {
+        ensure!(!name.is_empty(), "peer name cannot be empty");
+        ensure!(
+            name.len() <= MAX_PEER_NAME_LEN,
+            "peer name is longer than {MAX_PEER_NAME_LEN} bytes",
+        );
+        ensure!(
+            name.chars().all(|c| !c.is_control()),
+            "peer name contains control characters",
+        );
+        ensure!(
+            !self.peers.contains_key(name),
+            "a peer named `{name}` already exists",
+        );
+
+        if let Some((existing, _)) = self.peers.iter().find(|(_, p)| &p.endpoint == endpoint) {
+            bail!("endpoint {endpoint} is already paired as `{existing}`");
+        }
+
+        Ok(())
     }
 }
 
-/// A paired machine. This represente remote peers that we are allowed to
-/// exchange data wtih.
+/// A paired machine. This represents remote peers that we are allowed to
+/// exchange data with.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Peer {
