@@ -5,6 +5,7 @@
 //! serves live state on the control socket. Repo syncing plugs in next.
 
 pub mod control;
+mod pairing;
 mod peers;
 
 use std::{
@@ -17,10 +18,14 @@ use iroh::Endpoint;
 use tokio::sync::Semaphore;
 use tracing::{debug, info, warn};
 
-use self::{control::ControlServer, peers::PeerSet};
+use self::{
+    control::{ControlContext, ControlServer},
+    pairing::Pairing,
+    peers::PeerSet,
+};
 use crate::{
     config::{Config, ConfigDir, ConfigWatcher, MachineKey},
-    net::{bind_endpoint, sync},
+    net::{bind_endpoint, pair, sync},
 };
 
 /// Maximum in-flight handshakes of not-yet-authenticated connections.
@@ -38,21 +43,24 @@ pub async fn run(dir: &ConfigDir) -> Result<()> {
     let endpoint = bind_endpoint(&key, vec![sync::ALPN.to_vec()]).await?;
     info!("daemon started, endpoint id {}", key.endpoint_id());
 
-    let started = Instant::now();
     let peers = Arc::new(PeerSet::new(endpoint.clone(), key.endpoint_id()));
     peers.sync(&config);
     let config = Arc::new(Mutex::new(config));
+    let pairing = Arc::new(Pairing::new(endpoint.clone()));
+
+    let ctx = Arc::new(ControlContext {
+        dir: dir.clone(),
+        endpoint: endpoint.clone(),
+        started: Instant::now(),
+        peers: peers.clone(),
+        config: config.clone(),
+        pairing: pairing.clone(),
+    });
 
     let mut tasks = tokio::task::JoinSet::new();
-    tasks.spawn(serve_control(
-        server,
-        started,
-        key,
-        peers.clone(),
-        config.clone(),
-    ));
-    tasks.spawn(accept_loop(endpoint.clone(), peers.clone()));
-    tasks.spawn(reload_loop(watcher, dir.clone(), peers.clone(), config));
+    tasks.spawn(async move { server.serve(ctx).await });
+    tasks.spawn(accept_loop(endpoint.clone(), peers.clone(), pairing));
+    tasks.spawn(reload_loop(watcher, dir.clone(), peers, config));
 
     // A subsystem ending on its own would leave a zombie daemon (no config
     // reloads, or no inbound connections) that still looks healthy: treat
@@ -74,36 +82,10 @@ pub async fn run(dir: &ConfigDir) -> Result<()> {
     outcome
 }
 
-/// Serves the control socket, snapshotting the daemon state per request.
-async fn serve_control(
-    server: ControlServer,
-    started: Instant,
-    key: MachineKey,
-    peers: Arc<PeerSet>,
-    config: Arc<Mutex<Config>>,
-) {
-    server
-        .serve(move || control::Status {
-            endpoint: key.endpoint_id(),
-            uptime_secs: started.elapsed().as_secs(),
-            peers: peers.statuses(),
-            repos: config
-                .lock()
-                .unwrap()
-                .repos
-                .iter()
-                .map(|(name, repo)| control::RepoStatus {
-                    name: name.clone(),
-                    path: repo.path.clone(),
-                })
-                .collect(),
-        })
-        .await;
-}
-
-/// Accepts incoming connections and routes them to their peer task; the
-/// `PeerSet` refuses endpoints that are not paired.
-async fn accept_loop(endpoint: Endpoint, peers: Arc<PeerSet>) {
+/// Accepts incoming connections and routes them by ALPN: sync connections
+/// to their peer task (the `PeerSet` refuses unpaired endpoints), pairing
+/// connections to the open pairing window.
+async fn accept_loop(endpoint: Endpoint, peers: Arc<PeerSet>, pairing: Arc<Pairing>) {
     // Identity is only known after the handshake, so anyone can start one:
     // bound how many run concurrently.
     let handshakes = Arc::new(Semaphore::new(MAX_PENDING_HANDSHAKES));
@@ -120,9 +102,13 @@ async fn accept_loop(endpoint: Endpoint, peers: Arc<PeerSet>) {
         // Handshakes complete in their own task so a slow one cannot hold
         // the accept loop.
         let peers = peers.clone();
+        let pairing = pairing.clone();
         tokio::spawn(async move {
             let _permit = permit;
             match connecting.await {
+                Ok(conn) if conn.alpn() == pair::ALPN => {
+                    pairing.route_inbound(conn);
+                }
                 Ok(conn) => peers.route_inbound(conn),
                 Err(err) => debug!("incoming connection failed: {err}"),
             }

@@ -30,11 +30,8 @@ use iroh::{
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq as _;
 
-use super::{
-    bind_endpoint,
-    wire::{read_message, write_message},
-};
-use crate::config::{Config, MachineKey};
+use super::wire::{read_message, write_message};
+use crate::config::Config;
 
 /// ALPN of the pairing protocol.
 pub const ALPN: &[u8] = b"jj-mesh/pair/0";
@@ -44,14 +41,6 @@ const TICKET_PREFIX: &str = "jjmesh-pair-";
 
 /// Maximum accepted size of a protocol message.
 const MAX_MESSAGE_SIZE: u32 = 4096;
-
-/// How long the host waits for a relay connection when issuing a ticket.
-const ONLINE_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// Time budget for one connection to complete the whole exchange. Keeps
-/// stalled or malicious connections from blocking the host's wait, since the
-/// pairing ALPN accepts connections from unknown endpoints.
-const EXCHANGE_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// How long a rejecting side waits for the peer to close before giving up.
 const REJECT_LINGER: Duration = Duration::from_secs(5);
@@ -64,6 +53,16 @@ const REJECT_LINGER: Duration = Duration::from_secs(5);
 pub struct PairTicket {
     addr: EndpointAddr,
     secret: PairSecret,
+}
+
+impl PairTicket {
+    /// Issues a ticket, with a fresh secret, for a host reachable at `addr`.
+    pub fn generate(addr: EndpointAddr) -> Self {
+        PairTicket {
+            addr,
+            secret: PairSecret::generate(),
+        }
+    }
 }
 
 impl fmt::Display for PairTicket {
@@ -138,88 +137,15 @@ enum Message {
     Reject { reason: String },
 }
 
-/// Host side of a pairing exchange.
-///
-/// Binding and waiting are split so the caller can display the ticket before
-/// blocking on the peer.
-#[derive(Debug)]
-pub struct PairHost {
-    endpoint: Endpoint,
-    ticket: PairTicket,
-}
-
-impl PairHost {
-    /// Binds the endpoint, waits until it is reachable and issues a ticket.
-    pub async fn bind(key: &MachineKey) -> Result<Self> {
-        let endpoint = bind_endpoint(key, vec![ALPN.to_vec()]).await?;
-
-        // Wait for a relay connection so the ticket contains a usable
-        // relay address even before hole punching is possible.
-        tokio::time::timeout(ONLINE_TIMEOUT, endpoint.online())
-            .await
-            .map_err(|_| eyre!("cannot reach an iroh relay, check network connectivity"))?;
-
-        let ticket = PairTicket {
-            addr: endpoint.addr(),
-            secret: PairSecret::generate(),
-        };
-
-        Ok(PairHost { endpoint, ticket })
-    }
-
-    /// The ticket to transmit out-of-band to the joining machine.
-    pub fn ticket(&self) -> &PairTicket {
-        &self.ticket
-    }
-
-    /// Waits for a machine holding the ticket and exchanges identities with
-    /// it. Returns once one pairing succeeds; invalid or interrupted attempts
-    /// are shed without ending the wait.
-    pub async fn wait_for_peer(self, local_name: &str, config: &Config) -> Result<PairedPeer> {
-        let result = accept_loop(&self.endpoint, &self.ticket.secret, local_name, config).await;
-        self.endpoint.close().await;
-        result
-    }
-}
-
-/// Accepts connections sequentially until one completes the exchange, giving
-/// each connection [`EXCHANGE_TIMEOUT`] before shedding it.
-async fn accept_loop(
-    endpoint: &Endpoint,
-    secret: &PairSecret,
-    local_name: &str,
-    config: &Config,
-) -> Result<PairedPeer> {
-    loop {
-        let Some(incoming) = endpoint.accept().await else {
-            bail!("endpoint closed while waiting for a peer");
-        };
-        let Ok(connecting) = incoming.accept() else {
-            continue;
-        };
-        let Ok(conn) = connecting.await else {
-            continue;
-        };
-
-        let exchange = pair_with(&conn, secret, local_name, config);
-        match tokio::time::timeout(EXCHANGE_TIMEOUT, exchange).await {
-            Ok(Ok(Some(peer))) => return Ok(peer),
-            // Invalid or interrupted attempt: keep waiting.
-            Ok(Ok(None)) => {}
-            Ok(Err(err)) => return Err(err),
-            Err(_timeout) => conn.close(0u32.into(), b"timeout"),
-        }
-    }
-}
-
-/// Runs the host side of the exchange on one connection.
+/// Runs the host side of the exchange on one connection, accepted on the
+/// pairing ALPN with `ticket` outstanding.
 ///
 /// Returns `Ok(None)` when the attempt failed without needing user action
 /// (invalid ticket, connection trouble) and waiting should continue. Errors
 /// are terminal: the user must intervene before pairing can proceed.
-async fn pair_with(
+pub async fn pair_with(
     conn: &Connection,
-    secret: &PairSecret,
+    ticket: &PairTicket,
     local_name: &str,
     config: &Config,
 ) -> Result<Option<PairedPeer>> {
@@ -233,7 +159,7 @@ async fn pair_with(
         Ok(Message::Hello {
             secret: proof,
             name,
-        }) if secret.verify(&proof) => name,
+        }) if ticket.secret.verify(&proof) => name,
         Ok(_) | Err(_) => {
             send_reject(conn, &mut send, "invalid pairing ticket").await;
             return Ok(None);
@@ -272,31 +198,19 @@ async fn pair_with(
     }))
 }
 
-/// Joiner side: connects to the ticket's host and exchanges identities.
+/// Joiner side: connects to the ticket's host with `endpoint` (which stays
+/// open, the caller owns it) and exchanges identities.
 pub async fn join(
-    key: &MachineKey,
-    ticket: &PairTicket,
-    local_name: &str,
-    config: &Config,
-) -> Result<PairedPeer> {
-    ensure!(
-        ticket.addr.id != key.endpoint_id(),
-        "cannot pair a machine with itself",
-    );
-
-    let endpoint = bind_endpoint(key, vec![]).await?;
-    let result = join_with(&endpoint, ticket, local_name, config).await;
-    endpoint.close().await;
-    result
-}
-
-/// Runs the joiner side of the exchange on a fresh connection to the host.
-async fn join_with(
     endpoint: &Endpoint,
     ticket: &PairTicket,
     local_name: &str,
     config: &Config,
 ) -> Result<PairedPeer> {
+    ensure!(
+        ticket.addr.id != endpoint.secret_key().public(),
+        "cannot pair a machine with itself",
+    );
+
     let conn = endpoint
         .connect(ticket.addr.clone(), ALPN)
         .await
@@ -328,9 +242,11 @@ async fn join_with(
     let _ = send.finish();
 
     // The host closes with "paired" once it has read `Done`; any other close
-    // reason means the host may not have registered us.
+    // (including the code-0 close of a dropped connection, e.g. the host
+    // cancelling its window) means the host may not have registered us.
     match conn.closed().await {
-        ConnectionError::ApplicationClosed(close) if close.error_code == VarInt::from_u32(0) => {}
+        ConnectionError::ApplicationClosed(close)
+            if close.error_code == VarInt::from_u32(0) && close.reason.as_ref() == b"paired" => {}
         reason => bail!(
             "connection lost before pairing completed ({reason}); \
              check `jj-mesh peers` on the other machine before retrying",

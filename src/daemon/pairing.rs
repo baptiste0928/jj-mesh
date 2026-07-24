@@ -1,0 +1,146 @@
+//! Daemon-side pairing.
+//!
+//! The daemon owns the machine-key endpoint, so all pairing runs through it,
+//! driven by control-socket requests. Hosting opens a *pairing window*: the
+//! pairing ALPN is added to the endpoint for the window's lifetime (the only
+//! time unknown endpoints may connect) and removed when it closes. At most
+//! one window is open at a time, and it is tied to the requesting control
+//! client: when that client goes away, the window closes.
+
+use std::{
+    sync::{Arc, Mutex},
+    time::Duration,
+};
+
+use color_eyre::eyre::{Result, bail, eyre};
+use iroh::{Endpoint, endpoint::Connection};
+use tokio::sync::mpsc;
+use tracing::{debug, info};
+
+use crate::{
+    config::Config,
+    net::{pair, sync},
+};
+
+/// How long to wait for a relay connection when issuing a ticket.
+const ONLINE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Time budget for one connection to complete the whole exchange. Keeps
+/// stalled or malicious connections from blocking the window, since the
+/// pairing ALPN accepts connections from unknown endpoints.
+const EXCHANGE_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Pairing state of the daemon: at most one open window.
+#[derive(Debug)]
+pub struct Pairing {
+    endpoint: Endpoint,
+    /// Sender routing pair-ALPN connections to the open window, if any.
+    window: Arc<Mutex<Option<mpsc::Sender<Connection>>>>,
+}
+
+impl Pairing {
+    pub fn new(endpoint: Endpoint) -> Self {
+        Pairing {
+            endpoint,
+            window: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// Opens the pairing window, issuing a ticket and exposing the pairing
+    /// ALPN until the returned window is dropped.
+    pub async fn open(&self) -> Result<PairWindow> {
+        // Wait for a relay connection so the ticket contains a usable relay
+        // address even before hole punching is possible.
+        tokio::time::timeout(ONLINE_TIMEOUT, self.endpoint.online())
+            .await
+            .map_err(|_| eyre!("cannot reach an iroh relay, check network connectivity"))?;
+
+        let (tx, rx) = mpsc::channel(4);
+        {
+            let mut window = self.window.lock().unwrap();
+            if window.is_some() {
+                bail!("a pairing is already in progress");
+            }
+            *window = Some(tx);
+        }
+
+        info!("pairing window opened");
+        self.endpoint
+            .set_alpns(vec![sync::ALPN.to_vec(), pair::ALPN.to_vec()]);
+
+        Ok(PairWindow {
+            ticket: pair::PairTicket::generate(self.endpoint.addr()),
+            conns: rx,
+            endpoint: self.endpoint.clone(),
+            window: self.window.clone(),
+        })
+    }
+
+    /// Hands an accepted pair-ALPN connection to the open window, refusing
+    /// it if none is open (e.g. accepted right as the window closed).
+    pub fn route_inbound(&self, conn: Connection) {
+        let window = self.window.lock().unwrap();
+
+        match window.as_ref().map(|tx| tx.try_send(conn)) {
+            Some(Ok(())) => {}
+            Some(Err(err)) => {
+                debug!("dropping surplus pairing connection");
+                err.into_inner().close(0u32.into(), b"busy");
+            }
+            None => {
+                debug!("refusing pairing connection: no window open");
+            }
+        }
+    }
+}
+
+/// An open pairing window. Dropping it closes the window and removes the
+/// pairing ALPN from the endpoint.
+#[derive(Debug)]
+pub struct PairWindow {
+    ticket: pair::PairTicket,
+    conns: mpsc::Receiver<Connection>,
+    endpoint: Endpoint,
+    window: Arc<Mutex<Option<mpsc::Sender<Connection>>>>,
+}
+
+impl PairWindow {
+    /// The ticket to transmit out-of-band to the joining machine.
+    pub fn ticket(&self) -> &pair::PairTicket {
+        &self.ticket
+    }
+
+    /// Waits for a machine holding the ticket and exchanges identities with
+    /// it. Returns once one pairing succeeds; invalid or interrupted
+    /// attempts are shed without ending the wait.
+    pub async fn wait_for_peer(
+        &mut self,
+        local_name: &str,
+        config: &Config,
+    ) -> Result<pair::PairedPeer> {
+        loop {
+            let conn = self
+                .conns
+                .recv()
+                .await
+                .ok_or_else(|| eyre!("pairing window closed"))?;
+
+            let exchange = pair::pair_with(&conn, &self.ticket, local_name, config);
+            match tokio::time::timeout(EXCHANGE_TIMEOUT, exchange).await {
+                Ok(Ok(Some(peer))) => return Ok(peer),
+                // Invalid or interrupted attempt: keep waiting.
+                Ok(Ok(None)) => {}
+                Ok(Err(err)) => return Err(err),
+                Err(_timeout) => conn.close(0u32.into(), b"timeout"),
+            }
+        }
+    }
+}
+
+impl Drop for PairWindow {
+    fn drop(&mut self) {
+        *self.window.lock().unwrap() = None;
+        self.endpoint.set_alpns(vec![sync::ALPN.to_vec()]);
+        info!("pairing window closed");
+    }
+}

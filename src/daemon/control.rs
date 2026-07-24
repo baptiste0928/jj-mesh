@@ -1,34 +1,47 @@
 //! Daemon control socket.
 //!
-//! The CLI talks to the running daemon over a unix socket, with one
-//! length-prefixed postcard request/response exchange per connection (see
-//! [`crate::net::wire`]). The daemon is the only holder of live peer state:
-//! the CLI cannot bind the machine-key endpoint while the daemon runs, so
-//! reachability is only observable from here.
+//! The CLI talks to the running daemon over a unix socket with
+//! length-prefixed postcard messages (see [`crate::net::wire`]). Most
+//! requests are one request/response exchange; hosting a pairing gets two
+//! responses (the ticket, then the outcome) on one connection.
+//!
+//! The daemon is the only holder of the machine-key endpoint, so both live
+//! peer state and pairing are only reachable through here.
 
 use std::{
     fs::{self, File, TryLockError},
     io,
     path::PathBuf,
-    time::Duration,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
 };
 
 use color_eyre::eyre::{Result, WrapErr as _, bail, eyre};
-use iroh::EndpointId;
+use iroh::{Endpoint, EndpointId};
 use serde::{Deserialize, Serialize};
-use tokio::net::{UnixListener, UnixStream};
-use tracing::{debug, warn};
+use tokio::{
+    io::{AsyncRead, AsyncReadExt as _},
+    net::{UnixListener, UnixStream},
+};
+use tracing::{debug, info, warn};
 
+use super::{pairing::Pairing, peers::PeerSet};
 use crate::{
-    config::ConfigDir,
-    net::wire::{read_message, write_message},
+    config::{Config, ConfigDir, ConfigEdit, Peer},
+    net::{
+        pair,
+        wire::{read_message, write_message},
+    },
 };
 
 /// Maximum accepted size of a control message.
 const MAX_MESSAGE_SIZE: u32 = 1 << 20;
 
-/// Time budget for a whole client exchange with the daemon.
+/// Time budget for the quick parts of an exchange (request, status answer).
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Time budget for a whole join exchange, from dialing to completion.
+const JOIN_TIMEOUT: Duration = Duration::from_mins(1);
 
 /// Initial retry delay after an accept error, escalating to the max.
 const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
@@ -39,12 +52,26 @@ const ACCEPT_ERROR_BACKOFF_MAX: Duration = Duration::from_secs(5);
 pub enum Request {
     /// Report the daemon state; answered with [`Response::Status`].
     Status,
+    /// Host a pairing: open the window and issue a ticket. Answered with
+    /// [`Response::PairTicket`] immediately, then [`Response::Paired`] or
+    /// [`Response::Error`] once the exchange concludes. The window closes
+    /// when the requesting client disconnects.
+    PairHost { name: String },
+    /// Join a pairing hosted by another machine. Answered with
+    /// [`Response::Paired`] or [`Response::Error`].
+    PairJoin { ticket: String, name: String },
 }
 
 /// A daemon answer to a [`Request`].
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Response {
     Status(Status),
+    /// The pairing ticket to transmit to the other machine.
+    PairTicket(String),
+    /// Pairing succeeded and the peer is saved in the configuration.
+    Paired { name: String, endpoint: EndpointId },
+    /// The request failed.
+    Error(String),
 }
 
 /// Live daemon state, answering [`Request::Status`].
@@ -111,6 +138,44 @@ pub struct RepoStatus {
     pub path: PathBuf,
 }
 
+/// Everything the control handlers need from the daemon.
+#[derive(Debug)]
+pub struct ControlContext {
+    pub dir: ConfigDir,
+    pub endpoint: Endpoint,
+    pub started: Instant,
+    pub peers: Arc<PeerSet>,
+    pub config: Arc<Mutex<Config>>,
+    pub pairing: Arc<Pairing>,
+}
+
+impl ControlContext {
+    /// Snapshots the daemon state.
+    fn status(&self) -> Status {
+        Status {
+            endpoint: self.endpoint.secret_key().public(),
+            uptime_secs: self.started.elapsed().as_secs(),
+            peers: self.peers.statuses(),
+            repos: self
+                .config
+                .lock()
+                .unwrap()
+                .repos
+                .iter()
+                .map(|(name, repo)| RepoStatus {
+                    name: name.clone(),
+                    path: repo.path.clone(),
+                })
+                .collect(),
+        }
+    }
+
+    /// Clones the current configuration.
+    fn config(&self) -> Config {
+        self.config.lock().unwrap().clone()
+    }
+}
+
 /// Server side of the control socket.
 ///
 /// Dropping the server removes the socket file, covering both graceful
@@ -139,8 +204,7 @@ impl ControlServer {
                 bail!("another jj-mesh daemon is already running");
             }
             Err(TryLockError::Error(err)) => {
-                return Err(err)
-                    .wrap_err_with(|| format!("cannot lock {}", lock_path.display()));
+                return Err(err).wrap_err_with(|| format!("cannot lock {}", lock_path.display()));
             }
         }
 
@@ -162,15 +226,15 @@ impl ControlServer {
         })
     }
 
-    /// Serves control requests forever; `status` snapshots the daemon state.
-    pub async fn serve(self, status: impl Fn() -> Status + Clone + Send + Sync + 'static) -> ! {
+    /// Serves control requests forever.
+    pub async fn serve(self, ctx: Arc<ControlContext>) -> ! {
         let mut error_backoff = ACCEPT_ERROR_BACKOFF;
 
         loop {
             match self.listener.accept().await {
                 Ok((stream, _)) => {
                     error_backoff = ACCEPT_ERROR_BACKOFF;
-                    tokio::spawn(handle_client(stream, status.clone()));
+                    tokio::spawn(handle_client(stream, ctx.clone()));
                 }
                 Err(err) => {
                     // Persistent errors (e.g. fd exhaustion) escalate the
@@ -191,19 +255,168 @@ impl Drop for ControlServer {
 }
 
 /// Answers one client connection.
-async fn handle_client(mut stream: UnixStream, status: impl Fn() -> Status) {
-    let exchange = async {
-        match read_message(&mut stream, MAX_MESSAGE_SIZE).await? {
-            Request::Status => {
-                write_message(&mut stream, &Response::Status(status()), MAX_MESSAGE_SIZE).await
-            }
+async fn handle_client(mut stream: UnixStream, ctx: Arc<ControlContext>) {
+    let request = match tokio::time::timeout(
+        CLIENT_TIMEOUT,
+        read_message(&mut stream, MAX_MESSAGE_SIZE),
+    )
+    .await
+    {
+        Ok(Ok(request)) => request,
+        Ok(Err(err)) => return debug!("control client error: {err}"),
+        Err(_) => return debug!("control client timed out"),
+    };
+
+    let served = match request {
+        Request::Status => {
+            let response = Response::Status(ctx.status());
+            tokio::time::timeout(
+                CLIENT_TIMEOUT,
+                write_message(&mut stream, &response, MAX_MESSAGE_SIZE),
+            )
+            .await
+            .map_err(|_| eyre!("client timed out"))
+            .and_then(|res| res)
+        }
+        Request::PairHost { name } => pair_host(&mut stream, &ctx, &name).await,
+        Request::PairJoin { ticket, name } => pair_join(&mut stream, &ctx, &ticket, &name).await,
+    };
+
+    if let Err(err) = served {
+        debug!("control client error: {err}");
+    }
+}
+
+/// Hosts a pairing: opens the window, reports the ticket, then the outcome.
+/// The window closes when this function returns, including when the client
+/// disconnects while we wait.
+async fn pair_host(stream: &mut UnixStream, ctx: &ControlContext, name: &str) -> Result<()> {
+    let mut window = match ctx.pairing.open().await {
+        Ok(window) => window,
+        Err(err) => {
+            let response = Response::Error(format!("{err:#}"));
+            return write_message(stream, &response, MAX_MESSAGE_SIZE).await;
         }
     };
 
-    match tokio::time::timeout(CLIENT_TIMEOUT, exchange).await {
-        Ok(Ok(())) => {}
-        Ok(Err(err)) => debug!("control client error: {err}"),
-        Err(_) => debug!("control client timed out"),
+    let ticket = Response::PairTicket(window.ticket().to_string());
+    write_message(stream, &ticket, MAX_MESSAGE_SIZE).await?;
+
+    let (mut read_half, mut write_half) = stream.split();
+    let config = ctx.config();
+    let result = tokio::select! {
+        result = window.wait_for_peer(name, &config) => result,
+        () = client_gone(&mut read_half) => {
+            info!("pairing cancelled by the client");
+            return Ok(());
+        }
+    };
+
+    let response = pairing_response(ctx, result);
+    write_message(&mut write_half, &response, MAX_MESSAGE_SIZE).await
+}
+
+/// Joins a pairing hosted by another machine.
+async fn pair_join(
+    stream: &mut UnixStream,
+    ctx: &ControlContext,
+    ticket: &str,
+    name: &str,
+) -> Result<()> {
+    let exchange = async {
+        let ticket: pair::PairTicket = ticket.parse()?;
+        pair::join(&ctx.endpoint, &ticket, name, &ctx.config()).await
+    };
+    let result = tokio::time::timeout(JOIN_TIMEOUT, exchange)
+        .await
+        .unwrap_or_else(|_| Err(eyre!("pairing timed out after {}s", JOIN_TIMEOUT.as_secs())));
+
+    let response = pairing_response(ctx, result);
+    write_message(stream, &response, MAX_MESSAGE_SIZE).await
+}
+
+/// Persists a successful pairing and builds the outcome response.
+fn pairing_response(ctx: &ControlContext, result: Result<pair::PairedPeer>) -> Response {
+    match result.and_then(|peer| {
+        persist_peer(&ctx.dir, &peer)?;
+        Ok(peer)
+    }) {
+        Ok(peer) => {
+            info!(peer = %peer.name, "paired");
+            Response::Paired {
+                name: peer.name,
+                endpoint: peer.endpoint,
+            }
+        }
+        Err(err) => Response::Error(format!("{err:#}")),
+    }
+}
+
+/// Registers a paired peer in the configuration. The daemon's own config
+/// watcher picks the change up and starts connecting to the new peer.
+fn persist_peer(dir: &ConfigDir, peer: &pair::PairedPeer) -> Result<()> {
+    let mut edit = ConfigEdit::from_config(dir)?;
+    edit.add_peer(
+        peer.name.clone(),
+        Peer {
+            endpoint: peer.endpoint,
+        },
+    )?;
+    edit.save()
+}
+
+/// Resolves when the client closes its end of the connection.
+async fn client_gone(read: &mut (impl AsyncRead + Unpin)) {
+    let mut buf = [0u8; 64];
+    loop {
+        match read.read(&mut buf).await {
+            Ok(0) | Err(_) => return,
+            // Ignore stray bytes: requests are one-per-connection.
+            Ok(_) => {}
+        }
+    }
+}
+
+/// Client side of the control socket.
+#[derive(Debug)]
+pub struct ControlClient {
+    stream: UnixStream,
+}
+
+impl ControlClient {
+    /// Connects to the daemon serving this configuration, or `None` when no
+    /// daemon is running.
+    pub async fn connect(dir: &ConfigDir) -> Result<Option<Self>> {
+        let path = dir.socket_path();
+
+        match UnixStream::connect(&path).await {
+            Ok(stream) => Ok(Some(ControlClient { stream })),
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+                ) =>
+            {
+                Ok(None)
+            }
+            Err(err) => Err(err).wrap_err_with(|| format!("cannot connect to {}", path.display())),
+        }
+    }
+
+    /// Sends a request.
+    pub async fn send(&mut self, request: &Request) -> Result<()> {
+        write_message(&mut self.stream, request, MAX_MESSAGE_SIZE).await
+    }
+
+    /// Receives the next response, bounded by `limit` when given.
+    pub async fn recv(&mut self, limit: Option<Duration>) -> Result<Response> {
+        let read = read_message(&mut self.stream, MAX_MESSAGE_SIZE);
+        match limit {
+            Some(limit) => tokio::time::timeout(limit, read)
+                .await
+                .map_err(|_| eyre!("the daemon did not answer"))?,
+            None => read.await,
+        }
     }
 }
 
@@ -212,34 +425,15 @@ async fn handle_client(mut stream: UnixStream, status: impl Fn() -> Status) {
 /// Returns `None` when no daemon is running; errors when a daemon is
 /// listening but does not answer properly.
 pub async fn query_status(dir: &ConfigDir) -> Result<Option<Status>> {
-    let path = dir.socket_path();
-
-    let mut stream = match UnixStream::connect(&path).await {
-        Ok(stream) => stream,
-        Err(err)
-            if matches!(
-                err.kind(),
-                io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
-            ) =>
-        {
-            return Ok(None);
-        }
-        Err(err) => {
-            return Err(err).wrap_err_with(|| format!("cannot connect to {}", path.display()));
-        }
+    let Some(mut client) = ControlClient::connect(dir).await? else {
+        return Ok(None);
     };
 
-    let exchange = async {
-        write_message(&mut stream, &Request::Status, MAX_MESSAGE_SIZE).await?;
-        read_message(&mut stream, MAX_MESSAGE_SIZE).await
-    };
-    let response = tokio::time::timeout(CLIENT_TIMEOUT, exchange)
-        .await
-        .map_err(|_| eyre!("the daemon on {} did not answer", path.display()))?
-        .wrap_err("cannot query the daemon")?;
-
-    let Response::Status(status) = response;
-    Ok(Some(status))
+    client.send(&Request::Status).await?;
+    match client.recv(Some(CLIENT_TIMEOUT)).await? {
+        Response::Status(status) => Ok(Some(status)),
+        other => bail!("unexpected response from the daemon: {other:?}"),
+    }
 }
 
 /// Blocking convenience over [`query_status`] for CLI commands that have no
