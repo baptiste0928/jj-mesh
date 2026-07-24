@@ -4,6 +4,7 @@
 //! entry point. Networked commands build their own tokio runtime; config-only
 //! commands stay synchronous.
 
+mod add;
 mod pair;
 mod peers;
 
@@ -34,6 +35,7 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    Add(add::AddArgs),
     Pair(pair::PairArgs),
     Peers(peers::PeersArgs),
 }
@@ -44,6 +46,7 @@ pub fn run() -> Result<()> {
     let dir = ConfigDir::new(cli.config_dir)?;
 
     match cli.command {
+        Command::Add(args) => add::run(args, &dir),
         Command::Pair(args) => pair::run(args, &dir),
         Command::Peers(args) => peers::run(args, &dir),
     }

@@ -2,7 +2,7 @@
 
 use std::{fs, io, path::PathBuf};
 
-use color_eyre::eyre::{ContextCompat as _, Result, WrapErr as _, bail, ensure};
+use color_eyre::eyre::{ContextCompat as _, Result, WrapErr as _};
 use serde::Serialize;
 use toml_edit::{DocumentMut, Item, Table};
 
@@ -60,19 +60,7 @@ impl ConfigEdit {
 
     /// Adds a repo, rejecting duplicate names and paths.
     pub fn add_repo(&mut self, name: String, repo: Repo) -> Result<()> {
-        // Ensure the repo name is not already registered
-        ensure!(
-            !self.config.repos.contains_key(&name),
-            "a repo named `{name}` already exists",
-        );
-
-        // Ensure the path is not already registered
-        if let Some((existing, _)) = self.config.repos.iter().find(|(_, r)| r.path == repo.path) {
-            bail!(
-                "{} is already registered as `{existing}`",
-                repo.path.display(),
-            );
-        }
+        self.config.validate_new_repo(&name, &repo.path)?;
 
         self.insert_entry("repos", &name, &repo)?;
         self.config.repos.insert(name, repo);

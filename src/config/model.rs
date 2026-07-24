@@ -3,7 +3,11 @@
 //! This file contains the paired peers and registered repos. This module
 //! contains only the read-only view, update methods are in the `edit` module.
 
-use std::{collections::BTreeMap, fmt, path::PathBuf};
+use std::{
+    collections::BTreeMap,
+    fmt,
+    path::{Path, PathBuf},
+};
 
 use color_eyre::eyre::{Result, bail, ensure};
 use data_encoding::HEXLOWER;
@@ -12,11 +16,26 @@ use serde::{Deserialize, Serialize};
 
 use super::{ConfigDir, ConfigEdit};
 
-/// Maximum length of a peer name, in bytes.
+/// Maximum length of a peer or repo name, in bytes.
 ///
-/// Names announced by remote machines end up as TOML keys and terminal
-/// output, so they are kept short and free of control characters.
-const MAX_PEER_NAME_LEN: usize = 64;
+/// Names can be announced by remote machines and end up as TOML keys and
+/// terminal output, so they are kept short and free of control characters.
+const MAX_NAME_LEN: usize = 64;
+
+/// Checks that a peer or repo name is usable; `kind` names it in errors.
+fn validate_name(kind: &str, name: &str) -> Result<()> {
+    ensure!(!name.is_empty(), "{kind} name cannot be empty");
+    ensure!(
+        name.len() <= MAX_NAME_LEN,
+        "{kind} name is longer than {MAX_NAME_LEN} bytes",
+    );
+    ensure!(
+        name.chars().all(|c| !c.is_control()),
+        "{kind} name contains control characters",
+    );
+
+    Ok(())
+}
 
 /// Configuration of jj-mesh.
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -36,15 +55,7 @@ impl Config {
     /// Checks that a peer can be registered under this name and endpoint,
     /// rejecting invalid names and duplicates of either.
     pub fn validate_new_peer(&self, name: &str, endpoint: &EndpointId) -> Result<()> {
-        ensure!(!name.is_empty(), "peer name cannot be empty");
-        ensure!(
-            name.len() <= MAX_PEER_NAME_LEN,
-            "peer name is longer than {MAX_PEER_NAME_LEN} bytes",
-        );
-        ensure!(
-            name.chars().all(|c| !c.is_control()),
-            "peer name contains control characters",
-        );
+        validate_name("peer", name)?;
         ensure!(
             !self.peers.contains_key(name),
             "a peer named `{name}` already exists",
@@ -52,6 +63,22 @@ impl Config {
 
         if let Some((existing, _)) = self.peers.iter().find(|(_, p)| &p.endpoint == endpoint) {
             bail!("endpoint {endpoint} is already paired as `{existing}`");
+        }
+
+        Ok(())
+    }
+
+    /// Checks that a repo can be registered under this name and path,
+    /// rejecting invalid names and duplicates of either.
+    pub fn validate_new_repo(&self, name: &str, path: &Path) -> Result<()> {
+        validate_name("repo", name)?;
+        ensure!(
+            !self.repos.contains_key(name),
+            "a repo named `{name}` already exists",
+        );
+
+        if let Some((existing, _)) = self.repos.iter().find(|(_, r)| r.path == path) {
+            bail!("{} is already added as `{existing}`", path.display());
         }
 
         Ok(())
