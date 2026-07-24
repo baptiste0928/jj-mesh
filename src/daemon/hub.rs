@@ -1,0 +1,366 @@
+//! Routing between peer connections and repo tasks.
+//!
+//! Peer tasks and repo tasks do not know each other; the hub sits between
+//! them and makes announcements genuinely latest-wins in both directions:
+//!
+//! - Outbound, each connected peer has one sender task draining a per-repo
+//!   coalescing outbox: publishes overwrite the pending entry for their
+//!   repo, sends are sequential per peer, and a (re)connecting peer's
+//!   outbox is seeded with every published repo (anti-entropy replay).
+//! - Inbound, announcements land in a per-peer slot on the repo's inbox,
+//!   newer sequence numbers overwriting older ones, so reordered streams
+//!   and slow repo tasks can never make stale state win.
+//!
+//! Unknown repo ids are ignored (the repo is not registered here), and
+//! disconnecting a peer closes its connection through the hub: revocation
+//! must sever announcements even when it races connection setup.
+
+use std::{
+    collections::BTreeMap,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
+
+use iroh::{EndpointId, endpoint::Connection};
+use tokio::sync::Notify;
+use tracing::debug;
+
+use crate::{
+    config::RepoId,
+    net::sync::{self, Announce},
+};
+
+/// Budget for sending one announcement; a stalled peer connection kills
+/// its sender task (the reconnect replay recovers the state).
+const ANNOUNCE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// An announcement received from a peer, drained by a repo task.
+#[derive(Debug)]
+pub struct PeerAnnounce {
+    pub peer: EndpointId,
+    pub heads: Vec<Vec<u8>>,
+}
+
+/// The router between peer connections and repo tasks.
+#[derive(Debug, Default)]
+pub struct SyncHub {
+    state: Mutex<HubState>,
+}
+
+#[derive(Debug, Default)]
+struct HubState {
+    repos: BTreeMap<RepoId, RepoEntry>,
+    peers: BTreeMap<EndpointId, PeerSender>,
+}
+
+/// Hub-side state of one registered repo.
+#[derive(Debug)]
+struct RepoEntry {
+    /// Sequence of the latest publish, stamped into announcements so
+    /// receivers can discard reordered ones. Monotonic per daemon run.
+    seq: u64,
+    /// Latest published op heads, replayed to connecting peers. `None`
+    /// until the repo task first publishes (repo not opened yet).
+    published: Option<Vec<Vec<u8>>>,
+    inbox: Arc<Inbox>,
+}
+
+/// Hub-side state of one connected peer.
+#[derive(Debug)]
+struct PeerSender {
+    conn: Connection,
+    outbox: Arc<Outbox>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl SyncHub {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Registers a repo, returning the inbox its task drains inbound
+    /// announcements from. Replaces any previous registration for the id.
+    pub fn register_repo(&self, id: RepoId) -> Arc<Inbox> {
+        let inbox = Arc::new(Inbox::default());
+        self.state.lock().unwrap().repos.insert(
+            id,
+            RepoEntry {
+                seq: 0,
+                published: None,
+                inbox: inbox.clone(),
+            },
+        );
+        inbox
+    }
+
+    /// Removes a repo registration.
+    pub fn unregister_repo(&self, id: &RepoId) {
+        self.state.lock().unwrap().repos.remove(id);
+    }
+
+    /// Publishes a repo's current op heads: cached for peers that connect
+    /// later and queued to every connected peer's outbox, coalescing with
+    /// any announcement still pending there.
+    pub fn publish(&self, id: &RepoId, heads: Vec<Vec<u8>>) {
+        let mut state = self.state.lock().unwrap();
+        let Some(entry) = state.repos.get_mut(id) else {
+            return;
+        };
+        entry.seq += 1;
+        entry.published = Some(heads.clone());
+
+        let announce = Announce {
+            repo: id.clone(),
+            seq: entry.seq,
+            heads,
+        };
+        for sender in state.peers.values() {
+            sender.outbox.push(announce.clone());
+        }
+    }
+
+    /// Marks a peer connected: spawns its sender task and seeds the outbox
+    /// with every published repo, so a (re)connecting peer learns state it
+    /// missed while away.
+    pub fn peer_connected(&self, peer: EndpointId, conn: &Connection) {
+        let outbox = Arc::new(Outbox::default());
+        let task = tokio::spawn(run_sender(conn.clone(), outbox.clone()));
+
+        let mut state = self.state.lock().unwrap();
+        for (id, entry) in &state.repos {
+            if let Some(heads) = &entry.published {
+                outbox.push(Announce {
+                    repo: id.clone(),
+                    seq: entry.seq,
+                    heads: heads.clone(),
+                });
+            }
+        }
+        let previous = state.peers.insert(
+            peer,
+            PeerSender {
+                conn: conn.clone(),
+                outbox,
+                task,
+            },
+        );
+        if let Some(previous) = previous {
+            previous.task.abort();
+        }
+    }
+
+    /// Marks a peer disconnected, closing its connection: the caller may
+    /// be revoking the peer, and a revoked peer must stop receiving
+    /// announcements even if the removal raced connection setup.
+    pub fn peer_disconnected(&self, peer: &EndpointId) {
+        let removed = {
+            let mut state = self.state.lock().unwrap();
+            let removed = state.peers.remove(peer);
+            if removed.is_some() {
+                // Sequence tracking is per connection: a restarted peer
+                // daemon starts over from 1.
+                for entry in state.repos.values() {
+                    entry.inbox.forget(peer);
+                }
+            }
+            removed
+        };
+
+        if let Some(sender) = removed {
+            sender.task.abort();
+            sender.conn.close(0u32.into(), b"peer removed");
+        }
+    }
+
+    /// Routes an inbound announcement to its repo's inbox.
+    pub fn route(&self, peer: EndpointId, announce: Announce) {
+        let state = self.state.lock().unwrap();
+        let Some(entry) = state.repos.get(&announce.repo) else {
+            debug!(repo = %announce.repo, "ignoring announcement for unregistered repo");
+            return;
+        };
+        entry.inbox.offer(peer, announce.seq, announce.heads);
+    }
+}
+
+/// Inbound announcements for one repo: the latest per peer, drained by
+/// the repo task.
+#[derive(Debug, Default)]
+pub struct Inbox {
+    slots: Mutex<BTreeMap<EndpointId, Slot>>,
+    notify: Notify,
+}
+
+/// One peer's slot: the highest announcement sequence seen, and the heads
+/// not yet drained (`None` once consumed; the watermark stays to fend off
+/// reordered stale announcements arriving after a drain).
+#[derive(Debug)]
+struct Slot {
+    seq: u64,
+    heads: Option<Vec<Vec<u8>>>,
+}
+
+impl Inbox {
+    /// Stores an announcement unless a newer one was already seen.
+    fn offer(&self, peer: EndpointId, seq: u64, heads: Vec<Vec<u8>>) {
+        {
+            let mut slots = self.slots.lock().unwrap();
+            if slots.get(&peer).is_some_and(|slot| slot.seq >= seq) {
+                return;
+            }
+            slots.insert(
+                peer,
+                Slot {
+                    seq,
+                    heads: Some(heads),
+                },
+            );
+        }
+        self.notify.notify_one();
+    }
+
+    /// Drops a peer's slot (its connection is gone).
+    fn forget(&self, peer: &EndpointId) {
+        self.slots.lock().unwrap().remove(peer);
+    }
+
+    /// Resolves when an announcement may be waiting. Consumers should
+    /// still [`Self::drain`] on every wake from any source, so a missed
+    /// notification is healed by the next one.
+    pub async fn changed(&self) {
+        self.notify.notified().await;
+    }
+
+    /// Takes all undrained announcements, keeping the per-peer sequence
+    /// watermarks.
+    pub fn drain(&self) -> Vec<PeerAnnounce> {
+        let mut slots = self.slots.lock().unwrap();
+        slots
+            .iter_mut()
+            .filter_map(|(peer, slot)| {
+                slot.heads
+                    .take()
+                    .map(|heads| PeerAnnounce { peer: *peer, heads })
+            })
+            .collect()
+    }
+}
+
+/// Pending announcements for one peer, coalesced per repo: only the
+/// latest head set of each repo is kept until the sender task takes it.
+#[derive(Debug, Default)]
+struct Outbox {
+    pending: Mutex<BTreeMap<RepoId, Announce>>,
+    notify: Notify,
+}
+
+impl Outbox {
+    fn push(&self, announce: Announce) {
+        self.pending
+            .lock()
+            .unwrap()
+            .insert(announce.repo.clone(), announce);
+        self.notify.notify_one();
+    }
+
+    fn pop(&self) -> Option<Announce> {
+        self.pending
+            .lock()
+            .unwrap()
+            .pop_first()
+            .map(|(_, announce)| announce)
+    }
+}
+
+/// Sends a peer's outbox until its connection fails; announcements lost
+/// with the connection are recovered by the reconnect replay.
+async fn run_sender(conn: Connection, outbox: Arc<Outbox>) {
+    loop {
+        let Some(announce) = outbox.pop() else {
+            outbox.notify.notified().await;
+            continue;
+        };
+        match tokio::time::timeout(ANNOUNCE_TIMEOUT, sync::send_announce(&conn, &announce)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => return debug!("announcement failed: {err:#}"),
+            Err(_) => return debug!("announcement timed out"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn announce(repo: &RepoId, seq: u64, heads: Vec<Vec<u8>>) -> Announce {
+        Announce {
+            repo: repo.clone(),
+            seq,
+            heads,
+        }
+    }
+
+    #[tokio::test]
+    async fn routes_to_registered_repo() {
+        let hub = SyncHub::new();
+        let id = RepoId::generate();
+        let inbox = hub.register_repo(id.clone());
+
+        let peer = iroh::SecretKey::generate().public();
+        hub.route(peer, announce(&id, 1, vec![vec![1; 64]]));
+
+        let drained = inbox.drain();
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].peer, peer);
+        assert_eq!(drained[0].heads, vec![vec![1; 64]]);
+        assert!(inbox.drain().is_empty());
+    }
+
+    #[tokio::test]
+    async fn discards_reordered_announcements() {
+        let hub = SyncHub::new();
+        let id = RepoId::generate();
+        let inbox = hub.register_repo(id.clone());
+        let peer = iroh::SecretKey::generate().public();
+
+        hub.route(peer, announce(&id, 2, vec![vec![2; 64]]));
+        hub.route(peer, announce(&id, 1, vec![vec![1; 64]]));
+
+        let drained = inbox.drain();
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].heads, vec![vec![2; 64]]);
+
+        // The watermark survives draining: the stale announcement stays
+        // rejected even when it arrives afterwards.
+        hub.route(peer, announce(&id, 1, vec![vec![1; 64]]));
+        assert!(inbox.drain().is_empty());
+    }
+
+    #[tokio::test]
+    async fn ignores_unregistered_repo() {
+        let hub = SyncHub::new();
+        let id = RepoId::generate();
+        let inbox = hub.register_repo(id.clone());
+        hub.unregister_repo(&id);
+
+        let peer = iroh::SecretKey::generate().public();
+        hub.route(peer, announce(&id, 1, vec![vec![1; 64]]));
+        assert!(inbox.drain().is_empty());
+    }
+
+    #[test]
+    fn outbox_coalesces_per_repo() {
+        let outbox = Outbox::default();
+        let id = RepoId::generate();
+        let other = RepoId::generate();
+
+        outbox.push(announce(&id, 1, vec![vec![1; 64]]));
+        outbox.push(announce(&other, 1, vec![vec![3; 64]]));
+        outbox.push(announce(&id, 2, vec![vec![2; 64]]));
+
+        let sent: Vec<Announce> = std::iter::from_fn(|| outbox.pop()).collect();
+        assert_eq!(sent.len(), 2);
+        assert!(sent.iter().any(|a| a.repo == id && a.seq == 2));
+        assert!(sent.iter().any(|a| a.repo == other && a.seq == 1));
+    }
+}

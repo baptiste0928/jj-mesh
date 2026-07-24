@@ -1,11 +1,13 @@
 //! Long-running sync daemon.
 //!
 //! Maintains persistent connections to every paired peer (allowlisted at
-//! accept), watches every registered repo for op head changes, reloads the
-//! configuration when it changes, and serves live state on the control
-//! socket. Announcing head changes to peers plugs in next.
+//! accept), watches every registered repo for op head changes and announces
+//! them to peers, reloads the configuration when it changes, and serves
+//! live state on the control socket. Fetching announced operations plugs
+//! in next.
 
 pub mod control;
+mod hub;
 mod pairing;
 mod peers;
 mod repos;
@@ -22,6 +24,7 @@ use tracing::{debug, info, warn};
 
 use self::{
     control::{ControlContext, ControlServer},
+    hub::SyncHub,
     pairing::Pairing,
     peers::PeerSet,
     repos::RepoSet,
@@ -56,9 +59,14 @@ pub async fn run(dir: &ConfigDir) -> Result<()> {
     let endpoint = bind_endpoint(&key, base_alpns()).await?;
     info!("daemon started, endpoint id {}", key.endpoint_id());
 
-    let peers = Arc::new(PeerSet::new(endpoint.clone(), key.endpoint_id()));
+    let hub = Arc::new(SyncHub::new());
+    let peers = Arc::new(PeerSet::new(
+        endpoint.clone(),
+        key.endpoint_id(),
+        hub.clone(),
+    ));
     peers.sync(&config);
-    let repos = Arc::new(RepoSet::new());
+    let repos = Arc::new(RepoSet::new(hub));
     repos.sync(&config);
     let config = Arc::new(Mutex::new(config));
     let pairing = Arc::new(Pairing::new(endpoint.clone()));

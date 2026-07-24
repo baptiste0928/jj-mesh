@@ -13,11 +13,18 @@ use std::{
 };
 
 use iroh::{Endpoint, EndpointId, TransportAddr, endpoint::Connection};
-use tokio::sync::mpsc;
+use tokio::sync::{Semaphore, mpsc};
 use tracing::{debug, info};
 
-use super::control;
+use super::{control, hub::SyncHub};
 use crate::{config::Config, net::sync};
+
+/// Maximum announcement streams handled concurrently per peer connection.
+const MAX_ANNOUNCE_STREAMS: usize = 16;
+
+/// Budget for reading one announcement stream, so a stalled stream cannot
+/// hold its permit indefinitely.
+const ANNOUNCE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Reconnect delay after a first failure; doubles up to [`BACKOFF_MAX`].
 const BACKOFF_MIN: Duration = Duration::from_secs(1);
@@ -38,6 +45,7 @@ const STABLE_UPTIME: Duration = Duration::from_secs(10);
 pub struct PeerSet {
     endpoint: Endpoint,
     local_id: EndpointId,
+    hub: Arc<SyncHub>,
     peers: Mutex<BTreeMap<EndpointId, PeerHandle>>,
 }
 
@@ -60,10 +68,11 @@ enum PeerState {
 }
 
 impl PeerSet {
-    pub fn new(endpoint: Endpoint, local_id: EndpointId) -> Self {
+    pub fn new(endpoint: Endpoint, local_id: EndpointId, hub: Arc<SyncHub>) -> Self {
         PeerSet {
             endpoint,
             local_id,
+            hub,
             peers: Mutex::new(BTreeMap::new()),
         }
     }
@@ -83,6 +92,10 @@ impl PeerSet {
             let Some(name) = desired.get(id) else {
                 info!(peer = %handle.name, "removing peer");
                 handle.shutdown();
+                // The task cannot run its own hub cleanup once aborted, and
+                // revocation must not leave the peer receiving
+                // announcements (the hub also closes the connection).
+                self.hub.peer_disconnected(id);
                 return false;
             };
 
@@ -160,6 +173,7 @@ impl PeerSet {
             peer_id,
             name: name.clone(),
             state: state.clone(),
+            hub: self.hub.clone(),
             inbound: rx,
         }));
 
@@ -211,6 +225,7 @@ struct PeerTask {
     peer_id: EndpointId,
     name: String,
     state: Arc<Mutex<PeerState>>,
+    hub: Arc<SyncHub>,
     inbound: mpsc::Receiver<Connection>,
 }
 
@@ -290,10 +305,14 @@ impl PeerTask {
     }
 
     /// Holds an established connection until it closes, resolving duplicate
-    /// connections along the way.
+    /// connections, serving inbound announcement streams, and keeping the
+    /// hub's registration current.
     async fn connected(&mut self, mut conn: Connection, mut outbound: bool) {
         let mut since = Instant::now();
+        // The peer is authenticated but must not spawn unbounded work.
+        let announce_permits = Arc::new(Semaphore::new(MAX_ANNOUNCE_STREAMS));
 
+        self.hub.peer_connected(self.peer_id, &conn);
         loop {
             self.set_state(PeerState::Connected {
                 conn: conn.clone(),
@@ -303,7 +322,7 @@ impl PeerTask {
             tokio::select! {
                 reason = conn.closed() => {
                     debug!(peer = %self.name, "connection closed: {reason}");
-                    return;
+                    break;
                 }
                 Some(new) = self.inbound.recv() => {
                     // Keep the connection dialed by the lower endpoint id:
@@ -316,10 +335,41 @@ impl PeerTask {
                         conn = new;
                         outbound = false;
                         since = Instant::now();
+                        self.hub.peer_connected(self.peer_id, &conn);
                     }
+                }
+                stream = conn.accept_uni() => {
+                    let Ok(stream) = stream else {
+                        // The connection is going away; the closed() branch
+                        // would report the same on the next iteration.
+                        debug!(peer = %self.name, "connection lost");
+                        break;
+                    };
+                    self.serve_announce(stream, &announce_permits);
                 }
             }
         }
+        self.hub.peer_disconnected(&self.peer_id);
+    }
+
+    /// Reads one announcement stream in its own task and routes it.
+    fn serve_announce(&self, mut stream: iroh::endpoint::RecvStream, permits: &Arc<Semaphore>) {
+        let Ok(permit) = permits.clone().try_acquire_owned() else {
+            debug!(peer = %self.name, "dropping announcement: too many open streams");
+            return;
+        };
+
+        let hub = self.hub.clone();
+        let peer = self.peer_id;
+        let name = self.name.clone();
+        tokio::spawn(async move {
+            let _permit = permit;
+            match tokio::time::timeout(ANNOUNCE_TIMEOUT, sync::recv_announce(&mut stream)).await {
+                Ok(Ok(announce)) => hub.route(peer, announce),
+                Ok(Err(err)) => debug!(peer = %name, "bad announcement: {err:#}"),
+                Err(_) => debug!(peer = %name, "announcement timed out"),
+            }
+        });
     }
 
     fn set_state(&self, state: PeerState) {
