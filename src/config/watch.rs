@@ -5,11 +5,10 @@
 
 use std::{ffi::OsStr, time::Duration};
 
-use color_eyre::eyre::{Result, WrapErr as _, eyre};
-use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher as _};
-use tokio::sync::mpsc;
+use color_eyre::eyre::Result;
 
 use super::ConfigDir;
+use crate::watch::DirWatcher;
 
 /// Debounce window: editors and the CLI's atomic save emit event bursts.
 const DEBOUNCE: Duration = Duration::from_millis(300);
@@ -23,59 +22,26 @@ const DEBOUNCE_MAX: Duration = Duration::from_secs(2);
 /// by rename, so watching the file's inode directly would miss updates.
 #[derive(Debug)]
 pub struct ConfigWatcher {
-    /// Dropping the watcher stops notify's background threads.
-    _watcher: RecommendedWatcher,
-    events: mpsc::UnboundedReceiver<()>,
+    watch: DirWatcher,
 }
 
 impl ConfigWatcher {
     /// Starts watching the configuration directory.
     pub fn new(dir: &ConfigDir) -> Result<Self> {
-        let (tx, events) = mpsc::unbounded_channel();
-
-        let mut watcher = notify::recommended_watcher(move |event: notify::Result<Event>| {
-            let Ok(event) = event else { return };
-
-            // Ignore acess events, otherwise we start an infinite reloading loop
-            if event.kind.is_access() {
-                return;
-            }
-
-            let concerns_config = event
+        let watch = DirWatcher::new(dir.path(), DEBOUNCE, DEBOUNCE_MAX, |event| {
+            event
                 .paths
                 .iter()
-                .any(|path| path.file_name() == Some(OsStr::new("config.toml")));
+                .any(|path| path.file_name() == Some(OsStr::new("config.toml")))
+        })?;
 
-            if concerns_config {
-                let _ = tx.send(());
-            }
-        })
-        .wrap_err("cannot create config watcher")?;
-
-        watcher
-            .watch(dir.path(), RecursiveMode::NonRecursive)
-            .wrap_err_with(|| format!("cannot watch {}", dir.path().display()))?;
-
-        Ok(ConfigWatcher {
-            _watcher: watcher,
-            events,
-        })
+        Ok(ConfigWatcher { watch })
     }
 
-    /// Waits for the next config change, debouncing event bursts.
+    /// Waits for the next config change, debouncing event bursts. Errors
+    /// when the watch died (e.g. the config directory was removed).
     pub async fn changed(&mut self) -> Result<()> {
-        self.events
-            .recv()
-            .await
-            .ok_or_else(|| eyre!("config watcher stopped"))?;
-
-        let deadline = tokio::time::Instant::now() + DEBOUNCE_MAX;
-        loop {
-            match tokio::time::timeout(DEBOUNCE, self.events.recv()).await {
-                Ok(Some(())) if tokio::time::Instant::now() < deadline => {}
-                _ => return Ok(()),
-            }
-        }
+        self.watch.changed().await
     }
 }
 

@@ -52,9 +52,52 @@ fn print_live(status: &control::Status) {
         println!("repos:");
         let width = name_width(status.repos.iter().map(|r| r.name.as_str()));
         for repo in &status.repos {
-            println!("  {:width$}  {}", repo.name, repo.path.display());
+            println!(
+                "  {:width$}  {}  ({})",
+                repo.name,
+                watch_summary(&repo.watch),
+                repo.path.display(),
+            );
         }
     }
+}
+
+/// One-line description of a repo watch.
+fn watch_summary(watch: &control::WatchStatus) -> String {
+    match watch {
+        control::WatchStatus::Opening => "opening".to_owned(),
+        control::WatchStatus::Watching {
+            op_heads,
+            last_change_secs,
+        } => {
+            let changed = match last_change_secs {
+                Some(secs) => format!(", changed {} ago", format_duration(*secs)),
+                None => String::new(),
+            };
+            let divergent = match op_heads {
+                2.. => format!(", {op_heads} divergent heads"),
+                _ => String::new(),
+            };
+            format!("watching{changed}{divergent}")
+        }
+        control::WatchStatus::Failed {
+            error,
+            retry_in_secs,
+        } => format!(
+            "error: {} (retry in {})",
+            sanitize(error),
+            format_duration(*retry_in_secs)
+        ),
+    }
+}
+
+/// Strips control characters from daemon-provided text before it reaches
+/// the terminal: error messages embed bytes read from repo files, which
+/// could otherwise smuggle escape sequences.
+fn sanitize(text: &str) -> String {
+    text.chars()
+        .map(|c| if c.is_control() { '?' } else { c })
+        .collect()
 }
 
 /// Prints the static configuration when no daemon is running.
@@ -110,4 +153,15 @@ pub(super) fn format_duration(secs: u64) -> String {
 /// Width of the longest name, for column alignment.
 pub(super) fn name_width<'a>(names: impl Iterator<Item = &'a str>) -> usize {
     names.map(str::len).max().unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sanitize_strips_escape_sequences() {
+        assert_eq!(sanitize("plain text"), "plain text");
+        assert_eq!(sanitize("a\x1b[2Kb\r\nc"), "a?[2Kb??c");
+    }
 }

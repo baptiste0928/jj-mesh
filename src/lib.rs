@@ -17,3 +17,7 @@ pub mod config;
 pub mod daemon;
 pub mod net;
 pub mod repo;
+pub(crate) mod watch;
+
+#[cfg(test)]
+pub(crate) mod tests;

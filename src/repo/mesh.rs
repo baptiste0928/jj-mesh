@@ -16,9 +16,9 @@
 //! file I/O underneath (writes even fsync). Fine for single ops; bulk work
 //! (initial replication, catch-up) must run on a blocking thread.
 
-use std::{collections::HashSet, path::Path};
+use std::{collections::HashSet, path::Path, sync::LazyLock};
 
-use color_eyre::eyre::{Result, WrapErr as _, ensure};
+use color_eyre::eyre::{Result, WrapErr as _, ensure, eyre};
 use jj_lib::{
     config::StackedConfig,
     git_backend::GitBackend,
@@ -40,16 +40,21 @@ pub struct MeshRepo {
     loader: RepoLoader,
 }
 
+/// jj settings shared by every opened repo: jj's built-in defaults only.
+/// The daemon must not depend on the user's jj configuration; settings
+/// affect commit creation and merges, neither of which happens here.
+static SETTINGS: LazyLock<Result<UserSettings, String>> = LazyLock::new(|| {
+    UserSettings::from_config(StackedConfig::with_defaults()).map_err(|err| err.to_string())
+});
+
 impl MeshRepo {
     /// Opens the stores of a validated repo.
     pub(super) fn open(repo: JjRepo) -> Result<Self> {
-        // The daemon must not depend on the user's jj configuration: repos
-        // are opened with jj's built-in defaults only. Settings affect
-        // commit creation and merges, neither of which happens here.
-        let settings = UserSettings::from_config(StackedConfig::with_defaults())
-            .wrap_err("cannot build jj settings")?;
+        let settings = SETTINGS
+            .as_ref()
+            .map_err(|err| eyre!("cannot build jj settings: {err}"))?;
         let loader = RepoLoader::init_from_file_system(
-            &settings,
+            settings,
             &repo.repo_dir(),
             &StoreFactories::default(),
         )
@@ -229,51 +234,10 @@ fn ensure_replicated_id<T: ObjectId + PartialEq>(kind: &str, sent: &T, written: 
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, path::PathBuf, process::Command};
+    use std::process::Command;
 
     use super::*;
-
-    /// A tempdir with a hermetic jj setup: empty config, identity from env.
-    struct Fixture {
-        tmp: tempfile::TempDir,
-        config: PathBuf,
-    }
-
-    impl Fixture {
-        fn new() -> Self {
-            let tmp = tempfile::tempdir().unwrap();
-            let config = tmp.path().join("jj-config.toml");
-            fs::write(&config, "").unwrap();
-            Fixture { tmp, config }
-        }
-
-        /// Runs a jj command in `dir`, panicking on failure.
-        fn jj(&self, dir: &Path, args: &[&str]) {
-            let out = Command::new("jj")
-                .current_dir(dir)
-                .env("JJ_CONFIG", &self.config)
-                .env("JJ_USER", "Test User")
-                .env("JJ_EMAIL", "test@example.com")
-                .env("JJ_OP_HOSTNAME", "test-host")
-                .env("JJ_OP_USERNAME", "test-user")
-                .args(args)
-                .output()
-                .expect("jj must be installed to run these tests");
-            assert!(
-                out.status.success(),
-                "jj {args:?} failed:\n{}",
-                String::from_utf8_lossy(&out.stderr),
-            );
-        }
-
-        /// Creates a jj repo named `name` with an initial described commit.
-        fn init_repo(&self, name: &str) -> PathBuf {
-            let dir = self.tmp.path().join(name);
-            self.jj(self.tmp.path(), &["git", "init", name]);
-            self.jj(&dir, &["describe", "-m", "base"]);
-            dir
-        }
-    }
+    use crate::tests::Fixture;
 
     fn open(dir: &Path) -> MeshRepo {
         JjRepo::discover(dir).unwrap().open().unwrap()
@@ -327,7 +291,7 @@ mod tests {
     async fn replicates_ops_with_identical_ids() {
         let fx = Fixture::new();
         let a = fx.init_repo("a");
-        let b = fx.tmp.path().join("b");
+        let b = fx.path().join("b");
         let cp = Command::new("cp")
             .arg("-r")
             .args([&a, &b])

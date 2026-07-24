@@ -114,7 +114,7 @@ pub struct Repo {
 
 /// Mesh-wide identifier of a repo, shared by all machines syncing it. Randomly
 /// generated.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct RepoId(String);
 

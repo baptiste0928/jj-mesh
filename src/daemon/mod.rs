@@ -1,12 +1,14 @@
 //! Long-running sync daemon.
 //!
 //! Maintains persistent connections to every paired peer (allowlisted at
-//! accept), watches the configuration for changes, and serves live state on
-//! the control socket. Repo syncing plugs in next.
+//! accept), watches every registered repo for op head changes, reloads the
+//! configuration when it changes, and serves live state on the control
+//! socket. Announcing head changes to peers plugs in next.
 
 pub mod control;
 mod pairing;
 mod peers;
+mod repos;
 
 use std::{
     sync::{Arc, Mutex},
@@ -22,6 +24,7 @@ use self::{
     control::{ControlContext, ControlServer},
     pairing::Pairing,
     peers::PeerSet,
+    repos::RepoSet,
 };
 use crate::{
     config::{Config, ConfigDir, ConfigWatcher, MachineKey},
@@ -55,6 +58,8 @@ pub async fn run(dir: &ConfigDir) -> Result<()> {
 
     let peers = Arc::new(PeerSet::new(endpoint.clone(), key.endpoint_id()));
     peers.sync(&config);
+    let repos = Arc::new(RepoSet::new());
+    repos.sync(&config);
     let config = Arc::new(Mutex::new(config));
     let pairing = Arc::new(Pairing::new(endpoint.clone()));
 
@@ -63,6 +68,7 @@ pub async fn run(dir: &ConfigDir) -> Result<()> {
         endpoint: endpoint.clone(),
         started: Instant::now(),
         peers: peers.clone(),
+        repos: repos.clone(),
         config: config.clone(),
         pairing: pairing.clone(),
     });
@@ -70,7 +76,7 @@ pub async fn run(dir: &ConfigDir) -> Result<()> {
     let mut tasks = tokio::task::JoinSet::new();
     tasks.spawn(async move { server.serve(ctx).await });
     tasks.spawn(accept_loop(endpoint.clone(), peers.clone(), pairing));
-    tasks.spawn(reload_loop(watcher, dir.clone(), peers, config));
+    tasks.spawn(reload_loop(watcher, dir.clone(), peers, repos, config));
 
     // A subsystem ending on its own would leave a zombie daemon (no config
     // reloads, or no inbound connections) that still looks healthy: treat
@@ -134,6 +140,7 @@ async fn reload_loop(
     mut watcher: ConfigWatcher,
     dir: ConfigDir,
     peers: Arc<PeerSet>,
+    repos: Arc<RepoSet>,
     config: Arc<Mutex<Config>>,
 ) {
     loop {
@@ -146,6 +153,7 @@ async fn reload_loop(
             Ok(new) => {
                 info!("configuration changed, reloading");
                 peers.sync(&new);
+                repos.sync(&new);
                 *config.lock().unwrap() = new;
             }
             Err(err) => warn!("keeping previous configuration: {err:#}"),

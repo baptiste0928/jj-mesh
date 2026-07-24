@@ -25,7 +25,7 @@ use tokio::{
 };
 use tracing::{debug, info, warn};
 
-use super::{pairing::Pairing, peers::PeerSet};
+use super::{pairing::Pairing, peers::PeerSet, repos::RepoSet};
 use crate::{
     config::{Config, ConfigDir, ConfigEdit, Peer},
     net::{
@@ -143,6 +143,23 @@ pub enum Route {
 pub struct RepoStatus {
     pub name: String,
     pub path: PathBuf,
+    pub watch: WatchStatus,
+}
+
+/// State of the op-heads watch on a repo.
+#[derive(Debug, Serialize, Deserialize)]
+pub enum WatchStatus {
+    /// The repo is being opened.
+    Opening,
+    /// Watching for op head changes.
+    Watching {
+        /// Current number of op heads (more than one means divergence).
+        op_heads: u64,
+        /// Seconds since the last observed change, if any since starting.
+        last_change_secs: Option<u64>,
+    },
+    /// Opening or watching failed; waiting before retrying.
+    Failed { error: String, retry_in_secs: u64 },
 }
 
 /// Everything the control handlers need from the daemon.
@@ -152,6 +169,7 @@ pub struct ControlContext {
     pub endpoint: Endpoint,
     pub started: Instant,
     pub peers: Arc<PeerSet>,
+    pub repos: Arc<RepoSet>,
     pub config: Arc<Mutex<Config>>,
     pub pairing: Arc<Pairing>,
 }
@@ -163,17 +181,7 @@ impl ControlContext {
             endpoint: self.endpoint.secret_key().public(),
             uptime_secs: self.started.elapsed().as_secs(),
             peers: self.peers.statuses(),
-            repos: self
-                .config
-                .lock()
-                .unwrap()
-                .repos
-                .iter()
-                .map(|(name, repo)| RepoStatus {
-                    name: name.clone(),
-                    path: repo.path.clone(),
-                })
-                .collect(),
+            repos: self.repos.statuses(),
         }
     }
 
