@@ -33,7 +33,6 @@ use jj_lib::{
     op_store::{OperationId, ViewId},
 };
 
-pub use apply::mirror_after_join;
 pub use fetch::fetch;
 pub use serve::serve;
 
@@ -120,6 +119,15 @@ mod tests {
         assert!(cp.success());
     }
 
+    /// Initializes a fresh repo as `jj-mesh join` does: non-colocated,
+    /// with a machine-unique workspace name.
+    fn init_join_repo(fx: &Fixture, name: &str, workspace: &str) -> std::path::PathBuf {
+        let dir = fx.path().join(name);
+        fx.jj(fx.path(), &["git", "init", "--no-colocate", name]);
+        fx.jj(&dir, &["workspace", "rename", workspace]);
+        dir
+    }
+
     /// Runs one fetch of `wants` from `server` into `fetcher` over an
     /// in-memory stream pair, as the daemon would over QUIC.
     async fn sync_once(
@@ -153,6 +161,22 @@ mod tests {
         .unwrap();
         serve_task.await.unwrap();
         outcome
+    }
+
+    /// Fetches the heads `dst` lacks from `src`, as the daemon does on an
+    /// announcement. Returns whether anything was fetched.
+    async fn sync_missing(dst: &Arc<MeshRepo>, src: &Arc<MeshRepo>) -> bool {
+        let mut wants = Vec::new();
+        for head in src.op_heads().await.unwrap() {
+            if !dst.has_operation(&head).await.unwrap() {
+                wants.push(head);
+            }
+        }
+        if wants.is_empty() {
+            return false;
+        }
+        sync_once(dst, src, &wants).await;
+        true
     }
 
     #[tokio::test]
@@ -412,9 +436,9 @@ mod tests {
         assert!(!gone.status.success(), "deleted bookmark must propagate");
     }
 
-    /// The join flow: a freshly initialized repo with a renamed workspace
-    /// pulls the full mesh state; jj then merges the fresh workspace into
-    /// the replicated history on the next command.
+    /// The join flow: a freshly initialized non-colocated repo with a
+    /// renamed workspace pulls the full mesh state; jj then merges the
+    /// fresh workspace into the replicated history on the next command.
     #[tokio::test]
     async fn join_pull_into_fresh_repo() {
         let fx = Fixture::new();
@@ -422,27 +446,15 @@ mod tests {
         fx.jj(&a, &["bookmark", "create", "main", "-r", "@"]);
         fx.jj(&a, &["new", "-m", "second"]);
 
-        let b = fx.path().join("b");
-        fx.jj(fx.path(), &["git", "init", "b"]);
-        fx.jj(&b, &["workspace", "rename", "machine-b"]);
+        let b = init_join_repo(&fx, "b", "machine-b");
 
         let (ra, rb) = (open(&a), open(&b));
         let wants = ra.op_heads().await.unwrap();
-        let init_head = rb.op_heads().await.unwrap();
         let outcome = sync_once(&rb, &ra, &wants).await;
         assert_eq!(outcome.published, wants);
 
         // Divergent by construction: init ops are not mesh ancestors.
         assert_eq!(rb.op_heads().await.unwrap().len(), 2);
-
-        // Seed the colocated git refs as the daemon's join handler does.
-        mirror_after_join(&rb, &wants[0], &init_head[0])
-            .await
-            .unwrap();
-        assert_eq!(
-            git_rev(&b, "refs/heads/main"),
-            git_rev(&a, "refs/heads/main")
-        );
 
         // The next jj command merges: both workspaces coexist, and the
         // mesh history is visible from the fresh machine.
@@ -459,6 +471,55 @@ mod tests {
         assert!(list.contains("machine-b:"), "{list}");
         assert!(list.contains("default:"), "{list}");
         assert_eq!(rb.op_heads().await.unwrap().len(), 1, "merged");
+    }
+
+    /// Rewriting synced ancestors of another machine's working copy
+    /// (describe, squash, sign) must arrive as a clean rebase of the tip,
+    /// not as divergent changes. This holds only because joined repos are
+    /// never colocated: the view's `git_head` mirrors the colocated
+    /// `.git`'s machine-local HEAD, and a second colocated checkout makes
+    /// jj re-import its own HEAD after every sync, resurrecting the
+    /// rewritten commits as divergent changes and ping-ponging
+    /// `import git head` operations between the machines forever.
+    #[tokio::test]
+    async fn ancestor_rewrite_syncs_without_divergence() {
+        let fx = Fixture::new();
+        // The adding machine keeps jj's default (colocated) layout.
+        let a = fx.init_repo("a");
+        let b = init_join_repo(&fx, "b", "machine-b");
+        let (ra, rb) = (open(&a), open(&b));
+        sync_missing(&rb, &ra).await;
+        // Merge the join divergence on b and settle both sides.
+        fx.jj(&b, &["status"]);
+        sync_missing(&ra, &rb).await;
+        fx.jj(&a, &["status"]);
+
+        // A stack on a, with a's working copy on its tip.
+        fs::write(a.join("f.txt"), "one\n").unwrap();
+        fx.jj(&a, &["commit", "-m", "change-A"]);
+        fs::write(a.join("f.txt"), "two\n").unwrap();
+        fx.jj(&a, &["commit", "-m", "change-B"]);
+        fx.jj(&a, &["describe", "-m", "change-C"]);
+        sync_missing(&rb, &ra).await;
+
+        // b rewrites the middle of the stack; jj rebases the tip.
+        fx.jj(
+            &b,
+            &["describe", "-r", "subject(\"change-B\")", "-m", "change-B-upd"],
+        );
+        sync_missing(&ra, &rb).await;
+
+        // a sees a fast-forward with the tip rebased onto the update: one
+        // op head, no divergent changes, no stray branch.
+        assert_eq!(ra.op_heads().await.unwrap().len(), 1);
+        let log = fx.jj_output(&a, &["log", "-r", "all()"]);
+        assert!(log.contains("change-B-upd"), "{log}");
+        assert!(!log.contains("divergent"), "{log}");
+        assert_eq!(log.matches("change-C").count(), 1, "{log}");
+
+        // And the mesh settles: a's jj command produced nothing new to
+        // sync, so no import ops ping-pong between the machines.
+        assert!(!sync_missing(&rb, &ra).await, "unexpected op churn on a");
     }
 
     /// Repos containing gitlink (submodule) tree entries must sync: the

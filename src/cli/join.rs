@@ -4,6 +4,12 @@
 //! (mesh machines must never share one), asks the daemon to pull the mesh
 //! repo's full state from a peer and register it, and lets jj merge the
 //! fresh workspace into the replicated history.
+//!
+//! The repo is never colocated: the view's `git_head` is single-valued
+//! but mirrors machine-local state (the colocated `.git`'s HEAD), so a
+//! mesh repo supports at most one colocated checkout. A second one makes
+//! every jj command re-import the local HEAD as a working-copy move,
+//! resurrecting rewritten commits as divergent changes.
 
 use std::{path::PathBuf, process::Command};
 
@@ -55,8 +61,9 @@ pub fn run(args: JoinArgs, dir: &ConfigDir) -> Result<()> {
     };
 
     // Fresh repo with a machine-unique workspace name, using the user's
-    // own jj (their config applies to the repo from the start).
-    jj(None, &["git", "init", &path.to_string_lossy()])?;
+    // own jj (their config applies to the repo from the start). Never
+    // colocated (see the module docs), whatever the user's `git.colocate`.
+    jj(None, &["git", "init", "--no-colocate", &path.to_string_lossy()])?;
     jj(Some(&path), &["workspace", "rename", &workspace])?;
 
     println!("Pulling repo `{name}` from the mesh...");

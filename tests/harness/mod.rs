@@ -235,11 +235,12 @@ pub async fn connect(a: &Machine, b: &Machine) {
     b.wait_peer_connected(&a.name).await;
 }
 
-/// Initializes a fresh repo for [`Machine::join_repo`], with the
-/// machine-unique workspace name `jj-mesh join` would pick.
+/// Initializes a fresh repo for [`Machine::join_repo`] as `jj-mesh join`
+/// would: non-colocated, with a machine-unique workspace name.
 pub fn init_join_repo(mesh: &TestMesh, dir_name: &str, workspace: &str) -> std::path::PathBuf {
     let path = mesh.jj.path().join(dir_name);
-    mesh.jj.jj(mesh.jj.path(), &["git", "init", dir_name]);
+    mesh.jj
+        .jj(mesh.jj.path(), &["git", "init", "--no-colocate", dir_name]);
     mesh.jj.jj(&path, &["workspace", "rename", workspace]);
     path
 }

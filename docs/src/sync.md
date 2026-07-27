@@ -83,11 +83,22 @@ alone, and HEAD is never touched. It only happens when the sync is a clean
 fast-forward; under divergence there is no single previous view to reconcile
 against, so the mirror is skipped and jj's next import sorts it out.
 
+A mesh repo supports at most one collocated checkout. jj records the
+collocated `.git`'s HEAD in the view (`git_head`), which the mesh replicates,
+while the HEAD file itself is machine-local state jj pins to the local
+working copy's parent. With a second collocated checkout the two machines
+permanently disagree on that single field: every synced operation makes jj
+re-import the local HEAD as a working-copy move, which resurrects rewritten
+commits as divergent changes and ping-pongs `import git head` operations
+across the mesh. This is why joins never collocate; only the machine that
+originally added the repo gets git interop.
+
 ## Joining a repo
 
-`jj-mesh join` bootstraps a repo onto a new machine: it creates a fresh jj
-repo, gives its workspace a machine-unique name (mesh machines must never
-share one), and pulls the repo's full state from a peer that advertises it.
+`jj-mesh join` bootstraps a repo onto a new machine: it creates a fresh
+non-collocated jj repo (see above), gives its workspace a machine-unique
+name (mesh machines must never share one), and pulls the repo's full state
+from a peer that advertises it.
 The fresh repo's init operations are unrelated to the mesh history, so the
 pull is divergent by construction; the next jj command merges the fresh
 workspace into the replicated history.

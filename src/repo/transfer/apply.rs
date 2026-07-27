@@ -7,7 +7,7 @@ use std::{
     sync::Arc,
 };
 
-use color_eyre::eyre::{Result, WrapErr as _, eyre};
+use color_eyre::eyre::{Result, eyre};
 use jj_lib::{
     backend::CommitId,
     object_id::ObjectId as _,
@@ -187,33 +187,6 @@ fn write_keep_refs(repo: &MeshRepo, commit_ids: &HashSet<CommitId>) -> Result<()
     git.edit_references(edits)
         .map_err(|err| eyre!("cannot write keep refs: {err}"))?;
     Ok(())
-}
-
-/// Seeds a freshly joined repo's colocated `.git` with the fetched view's
-/// refs. Join pulls are divergent by construction (the fresh init ops are
-/// not ancestors of the mesh head), so [`apply`] skips its mirror; without
-/// this, the first jj command in the new repo would misread the
-/// replicated refs as git-side deletions.
-pub async fn mirror_after_join(
-    repo: &Arc<MeshRepo>,
-    mesh_head: &OperationId,
-    old_head: &OperationId,
-) -> Result<()> {
-    if !repo.is_colocated() {
-        return Ok(());
-    }
-    let repo = repo.clone();
-    let mesh_head = mesh_head.clone();
-    let old_head = old_head.clone();
-    tokio::task::spawn_blocking(move || -> Result<()> {
-        let new_op = repo.read_operation(&mesh_head).block_on()?;
-        let new_view = repo.read_view(&new_op.view_id).block_on()?;
-        let old_op = repo.read_operation(&old_head).block_on()?;
-        let old_view = repo.read_view(&old_op.view_id).block_on()?;
-        mirror_git_refs(&repo, &new_view, &old_view)
-    })
-    .await
-    .wrap_err("mirror task failed")?
 }
 
 /// Mirrors the applied view's `git_refs` (all namespaces: heads, tags,

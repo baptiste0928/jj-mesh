@@ -377,9 +377,6 @@ async fn join_pull(
             continue;
         };
 
-        // The fresh repo's single head is the baseline for the ref mirror.
-        let local_heads = repo.op_heads().await?;
-
         let pull = async {
             let (mut send, mut recv) = conn.open_bi().await?;
             let outcome =
@@ -390,18 +387,7 @@ async fn join_pull(
         match tokio::time::timeout(JOIN_PULL_TIMEOUT, pull).await {
             Err(_) => last_error = eyre!("pull from {peer} timed out"),
             Ok(Err(err)) => last_error = err.wrap_err(format!("pull from {peer} failed")),
-            Ok(Ok(outcome)) => {
-                // Seed the colocated .git so the first jj command does not
-                // misread replicated refs as deletions. With several mesh
-                // heads there is no single view to mirror; jj's merge and
-                // the next fast-forward sync then converge the refs.
-                if let ([mesh_head], [old_head]) = (&outcome.published[..], &local_heads[..]) {
-                    transfer::mirror_after_join(&repo, mesh_head, old_head).await?;
-                } else {
-                    info!("joined with divergent mesh heads; git refs not seeded");
-                }
-                return Ok((outcome.ops as u64, outcome.git_objects as u64));
-            }
+            Ok(Ok(outcome)) => return Ok((outcome.ops as u64, outcome.git_objects as u64)),
         }
         warn!("join pull attempt failed: {last_error:#}");
     }
