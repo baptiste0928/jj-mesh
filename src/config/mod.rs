@@ -17,4 +17,4 @@ pub use state::{
     MAX_MESH_PEERS, MAX_MESH_REPOS, MAX_NAME_LEN, Membership, MeshRepo, MeshRepoStatus, MeshState,
     Peer, PeerStatus, Repo, RepoId,
 };
-pub(crate) use state::{is_confusable, validate_name};
+pub(crate) use state::{is_confusable, sanitize, validate_name};

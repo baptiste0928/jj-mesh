@@ -371,19 +371,30 @@ async fn handle_client(mut stream: UnixStream, ctx: Arc<ControlContext>) {
             Err(_) => return debug!("control client timed out"),
         };
 
+    // Pairing owns its stream (two responses, plus client-cancel handling);
+    // the rest return a single response and share one error conversion.
     let served = match request {
-        Request::Status => respond(&mut stream, &Response::Status(ctx.status())).await,
         Request::PairHost { name } => pair_host(&mut stream, &ctx, &name).await,
         Request::PairJoin { ticket, name } => pair_join(&mut stream, &ctx, &ticket, &name).await,
-        Request::JoinRepo { name, path } => join_repo(&mut stream, &ctx, &name, &path).await,
-        Request::AddRepo { name, path } => add_repo(&mut stream, &ctx, name, path).await,
-        Request::ForgetRepo { name } => forget_repo(&mut stream, &ctx, &name).await,
-        Request::RemovePeer { peer } => remove_peer(&mut stream, &ctx, &peer).await,
+        Request::Status => reply(&mut stream, Ok(Response::Status(ctx.status()))).await,
+        Request::JoinRepo { name, path } => {
+            reply(&mut stream, join_repo(&ctx, &name, &path).await).await
+        }
+        Request::AddRepo { name, path } => reply(&mut stream, add_repo(&ctx, name, path)).await,
+        Request::ForgetRepo { name } => reply(&mut stream, forget_repo(&ctx, &name)).await,
+        Request::RemovePeer { peer } => reply(&mut stream, remove_peer(&ctx, &peer)).await,
     };
 
     if let Err(err) = served {
         debug!("control client error: {err}");
     }
+}
+
+/// Sends a handler's outcome, turning any failure into an error response so
+/// every handler does not repeat the conversion.
+async fn reply(stream: &mut UnixStream, result: Result<Response>) -> Result<()> {
+    let response = result.unwrap_or_else(|err| Response::Error(format!("{err:#}")));
+    respond(stream, &response).await
 }
 
 /// Writes a response, bounded so a client that stopped reading cannot park
@@ -495,47 +506,33 @@ async fn pair_join(
 /// repo's mesh id is adopted from the announcements. The pull runs on an
 /// ad-hoc repo handle in this connection's task, as the repo set only
 /// manages it once registered.
-async fn join_repo(
-    stream: &mut UnixStream,
-    ctx: &ControlContext,
-    name: &str,
-    path: &std::path::Path,
-) -> Result<()> {
-    let joined = async {
-        let (repo_id, sources) = ctx.hub.join_sources(name)?;
+async fn join_repo(ctx: &ControlContext, name: &str, path: &std::path::Path) -> Result<Response> {
+    let (repo_id, sources) = ctx.hub.join_sources(name)?;
 
-        // Fail before the (long) pull when the registration cannot succeed.
-        // Only the re-validation inside `update_state` below is
-        // authoritative: the state may change during the pull.
-        {
-            let state = ctx.state();
-            state.validate_new_repo(name, path)?;
-            state.ensure_mesh_id(name, &repo_id)?;
-            if let Some(existing) = state.repo_name(&repo_id) {
-                bail!("`{name}` is the repo already registered here as `{existing}`");
-            }
+    // Fail before the (long) pull when the registration cannot succeed. Only
+    // the re-validation inside `update_state` below is authoritative: the
+    // state may change during the pull.
+    {
+        let state = ctx.state();
+        state.validate_new_repo(name, path)?;
+        state.ensure_mesh_id(name, &repo_id)?;
+        if let Some(existing) = state.repo_name(&repo_id) {
+            bail!("`{name}` is the repo already registered here as `{existing}`");
         }
-
-        let outcome = join_pull(ctx, name, &repo_id, sources, path).await?;
-
-        ctx.update_state(|state| {
-            state.add_repo(
-                name.to_owned(),
-                Repo {
-                    id: repo_id.clone(),
-                    path: path.to_owned(),
-                },
-            )
-        })?;
-        Ok::<_, color_eyre::Report>(outcome)
     }
-    .await;
 
-    let response = match joined {
-        Ok((ops, git_objects)) => Response::Joined { ops, git_objects },
-        Err(err) => Response::Error(format!("{err:#}")),
-    };
-    respond(stream, &response).await
+    let (ops, git_objects) = join_pull(ctx, name, &repo_id, sources, path).await?;
+
+    ctx.update_state(|state| {
+        state.add_repo(
+            name.to_owned(),
+            Repo {
+                id: repo_id.clone(),
+                path: path.to_owned(),
+            },
+        )
+    })?;
+    Ok(Response::Joined { ops, git_objects })
 }
 
 async fn join_pull(
@@ -593,53 +590,33 @@ async fn join_pull(
 }
 
 /// Registers the repo at `path` under `name` with a fresh id.
-async fn add_repo(
-    stream: &mut UnixStream,
-    ctx: &ControlContext,
-    name: String,
-    path: PathBuf,
-) -> Result<()> {
-    let result = ctx.update_state(|state| {
+fn add_repo(ctx: &ControlContext, name: String, path: PathBuf) -> Result<Response> {
+    ctx.update_state(|state| {
         state.add_repo(
-            name.clone(),
+            name,
             Repo {
                 id: RepoId::generate(),
                 path,
             },
         )
-    });
-
-    let response = match result {
-        Ok(()) => Response::RepoAdded,
-        Err(err) => Response::Error(format!("{err:#}")),
-    };
-    respond(stream, &response).await
+    })?;
+    Ok(Response::RepoAdded)
 }
 
 /// Retires a repo name from the mesh; the repo set stops watching it here
 /// and the gossip propagates the removal to the other machines.
-async fn forget_repo(stream: &mut UnixStream, ctx: &ControlContext, name: &str) -> Result<()> {
-    let response = match ctx.update_state(|state| state.forget_repo(name)) {
-        Ok(was_local) => {
-            info!(repo = %name, "repo forgotten");
-            Response::RepoForgotten { was_local }
-        }
-        Err(err) => Response::Error(format!("{err:#}")),
-    };
-    respond(stream, &response).await
+fn forget_repo(ctx: &ControlContext, name: &str) -> Result<Response> {
+    let was_local = ctx.update_state(|state| state.forget_repo(name))?;
+    info!(repo = %name, "repo forgotten");
+    Ok(Response::RepoForgotten { was_local })
 }
 
 /// Tombstones a paired peer; the peer set disconnects it immediately and
 /// the gossip propagates the removal.
-async fn remove_peer(stream: &mut UnixStream, ctx: &ControlContext, peer: &str) -> Result<()> {
-    let response = match ctx.update_state(|state| state.remove_peer(peer)) {
-        Ok(endpoint) => {
-            info!(peer = %peer, "peer removed");
-            Response::PeerRemoved(endpoint)
-        }
-        Err(err) => Response::Error(format!("{err:#}")),
-    };
-    respond(stream, &response).await
+fn remove_peer(ctx: &ControlContext, peer: &str) -> Result<Response> {
+    let endpoint = ctx.update_state(|state| state.remove_peer(peer))?;
+    info!(peer = %peer, "peer removed");
+    Ok(Response::PeerRemoved(endpoint))
 }
 
 /// Registers a paired peer in the mesh state; a no-op when the endpoint is

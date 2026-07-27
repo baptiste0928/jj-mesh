@@ -233,37 +233,25 @@ impl SyncHub {
         mut send: SendStream,
         mut recv: RecvStream,
     ) {
-        let message = match self.lookup_serving(&request) {
-            None => "repo not available",
-            Some(serving) => match serving.permits.clone().try_acquire_owned() {
-                Err(_) => {
-                    debug!(repo = %request.name, "refusing fetch: too many being served");
-                    "busy, retry later"
-                }
-                Ok(permit) => {
-                    tokio::spawn(async move {
-                        let _permit = permit;
-                        let serve = transfer::serve(&serving.repo, request, &mut send, &mut recv);
-                        match tokio::time::timeout(SERVE_TIMEOUT, serve).await {
-                            Ok(Ok(())) => {
-                                let _ = send.finish();
-                                debug!(peer = %peer, "served fetch");
-                            }
-                            Ok(Err(err)) => debug!(peer = %peer, "serve failed: {err:#}"),
-                            Err(_) => debug!(peer = %peer, "serve timed out"),
-                        }
-                    });
-                    return;
-                }
-            },
+        let Some(serving) = self.lookup_serving(&request) else {
+            return refuse_fetch(send, "repo not available");
+        };
+        let Ok(permit) = serving.permits.clone().try_acquire_owned() else {
+            debug!(repo = %request.name, "refusing fetch: too many being served");
+            return refuse_fetch(send, "busy, retry later");
         };
 
         tokio::spawn(async move {
-            let frame = OpFrame::Error {
-                message: message.to_owned(),
-            };
-            let _ = wire::write_message(&mut send, &frame, MAX_OP_FRAME_SIZE).await;
-            let _ = send.finish();
+            let _permit = permit;
+            let serve = transfer::serve(&serving.repo, request, &mut send, &mut recv);
+            match tokio::time::timeout(SERVE_TIMEOUT, serve).await {
+                Ok(Ok(())) => {
+                    let _ = send.finish();
+                    debug!(peer = %peer, "served fetch");
+                }
+                Ok(Err(err)) => debug!(peer = %peer, "serve failed: {err:#}"),
+                Err(_) => debug!(peer = %peer, "serve timed out"),
+            }
         });
     }
 
@@ -499,6 +487,17 @@ impl SyncHub {
             .flat_map(|(name, entry)| entry.conflicts.keys().map(|peer| (name.clone(), *peer)))
             .collect()
     }
+}
+
+/// Refuses a fetch on a detached task, telling the peer why before closing.
+fn refuse_fetch(mut send: SendStream, message: &'static str) {
+    tokio::spawn(async move {
+        let frame = OpFrame::Error {
+            message: message.to_owned(),
+        };
+        let _ = wire::write_message(&mut send, &frame, MAX_OP_FRAME_SIZE).await;
+        let _ = send.finish();
+    });
 }
 
 /// Inbound announcements for one repo: the latest per peer, drained by

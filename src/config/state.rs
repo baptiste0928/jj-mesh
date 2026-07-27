@@ -63,6 +63,17 @@ pub(crate) fn validate_name(kind: &str, name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Makes a peer-supplied string safe to surface to the user: drops the
+/// characters that could hide or reorder terminal output, and bounds the
+/// length (a peer's string is not ours to trust for size).
+pub(crate) fn sanitize(text: &str) -> String {
+    const MAX_SANITIZED_LEN: usize = 200;
+    text.chars()
+        .filter(|c| !is_confusable(*c))
+        .take(MAX_SANITIZED_LEN)
+        .collect()
+}
+
 /// Whether a character can hide or reorder text in terminal output: controls
 /// (`is_control` covers only `Cc`), zero-width and bidi formatting. Names and
 /// other peer-supplied strings must never reach the terminal carrying one.

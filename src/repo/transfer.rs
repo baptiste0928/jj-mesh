@@ -429,16 +429,6 @@ fn mark_have_trees(
 
 // --- Fetcher side ---
 
-/// Makes a peer-supplied error message safe to surface to the user: bounded
-/// and stripped of characters that could hide or reorder terminal output.
-fn sanitize_peer_error(message: &str) -> String {
-    message
-        .chars()
-        .filter(|c| !crate::config::is_confusable(*c))
-        .take(200)
-        .collect()
-}
-
 /// Fetches the given op heads from a peer over the stream pair and applies
 /// them locally in crash-safe order.
 pub async fn fetch(
@@ -622,7 +612,7 @@ async fn receive_ops(
                 return Ok(batch);
             }
             OpFrame::Error { message } => {
-                bail!("peer refused fetch: {}", sanitize_peer_error(&message))
+                bail!("peer refused fetch: {}", crate::config::sanitize(&message))
             }
         }
     }
@@ -724,7 +714,10 @@ async fn receive_git_objects(
                 return Ok(total);
             }
             GitFrame::Error { message } => {
-                bail!("peer failed git phase: {}", sanitize_peer_error(&message))
+                bail!(
+                    "peer failed git phase: {}",
+                    crate::config::sanitize(&message)
+                )
             }
         }
     }
