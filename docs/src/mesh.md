@@ -26,11 +26,15 @@ security boundary: a machine that is partitioned when a peer is removed,
 and re-adds that peer meanwhile, will win with its higher version. Revoking
 a machine you no longer trust means rotating what it had access to.
 
-Repos are advertised exactly like machines: registering a repo on one machine
-makes it visible, and joinable by its name, everywhere. Repos also carry a
-random internal id, used to catch the pathological case where two machines
-concurrently create different repos under the same name: same name but
-different id is a conflict surfaced to the user, never silently merged.
+Repos are advertised exactly like machines, and their mesh records are
+versioned registers too: registering a repo on one machine makes it visible,
+and joinable by its name, everywhere, and forgetting one retires the name
+mesh-wide (every machine stops syncing it, none of them touch its files).
+The name can then be reused, since the re-registration outranks the
+tombstone. Repos also carry a random internal id, used to catch the
+pathological case where two machines concurrently create different repos
+under the same name: same name but different id is a conflict surfaced to
+the user, never silently merged.
 
 Both replicated sets are capped, because a machine has to be able to gossip
 its whole view in one message: past the cap new entries stop being adopted.

@@ -92,6 +92,10 @@ pub enum Request {
     /// Register the repo at `path` under `name`, with a fresh id. Answered
     /// with [`Response::RepoAdded`] or [`Response::Error`].
     AddRepo { name: String, path: PathBuf },
+    /// Retire a repo name from the mesh, unregistering it everywhere (its
+    /// files are left alone). Answered with [`Response::RepoForgotten`] or
+    /// [`Response::Error`].
+    ForgetRepo { name: String },
     /// Remove a paired peer (by name, or endpoint id when names are
     /// ambiguous), disconnecting it. Answered with
     /// [`Response::PeerRemoved`] or [`Response::Error`].
@@ -116,6 +120,11 @@ pub enum Response {
     },
     /// The repo is registered (with a freshly generated internal id).
     RepoAdded,
+    /// The repo is retired from the mesh; `was_local` tells whether it was
+    /// registered on this machine.
+    RepoForgotten {
+        was_local: bool,
+    },
     /// The peer is removed from the mesh state.
     PeerRemoved(EndpointId),
     /// The request failed.
@@ -246,10 +255,9 @@ impl ControlContext {
             .collect();
         // Mesh repos not registered here are joinable.
         let available = state
-            .mesh_repos
-            .keys()
+            .mesh_repo_names()
             .filter(|name| !state.repos.contains_key(*name))
-            .cloned()
+            .map(str::to_owned)
             .collect();
 
         Status {
@@ -369,6 +377,7 @@ async fn handle_client(mut stream: UnixStream, ctx: Arc<ControlContext>) {
         Request::PairJoin { ticket, name } => pair_join(&mut stream, &ctx, &ticket, &name).await,
         Request::JoinRepo { name, path } => join_repo(&mut stream, &ctx, &name, &path).await,
         Request::AddRepo { name, path } => add_repo(&mut stream, &ctx, name, path).await,
+        Request::ForgetRepo { name } => forget_repo(&mut stream, &ctx, &name).await,
         Request::RemovePeer { peer } => remove_peer(&mut stream, &ctx, &peer).await,
     };
 
@@ -602,6 +611,19 @@ async fn add_repo(
 
     let response = match result {
         Ok(()) => Response::RepoAdded,
+        Err(err) => Response::Error(format!("{err:#}")),
+    };
+    respond(stream, &response).await
+}
+
+/// Retires a repo name from the mesh; the repo set stops watching it here
+/// and the gossip propagates the removal to the other machines.
+async fn forget_repo(stream: &mut UnixStream, ctx: &ControlContext, name: &str) -> Result<()> {
+    let response = match ctx.update_state(|state| state.forget_repo(name)) {
+        Ok(was_local) => {
+            info!(repo = %name, "repo forgotten");
+            Response::RepoForgotten { was_local }
+        }
         Err(err) => Response::Error(format!("{err:#}")),
     };
     respond(stream, &response).await

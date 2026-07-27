@@ -88,9 +88,10 @@ pub struct MeshState {
     pub peers: BTreeMap<EndpointId, Peer>,
     /// Repos registered on this machine, keyed by their mesh-wide name.
     pub repos: BTreeMap<String, Repo>,
-    /// Every repo known to exist on the mesh (registered here or not).
-    /// Grow-only for now: nothing retires an entry yet.
-    pub mesh_repos: BTreeMap<String, RepoId>,
+    /// Every repo the mesh knows, registered here or not. Includes
+    /// tombstones (forgotten repos), which gossip must remember so a
+    /// machine that missed the removal cannot resurrect the name.
+    pub mesh_repos: BTreeMap<String, MeshRepo>,
 }
 
 impl MeshState {
@@ -176,12 +177,25 @@ impl MeshState {
         Ok(())
     }
 
+    /// The id the mesh knows for a repo name, if the name is live there.
+    pub fn mesh_repo_id(&self, name: &str) -> Option<&RepoId> {
+        self.mesh_repos.get(name).and_then(MeshRepo::id)
+    }
+
+    /// The repo names the mesh knows, in use (not forgotten).
+    pub fn mesh_repo_names(&self) -> impl Iterator<Item = &str> {
+        self.mesh_repos
+            .iter()
+            .filter(|(_, repo)| repo.id().is_some())
+            .map(|(name, _)| name.as_str())
+    }
+
     /// Checks that registering `name` with this id agrees with the mesh: a
     /// name the mesh already knows may only be registered with its id (that
     /// is what a join does), since anything else forks the name into two
     /// unrelated repos.
     pub fn ensure_mesh_id(&self, name: &str, id: &RepoId) -> Result<()> {
-        if let Some(mesh_id) = self.mesh_repos.get(name)
+        if let Some(mesh_id) = self.mesh_repo_id(name)
             && mesh_id != id
         {
             bail!("a repo named `{name}` already exists in the mesh; join it instead");
@@ -272,18 +286,70 @@ impl MeshState {
     }
 
     /// Adds a repo, rejecting duplicate names, paths and ids, and records
-    /// it in the mesh-wide repo list.
+    /// it in the mesh-wide repo list, superseding any tombstone.
     pub fn add_repo(&mut self, name: String, repo: Repo) -> Result<()> {
         self.validate_new_repo(&name, &repo.path)?;
         self.ensure_mesh_id(&name, &repo.id)?;
         if let Some(existing) = self.repo_name(&repo.id) {
             bail!("repo {} is already registered as `{existing}`", repo.id);
         }
+        ensure!(
+            self.mesh_repos.contains_key(&name) || self.mesh_repos.len() < MAX_MESH_REPOS,
+            "the mesh already has {MAX_MESH_REPOS} repos",
+        );
 
-        self.mesh_repos.insert(name.clone(), repo.id.clone());
+        let version = self.bumped_repo_version(&name)?;
+        self.mesh_repos.insert(
+            name.clone(),
+            MeshRepo {
+                version,
+                status: MeshRepoStatus::Present {
+                    id: repo.id.clone(),
+                },
+            },
+        );
         self.repos.insert(name, repo);
 
         Ok(())
+    }
+
+    /// Retires a repo name from the mesh: tombstones the mesh record and
+    /// unregisters the repo here. The tombstone propagates the removal, so
+    /// every machine stops syncing the repo; none of them touch its files.
+    /// Returns whether the repo was registered on this machine.
+    pub fn forget_repo(&mut self, name: &str) -> Result<bool> {
+        ensure!(
+            self.mesh_repos.contains_key(name) || self.repos.contains_key(name),
+            "no repo named `{name}` in the mesh",
+        );
+        ensure!(
+            self.mesh_repo_id(name).is_some() || self.repos.contains_key(name),
+            "repo `{name}` is already forgotten",
+        );
+
+        let version = self.bumped_repo_version(name)?;
+        self.mesh_repos.insert(
+            name.to_owned(),
+            MeshRepo {
+                version,
+                status: MeshRepoStatus::Forgotten,
+            },
+        );
+
+        Ok(self.repos.remove(name).is_some())
+    }
+
+    /// The version a local change to a mesh repo record must carry to
+    /// outrank the stored one; see [`Self::bumped_version`].
+    fn bumped_repo_version(&self, name: &str) -> Result<u64> {
+        let version = self.mesh_repos.get(name).map_or(0, |repo| repo.version);
+        ensure!(
+            version < MAX_PEER_VERSION,
+            "the mesh record of `{name}` is corrupted (version {version}); \
+             remove it from peers.json on every machine",
+        );
+
+        Ok(version + 1)
     }
 
     /// The membership this machine gossips: every peer record (tombstones
@@ -298,11 +364,12 @@ impl MeshState {
     /// Merges a peer's membership into ours. `local` is this machine's own
     /// endpoint: records about ourselves are not ours to store.
     ///
-    /// Peer records are versioned registers: the higher version wins, and
-    /// ties resolve to removed, then to the lexicographically smaller name,
-    /// so every machine converges on the same record without clocks. Mesh
-    /// repos are grow-only; a name announced with a different id keeps our
-    /// record and is left for the sync-level conflict to surface.
+    /// Peer and mesh repo records are versioned registers: the higher
+    /// version wins, and ties resolve to the retired state (removed,
+    /// forgotten), then to the smaller name or id, so every machine
+    /// converges on the same record without clocks. Adopting a forgotten
+    /// repo also unregisters it here: that is how the removal reaches the
+    /// machines that hold it.
     ///
     /// The merged maps are capped: a peer is authenticated but not trusted
     /// to grow our state file (which we must keep gossipable) without
@@ -336,26 +403,32 @@ impl MeshState {
             }
         }
 
-        for (name, id) in &remote.repos {
-            if validate_name("repo", name).is_err() {
+        for (name, record) in &remote.repos {
+            if validate_name("repo", name).is_err() || record.version >= MAX_PEER_VERSION {
                 continue;
             }
-            match self.mesh_repos.get(name) {
+
+            let adopt = match self.mesh_repos.get(name) {
                 // Two unrelated repos claiming one name is a conflict only
                 // the user can settle, but the list must still converge, so
-                // the smaller id wins everywhere. The sync-level conflict
-                // (see `daemon::hub`) is what surfaces it.
-                Some(ours) if ours != id => {
-                    debug!(repo = %name, "mesh repo list disagrees on the id");
-                    if id < ours {
-                        self.mesh_repos.insert(name.clone(), id.clone());
-                    }
+                // the ranking decides it everywhere the same way. The
+                // sync-level conflict (see `daemon::hub`) surfaces it.
+                Some(ours) => mesh_repo_rank(record) > mesh_repo_rank(ours),
+                None if self.mesh_repos.len() < MAX_MESH_REPOS => true,
+                None => {
+                    debug!(repo = %name, "dropping gossiped repo: the mesh repo list is full");
+                    false
                 }
-                Some(_) => {}
-                None if self.mesh_repos.len() < MAX_MESH_REPOS => {
-                    self.mesh_repos.insert(name.clone(), id.clone());
-                }
-                None => debug!(repo = %name, "dropping gossiped repo: the mesh repo list is full"),
+            };
+            if !adopt {
+                continue;
+            }
+
+            self.mesh_repos.insert(name.clone(), record.clone());
+            // A repo forgotten mesh-wide stops being synced here; its
+            // files stay where they are.
+            if record.id().is_none() && self.repos.remove(name).is_some() {
+                debug!(repo = %name, "repo forgotten on the mesh; no longer syncing it");
             }
         }
     }
@@ -370,6 +443,12 @@ fn record_rank(peer: &Peer) -> (u64, bool, cmp::Reverse<&str>) {
         peer.name().is_none(),
         cmp::Reverse(peer.name().unwrap_or("")),
     )
+}
+
+/// The same total order for mesh repo records: higher version first,
+/// forgetting beating presence on ties, then the smaller id.
+fn mesh_repo_rank(repo: &MeshRepo) -> (u64, bool, cmp::Reverse<Option<&RepoId>>) {
+    (repo.version, repo.id().is_none(), cmp::Reverse(repo.id()))
 }
 
 /// A machine's record in the mesh, replicated by the membership gossip as
@@ -404,14 +483,44 @@ pub enum PeerStatus {
     Removed,
 }
 
+/// A repo's record in the mesh-wide list, replicated by the membership
+/// gossip as a versioned register like [`Peer`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MeshRepo {
+    /// Bumped on every local change to the record.
+    pub version: u64,
+    pub status: MeshRepoStatus,
+}
+
+/// Whether a repo name is in use on the mesh. `Forgotten` is a tombstone:
+/// remembering it is what keeps a machine that missed the removal from
+/// resurrecting the name.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MeshRepoStatus {
+    Present { id: RepoId },
+    Forgotten,
+}
+
+impl MeshRepo {
+    /// The repo's mesh id while the name is in use; `None` for a tombstone.
+    pub fn id(&self) -> Option<&RepoId> {
+        match &self.status {
+            MeshRepoStatus::Present { id } => Some(id),
+            MeshRepoStatus::Forgotten => None,
+        }
+    }
+}
+
 /// The membership one machine gossips: its whole view of the mesh. Sent as
-/// idempotent latest-wins snapshots (on connect and on every change), so a
-/// lost message is healed by the next one.
+/// idempotent latest-wins snapshots (on connect, on every change, and
+/// periodically), so a lost message is healed by a later one.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Membership {
     pub peers: BTreeMap<EndpointId, Peer>,
-    /// The mesh-wide repo list: name to id.
-    pub repos: BTreeMap<String, RepoId>,
+    /// The mesh-wide repo list, tombstones included.
+    pub repos: BTreeMap<String, MeshRepo>,
 }
 
 /// A repo registered on this machine.
@@ -473,6 +582,14 @@ mod tests {
     use iroh::SecretKey;
 
     use super::*;
+
+    /// A mesh repo record in use.
+    fn present(version: u64, id: &RepoId) -> MeshRepo {
+        MeshRepo {
+            version,
+            status: MeshRepoStatus::Present { id: id.clone() },
+        }
+    }
 
     #[test]
     fn repo_id_rejects_non_generated_forms() {
@@ -640,7 +757,7 @@ mod tests {
                 .map(|n| {
                     (
                         format!("repo{n}-{:?}", RepoId::generate()),
-                        RepoId::generate(),
+                        present(1, &RepoId::generate()),
                     )
                 })
                 .collect();
@@ -694,44 +811,54 @@ mod tests {
         };
         let membership = |id: &RepoId| Membership {
             peers: BTreeMap::new(),
-            repos: BTreeMap::from([("a".to_owned(), id.clone())]),
+            repos: BTreeMap::from([("a".to_owned(), present(1, id))]),
         };
 
         // Both machines must settle on the same id whichever they held
         // first, or their "available repos" and add/join guards disagree
         // forever.
         let mut holding_low = MeshState::default();
-        holding_low.mesh_repos.insert("a".to_owned(), low.clone());
+        holding_low
+            .mesh_repos
+            .insert("a".to_owned(), present(1, &low));
         holding_low.merge_membership(&membership(&high), &local);
 
         let mut holding_high = MeshState::default();
-        holding_high.mesh_repos.insert("a".to_owned(), high.clone());
+        holding_high
+            .mesh_repos
+            .insert("a".to_owned(), present(1, &high));
         holding_high.merge_membership(&membership(&low), &local);
 
-        assert_eq!(holding_low.mesh_repos["a"], low);
-        assert_eq!(holding_high.mesh_repos["a"], low);
+        assert_eq!(holding_low.mesh_repo_id("a"), Some(&low));
+        assert_eq!(holding_high.mesh_repo_id("a"), Some(&low));
     }
 
     #[test]
     fn merge_grows_mesh_repos_and_keeps_ours_on_conflict() {
         let local = SecretKey::generate().public();
-        let (ours, theirs) = (RepoId::generate(), RepoId::generate());
+        let (ours, theirs) = {
+            let (a, b) = (RepoId::generate(), RepoId::generate());
+            if a < b { (a, b) } else { (b, a) }
+        };
 
         let mut state = MeshState::default();
-        state.mesh_repos.insert("a".to_owned(), ours.clone());
+        state.mesh_repos.insert("a".to_owned(), present(1, &ours));
         state.merge_membership(
             &Membership {
                 peers: BTreeMap::new(),
                 repos: BTreeMap::from([
-                    ("a".to_owned(), theirs),
-                    ("b".to_owned(), RepoId::generate()),
-                    ("bad\u{202E}name".to_owned(), RepoId::generate()),
+                    ("a".to_owned(), present(1, &theirs)),
+                    ("b".to_owned(), present(1, &RepoId::generate())),
+                    (
+                        "bad\u{202E}name".to_owned(),
+                        present(1, &RepoId::generate()),
+                    ),
                 ]),
             },
             &local,
         );
 
-        assert_eq!(state.mesh_repos["a"], ours);
+        assert_eq!(state.mesh_repo_id("a"), Some(&ours));
         assert!(state.mesh_repos.contains_key("b"));
         assert_eq!(state.mesh_repos.len(), 2);
     }
@@ -741,7 +868,7 @@ mod tests {
         let mut state = MeshState::default();
         state
             .mesh_repos
-            .insert("proj".to_owned(), RepoId::generate());
+            .insert("proj".to_owned(), present(1, &RepoId::generate()));
 
         let err = state
             .add_repo(
@@ -753,6 +880,68 @@ mod tests {
             )
             .unwrap_err();
         assert!(err.to_string().contains("join"), "{err:#}");
+    }
+
+    #[test]
+    fn forgetting_a_repo_tombstones_it_and_frees_the_name() {
+        let mut state = MeshState::default();
+        let repo = |id: &RepoId| Repo {
+            id: id.clone(),
+            path: "/p".into(),
+        };
+
+        let first = RepoId::generate();
+        state.add_repo("proj".to_owned(), repo(&first)).unwrap();
+        assert!(state.forget_repo("proj").unwrap(), "it was registered here");
+
+        // The name is retired, not deleted: it stays as a tombstone so a
+        // machine that missed the removal cannot resurrect it.
+        assert!(state.repos.is_empty());
+        assert_eq!(state.mesh_repo_id("proj"), None);
+        assert_eq!(state.mesh_repo_names().count(), 0);
+        assert!(state.mesh_repos.contains_key("proj"));
+        assert!(state.forget_repo("proj").is_err());
+        assert!(state.forget_repo("nope").is_err());
+
+        // And the name can be reused, superseding the tombstone.
+        let second = RepoId::generate();
+        state.add_repo("proj".to_owned(), repo(&second)).unwrap();
+        assert_eq!(state.mesh_repo_id("proj"), Some(&second));
+        assert!(state.mesh_repos["proj"].version > 2);
+    }
+
+    #[test]
+    fn a_gossiped_tombstone_unregisters_the_repo() {
+        let local = SecretKey::generate().public();
+        let id = RepoId::generate();
+
+        let mut state = MeshState::default();
+        state
+            .add_repo(
+                "proj".to_owned(),
+                Repo {
+                    id: id.clone(),
+                    path: "/p".into(),
+                },
+            )
+            .unwrap();
+
+        // Another machine forgot the repo: we stop syncing it, and a stale
+        // announcement of the old record cannot bring it back.
+        let forgotten = MeshRepo {
+            version: state.mesh_repos["proj"].version + 1,
+            status: MeshRepoStatus::Forgotten,
+        };
+        let membership = |record: MeshRepo| Membership {
+            peers: BTreeMap::new(),
+            repos: BTreeMap::from([("proj".to_owned(), record)]),
+        };
+        state.merge_membership(&membership(forgotten), &local);
+        assert!(state.repos.is_empty());
+        assert_eq!(state.mesh_repo_id("proj"), None);
+
+        state.merge_membership(&membership(present(1, &id)), &local);
+        assert_eq!(state.mesh_repo_id("proj"), None);
     }
 
     #[test]

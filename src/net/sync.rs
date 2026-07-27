@@ -156,7 +156,9 @@ pub struct GitRequest {
 mod tests {
     use std::collections::BTreeMap;
 
-    use crate::config::{MAX_MESH_PEERS, MAX_MESH_REPOS, MAX_NAME_LEN, Membership, Peer, RepoId};
+    use crate::config::{
+        MAX_MESH_PEERS, MAX_MESH_REPOS, MAX_NAME_LEN, Membership, MeshRepo, Peer, RepoId,
+    };
 
     /// A membership carrying the largest state we accept must stay inside
     /// the wire cap: if it did not, a machine at the caps could no longer
@@ -176,8 +178,18 @@ mod tests {
                 )
             })
             .collect();
-        let repos: BTreeMap<String, RepoId> = (0..MAX_MESH_REPOS)
-            .map(|n| (format!("{n:0>64}"), RepoId::generate()))
+        let repos: BTreeMap<String, MeshRepo> = (0..MAX_MESH_REPOS)
+            .map(|n| {
+                (
+                    format!("{n:0>64}"),
+                    MeshRepo {
+                        version: u64::from(u32::MAX),
+                        status: crate::config::MeshRepoStatus::Present {
+                            id: RepoId::generate(),
+                        },
+                    },
+                )
+            })
             .collect();
 
         let encoded =
