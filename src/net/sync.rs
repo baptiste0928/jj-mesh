@@ -93,17 +93,17 @@ pub async fn recv_uni(stream: &mut RecvStream) -> Result<UniMessage> {
 /// views mean something is deeply wrong.
 pub const MAX_OP_FRAME_SIZE: u32 = 4 << 20;
 
-/// Cap on git object frames: must fit the largest blob in the repo (large
-/// files deserve a dedicated mechanism later).
-pub const MAX_GIT_FRAME_SIZE: u32 = 64 << 20;
+/// Git object frames (and the git request that lists them) are bounded only
+/// by the wire's `u32` length prefix. A frame carries one whole git object,
+/// so any artificial cap would just refuse a repo whose blobs are larger,
+/// and peers are trusted with our memory. jj keeps oversized files out of
+/// its default backend, so what travels here is the user's own content; the
+/// receiver still bounds resident memory by streaming to disk in chunks.
+pub const MAX_GIT_FRAME_SIZE: u32 = u32::MAX;
 
 /// Cap on ids in want/have lists.
 pub const MAX_WANTS: usize = 64;
 pub const MAX_HAVES: usize = 256;
-
-/// Cap on commit ids in a git request: commits referenced by the fetched
-/// views (heads, refs, working copies), not history.
-pub const MAX_GIT_WANTS: usize = 65_536;
 
 /// Cap on commit haves sent in the git phase (current view heads).
 pub const MAX_GIT_HAVES: usize = 4096;

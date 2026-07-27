@@ -37,8 +37,8 @@ use crate::{
     config::RepoId,
     net::{
         sync::{
-            FetchRequest, GitFrame, GitRequest, MAX_GIT_FRAME_SIZE, MAX_GIT_HAVES, MAX_GIT_WANTS,
-            MAX_HAVES, MAX_OP_FRAME_SIZE, MAX_WANTS, OpFrame, WireObjectKind,
+            FetchRequest, GitFrame, GitRequest, MAX_GIT_FRAME_SIZE, MAX_GIT_HAVES, MAX_HAVES,
+            MAX_OP_FRAME_SIZE, MAX_WANTS, OpFrame, WireObjectKind,
         },
         wire::{read_message, write_message},
     },
@@ -47,9 +47,16 @@ use crate::{
 /// Read budget when sampling have-ancestors for a fetch request.
 const SAMPLE_BUDGET: usize = 128;
 
-/// Git objects are written in chunks of this many to amortize the
-/// blocking-thread hops.
+/// Op/view frames buffered between the server's blocking walk and the
+/// stream writer. Small: it only smooths the pipeline, the point is to not
+/// hold the whole delta at once.
+const OP_STREAM_BUFFER: usize = 16;
+
+/// Git objects are written in chunks, flushed once either bound is reached,
+/// to amortize the blocking-thread hops without letting large blobs pile up
+/// in memory: the byte bound caps resident data whatever the object sizes.
 const GIT_WRITE_CHUNK: usize = 256;
+const GIT_WRITE_BYTES: usize = 32 << 20;
 
 /// Upper bound on op frames accepted in one fetch, against runaway
 /// streams. Far above any real op log delta.
@@ -90,52 +97,64 @@ pub async fn serve(
         }
     }
 
-    // Collect the delta on a blocking thread: the walk is bulk store I/O.
-    // Ops and views are read back as their raw stored bytes, which is what
-    // replication transfers.
-    let batch = {
+    // Stream the delta through a bounded channel so the whole op-log delta
+    // never sits in memory at once: a join pulls the entire log. The walk is
+    // bulk store I/O, so it runs on a blocking thread; each view is sent
+    // before the first op referencing it, and ops stay parents-first.
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<OpFrame>>(OP_STREAM_BUFFER);
+    let walk = {
         let repo = repo.clone();
-        tokio::task::spawn_blocking(move || -> Result<_> {
-            let ops = repo.ancestors_until(&wants, &haves).block_on()?;
-            let mut views: HashMap<ViewId, Vec<u8>> = HashMap::new();
-            let mut raw_ops: Vec<(OperationId, ViewId, Vec<u8>)> = Vec::new();
-            for (id, op) in ops {
-                if !views.contains_key(&op.view_id) {
-                    views.insert(op.view_id.clone(), repo.read_view_bytes(&op.view_id)?);
+        tokio::task::spawn_blocking(move || {
+            let outcome = (|| -> Result<()> {
+                let ops = repo.ancestors_until(&wants, &haves).block_on()?;
+                let mut sent_views: HashSet<ViewId> = HashSet::new();
+                for (id, op) in ops {
+                    if sent_views.insert(op.view_id.clone()) {
+                        let view = repo.read_view_bytes(&op.view_id)?;
+                        let frame = OpFrame::View {
+                            id: op.view_id.as_bytes().to_vec(),
+                            view,
+                        };
+                        tx.blocking_send(Ok(frame))
+                            .map_err(|_| eyre!("fetcher went away"))?;
+                    }
+                    let bytes = repo.read_operation_bytes(&id)?;
+                    let frame = OpFrame::Op {
+                        id: id.as_bytes().to_vec(),
+                        op: bytes,
+                    };
+                    tx.blocking_send(Ok(frame))
+                        .map_err(|_| eyre!("fetcher went away"))?;
                 }
-                let bytes = repo.read_operation_bytes(&id)?;
-                raw_ops.push((id, op.view_id, bytes));
+                Ok(())
+            })();
+            if let Err(err) = outcome {
+                let _ = tx.blocking_send(Err(err));
             }
-            Ok((raw_ops, views))
         })
-        .await
-        .wrap_err("fetch serve task failed")?
-    };
-    let (ops, mut views) = match batch {
-        Ok(batch) => batch,
-        Err(err) => {
-            let message = format!("cannot collect operations: {err:#}");
-            write_message(send, &OpFrame::Error { message }, MAX_OP_FRAME_SIZE).await?;
-            return Ok(());
-        }
     };
 
-    // Views go out before the first op referencing them; ops are already
-    // parents-first.
-    let op_count = ops.len();
-    for (id, view_id, bytes) in ops {
-        if let Some(view) = views.remove(&view_id) {
-            let frame = OpFrame::View {
-                id: view_id.as_bytes().to_vec(),
-                view,
-            };
-            write_message(send, &frame, MAX_OP_FRAME_SIZE).await?;
+    let mut op_count = 0usize;
+    let mut failed = None;
+    while let Some(frame) = rx.recv().await {
+        match frame {
+            Ok(frame) => {
+                if matches!(frame, OpFrame::Op { .. }) {
+                    op_count += 1;
+                }
+                write_message(send, &frame, MAX_OP_FRAME_SIZE).await?;
+            }
+            Err(err) => {
+                failed = Some(format!("cannot collect operations: {err:#}"));
+                break;
+            }
         }
-        let frame = OpFrame::Op {
-            id: id.as_bytes().to_vec(),
-            op: bytes,
-        };
-        write_message(send, &frame, MAX_OP_FRAME_SIZE).await?;
+    }
+    walk.await.wrap_err("fetch serve task failed")?;
+
+    if let Some(message) = failed {
+        write_message(send, &OpFrame::Error { message }, MAX_OP_FRAME_SIZE).await?;
+        return Ok(());
     }
     write_message(send, &OpFrame::Done, MAX_OP_FRAME_SIZE).await?;
     debug!(ops = op_count, "served op phase");
@@ -168,11 +187,10 @@ async fn serve_git_phase(
     send: &mut (impl AsyncWrite + Unpin),
     recv: &mut (impl AsyncRead + Unpin),
 ) -> Result<()> {
-    let request: GitRequest = read_message(recv, MAX_OP_FRAME_SIZE).await?;
+    let request: GitRequest = read_message(recv, MAX_GIT_FRAME_SIZE).await?;
 
     let hash_len = repo.git_backend().git_repo().object_hash().len_in_bytes();
-    let ok = request.wants.len() <= MAX_GIT_WANTS
-        && request.haves.len() <= MAX_GIT_HAVES
+    let ok = request.haves.len() <= MAX_GIT_HAVES
         && request
             .wants
             .iter()
@@ -236,8 +254,9 @@ async fn serve_git_phase(
 }
 
 /// Walks the object closure of the wanted commits, stopping at haves, and
-/// emits every object once. Shared trees below the frontier may be
-/// re-sent (no reachability marking); the fetcher deduplicates on write.
+/// emits every object once. Trees and blobs the fetcher already has (those
+/// reachable from its have commits) are pruned, so a sync transfers only the
+/// objects the change actually introduced, not the whole working tree.
 fn walk_git_closure(
     repo: &MeshRepo,
     request: &GitRequest,
@@ -250,10 +269,15 @@ fn walk_git_closure(
         .map(|id| gix::ObjectId::try_from(id.as_slice()))
         .collect::<Result<_, _>>()?;
 
+    // Seed the seen set with everything reachable from the haves' trees, so
+    // the emit walk below skips the (often vast) part of the tree the change
+    // left untouched.
+    let mut seen: HashSet<gix::ObjectId> = HashSet::new();
+    mark_have_trees(&git, &haves, &mut seen);
+
     // Pass 1: collect wanted commits, children before parents. Non-commit
     // wants (tags, arbitrary git ref targets) join the tree walk at the
     // end.
-    let mut seen: HashSet<gix::ObjectId> = HashSet::new();
     let mut queue: VecDeque<gix::ObjectId> = VecDeque::new();
     for want in &request.wants {
         let id = gix::ObjectId::try_from(want.as_slice())?;
@@ -349,6 +373,60 @@ fn walk_tree(
     Ok(())
 }
 
+/// Marks every tree and blob reachable from the have commits as already
+/// present, so [`walk_git_closure`] does not re-send subtrees the fetcher
+/// shares with its haves. The fetcher holds each have's full object closure
+/// (our own emit order guarantees a stored commit implies its trees), so
+/// pruning against it is sound. Best-effort: haves the server lacks, or that
+/// are not commits, are skipped, at worst re-sending more.
+fn mark_have_trees(
+    git: &gix::Repository,
+    haves: &HashSet<gix::ObjectId>,
+    seen: &mut HashSet<gix::ObjectId>,
+) {
+    let mut stack: Vec<gix::ObjectId> = Vec::new();
+    for have in haves {
+        let Ok(object) = git.find_object(*have) else {
+            continue;
+        };
+        let Ok(commit) = object.try_into_commit() else {
+            continue;
+        };
+        if let Ok(tree) = commit.tree_id() {
+            let tree = tree.detach();
+            if seen.insert(tree) {
+                stack.push(tree);
+            }
+        }
+    }
+    while let Some(id) = stack.pop() {
+        let Ok(object) = git.find_object(id) else {
+            continue;
+        };
+        let Ok(tree) = object.try_into_tree() else {
+            continue;
+        };
+        for entry in tree.iter().flatten() {
+            let mode = entry.mode();
+            // Gitlink (submodule) entries point outside this repo and are
+            // never sent, so they need no marking.
+            if mode.is_commit() {
+                continue;
+            }
+            let oid = entry.oid().to_owned();
+            // Only trees need descending; blobs are leaves, mark and move on
+            // (their content is not even loaded here).
+            if mode.is_tree() {
+                if seen.insert(oid) {
+                    stack.push(oid);
+                }
+            } else {
+                seen.insert(oid);
+            }
+        }
+    }
+}
+
 // --- Fetcher side ---
 
 /// Makes a peer-supplied error message safe to surface to the user: bounded
@@ -418,17 +496,11 @@ pub async fn fetch(
         .await
         .wrap_err("git check task failed")??
     };
-    ensure!(
-        missing.len() <= MAX_GIT_WANTS,
-        "peer data references too many missing commits ({})",
-        missing.len(),
-    );
-
     let git_request = GitRequest {
         wants: missing.iter().map(|id| id.as_bytes().to_vec()).collect(),
         haves: git_haves.iter().map(|id| id.as_bytes().to_vec()).collect(),
     };
-    write_message(send, &git_request, MAX_OP_FRAME_SIZE).await?;
+    write_message(send, &git_request, MAX_GIT_FRAME_SIZE).await?;
     let git_objects = receive_git_objects(repo, recv).await?;
 
     // Nothing threw: objects are on disk, batch is closed and verified.
@@ -611,6 +683,7 @@ async fn receive_git_objects(
 ) -> Result<usize> {
     let hash_kind = repo.git_backend().git_repo().object_hash();
     let mut chunk: Vec<(gix::ObjectId, gix::object::Kind, Vec<u8>)> = Vec::new();
+    let mut chunk_bytes = 0usize;
     let mut total = 0usize;
 
     // The previous chunk writes to disk while the next one streams in;
@@ -630,13 +703,15 @@ async fn receive_git_objects(
                     computed == id,
                     "object {id} does not match its content (hashes to {computed})",
                 );
+                chunk_bytes += data.len();
                 chunk.push((id, kind, data));
                 total += 1;
-                if chunk.len() >= GIT_WRITE_CHUNK {
+                if chunk.len() >= GIT_WRITE_CHUNK || chunk_bytes >= GIT_WRITE_BYTES {
                     if let Some(write) = pending.take() {
                         write.await.wrap_err("git write task failed")??;
                     }
                     pending = Some(write_git_chunk(repo, std::mem::take(&mut chunk)));
+                    chunk_bytes = 0;
                 }
             }
             GitFrame::Done => {
@@ -1103,6 +1178,40 @@ mod tests {
         // Re-fetching the same heads is a no-op.
         let again = sync_once(&rb, &ra, &wants).await;
         assert!(again.published.is_empty());
+    }
+
+    /// An incremental sync must carry only the objects the change touched,
+    /// not the whole working tree: the server prunes everything reachable
+    /// from the fetcher's haves.
+    #[tokio::test]
+    async fn incremental_sync_transfers_only_changed_objects() {
+        let fx = Fixture::new();
+        let a = fx.init_repo("a");
+        // Enough files that a full-tree resend would be conspicuous.
+        for n in 0..20 {
+            fs::write(a.join(format!("file{n}.txt")), format!("content {n}\n")).unwrap();
+        }
+        fx.jj(&a, &["commit", "-m", "populate"]);
+        fork(&a, &fx.path().join("b"));
+        let b = fx.path().join("b");
+
+        // b now has every object; a changes a single file.
+        fs::write(a.join("file0.txt"), "changed\n").unwrap();
+        fx.jj(&a, &["commit", "-m", "one change"]);
+
+        let (ra, rb) = (open(&a), open(&b));
+        let wants = ra.op_heads().await.unwrap();
+        let outcome = sync_once(&rb, &ra, &wants).await;
+
+        // The delta is the one changed blob, the trees on its path, and the
+        // commits, nowhere near the 20-plus objects a full resend carries.
+        assert!(outcome.git_objects > 0);
+        assert!(
+            outcome.git_objects < 10,
+            "sent {} objects for a one-file change",
+            outcome.git_objects,
+        );
+        assert_eq!(rb.op_heads().await.unwrap(), wants);
     }
 
     #[tokio::test]
