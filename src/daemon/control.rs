@@ -6,14 +6,15 @@
 //! responses (the ticket, then the outcome) on one connection.
 //!
 //! The daemon is the only holder of the machine-key endpoint and the only
-//! writer of the mesh state, so live peer state, pairing and every mesh
-//! mutation go through here.
+//! writer of the mesh state, so live peer state, pairing and every
+//! user-driven mesh mutation go through here. Gossip-driven mutations
+//! reach the same store from the daemon's membership loop.
 
 use std::{
     fs::{self, File, TryLockError},
     io,
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -31,9 +32,10 @@ use super::{
     pairing::Pairing,
     peers::PeerSet,
     repos::RepoSet,
+    store::MeshStore,
 };
 use crate::{
-    config::{ConfigDir, MeshState, Peer, Repo, RepoId},
+    config::{ConfigDir, MeshState, Repo, RepoId},
     net::{
         pair,
         wire::{read_message, write_message},
@@ -90,9 +92,10 @@ pub enum Request {
     /// Register the repo at `path` under `name`, with a fresh id. Answered
     /// with [`Response::RepoAdded`] or [`Response::Error`].
     AddRepo { name: String, path: PathBuf },
-    /// Remove a paired peer, disconnecting it. Answered with
+    /// Remove a paired peer (by name, or endpoint id when names are
+    /// ambiguous), disconnecting it. Answered with
     /// [`Response::PeerRemoved`] or [`Response::Error`].
-    RemovePeer { name: String },
+    RemovePeer { peer: String },
 }
 
 /// A daemon answer to a [`Request`].
@@ -130,6 +133,8 @@ pub struct Status {
     pub peers: Vec<PeerStatus>,
     /// Repos registered on this machine.
     pub repos: Vec<RepoStatus>,
+    /// Mesh repos not registered here, joinable by name.
+    pub available: Vec<String>,
     /// Repo names contested by peers announcing a different repo.
     pub conflicts: Vec<ConflictStatus>,
 }
@@ -216,19 +221,19 @@ pub enum WatchStatus {
 /// Everything the control handlers need from the daemon.
 #[derive(Debug)]
 pub struct ControlContext {
-    pub dir: ConfigDir,
     pub endpoint: Endpoint,
     pub started: Instant,
     pub peers: Arc<PeerSet>,
     pub repos: Arc<RepoSet>,
     pub hub: Arc<SyncHub>,
-    pub state: Arc<Mutex<MeshState>>,
+    pub store: Arc<MeshStore>,
     pub pairing: Arc<Pairing>,
 }
 
 impl ControlContext {
     /// Snapshots the daemon state.
     fn status(&self) -> Status {
+        let state = self.state();
         let peers = self.peers.statuses();
         // Conflicts recorded for a since-unpaired peer are dropped: they
         // can no longer be acted on, and the endpoint is not ours to show.
@@ -239,38 +244,33 @@ impl ControlContext {
             .filter(|(_, peer)| peers.iter().any(|status| &status.endpoint == peer))
             .map(|(repo, peer)| ConflictStatus { repo, peer })
             .collect();
+        // Mesh repos not registered here are joinable.
+        let available = state
+            .mesh_repos
+            .keys()
+            .filter(|name| !state.repos.contains_key(*name))
+            .cloned()
+            .collect();
 
         Status {
             endpoint: self.endpoint.secret_key().public(),
             uptime_secs: self.started.elapsed().as_secs(),
             peers,
             repos: self.repos.statuses(),
+            available,
             conflicts,
         }
     }
 
     /// Clones the current mesh state.
     fn state(&self) -> MeshState {
-        self.state.lock().unwrap().clone()
+        self.store.snapshot()
     }
 
-    /// Mutates the mesh state: persists the change to `peers.json` and then
-    /// aligns the peer and repo sets with it. Nothing is committed (in
-    /// memory or on disk) when the mutation or the save fails. The lock is
-    /// deliberately held across the set syncs, so concurrent mutations
-    /// apply their syncs in commit order.
+    /// Mutates the mesh state through the store: persisted, applied to the
+    /// live sets, and broadcast when the membership changed.
     fn update_state<T>(&self, mutate: impl FnOnce(&mut MeshState) -> Result<T>) -> Result<T> {
-        let mut state = self.state.lock().unwrap();
-
-        let mut next = state.clone();
-        let value = mutate(&mut next)?;
-        next.save(&self.dir)?;
-        *state = next;
-
-        self.peers.sync(&state);
-        self.repos.sync(&state);
-
-        Ok(value)
+        self.store.update(mutate)
     }
 }
 
@@ -369,7 +369,7 @@ async fn handle_client(mut stream: UnixStream, ctx: Arc<ControlContext>) {
         Request::PairJoin { ticket, name } => pair_join(&mut stream, &ctx, &ticket, &name).await,
         Request::JoinRepo { name, path } => join_repo(&mut stream, &ctx, &name, &path).await,
         Request::AddRepo { name, path } => add_repo(&mut stream, &ctx, name, path).await,
-        Request::RemovePeer { name } => remove_peer(&mut stream, &ctx, &name).await,
+        Request::RemovePeer { peer } => remove_peer(&mut stream, &ctx, &peer).await,
     };
 
     if let Err(err) = served {
@@ -497,10 +497,11 @@ async fn join_repo(
 
         // Fail before the (long) pull when the registration cannot succeed.
         // Only the re-validation inside `update_state` below is
-        // authoritative: the lock is released during the pull.
+        // authoritative: the state may change during the pull.
         {
-            let state = ctx.state.lock().unwrap();
+            let state = ctx.state();
             state.validate_new_repo(name, path)?;
+            state.ensure_mesh_id(name, &repo_id)?;
             if let Some(existing) = state.repo_name(&repo_id) {
                 bail!("`{name}` is the repo already registered here as `{existing}`");
             }
@@ -606,12 +607,13 @@ async fn add_repo(
     respond(stream, &response).await
 }
 
-/// Removes a paired peer; the peer set disconnects it immediately.
-async fn remove_peer(stream: &mut UnixStream, ctx: &ControlContext, name: &str) -> Result<()> {
-    let response = match ctx.update_state(|state| state.remove_peer(name)) {
-        Ok(peer) => {
-            info!(peer = %name, "peer removed");
-            Response::PeerRemoved(peer.endpoint)
+/// Tombstones a paired peer; the peer set disconnects it immediately and
+/// the gossip propagates the removal.
+async fn remove_peer(stream: &mut UnixStream, ctx: &ControlContext, peer: &str) -> Result<()> {
+    let response = match ctx.update_state(|state| state.remove_peer(peer)) {
+        Ok(endpoint) => {
+            info!(peer = %peer, "peer removed");
+            Response::PeerRemoved(endpoint)
         }
         Err(err) => Response::Error(format!("{err:#}")),
     };
@@ -619,19 +621,15 @@ async fn remove_peer(stream: &mut UnixStream, ctx: &ControlContext, name: &str) 
 }
 
 /// Registers a paired peer in the mesh state; a no-op when the endpoint is
-/// already registered (idempotent re-pair). The peer set starts connecting
-/// as part of the update.
+/// already alive (idempotent re-pair). The peer set starts connecting and
+/// the gossip introduces the peer to the rest of the mesh as part of the
+/// update.
 fn persist_peer(ctx: &ControlContext, peer: &pair::PairedPeer) -> Result<()> {
     ctx.update_state(|state| {
         if state.peer_name(&peer.endpoint).is_some() {
             return Ok(());
         }
-        state.add_peer(
-            peer.name.clone(),
-            Peer {
-                endpoint: peer.endpoint,
-            },
-        )
+        state.add_peer(peer.endpoint, peer.name.clone())
     })
 }
 

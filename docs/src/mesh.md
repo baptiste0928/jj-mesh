@@ -9,16 +9,33 @@ machine keeps its own copy of the mesh state, and the copies converge.
 
 Any member can add a new machine to the mesh by [pairing](#pairing) with it.
 Membership then propagates on its own: peers exchange the machines and repos
-they know on every connection, and broadcast new ones as they appear, so the
-whole mesh converges without ever pairing the same machine twice. Removals
-propagate the same way, as tombstones, so a removed peer cannot be re-added by
-a machine that missed the news.
+they know on every connection, whenever anything changes, and periodically
+as anti-entropy, so the whole mesh converges without ever pairing the same
+machine twice. A machine that learns something new re-broadcasts it, which
+is what carries membership to peers it is not directly exchanging with; a
+machine that learns nothing stays silent, which is what stops the echo.
+
+Machines are identified by their key and carry a name for humans, so two
+machines may legitimately share a name (commands then take the endpoint id
+to disambiguate). Each machine's record is a **versioned register**: every
+local change bumps a counter, and a merge keeps the higher version, so both
+removals (as tombstones) and re-additions propagate. On equal versions
+removal wins, then the smaller name, so every machine settles on the same
+record without needing clocks. Removal is best-effort rather than a
+security boundary: a machine that is partitioned when a peer is removed,
+and re-adds that peer meanwhile, will win with its higher version. Revoking
+a machine you no longer trust means rotating what it had access to.
 
 Repos are advertised exactly like machines: registering a repo on one machine
 makes it visible, and joinable by its name, everywhere. Repos also carry a
 random internal id, used to catch the pathological case where two machines
 concurrently create different repos under the same name: same name but
 different id is a conflict surfaced to the user, never silently merged.
+
+Both replicated sets are capped, because a machine has to be able to gossip
+its whole view in one message: past the cap new entries stop being adopted.
+The caps sit far above what a personal mesh reaches, and the alternative is
+a state file that grows until it can no longer be exchanged at all.
 
 ## Pairing
 
@@ -43,10 +60,12 @@ Each machine stores everything mesh-related in its config directory
 (`~/.config/jj-mesh`), split in three files by ownership:
 
 - **The identity key**, in its own file, only ever read by the daemon.
-- **`peers.json`**, this machine's copy of the converging mesh state: peers,
-  tombstones and repos. It is owned and written exclusively by the daemon;
-  the CLI mutates it through the daemon's control socket, and users are not
-  meant to edit it.
+- **`peers.json`**, this machine's copy of the mesh state, in two parts: what
+  is replicated by the gossip (peer records, tombstones included, and the
+  mesh-wide repo list) and what is strictly local (the repos registered
+  here, with their paths). It is owned and written exclusively by the
+  daemon; the CLI mutates it through the daemon's control socket, and users
+  are not meant to edit it.
 - **The user configuration**, the only hand-edited file, holding local
   settings such as the per-repo watching behavior (see [Daemon](daemon.md)).
 

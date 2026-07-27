@@ -4,23 +4,21 @@
 //! accept), watches every registered repo for op head changes and announces
 //! them to peers, and serves live state on the control socket. The daemon
 //! owns the mesh state (`peers.json`): every mutation arrives through the
-//! control socket and is persisted here.
+//! control socket or the membership gossip, and is persisted here.
 
 pub mod control;
 mod hub;
 mod pairing;
 mod peers;
 mod repos;
+mod store;
 
-use std::{
-    sync::{Arc, Mutex},
-    time::Instant,
-};
+use std::{sync::Arc, time::Instant};
 
 use color_eyre::eyre::{Result, eyre};
-use iroh::Endpoint;
-use tokio::sync::Semaphore;
-use tracing::{debug, info};
+use iroh::{Endpoint, EndpointId};
+use tokio::sync::{Semaphore, mpsc};
+use tracing::{debug, info, warn};
 
 use self::{
     control::{ControlContext, ControlServer},
@@ -28,14 +26,23 @@ use self::{
     pairing::Pairing,
     peers::PeerSet,
     repos::RepoSet,
+    store::MeshStore,
 };
 use crate::{
-    config::{ConfigDir, MachineKey, MeshState},
+    config::{ConfigDir, MachineKey, Membership, MeshState},
     net::{bind_endpoint, pair, sync},
 };
 
 /// Maximum in-flight handshakes of not-yet-authenticated connections.
 const MAX_PENDING_HANDSHAKES: usize = 32;
+
+/// Pending inbound memberships; merging is fast, so a full channel means a
+/// flood, and dropped snapshots are healed by the anti-entropy re-gossip.
+const GOSSIP_QUEUE: usize = 16;
+
+/// How often the membership is re-gossiped even when nothing changed, so a
+/// snapshot dropped under load is not lost until the next change.
+const GOSSIP_INTERVAL: std::time::Duration = std::time::Duration::from_mins(5);
 
 /// Handshake budget, so stalled attempts release their permit quickly
 /// instead of waiting out the transport-level timeout.
@@ -59,31 +66,43 @@ pub async fn run(dir: &ConfigDir) -> Result<()> {
     info!("daemon started, endpoint id {}", key.endpoint_id());
 
     let hub = Arc::new(SyncHub::new());
+    let (gossip_tx, gossip_rx) = mpsc::channel(GOSSIP_QUEUE);
     let peers = Arc::new(PeerSet::new(
         endpoint.clone(),
         key.endpoint_id(),
         hub.clone(),
+        gossip_tx,
     ));
-    peers.sync(&state);
     let repos = Arc::new(RepoSet::new(hub.clone()));
-    repos.sync(&state);
-    let state = Arc::new(Mutex::new(state));
+    let store = Arc::new(MeshStore::new(
+        dir.clone(),
+        state,
+        peers.clone(),
+        repos.clone(),
+        hub.clone(),
+    ));
     let pairing = Arc::new(Pairing::new(endpoint.clone()));
 
     let ctx = Arc::new(ControlContext {
-        dir: dir.clone(),
         endpoint: endpoint.clone(),
         started: Instant::now(),
         peers: peers.clone(),
         repos,
         hub,
-        state,
+        store: store.clone(),
         pairing: pairing.clone(),
     });
 
     let mut tasks = tokio::task::JoinSet::new();
     tasks.spawn(async move { server.serve(ctx).await });
     tasks.spawn(accept_loop(endpoint.clone(), peers, pairing));
+    tasks.spawn(membership_loop(gossip_rx, key.endpoint_id(), store.clone()));
+    tasks.spawn(async move {
+        loop {
+            tokio::time::sleep(GOSSIP_INTERVAL).await;
+            store.republish_membership();
+        }
+    });
 
     // A subsystem ending on its own would leave a zombie daemon (no control
     // socket, or no inbound connections) that still looks healthy: treat it
@@ -139,6 +158,27 @@ async fn accept_loop(endpoint: Endpoint, peers: Arc<PeerSet>, pairing: Arc<Pairi
                 Err(_) => debug!("incoming handshake timed out"),
             }
         });
+    }
+}
+
+/// Merges memberships received from peers into the mesh state. A merge
+/// that changes anything is persisted and re-broadcast by the store, which
+/// is what propagates membership across machines that are not directly
+/// exchanging right now; a merge that changes nothing is silent, which is
+/// what stops the echo.
+async fn membership_loop(
+    mut gossip: mpsc::Receiver<(EndpointId, Membership)>,
+    local: EndpointId,
+    store: Arc<MeshStore>,
+) {
+    while let Some((peer, membership)) = gossip.recv().await {
+        let merged = store.update(|state| {
+            state.merge_membership(&membership, &local);
+            Ok(())
+        });
+        if let Err(err) = merged {
+            warn!("cannot apply membership from {peer}: {err:#}");
+        }
     }
 }
 

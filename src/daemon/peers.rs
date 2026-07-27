@@ -18,7 +18,7 @@ use tracing::{debug, info};
 
 use super::{control, hub::SyncHub};
 use crate::{
-    config::MeshState,
+    config::{Membership, MeshState},
     net::{sync, wire},
 };
 
@@ -53,6 +53,8 @@ pub struct PeerSet {
     endpoint: Endpoint,
     local_id: EndpointId,
     hub: Arc<SyncHub>,
+    /// Inbound memberships, drained by the daemon's membership loop.
+    gossip: mpsc::Sender<(EndpointId, Membership)>,
     peers: Mutex<BTreeMap<EndpointId, PeerHandle>>,
 }
 
@@ -75,22 +77,27 @@ enum PeerState {
 }
 
 impl PeerSet {
-    pub fn new(endpoint: Endpoint, local_id: EndpointId, hub: Arc<SyncHub>) -> Self {
+    pub fn new(
+        endpoint: Endpoint,
+        local_id: EndpointId,
+        hub: Arc<SyncHub>,
+        gossip: mpsc::Sender<(EndpointId, Membership)>,
+    ) -> Self {
         PeerSet {
             endpoint,
             local_id,
             hub,
+            gossip,
             peers: Mutex::new(BTreeMap::new()),
         }
     }
 
     /// Aligns the managed peers with the mesh state: spawns tasks for new
-    /// peers and shuts down removed ones. A renamed peer is respawned.
+    /// (alive) peers and shuts down removed ones.
     pub fn sync(&self, state: &MeshState) {
         let desired: BTreeMap<EndpointId, &str> = state
-            .peers
-            .iter()
-            .map(|(name, peer)| (peer.endpoint, name.as_str()))
+            .alive_peers()
+            .map(|(endpoint, name)| (*endpoint, name))
             .collect();
 
         let mut peers = self.peers.lock().unwrap();
@@ -194,6 +201,7 @@ impl PeerSet {
             name: name.clone(),
             state: state.clone(),
             hub: self.hub.clone(),
+            gossip: self.gossip.clone(),
             inbound: rx,
         }));
 
@@ -246,6 +254,7 @@ struct PeerTask {
     name: String,
     state: Arc<Mutex<PeerState>>,
     hub: Arc<SyncHub>,
+    gossip: mpsc::Sender<(EndpointId, Membership)>,
     inbound: mpsc::Receiver<Connection>,
 }
 
@@ -366,7 +375,7 @@ impl PeerTask {
                         debug!(peer = %self.name, "connection lost");
                         break;
                     };
-                    self.serve_announce(stream, &announce_permits);
+                    self.serve_uni(stream, &announce_permits);
                 }
                 stream = conn.accept_bi() => {
                     let Ok((send, recv)) = stream else {
@@ -413,22 +422,31 @@ impl PeerTask {
         });
     }
 
-    /// Reads one announcement stream in its own task and routes it.
-    fn serve_announce(&self, mut stream: iroh::endpoint::RecvStream, permits: &Arc<Semaphore>) {
+    /// Reads one uni stream (announcement or membership) in its own task
+    /// and routes it.
+    fn serve_uni(&self, mut stream: iroh::endpoint::RecvStream, permits: &Arc<Semaphore>) {
         let Ok(permit) = permits.clone().try_acquire_owned() else {
-            debug!(peer = %self.name, "dropping announcement: too many open streams");
+            debug!(peer = %self.name, "dropping message: too many open streams");
             return;
         };
 
         let hub = self.hub.clone();
+        let gossip = self.gossip.clone();
         let peer = self.peer_id;
         let name = self.name.clone();
         tokio::spawn(async move {
             let _permit = permit;
-            match tokio::time::timeout(ANNOUNCE_TIMEOUT, sync::recv_announce(&mut stream)).await {
-                Ok(Ok(announce)) => hub.route(peer, announce),
-                Ok(Err(err)) => debug!(peer = %name, "bad announcement: {err:#}"),
-                Err(_) => debug!(peer = %name, "announcement timed out"),
+            match tokio::time::timeout(ANNOUNCE_TIMEOUT, sync::recv_uni(&mut stream)).await {
+                Ok(Ok(sync::UniMessage::Announce(announce))) => hub.route(peer, announce),
+                Ok(Ok(sync::UniMessage::Membership(membership))) => {
+                    // A full queue means a membership flood; dropping is
+                    // safe, the next change or reconnect re-sends.
+                    if gossip.try_send((peer, membership)).is_err() {
+                        debug!(peer = %name, "dropping membership: gossip queue full");
+                    }
+                }
+                Ok(Err(err)) => debug!(peer = %name, "bad message: {err:#}"),
+                Err(_) => debug!(peer = %name, "message timed out"),
             }
         });
     }

@@ -39,7 +39,7 @@ pub fn run(args: JoinArgs, dir: &ConfigDir) -> Result<()> {
     let name = args.name;
     let path = args.path.unwrap_or_else(|| PathBuf::from(&name));
 
-    // Best-effort pre-checks against the stored state, so an obviously
+    // Best-effort pre-check against the stored state, so an obviously
     // doomed join fails before anything is created on disk; the daemon
     // re-validates authoritatively before registering.
     MeshState::load(dir)?.validate_new_repo(&name, &path)?;

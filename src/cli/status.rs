@@ -61,6 +61,14 @@ fn print_live(status: &control::Status) {
         }
     }
 
+    if !status.available.is_empty() {
+        println!();
+        println!("available mesh repos (join with `jj-mesh join <name>`):");
+        for name in &status.available {
+            println!("  {name}");
+        }
+    }
+
     if !status.conflicts.is_empty() {
         println!();
         println!("name conflicts:");
@@ -139,7 +147,7 @@ fn print_static(dir: &ConfigDir) -> Result<()> {
     println!("local endpoint id: {}", key.endpoint_id());
     println!(
         "{} paired peer(s), {} repo(s) registered",
-        state.peers.len(),
+        state.alive_peers().count(),
         state.repos.len(),
     );
 

@@ -22,12 +22,14 @@ pub struct PeersArgs {
 
 #[derive(Debug, Subcommand)]
 enum PeersCommand {
-    /// Remove a paired machine
+    /// Remove a machine from the mesh
     ///
-    /// The daemon disconnects the peer immediately. It must be running.
+    /// The daemon disconnects the peer immediately and propagates the
+    /// removal to the other machines. It must be running.
     Remove {
-        /// Name of the peer to remove
-        name: String,
+        /// Name of the peer to remove (or its endpoint id, when several
+        /// peers share a name)
+        peer: String,
     },
 }
 
@@ -35,21 +37,21 @@ enum PeersCommand {
 pub fn run(args: PeersArgs, dir: &ConfigDir) -> Result<()> {
     match args.command {
         None => list(dir),
-        Some(PeersCommand::Remove { name }) => remove(dir, &name),
+        Some(PeersCommand::Remove { peer }) => remove(dir, &peer),
     }
 }
 
 /// Asks the daemon to remove a peer.
-fn remove(dir: &ConfigDir, name: &str) -> Result<()> {
+fn remove(dir: &ConfigDir, peer: &str) -> Result<()> {
     let request = Request::RemovePeer {
-        name: name.to_owned(),
+        peer: peer.to_owned(),
     };
     let response = control::request_blocking(dir, &request, control::MUTATE_WAIT)?;
     let Response::PeerRemoved(endpoint) = response else {
         bail!("unexpected response from the daemon: {response:?}");
     };
 
-    println!("Removed peer `{name}` ({endpoint})");
+    println!("Removed peer `{peer}` ({endpoint})");
     Ok(())
 }
 
@@ -77,15 +79,15 @@ fn list(dir: &ConfigDir) -> Result<()> {
         }
     } else {
         let state = MeshState::load(dir)?;
-        if state.peers.is_empty() {
+        if state.alive_peers().count() == 0 {
             println!("this machine has no paired peers (run `jj-mesh pair` to add one)");
             return Ok(());
         }
 
         println!("(daemon not running; showing the stored mesh state)");
-        let width = name_width(state.peers.keys().map(String::as_str));
-        for (name, peer) in &state.peers {
-            println!("{name:width$}  {}", peer.endpoint);
+        let width = name_width(state.alive_peers().map(|(_, name)| name));
+        for (endpoint, name) in state.alive_peers() {
+            println!("{name:width$}  {endpoint}");
         }
     }
 

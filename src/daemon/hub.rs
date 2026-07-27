@@ -18,6 +18,10 @@
 //! registered here are remembered for `join`. Disconnecting a peer closes
 //! its connection through the hub: revocation must sever announcements even
 //! when it races connection setup.
+//!
+//! The hub also carries the machine's latest membership, since it owns the
+//! outboxes: the mesh store publishes it here on every change, and it is
+//! replayed (before any announcement) to every connecting peer.
 
 use std::{
     collections::BTreeMap,
@@ -34,9 +38,9 @@ use tokio::sync::Notify;
 use tracing::{debug, warn};
 
 use crate::{
-    config::{RepoId, validate_name},
+    config::{Membership, RepoId, validate_name},
     net::{
-        sync::{self, Announce, FetchRequest, MAX_OP_FRAME_SIZE, OpFrame},
+        sync::{self, Announce, FetchRequest, MAX_OP_FRAME_SIZE, OpFrame, UniMessage},
         wire,
     },
     repo::{MeshRepo, transfer},
@@ -75,6 +79,9 @@ struct HubState {
     /// learns a repo's id and heads and who serves it. Bounded; stale
     /// entries are healed like any announcement.
     orphans: BTreeMap<String, BTreeMap<EndpointId, OrphanAnnounce>>,
+    /// This machine's latest membership, replayed to connecting peers and
+    /// broadcast on every change (see [`SyncHub::publish_membership`]).
+    membership: Membership,
 }
 
 /// Cap on unregistered repo names tracked *per peer*, so one peer (hostile
@@ -308,21 +315,35 @@ impl SyncHub {
             heads,
         };
         for sender in state.peers.values() {
-            sender.outbox.push(announce.clone());
+            sender.outbox.push_announce(announce.clone());
+        }
+    }
+
+    /// Publishes this machine's membership: cached for peers that connect
+    /// later and queued to every connected peer, coalescing with any
+    /// membership still pending there. Called on every membership change,
+    /// including changes learned from gossip, which is what makes the
+    /// propagation transitive.
+    pub fn publish_membership(&self, membership: Membership) {
+        let mut state = self.state.lock().unwrap();
+        state.membership = membership;
+        for sender in state.peers.values() {
+            sender.outbox.push_membership(state.membership.clone());
         }
     }
 
     /// Marks a peer connected: spawns its sender task and seeds the outbox
-    /// with every published repo, so a (re)connecting peer learns state it
-    /// missed while away.
+    /// with the membership and every published repo, so a (re)connecting
+    /// peer learns state it missed while away.
     pub fn peer_connected(&self, peer: EndpointId, conn: &Connection) {
         let outbox = Arc::new(Outbox::default());
         let task = tokio::spawn(run_sender(conn.clone(), outbox.clone()));
 
         let mut state = self.state.lock().unwrap();
+        outbox.push_membership(state.membership.clone());
         for (name, entry) in &state.repos {
             if let Some(heads) = &entry.published {
-                outbox.push(Announce {
+                outbox.push_announce(Announce {
                     name: name.clone(),
                     id: entry.id.clone(),
                     seq: entry.seq,
@@ -538,44 +559,62 @@ impl Inbox {
     }
 }
 
-/// Pending announcements for one peer, coalesced per repo: only the
-/// latest head set of each repo is kept until the sender task takes it.
+/// Pending messages for one peer, coalesced latest-wins: one slot for the
+/// membership and one per repo for announcements, each kept until the
+/// sender task takes it.
 #[derive(Debug, Default)]
 struct Outbox {
-    pending: Mutex<BTreeMap<String, Announce>>,
+    pending: Mutex<OutboxState>,
     notify: Notify,
 }
 
+#[derive(Debug, Default)]
+struct OutboxState {
+    membership: Option<Membership>,
+    announces: BTreeMap<String, Announce>,
+}
+
 impl Outbox {
-    fn push(&self, announce: Announce) {
+    fn push_announce(&self, announce: Announce) {
         self.pending
             .lock()
             .unwrap()
+            .announces
             .insert(announce.name.clone(), announce);
         self.notify.notify_one();
     }
 
-    fn pop(&self) -> Option<Announce> {
-        self.pending
-            .lock()
-            .unwrap()
+    fn push_membership(&self, membership: Membership) {
+        self.pending.lock().unwrap().membership = Some(membership);
+        self.notify.notify_one();
+    }
+
+    /// Takes the next message, membership first: a new peer should learn
+    /// the mesh before the repo heads.
+    fn pop(&self) -> Option<UniMessage> {
+        let mut pending = self.pending.lock().unwrap();
+        if let Some(membership) = pending.membership.take() {
+            return Some(UniMessage::Membership(membership));
+        }
+        pending
+            .announces
             .pop_first()
-            .map(|(_, announce)| announce)
+            .map(|(_, announce)| UniMessage::Announce(announce))
     }
 }
 
-/// Sends a peer's outbox until its connection fails; announcements lost
-/// with the connection are recovered by the reconnect replay.
+/// Sends a peer's outbox until its connection fails; messages lost with
+/// the connection are recovered by the reconnect replay.
 async fn run_sender(conn: Connection, outbox: Arc<Outbox>) {
     loop {
-        let Some(announce) = outbox.pop() else {
+        let Some(message) = outbox.pop() else {
             outbox.notify.notified().await;
             continue;
         };
-        match tokio::time::timeout(ANNOUNCE_TIMEOUT, sync::send_announce(&conn, &announce)).await {
+        match tokio::time::timeout(ANNOUNCE_TIMEOUT, sync::send_uni(&conn, &message)).await {
             Ok(Ok(())) => {}
-            Ok(Err(err)) => return debug!("announcement failed: {err:#}"),
-            Err(_) => return debug!("announcement timed out"),
+            Ok(Err(err)) => return debug!("send failed: {err:#}"),
+            Err(_) => return debug!("send timed out"),
         }
     }
 }
@@ -763,18 +802,27 @@ mod tests {
     }
 
     #[test]
-    fn outbox_coalesces_per_repo() {
+    fn outbox_coalesces_per_repo_with_membership_first() {
         let outbox = Outbox::default();
         let id = RepoId::generate();
         let other = RepoId::generate();
 
-        outbox.push(announce("a", &id, 1, vec![vec![1; 64]]));
-        outbox.push(announce("b", &other, 1, vec![vec![3; 64]]));
-        outbox.push(announce("a", &id, 2, vec![vec![2; 64]]));
+        outbox.push_announce(announce("a", &id, 1, vec![vec![1; 64]]));
+        outbox.push_membership(Membership::default());
+        outbox.push_announce(announce("b", &other, 1, vec![vec![3; 64]]));
+        outbox.push_announce(announce("a", &id, 2, vec![vec![2; 64]]));
+        outbox.push_membership(Membership::default());
 
-        let sent: Vec<Announce> = std::iter::from_fn(|| outbox.pop()).collect();
-        assert_eq!(sent.len(), 2);
-        assert!(sent.iter().any(|a| a.name == "a" && a.seq == 2));
-        assert!(sent.iter().any(|a| a.name == "b" && a.seq == 1));
+        let sent: Vec<UniMessage> = std::iter::from_fn(|| outbox.pop()).collect();
+        assert_eq!(sent.len(), 3);
+        assert!(matches!(sent[0], UniMessage::Membership(_)));
+        let seqs: Vec<(&str, u64)> = sent
+            .iter()
+            .filter_map(|message| match message {
+                UniMessage::Announce(a) => Some((a.name.as_str(), a.seq)),
+                UniMessage::Membership(_) => None,
+            })
+            .collect();
+        assert!(seqs.contains(&("a", 2)) && seqs.contains(&("b", 1)));
     }
 }

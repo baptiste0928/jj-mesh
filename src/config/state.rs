@@ -1,21 +1,27 @@
 //! Mesh state file (`peers.json`).
 //!
-//! This file holds the machine's copy of the mesh state: the paired peers
-//! and the registered repos. It is owned and written exclusively by the
-//! daemon; the CLI mutates it through the control socket and only reads it
-//! directly as a fallback when no daemon is running.
+//! This file holds the machine's copy of the mesh state, in two parts:
+//! what is replicated across the mesh by the membership gossip (the peer
+//! records, tombstones included, and the mesh-wide repo list) and what is
+//! strictly local (the repos registered here, with their paths).
+//!
+//! It is owned and written exclusively by the daemon; the CLI mutates it
+//! through the control socket and only reads it directly as a fallback
+//! when no daemon is running.
 
 use std::{
+    cmp,
     collections::BTreeMap,
     fmt, fs, io,
     io::Write as _,
     path::{Path, PathBuf},
 };
 
-use color_eyre::eyre::{Result, WrapErr as _, bail, ensure, eyre};
+use color_eyre::eyre::{Result, WrapErr as _, bail, ensure};
 use data_encoding::HEXLOWER;
 use iroh::EndpointId;
 use serde::{Deserialize, Serialize};
+use tracing::debug;
 
 use super::ConfigDir;
 
@@ -23,7 +29,22 @@ use super::ConfigDir;
 ///
 /// Names can be announced by remote machines and end up as terminal output,
 /// so they are kept short and free of control characters.
-const MAX_NAME_LEN: usize = 64;
+pub const MAX_NAME_LEN: usize = 64;
+
+/// Cap on machines tracked in the mesh state, tombstones included. A
+/// personal mesh is a handful of machines; the cap keeps a peer from
+/// growing the state file (and the membership we must be able to gossip)
+/// without bound.
+pub const MAX_MESH_PEERS: usize = 256;
+
+/// Cap on repos tracked in the mesh-wide repo list, same reasoning.
+pub const MAX_MESH_REPOS: usize = 1024;
+
+/// Cap on a peer record's version. Versions only ever advance by one per
+/// local change, so a record beyond this is corrupted or hostile: without
+/// the cap, a record parked at `u64::MAX` could never be superseded again,
+/// permanently freezing a machine out of the mesh.
+const MAX_PEER_VERSION: u64 = 1 << 32;
 
 /// Checks that a peer or repo name is usable; `kind` names it in errors.
 /// Also applied to names arriving from remote machines (announcements),
@@ -54,11 +75,22 @@ pub(crate) fn is_confusable(c: char) -> bool {
 }
 
 /// This machine's copy of the mesh state.
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+///
+/// `peers` and `mesh_repos` are replicated across the mesh by the
+/// membership gossip; `repos` (with its local paths) never leaves this
+/// machine.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct MeshState {
-    pub peers: BTreeMap<String, Peer>,
+    /// Machines of the mesh, keyed by endpoint id. Includes tombstones
+    /// (removed peers), which gossip must remember so a removal cannot be
+    /// undone by a machine that missed it.
+    pub peers: BTreeMap<EndpointId, Peer>,
+    /// Repos registered on this machine, keyed by their mesh-wide name.
     pub repos: BTreeMap<String, Repo>,
+    /// Every repo known to exist on the mesh (registered here or not).
+    /// Grow-only for now: nothing retires an entry yet.
+    pub mesh_repos: BTreeMap<String, RepoId>,
 }
 
 impl MeshState {
@@ -98,12 +130,16 @@ impl MeshState {
         Ok(())
     }
 
-    /// The name under which an endpoint is paired, if any.
+    /// The name under which an endpoint is paired, if alive.
     pub fn peer_name(&self, endpoint: &EndpointId) -> Option<&str> {
+        self.peers.get(endpoint).and_then(Peer::name)
+    }
+
+    /// The alive peers, as `(endpoint, name)` pairs.
+    pub fn alive_peers(&self) -> impl Iterator<Item = (&EndpointId, &str)> {
         self.peers
             .iter()
-            .find(|(_, peer)| &peer.endpoint == endpoint)
-            .map(|(name, _)| name.as_str())
+            .filter_map(|(endpoint, peer)| Some((endpoint, peer.name()?)))
     }
 
     /// The name under which a repo id is registered, if any.
@@ -114,15 +150,11 @@ impl MeshState {
             .map(|(name, _)| name.as_str())
     }
 
-    /// Checks that a peer can be registered under this name and endpoint,
-    /// rejecting invalid names and duplicates of either.
+    /// Checks that a peer can be paired under this name and endpoint.
+    /// Duplicate names are allowed (machines are identified by their key;
+    /// two laptops may both be called `laptop`), an alive endpoint is not.
     pub fn validate_new_peer(&self, name: &str, endpoint: &EndpointId) -> Result<()> {
         validate_name("peer", name)?;
-        ensure!(
-            !self.peers.contains_key(name),
-            "a peer named `{name}` already exists",
-        );
-
         if let Some(existing) = self.peer_name(endpoint) {
             bail!("endpoint {endpoint} is already paired as `{existing}`");
         }
@@ -130,15 +162,13 @@ impl MeshState {
         Ok(())
     }
 
-    /// Checks that a repo can be registered under this name and path,
-    /// rejecting invalid names and duplicates of either.
+    /// Checks that a repo can be registered here under this name and path.
     pub fn validate_new_repo(&self, name: &str, path: &Path) -> Result<()> {
         validate_name("repo", name)?;
         ensure!(
             !self.repos.contains_key(name),
             "a repo named `{name}` already exists",
         );
-
         if let Some((existing, _)) = self.repos.iter().find(|(_, r)| r.path == path) {
             bail!("{} is already added as `{existing}`", path.display());
         }
@@ -146,40 +176,242 @@ impl MeshState {
         Ok(())
     }
 
-    /// Adds a peer, rejecting duplicate names and endpoints.
-    pub fn add_peer(&mut self, name: String, peer: Peer) -> Result<()> {
-        self.validate_new_peer(&name, &peer.endpoint)?;
-        self.peers.insert(name, peer);
+    /// Checks that registering `name` with this id agrees with the mesh: a
+    /// name the mesh already knows may only be registered with its id (that
+    /// is what a join does), since anything else forks the name into two
+    /// unrelated repos.
+    pub fn ensure_mesh_id(&self, name: &str, id: &RepoId) -> Result<()> {
+        if let Some(mesh_id) = self.mesh_repos.get(name)
+            && mesh_id != id
+        {
+            bail!("a repo named `{name}` already exists in the mesh; join it instead");
+        }
 
         Ok(())
     }
 
-    /// Removes a peer by name.
-    pub fn remove_peer(&mut self, name: &str) -> Result<Peer> {
-        self.peers
-            .remove(name)
-            .ok_or_else(|| eyre!("no peer named `{name}`"))
+    /// Registers a paired peer as alive, superseding any tombstone: the
+    /// bumped version propagates the re-add through the gossip.
+    pub fn add_peer(&mut self, endpoint: EndpointId, name: String) -> Result<()> {
+        self.validate_new_peer(&name, &endpoint)?;
+        // The same cap the merge and the wire enforce: going past it here
+        // would make our own membership undecodable by every peer, which
+        // silently stops us from gossiping anything at all.
+        ensure!(
+            self.peers.contains_key(&endpoint) || self.peers.len() < MAX_MESH_PEERS,
+            "the mesh already has {MAX_MESH_PEERS} machines",
+        );
+
+        let version = self.bumped_version(&endpoint)?;
+        self.peers.insert(
+            endpoint,
+            Peer {
+                version,
+                status: PeerStatus::Alive { name },
+            },
+        );
+
+        Ok(())
     }
 
-    /// Adds a repo, rejecting duplicate names, paths and ids.
+    /// Tombstones an alive peer, resolved by name or full endpoint id.
+    /// The tombstone propagates the removal through the gossip.
+    pub fn remove_peer(&mut self, selector: &str) -> Result<EndpointId> {
+        let endpoint = self.resolve_peer(selector)?;
+        let version = self.bumped_version(&endpoint)?;
+
+        let peer = self.peers.get_mut(&endpoint).expect("resolved above");
+        peer.version = version;
+        peer.status = PeerStatus::Removed;
+
+        Ok(endpoint)
+    }
+
+    /// The version a local change to this record must carry to outrank the
+    /// stored one. Refuses to go past [`MAX_PEER_VERSION`]: a saturating
+    /// bump would make the record unchangeable, so a record parked at the
+    /// ceiling is reported instead of silently freezing the peer out.
+    fn bumped_version(&self, endpoint: &EndpointId) -> Result<u64> {
+        let version = self.peers.get(endpoint).map_or(0, |peer| peer.version);
+        ensure!(
+            version < MAX_PEER_VERSION,
+            "the record of {endpoint} is corrupted (version {version}); \
+             remove it from peers.json on every machine",
+        );
+
+        Ok(version + 1)
+    }
+
+    /// Resolves an alive peer from a name or a full endpoint id. Names are
+    /// matched first: a peer could otherwise be named after another peer's
+    /// endpoint id and shadow it.
+    fn resolve_peer(&self, selector: &str) -> Result<EndpointId> {
+        let matches: Vec<&EndpointId> = self
+            .alive_peers()
+            .filter(|(_, name)| *name == selector)
+            .map(|(endpoint, _)| endpoint)
+            .collect();
+        match matches[..] {
+            [endpoint] => return Ok(*endpoint),
+            [_, _, ..] => bail!(
+                "several peers are named `{selector}`; use the endpoint id \
+                 (see `jj-mesh peers`)"
+            ),
+            [] => {}
+        }
+
+        let Ok(endpoint) = selector.parse::<EndpointId>() else {
+            bail!("no peer named `{selector}`");
+        };
+        ensure!(
+            self.peer_name(&endpoint).is_some(),
+            "endpoint {endpoint} is not a paired peer",
+        );
+
+        Ok(endpoint)
+    }
+
+    /// Adds a repo, rejecting duplicate names, paths and ids, and records
+    /// it in the mesh-wide repo list.
     pub fn add_repo(&mut self, name: String, repo: Repo) -> Result<()> {
         self.validate_new_repo(&name, &repo.path)?;
+        self.ensure_mesh_id(&name, &repo.id)?;
         if let Some(existing) = self.repo_name(&repo.id) {
             bail!("repo {} is already registered as `{existing}`", repo.id);
         }
+
+        self.mesh_repos.insert(name.clone(), repo.id.clone());
         self.repos.insert(name, repo);
 
         Ok(())
     }
+
+    /// The membership this machine gossips: every peer record (tombstones
+    /// included) and the mesh-wide repo list.
+    pub fn membership(&self) -> Membership {
+        Membership {
+            peers: self.peers.clone(),
+            repos: self.mesh_repos.clone(),
+        }
+    }
+
+    /// Merges a peer's membership into ours. `local` is this machine's own
+    /// endpoint: records about ourselves are not ours to store.
+    ///
+    /// Peer records are versioned registers: the higher version wins, and
+    /// ties resolve to removed, then to the lexicographically smaller name,
+    /// so every machine converges on the same record without clocks. Mesh
+    /// repos are grow-only; a name announced with a different id keeps our
+    /// record and is left for the sync-level conflict to surface.
+    ///
+    /// The merged maps are capped: a peer is authenticated but not trusted
+    /// to grow our state file (which we must keep gossipable) without
+    /// bound, so *new* entries stop being accepted at the cap while updates
+    /// to known ones keep flowing. At the cap machines can disagree on
+    /// which entries they hold, which is the accepted trade: the caps sit
+    /// far above a personal mesh, and an unbounded state file breaks
+    /// gossip outright.
+    pub fn merge_membership(&mut self, remote: &Membership, local: &EndpointId) {
+        for (endpoint, record) in &remote.peers {
+            // Strictly below the ceiling: a record *at* it could never be
+            // superseded by a local change, freezing the machine's status.
+            if endpoint == local || record.version >= MAX_PEER_VERSION {
+                continue;
+            }
+            if let PeerStatus::Alive { name } = &record.status
+                && validate_name("peer", name).is_err()
+            {
+                continue;
+            }
+
+            match self.peers.get(endpoint) {
+                Some(ours) if record_rank(record) > record_rank(ours) => {
+                    self.peers.insert(*endpoint, record.clone());
+                }
+                Some(_) => {}
+                None if self.peers.len() < MAX_MESH_PEERS => {
+                    self.peers.insert(*endpoint, record.clone());
+                }
+                None => debug!("dropping gossiped peer {endpoint}: the mesh is full"),
+            }
+        }
+
+        for (name, id) in &remote.repos {
+            if validate_name("repo", name).is_err() {
+                continue;
+            }
+            match self.mesh_repos.get(name) {
+                // Two unrelated repos claiming one name is a conflict only
+                // the user can settle, but the list must still converge, so
+                // the smaller id wins everywhere. The sync-level conflict
+                // (see `daemon::hub`) is what surfaces it.
+                Some(ours) if ours != id => {
+                    debug!(repo = %name, "mesh repo list disagrees on the id");
+                    if id < ours {
+                        self.mesh_repos.insert(name.clone(), id.clone());
+                    }
+                }
+                Some(_) => {}
+                None if self.mesh_repos.len() < MAX_MESH_REPOS => {
+                    self.mesh_repos.insert(name.clone(), id.clone());
+                }
+                None => debug!(repo = %name, "dropping gossiped repo: the mesh repo list is full"),
+            }
+        }
+    }
 }
 
-/// A paired machine. This represents remote peers that we are allowed to
-/// exchange data with.
+/// Total order on peer records deciding which one a merge keeps: higher
+/// version first, removal beating alive on ties, then the smaller name (so
+/// equal-version renames converge mesh-wide instead of ping-ponging).
+fn record_rank(peer: &Peer) -> (u64, bool, cmp::Reverse<&str>) {
+    (
+        peer.version,
+        peer.name().is_none(),
+        cmp::Reverse(peer.name().unwrap_or("")),
+    )
+}
+
+/// A machine's record in the mesh, replicated by the membership gossip as
+/// a versioned register (see [`MeshState::merge_membership`]).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Peer {
-    /// The peer's iroh endpoint id (its public key).
-    pub endpoint: EndpointId,
+    /// Bumped on every local change to the record, so the change outranks
+    /// the state every other machine holds.
+    pub version: u64,
+    pub status: PeerStatus,
+}
+
+impl Peer {
+    /// The machine's name while it is part of the mesh; `None` for a
+    /// tombstone.
+    pub fn name(&self) -> Option<&str> {
+        match &self.status {
+            PeerStatus::Alive { name } => Some(name),
+            PeerStatus::Removed => None,
+        }
+    }
+}
+
+/// Whether a machine is part of the mesh. `Removed` is a tombstone: it
+/// must be remembered (and gossiped) so a machine that missed the removal
+/// cannot resurrect the peer.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PeerStatus {
+    Alive { name: String },
+    Removed,
+}
+
+/// The membership one machine gossips: its whole view of the mesh. Sent as
+/// idempotent latest-wins snapshots (on connect and on every change), so a
+/// lost message is healed by the next one.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Membership {
+    pub peers: BTreeMap<EndpointId, Peer>,
+    /// The mesh-wide repo list: name to id.
+    pub repos: BTreeMap<String, RepoId>,
 }
 
 /// A repo registered on this machine.
@@ -264,9 +496,7 @@ mod tests {
 
         let mut state = MeshState::load(&dir).unwrap();
         assert!(state.peers.is_empty());
-        state
-            .add_peer("laptop".to_owned(), Peer { endpoint })
-            .unwrap();
+        state.add_peer(endpoint, "laptop".to_owned()).unwrap();
         state
             .add_repo(
                 "project".to_owned(),
@@ -279,15 +509,250 @@ mod tests {
         state.save(&dir).unwrap();
 
         let mut state = MeshState::load(&dir).unwrap();
-        assert_eq!(state.peers["laptop"].endpoint, endpoint);
+        assert_eq!(state.peer_name(&endpoint), Some("laptop"));
         assert!(state.repos.contains_key("project"));
+        assert_eq!(state.mesh_repos.len(), 1);
 
         assert!(state.remove_peer("desktop").is_err());
         let removed = state.remove_peer("laptop").unwrap();
-        assert_eq!(removed.endpoint, endpoint);
+        assert_eq!(removed, endpoint);
         state.save(&dir).unwrap();
 
-        assert!(MeshState::load(&dir).unwrap().peers.is_empty());
+        // The removal leaves a tombstone, not a hole.
+        let state = MeshState::load(&dir).unwrap();
+        assert_eq!(state.alive_peers().count(), 0);
+        assert_eq!(state.peers[&endpoint].status, PeerStatus::Removed);
+    }
+
+    #[test]
+    fn repairing_supersedes_the_tombstone() {
+        let mut state = MeshState::default();
+        let endpoint = SecretKey::generate().public();
+
+        state.add_peer(endpoint, "laptop".to_owned()).unwrap();
+        state.remove_peer("laptop").unwrap();
+        let tombstone_version = state.peers[&endpoint].version;
+
+        state.add_peer(endpoint, "laptop".to_owned()).unwrap();
+        assert_eq!(state.peer_name(&endpoint), Some("laptop"));
+        assert!(state.peers[&endpoint].version > tombstone_version);
+    }
+
+    #[test]
+    fn removal_resolves_ambiguous_names_by_endpoint() {
+        let mut state = MeshState::default();
+        let (a, b) = (
+            SecretKey::generate().public(),
+            SecretKey::generate().public(),
+        );
+
+        // Duplicate names are allowed: machines are keyed by endpoint.
+        state.add_peer(a, "laptop".to_owned()).unwrap();
+        state.add_peer(b, "laptop".to_owned()).unwrap();
+
+        assert!(state.remove_peer("laptop").is_err());
+        assert_eq!(state.remove_peer(&a.to_string()).unwrap(), a);
+        assert_eq!(state.remove_peer("laptop").unwrap(), b);
+    }
+
+    #[test]
+    fn merge_is_versioned_with_removed_winning_ties() {
+        let local = SecretKey::generate().public();
+        let peer = SecretKey::generate().public();
+        let alive = |version, name: &str| Peer {
+            version,
+            status: PeerStatus::Alive {
+                name: name.to_owned(),
+            },
+        };
+        let removed = |version| Peer {
+            version,
+            status: PeerStatus::Removed,
+        };
+        let membership = |record: Peer| Membership {
+            peers: BTreeMap::from([(peer, record)]),
+            repos: BTreeMap::new(),
+        };
+
+        let mut state = MeshState::default();
+        state.merge_membership(&membership(alive(2, "laptop")), &local);
+        assert_eq!(state.peer_name(&peer), Some("laptop"));
+
+        // A lower version never downgrades the record...
+        state.merge_membership(&membership(alive(1, "aaa")), &local);
+        assert_eq!(state.peer_name(&peer), Some("laptop"));
+
+        // ...an equal version only wins with a smaller name, so every
+        // machine settles on the same one...
+        state.merge_membership(&membership(alive(2, "zzz")), &local);
+        assert_eq!(state.peer_name(&peer), Some("laptop"));
+        state.merge_membership(&membership(alive(2, "aaa")), &local);
+        assert_eq!(state.peer_name(&peer), Some("aaa"));
+
+        // ...re-merging the same membership changes nothing, which is what
+        // stops the gossip from echoing forever...
+        let before = state.clone();
+        state.merge_membership(&membership(alive(2, "aaa")), &local);
+        assert_eq!(state, before);
+
+        // ...a removal at the same version wins the tie...
+        state.merge_membership(&membership(removed(2)), &local);
+        assert_eq!(state.peer_name(&peer), None);
+
+        // ...and a higher version supersedes the tombstone (re-pairing).
+        state.merge_membership(&membership(alive(3, "laptop")), &local);
+        assert_eq!(state.peer_name(&peer), Some("laptop"));
+
+        // Records about ourselves are ignored.
+        state.merge_membership(
+            &Membership {
+                peers: BTreeMap::from([(local, removed(9))]),
+                repos: BTreeMap::new(),
+            },
+            &local,
+        );
+        assert!(!state.peers.contains_key(&local));
+    }
+
+    #[test]
+    fn merge_bounds_the_state_it_adopts() {
+        let local = SecretKey::generate().public();
+        let mut state = MeshState::default();
+
+        // A peer cannot grow our state past the caps: beyond them, new
+        // entries are dropped rather than making our own membership
+        // ungossipable (it would exceed the wire limit).
+        for _ in 0..3 {
+            let peers = (0..MAX_MESH_PEERS)
+                .map(|_| {
+                    (
+                        SecretKey::generate().public(),
+                        Peer {
+                            version: 1,
+                            status: PeerStatus::Alive {
+                                name: "flood".to_owned(),
+                            },
+                        },
+                    )
+                })
+                .collect();
+            let repos = (0..MAX_MESH_REPOS)
+                .map(|n| {
+                    (
+                        format!("repo{n}-{:?}", RepoId::generate()),
+                        RepoId::generate(),
+                    )
+                })
+                .collect();
+            state.merge_membership(&Membership { peers, repos }, &local);
+        }
+
+        assert_eq!(state.peers.len(), MAX_MESH_PEERS);
+        assert_eq!(state.mesh_repos.len(), MAX_MESH_REPOS);
+    }
+
+    #[test]
+    fn merge_rejects_versions_that_would_freeze_a_record() {
+        let local = SecretKey::generate().public();
+        let peer = SecretKey::generate().public();
+
+        // A record parked at an unreachable version could never be
+        // superseded, locking the machine out of the mesh for good. The
+        // ceiling itself must be refused too: a record *at* it leaves the
+        // local bump no headroom.
+        for version in [u64::MAX, MAX_PEER_VERSION] {
+            let mut state = MeshState::default();
+            state.merge_membership(
+                &Membership {
+                    peers: BTreeMap::from([(
+                        peer,
+                        Peer {
+                            version,
+                            status: PeerStatus::Removed,
+                        },
+                    )]),
+                    repos: BTreeMap::new(),
+                },
+                &local,
+            );
+            assert!(state.peers.is_empty(), "version {version} must be refused");
+
+            // Pairing therefore still works.
+            state.add_peer(peer, "laptop".to_owned()).unwrap();
+            assert_eq!(state.peer_name(&peer), Some("laptop"));
+            // And so does removing it again.
+            state.remove_peer("laptop").unwrap();
+        }
+    }
+
+    #[test]
+    fn mesh_repo_id_disagreements_converge() {
+        let local = SecretKey::generate().public();
+        let (low, high) = {
+            let (a, b) = (RepoId::generate(), RepoId::generate());
+            if a < b { (a, b) } else { (b, a) }
+        };
+        let membership = |id: &RepoId| Membership {
+            peers: BTreeMap::new(),
+            repos: BTreeMap::from([("a".to_owned(), id.clone())]),
+        };
+
+        // Both machines must settle on the same id whichever they held
+        // first, or their "available repos" and add/join guards disagree
+        // forever.
+        let mut holding_low = MeshState::default();
+        holding_low.mesh_repos.insert("a".to_owned(), low.clone());
+        holding_low.merge_membership(&membership(&high), &local);
+
+        let mut holding_high = MeshState::default();
+        holding_high.mesh_repos.insert("a".to_owned(), high.clone());
+        holding_high.merge_membership(&membership(&low), &local);
+
+        assert_eq!(holding_low.mesh_repos["a"], low);
+        assert_eq!(holding_high.mesh_repos["a"], low);
+    }
+
+    #[test]
+    fn merge_grows_mesh_repos_and_keeps_ours_on_conflict() {
+        let local = SecretKey::generate().public();
+        let (ours, theirs) = (RepoId::generate(), RepoId::generate());
+
+        let mut state = MeshState::default();
+        state.mesh_repos.insert("a".to_owned(), ours.clone());
+        state.merge_membership(
+            &Membership {
+                peers: BTreeMap::new(),
+                repos: BTreeMap::from([
+                    ("a".to_owned(), theirs),
+                    ("b".to_owned(), RepoId::generate()),
+                    ("bad\u{202E}name".to_owned(), RepoId::generate()),
+                ]),
+            },
+            &local,
+        );
+
+        assert_eq!(state.mesh_repos["a"], ours);
+        assert!(state.mesh_repos.contains_key("b"));
+        assert_eq!(state.mesh_repos.len(), 2);
+    }
+
+    #[test]
+    fn adding_a_repo_known_to_the_mesh_requires_joining() {
+        let mut state = MeshState::default();
+        state
+            .mesh_repos
+            .insert("proj".to_owned(), RepoId::generate());
+
+        let err = state
+            .add_repo(
+                "proj".to_owned(),
+                Repo {
+                    id: RepoId::generate(),
+                    path: "/p".into(),
+                },
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("join"), "{err:#}");
     }
 
     #[test]
@@ -318,22 +783,11 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_names_and_endpoints_are_rejected() {
+    fn alive_endpoints_cannot_be_paired_twice() {
         let mut state = MeshState::default();
         let endpoint = SecretKey::generate().public();
 
-        state
-            .add_peer("laptop".to_owned(), Peer { endpoint })
-            .unwrap();
-        assert!(
-            state
-                .add_peer("laptop".to_owned(), Peer { endpoint })
-                .is_err()
-        );
-        assert!(
-            state
-                .add_peer("desktop".to_owned(), Peer { endpoint })
-                .is_err()
-        );
+        state.add_peer(endpoint, "laptop".to_owned()).unwrap();
+        assert!(state.add_peer(endpoint, "desktop".to_owned()).is_err());
     }
 }

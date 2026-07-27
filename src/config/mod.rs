@@ -13,5 +13,8 @@ mod state;
 
 pub use key::MachineKey;
 pub use resolve::ConfigDir;
-pub use state::{MeshState, Peer, Repo, RepoId};
+pub use state::{
+    MAX_MESH_PEERS, MAX_MESH_REPOS, MAX_NAME_LEN, Membership, MeshState, Peer, PeerStatus, Repo,
+    RepoId,
+};
 pub(crate) use state::{is_confusable, validate_name};

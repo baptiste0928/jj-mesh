@@ -1,24 +1,34 @@
 //! Sync protocol, multiplexed over the persistent peer connection.
 //!
-//! Head announcements travel as one-shot uni streams carrying an
-//! [`Announce`]. They are idempotent latest-wins state, re-sent on every
-//! head change, watch start, and peer (re)connect, so a lost or dropped
-//! announcement is always healed by a later one. Op negotiation and git
-//! object transfer come next, on bidirectional streams.
+//! One-shot uni streams carry a [`UniMessage`]: op-head announcements and
+//! membership gossip. Both are idempotent latest-wins state, re-sent on
+//! every change and on peer (re)connect, so a lost or dropped message is
+//! always healed by a later one. Op negotiation and git object transfer
+//! run on bidirectional streams.
 
-use color_eyre::eyre::Result;
+use color_eyre::eyre::{Result, ensure};
 use iroh::endpoint::{Connection, RecvStream};
 use serde::{Deserialize, Serialize};
 
 use super::wire::{read_message, write_message};
-use crate::config::RepoId;
+use crate::config::{MAX_MESH_PEERS, MAX_MESH_REPOS, Membership, RepoId};
 
-/// ALPN of the sync protocol.
-pub const ALPN: &[u8] = b"jj-mesh/sync/1";
+/// ALPN of the sync protocol. Bumped whenever the wire format changes, so
+/// mismatched daemons refuse each other instead of mis-decoding.
+pub const ALPN: &[u8] = b"jj-mesh/sync/2";
 
-/// Cap on announce messages; a legitimate one carries a handful of head
-/// ids, and the peer, while authenticated, is not trusted with our memory.
-const MAX_ANNOUNCE_SIZE: u32 = 64 * 1024;
+/// Cap on uni-stream messages. Sized for the largest legitimate message, a
+/// full membership (peer records are ~100 bytes, repo records ~100), with
+/// headroom; the peer, while authenticated, is not trusted with our
+/// memory, and every byte here is decoded before we can check anything.
+const MAX_UNI_SIZE: u32 = 192 * 1024;
+
+/// A message carried by a one-shot uni stream.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum UniMessage {
+    Announce(Announce),
+    Membership(Membership),
+}
 
 /// Advertises the current op heads of one repo.
 ///
@@ -40,17 +50,28 @@ pub struct Announce {
     pub heads: Vec<Vec<u8>>,
 }
 
-/// Sends one announcement on a fresh uni stream.
-pub async fn send_announce(conn: &Connection, announce: &Announce) -> Result<()> {
+/// Sends one message on a fresh uni stream.
+pub async fn send_uni(conn: &Connection, message: &UniMessage) -> Result<()> {
     let mut stream = conn.open_uni().await?;
-    write_message(&mut stream, announce, MAX_ANNOUNCE_SIZE).await?;
+    write_message(&mut stream, message, MAX_UNI_SIZE).await?;
     stream.finish()?;
     Ok(())
 }
 
-/// Reads the announcement from an accepted uni stream.
-pub async fn recv_announce(stream: &mut RecvStream) -> Result<Announce> {
-    read_message(stream, MAX_ANNOUNCE_SIZE).await
+/// Reads the message from an accepted uni stream, rejecting memberships
+/// too big to be legitimate before they reach the daemon: the merge caps
+/// what it stores, but a bounded message keeps the flood off the queue.
+pub async fn recv_uni(stream: &mut RecvStream) -> Result<UniMessage> {
+    let message: UniMessage = read_message(stream, MAX_UNI_SIZE).await?;
+
+    if let UniMessage::Membership(membership) = &message {
+        ensure!(
+            membership.peers.len() <= MAX_MESH_PEERS && membership.repos.len() <= MAX_MESH_REPOS,
+            "membership too large",
+        );
+    }
+
+    Ok(message)
 }
 
 // --- Fetch protocol ---
@@ -129,6 +150,46 @@ pub enum OpFrame {
 pub struct GitRequest {
     pub wants: Vec<Vec<u8>>,
     pub haves: Vec<Vec<u8>>,
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use crate::config::{MAX_MESH_PEERS, MAX_MESH_REPOS, MAX_NAME_LEN, Membership, Peer, RepoId};
+
+    /// A membership carrying the largest state we accept must stay inside
+    /// the wire cap: if it did not, a machine at the caps could no longer
+    /// gossip at all, and its sender task would die on every reconnect.
+    #[test]
+    fn a_full_membership_fits_on_the_wire() {
+        let peers = (0..MAX_MESH_PEERS)
+            .map(|_| {
+                (
+                    iroh::SecretKey::generate().public(),
+                    Peer {
+                        version: u64::from(u32::MAX),
+                        status: crate::config::PeerStatus::Alive {
+                            name: "n".repeat(MAX_NAME_LEN),
+                        },
+                    },
+                )
+            })
+            .collect();
+        let repos: BTreeMap<String, RepoId> = (0..MAX_MESH_REPOS)
+            .map(|n| (format!("{n:0>64}"), RepoId::generate()))
+            .collect();
+
+        let encoded =
+            postcard::to_stdvec(&super::UniMessage::Membership(Membership { peers, repos }))
+                .unwrap();
+        assert!(
+            encoded.len() <= super::MAX_UNI_SIZE as usize,
+            "a full membership is {} bytes, over the {} byte cap",
+            encoded.len(),
+            super::MAX_UNI_SIZE,
+        );
+    }
 }
 
 /// Server-to-fetcher frame of the git phase.
