@@ -1020,7 +1020,7 @@ mod tests {
     use std::{fs, path::Path, process::Command};
 
     use super::*;
-    use crate::{repo::JjRepo, tests::Fixture};
+    use crate::{repo::JjRepo, testing::Fixture};
 
     fn open(dir: &Path) -> Arc<MeshRepo> {
         Arc::new(JjRepo::discover(dir).unwrap().open().unwrap())

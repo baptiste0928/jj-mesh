@@ -222,7 +222,7 @@ mod tests {
     use pollster::FutureExt as _;
 
     use super::*;
-    use crate::{repo::JjRepo, tests::Fixture};
+    use crate::{repo::JjRepo, testing::Fixture};
 
     /// Parses every op and view of a real repo with non-trivial content:
     /// the extracted DAG must match what jj_lib reads, and the extracted

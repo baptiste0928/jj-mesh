@@ -19,5 +19,5 @@ pub mod net;
 pub mod repo;
 pub(crate) mod watch;
 
-#[cfg(test)]
-pub(crate) mod tests;
+#[cfg(any(test, feature = "test-util"))]
+pub mod testing;

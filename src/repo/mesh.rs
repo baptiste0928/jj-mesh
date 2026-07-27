@@ -305,7 +305,7 @@ mod tests {
     use std::process::Command;
 
     use super::*;
-    use crate::tests::Fixture;
+    use crate::testing::Fixture;
 
     fn open(dir: &Path) -> MeshRepo {
         JjRepo::discover(dir).unwrap().open().unwrap()

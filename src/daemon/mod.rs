@@ -30,7 +30,7 @@ use self::{
 };
 use crate::{
     config::{ConfigDir, MachineKey, Membership, MeshState},
-    net::{bind_endpoint, pair, sync},
+    net::{EndpointOptions, bind_endpoint, pair, sync},
 };
 
 /// Maximum in-flight handshakes of not-yet-authenticated connections.
@@ -54,73 +54,101 @@ pub(crate) fn base_alpns() -> Vec<Vec<u8>> {
     vec![sync::ALPN.to_vec()]
 }
 
+/// A running daemon: all subsystems spawned, endpoint bound, control
+/// socket served.
+///
+/// The binary drives it through [`run`]; tests start and stop it directly.
+pub struct Daemon {
+    tasks: tokio::task::JoinSet<()>,
+    endpoint: Endpoint,
+}
+
+impl Daemon {
+    /// Starts every daemon subsystem.
+    pub async fn start(dir: &ConfigDir, options: &EndpointOptions) -> Result<Self> {
+        let key = MachineKey::from_config(dir)?;
+        let state = MeshState::load(dir)?;
+
+        // Binding the control socket first doubles as the single-daemon
+        // guard.
+        let server = ControlServer::bind(dir)?;
+
+        let endpoint = bind_endpoint(&key, base_alpns(), options).await?;
+        info!("daemon started, endpoint id {}", key.endpoint_id());
+
+        let hub = Arc::new(SyncHub::new());
+        let (gossip_tx, gossip_rx) = mpsc::channel(GOSSIP_QUEUE);
+        let peers = Arc::new(PeerSet::new(
+            endpoint.clone(),
+            key.endpoint_id(),
+            hub.clone(),
+            gossip_tx,
+        ));
+        let repos = Arc::new(RepoSet::new(hub.clone()));
+        let store = Arc::new(MeshStore::new(
+            dir.clone(),
+            state,
+            peers.clone(),
+            repos.clone(),
+            hub.clone(),
+        ));
+        let pairing = Arc::new(Pairing::new(endpoint.clone(), options.uses_relays()));
+
+        let ctx = Arc::new(ControlContext {
+            endpoint: endpoint.clone(),
+            started: Instant::now(),
+            peers: peers.clone(),
+            repos,
+            hub,
+            store: store.clone(),
+            pairing: pairing.clone(),
+        });
+
+        let mut tasks = tokio::task::JoinSet::new();
+        tasks.spawn(async move { server.serve(ctx).await });
+        tasks.spawn(accept_loop(endpoint.clone(), peers, pairing));
+        tasks.spawn(membership_loop(gossip_rx, key.endpoint_id(), store.clone()));
+        tasks.spawn(async move {
+            loop {
+                tokio::time::sleep(GOSSIP_INTERVAL).await;
+                store.republish_membership();
+            }
+        });
+
+        Ok(Daemon { tasks, endpoint })
+    }
+
+    /// Resolves when a subsystem terminates on its own. That is always
+    /// fatal: it would leave a zombie daemon (no control socket, or no
+    /// inbound connections) that still looks healthy.
+    pub async fn failed(&mut self) -> color_eyre::Report {
+        let res = self.tasks.join_next().await;
+        eyre!("a daemon subsystem terminated unexpectedly: {res:?}")
+    }
+
+    /// Stops all subsystems and closes the endpoint. Waits for the aborted
+    /// tasks to finish, so the control socket is released (its file
+    /// removed, its lock dropped) before returning.
+    pub async fn shutdown(mut self) {
+        self.tasks.abort_all();
+        while self.tasks.join_next().await.is_some() {}
+        self.endpoint.close().await;
+    }
+}
+
 /// Runs the daemon until SIGINT or SIGTERM.
 pub async fn run(dir: &ConfigDir) -> Result<()> {
-    let key = MachineKey::from_config(dir)?;
-    let state = MeshState::load(dir)?;
+    let mut daemon = Daemon::start(dir, &EndpointOptions::default()).await?;
 
-    // Binding the control socket first doubles as the single-daemon guard.
-    let server = ControlServer::bind(dir)?;
-
-    let endpoint = bind_endpoint(&key, base_alpns()).await?;
-    info!("daemon started, endpoint id {}", key.endpoint_id());
-
-    let hub = Arc::new(SyncHub::new());
-    let (gossip_tx, gossip_rx) = mpsc::channel(GOSSIP_QUEUE);
-    let peers = Arc::new(PeerSet::new(
-        endpoint.clone(),
-        key.endpoint_id(),
-        hub.clone(),
-        gossip_tx,
-    ));
-    let repos = Arc::new(RepoSet::new(hub.clone()));
-    let store = Arc::new(MeshStore::new(
-        dir.clone(),
-        state,
-        peers.clone(),
-        repos.clone(),
-        hub.clone(),
-    ));
-    let pairing = Arc::new(Pairing::new(endpoint.clone()));
-
-    let ctx = Arc::new(ControlContext {
-        endpoint: endpoint.clone(),
-        started: Instant::now(),
-        peers: peers.clone(),
-        repos,
-        hub,
-        store: store.clone(),
-        pairing: pairing.clone(),
-    });
-
-    let mut tasks = tokio::task::JoinSet::new();
-    tasks.spawn(async move { server.serve(ctx).await });
-    tasks.spawn(accept_loop(endpoint.clone(), peers, pairing));
-    tasks.spawn(membership_loop(gossip_rx, key.endpoint_id(), store.clone()));
-    tasks.spawn(async move {
-        loop {
-            tokio::time::sleep(GOSSIP_INTERVAL).await;
-            store.republish_membership();
-        }
-    });
-
-    // A subsystem ending on its own would leave a zombie daemon (no control
-    // socket, or no inbound connections) that still looks healthy: treat it
-    // as fatal instead.
     let outcome = tokio::select! {
         () = wait_for_shutdown() => {
             info!("shutting down");
             Ok(())
         }
-        res = tasks.join_next() => {
-            Err(eyre!("a daemon subsystem terminated unexpectedly: {res:?}"))
-        }
+        err = daemon.failed() => Err(err),
     };
 
-    // Aborting drops the control server, which removes its socket file.
-    tasks.abort_all();
-    endpoint.close().await;
-
+    daemon.shutdown().await;
     outcome
 }
 

@@ -1,4 +1,7 @@
 //! Test fixtures driving the real `jj` binary against temporary repos.
+//!
+//! Available to this crate's unit tests and, through the `test-util`
+//! feature, to the integration tests.
 
 use std::{
     fs,
@@ -27,6 +30,12 @@ impl Fixture {
 
     /// Runs a jj command in `dir`, panicking on failure.
     pub fn jj(&self, dir: &Path, args: &[&str]) {
+        self.jj_output(dir, args);
+    }
+
+    /// Runs a jj command in `dir`, panicking on failure and returning its
+    /// stdout.
+    pub fn jj_output(&self, dir: &Path, args: &[&str]) -> String {
         let out = Command::new("jj")
             .current_dir(dir)
             .env("JJ_CONFIG", &self.config)
@@ -42,6 +51,7 @@ impl Fixture {
             "jj {args:?} failed:\n{}",
             String::from_utf8_lossy(&out.stderr),
         );
+        String::from_utf8(out.stdout).unwrap()
     }
 
     /// Creates a jj repo named `name` with an initial described commit.
@@ -50,5 +60,11 @@ impl Fixture {
         self.jj(self.tmp.path(), &["git", "init", name]);
         self.jj(&dir, &["describe", "-m", "base"]);
         dir
+    }
+}
+
+impl Default for Fixture {
+    fn default() -> Self {
+        Fixture::new()
     }
 }

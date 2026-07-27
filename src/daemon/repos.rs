@@ -423,7 +423,7 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
-    use crate::{config::Repo, tests::Fixture};
+    use crate::{config::Repo, testing::Fixture};
 
     /// Polls until `pred` holds on the statuses, panicking after 10s.
     async fn wait_for(set: &RepoSet, pred: impl Fn(&[control::RepoStatus]) -> bool) {

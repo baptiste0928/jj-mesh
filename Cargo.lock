@@ -2889,6 +2889,7 @@ dependencies = [
  "gix",
  "iroh",
  "jj-lib",
+ "jj-mesh",
  "notify",
  "pollster",
  "postcard",

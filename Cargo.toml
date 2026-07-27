@@ -33,5 +33,11 @@ tokio = { version = "1.49.0", features = [
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
 
+[features]
+# Test-only construction hooks: hermetic localhost endpoints and the jj
+# fixture. Enabled for this crate's own tests via the self dev-dependency.
+test-util = []
+
 [dev-dependencies]
+jj-mesh = { path = ".", features = ["test-util"] }
 tokio = { version = "1.49.0", features = ["macros"] }

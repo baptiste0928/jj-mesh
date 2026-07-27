@@ -31,14 +31,18 @@ const EXCHANGE_TIMEOUT: Duration = Duration::from_secs(15);
 #[derive(Debug)]
 pub struct Pairing {
     endpoint: Endpoint,
+    /// Whether the endpoint uses relays; without them (hermetic tests)
+    /// there is no relay connection to wait for when issuing a ticket.
+    uses_relays: bool,
     /// Sender routing pair-ALPN connections to the open window, if any.
     window: Arc<Mutex<Option<mpsc::Sender<Connection>>>>,
 }
 
 impl Pairing {
-    pub fn new(endpoint: Endpoint) -> Self {
+    pub fn new(endpoint: Endpoint, uses_relays: bool) -> Self {
         Pairing {
             endpoint,
+            uses_relays,
             window: Arc::new(Mutex::new(None)),
         }
     }
@@ -47,10 +51,13 @@ impl Pairing {
     /// ALPN until the returned window is dropped.
     pub async fn open(&self) -> Result<PairWindow> {
         // Wait for a relay connection so the ticket contains a usable relay
-        // address even before hole punching is possible.
-        tokio::time::timeout(ONLINE_TIMEOUT, self.endpoint.online())
-            .await
-            .map_err(|_| eyre!("cannot reach an iroh relay, check network connectivity"))?;
+        // address even before hole punching is possible. Without relays
+        // `online()` would never resolve, and there is nothing to wait for.
+        if self.uses_relays {
+            tokio::time::timeout(ONLINE_TIMEOUT, self.endpoint.online())
+                .await
+                .map_err(|_| eyre!("cannot reach an iroh relay, check network connectivity"))?;
+        }
 
         let (tx, rx) = mpsc::channel(4);
         {

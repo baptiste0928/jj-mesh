@@ -8,4 +8,4 @@ pub mod pair;
 pub mod sync;
 pub mod wire;
 
-pub use endpoint::bind_endpoint;
+pub use endpoint::{EndpointOptions, bind_endpoint};
