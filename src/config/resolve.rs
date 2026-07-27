@@ -83,11 +83,11 @@ impl ConfigDir {
         self.path.join("machine.key")
     }
 
-    /// Get the path to the configuration file.
+    /// Get the path to the mesh state file.
     ///
     /// There is no guarantee that the file exists.
-    pub fn config_file(&self) -> PathBuf {
-        self.path.join("config.toml")
+    pub fn peers_file(&self) -> PathBuf {
+        self.path.join("peers.json")
     }
 
     /// Get the path to the daemon control socket.

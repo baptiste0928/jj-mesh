@@ -18,7 +18,7 @@ use tracing::{debug, info};
 
 use super::{control, hub::SyncHub};
 use crate::{
-    config::Config,
+    config::MeshState,
     net::{sync, wire},
 };
 
@@ -44,7 +44,7 @@ const BACKOFF_MAX: Duration = Duration::from_mins(1);
 /// advance it instead, so establish-then-close cycles cannot redial hot.
 const STABLE_UPTIME: Duration = Duration::from_secs(10);
 
-/// The set of managed peers, synced from the configuration.
+/// The set of managed peers, synced from the mesh state.
 ///
 /// Also acts as the connection allowlist: inbound connections are routed to
 /// the matching peer task and refused when the endpoint is not a peer.
@@ -84,10 +84,10 @@ impl PeerSet {
         }
     }
 
-    /// Aligns the managed peers with the configuration: spawns tasks for new
+    /// Aligns the managed peers with the mesh state: spawns tasks for new
     /// peers and shuts down removed ones. A renamed peer is respawned.
-    pub fn sync(&self, config: &Config) {
-        let desired: BTreeMap<EndpointId, &str> = config
+    pub fn sync(&self, state: &MeshState) {
+        let desired: BTreeMap<EndpointId, &str> = state
             .peers
             .iter()
             .map(|(name, peer)| (peer.endpoint, name.as_str()))
@@ -95,25 +95,38 @@ impl PeerSet {
 
         let mut peers = self.peers.lock().unwrap();
 
-        peers.retain(|id, handle| {
-            let Some(name) = desired.get(id) else {
-                info!(peer = %handle.name, "removing peer");
-                handle.shutdown();
-                // The task cannot run its own hub cleanup once aborted, and
-                // revocation must not leave the peer receiving
-                // announcements (the hub also closes the connection).
-                self.hub.peer_disconnected(id);
-                return false;
-            };
+        let removed: Vec<EndpointId> = peers
+            .keys()
+            .filter(|id| !desired.contains_key(*id))
+            .copied()
+            .collect();
+        for id in removed {
+            let handle = peers.remove(&id).expect("id was collected from the map");
+            info!(peer = %handle.name, "removing peer");
+            handle.shutdown();
+            // The aborted task cannot run its own hub cleanup, and it may
+            // even register its connection *after* the abort (it only stops
+            // at its next await point): clean up once the task is truly
+            // gone, so revocation never leaves the peer registered in the
+            // hub (which also closes the connection). A peer re-added in
+            // that window may see its fresh connection closed once; its
+            // task then simply reconnects.
+            let hub = self.hub.clone();
+            tokio::spawn(async move {
+                let _ = handle.task.await;
+                hub.peer_disconnected(&id);
+            });
+        }
 
-            if handle.name != *name {
+        for (id, handle) in peers.iter_mut() {
+            let name = desired[id];
+            if handle.name != name {
                 // Renaming must not drop the live connection; the task
                 // keeps logging under its spawn-time name.
                 info!(old = %handle.name, new = %name, "renaming peer");
-                (*name).clone_into(&mut handle.name);
+                name.clone_into(&mut handle.name);
             }
-            true
-        });
+        }
 
         for (id, name) in desired {
             peers.entry(id).or_insert_with(|| {

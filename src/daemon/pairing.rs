@@ -17,7 +17,7 @@ use iroh::{Endpoint, endpoint::Connection};
 use tokio::sync::mpsc;
 use tracing::{debug, info};
 
-use crate::{config::Config, net::pair};
+use crate::{config::MeshState, net::pair};
 
 /// How long to wait for a relay connection when issuing a ticket.
 const ONLINE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -115,12 +115,12 @@ impl PairWindow {
     /// attempts are shed without ending the wait.
     ///
     /// The successful connection is returned still open: the caller must
-    /// persist the peer and then [`pair::confirm_paired`] it. `config` is
+    /// persist the peer and then [`pair::confirm_paired`] it. `state` is
     /// sampled per attempt, as a window can stay open for long.
     pub async fn wait_for_peer(
         &mut self,
         local_name: &str,
-        config: impl Fn() -> Config,
+        state: impl Fn() -> MeshState,
     ) -> Result<(pair::PairedPeer, Connection)> {
         loop {
             let conn = self
@@ -129,7 +129,7 @@ impl PairWindow {
                 .await
                 .ok_or_else(|| eyre!("pairing window closed"))?;
 
-            let snapshot = config();
+            let snapshot = state();
             let exchange = pair::pair_with(&conn, &self.ticket, local_name, &snapshot);
             match tokio::time::timeout(EXCHANGE_TIMEOUT, exchange).await {
                 Ok(Ok(Some(peer))) => return Ok((peer, conn)),

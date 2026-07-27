@@ -3,24 +3,24 @@
 use std::path::PathBuf;
 
 use clap::Args;
-use color_eyre::eyre::{Result, eyre};
+use color_eyre::eyre::{Result, bail, eyre};
 
 use crate::{
-    config::{ConfigDir, ConfigEdit, Repo, RepoId},
+    config::ConfigDir,
+    daemon::control::{self, Request, Response},
     repo::JjRepo,
 };
 
 /// Add a repo to the mesh
 ///
-/// The repo starts being synchronized with the paired machines running the
-/// jj-mesh daemon.
+/// The repo starts being synchronized with the paired machines. The daemon
+/// must be running.
 #[derive(Debug, Args)]
 pub struct AddArgs {
     /// Path inside the jj repo to add (defaults to the current directory)
     path: Option<PathBuf>,
 
-    /// Name of the repo in the mesh configuration (defaults to the repo
-    /// directory name)
+    /// Name of the repo in the mesh (defaults to the repo directory name)
     #[arg(long)]
     name: Option<String>,
 }
@@ -40,16 +40,14 @@ pub fn run(args: AddArgs, dir: &ConfigDir) -> Result<()> {
             .into_owned(),
     };
 
-    let id = RepoId::generate();
-    let mut edit = ConfigEdit::from_config(dir)?;
-    edit.add_repo(
-        name.clone(),
-        Repo {
-            id: id.clone(),
-            path: repo.root().to_owned(),
-        },
-    )?;
-    edit.save()?;
+    let request = Request::AddRepo {
+        name: name.clone(),
+        path: repo.root().to_owned(),
+    };
+    let response = control::request_blocking(dir, &request, control::MUTATE_WAIT)?;
+    let Response::RepoAdded(id) = response else {
+        bail!("unexpected response from the daemon: {response:?}");
+    };
 
     println!("Added repo `{name}` ({id}) at {}", repo.root().display());
     Ok(())

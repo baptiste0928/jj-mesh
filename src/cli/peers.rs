@@ -1,16 +1,16 @@
 //! `jj-mesh peers`: list and manage paired peers.
 //!
 //! The listing shows live connection state (reachability, direct or relay
-//! path, rtt) when the daemon is running, and falls back to the static
-//! configuration otherwise.
+//! path, rtt) when the daemon is running, and falls back to the stored mesh
+//! state otherwise.
 
 use clap::{Args, Subcommand};
-use color_eyre::eyre::Result;
+use color_eyre::eyre::{Result, bail};
 
 use super::status::{connection_summary, name_width};
 use crate::{
-    config::{Config, ConfigDir, ConfigEdit, MachineKey},
-    daemon::control,
+    config::{ConfigDir, MachineKey, MeshState},
+    daemon::control::{self, Request, Response},
 };
 
 /// List the paired machines
@@ -24,7 +24,7 @@ pub struct PeersArgs {
 enum PeersCommand {
     /// Remove a paired machine
     ///
-    /// A running daemon disconnects the peer when it picks up the change.
+    /// The daemon disconnects the peer immediately. It must be running.
     Remove {
         /// Name of the peer to remove
         name: String,
@@ -39,13 +39,17 @@ pub fn run(args: PeersArgs, dir: &ConfigDir) -> Result<()> {
     }
 }
 
-/// Removes a peer from the configuration.
+/// Asks the daemon to remove a peer.
 fn remove(dir: &ConfigDir, name: &str) -> Result<()> {
-    let mut edit = ConfigEdit::from_config(dir)?;
-    let peer = edit.remove_peer(name)?;
-    edit.save()?;
+    let request = Request::RemovePeer {
+        name: name.to_owned(),
+    };
+    let response = control::request_blocking(dir, &request, control::MUTATE_WAIT)?;
+    let Response::PeerRemoved(endpoint) = response else {
+        bail!("unexpected response from the daemon: {response:?}");
+    };
 
-    println!("Removed peer `{name}` ({})", peer.endpoint);
+    println!("Removed peer `{name}` ({endpoint})");
     Ok(())
 }
 
@@ -72,15 +76,15 @@ fn list(dir: &ConfigDir) -> Result<()> {
             );
         }
     } else {
-        let config = Config::from_config(dir)?;
-        if config.peers.is_empty() {
+        let state = MeshState::load(dir)?;
+        if state.peers.is_empty() {
             println!("this machine has no paired peers (run `jj-mesh pair` to add one)");
             return Ok(());
         }
 
-        println!("(daemon not running; showing the static configuration)");
-        let width = name_width(config.peers.keys().map(String::as_str));
-        for (name, peer) in &config.peers {
+        println!("(daemon not running; showing the stored mesh state)");
+        let width = name_width(state.peers.keys().map(String::as_str));
+        for (name, peer) in &state.peers {
             println!("{name:width$}  {}", peer.endpoint);
         }
     }

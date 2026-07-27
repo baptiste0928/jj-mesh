@@ -2,21 +2,18 @@
 //!
 //! Creates a fresh jj repo, gives its workspace a machine-unique name
 //! (mesh machines must never share one), asks the daemon to pull the mesh
-//! repo's full state from a peer, registers the repo, and lets jj merge
-//! the fresh workspace into the replicated history.
+//! repo's full state from a peer and register it, and lets jj merge the
+//! fresh workspace into the replicated history.
 
-use std::{path::PathBuf, process::Command, time::Duration};
+use std::{path::PathBuf, process::Command};
 
 use clap::Args;
 use color_eyre::eyre::{Result, WrapErr as _, bail, ensure, eyre};
 
 use crate::{
-    config::{ConfigDir, ConfigEdit, Repo, RepoId},
-    daemon::control::{ControlClient, Request, Response},
+    config::{ConfigDir, MeshState, RepoId},
+    daemon::control::{self, Request, Response},
 };
-
-/// The daemon's pull may transfer an entire repository.
-const JOIN_WAIT: Duration = Duration::from_mins(31);
 
 /// Join a repo another machine added to the mesh
 ///
@@ -30,8 +27,7 @@ pub struct JoinArgs {
     /// Directory to create the repo in (must not exist yet)
     path: PathBuf,
 
-    /// Name of the repo in the mesh configuration (defaults to the
-    /// directory name)
+    /// Name of the repo in the mesh (defaults to the directory name)
     #[arg(long)]
     name: Option<String>,
 
@@ -44,16 +40,6 @@ pub struct JoinArgs {
 /// Runs the `join` command.
 pub fn run(args: JoinArgs, dir: &ConfigDir) -> Result<()> {
     let repo_id = RepoId::try_from(args.repo_id).map_err(|err| eyre!(err))?;
-
-    let edit = ConfigEdit::from_config(dir)?;
-    if let Some((name, _)) = edit
-        .config()
-        .repos
-        .iter()
-        .find(|(_, repo)| repo.id == repo_id)
-    {
-        bail!("repo {repo_id} is already registered here as `{name}`");
-    }
 
     ensure!(
         !args.path.exists(),
@@ -69,6 +55,16 @@ pub fn run(args: JoinArgs, dir: &ConfigDir) -> Result<()> {
             .to_string_lossy()
             .into_owned(),
     };
+
+    // Best-effort pre-checks against the stored state, so an obviously
+    // doomed join fails before anything is created on disk; the daemon
+    // re-validates authoritatively before registering.
+    let state = MeshState::load(dir)?;
+    if let Some(existing) = state.repo_name(&repo_id) {
+        bail!("repo {repo_id} is already registered here as `{existing}`");
+    }
+    state.validate_new_repo(&name, &args.path)?;
+
     let workspace = match args.workspace {
         Some(name) => name,
         None => gethostname::gethostname().to_string_lossy().into_owned(),
@@ -80,26 +76,21 @@ pub fn run(args: JoinArgs, dir: &ConfigDir) -> Result<()> {
     jj(Some(&args.path), &["workspace", "rename", &workspace])?;
 
     println!("Pulling repo {repo_id} from the mesh...");
-    let pulled = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?
-        .block_on(pull(dir, &repo_id, &args.path));
-    let (ops, git_objects) = pulled.wrap_err_with(|| {
+    let request = Request::JoinRepo {
+        repo: repo_id.clone(),
+        name: name.clone(),
+        path: std::fs::canonicalize(&args.path)?,
+    };
+    let pulled = control::request_blocking(dir, &request, control::JOIN_WAIT);
+    let response = pulled.wrap_err_with(|| {
         format!(
             "the repo directory {} was created but not registered; remove it before retrying",
             args.path.display(),
         )
     })?;
-
-    let mut edit = ConfigEdit::from_config(dir)?;
-    edit.add_repo(
-        name.clone(),
-        Repo {
-            id: repo_id.clone(),
-            path: std::fs::canonicalize(&args.path)?,
-        },
-    )?;
-    edit.save()?;
+    let Response::Joined { ops, git_objects } = response else {
+        bail!("unexpected response from the daemon: {response:?}");
+    };
 
     // Any jj command merges the fresh workspace into the pulled history;
     // doing it here leaves the repo ready to use.
@@ -107,24 +98,6 @@ pub fn run(args: JoinArgs, dir: &ConfigDir) -> Result<()> {
 
     println!("Joined `{name}` ({repo_id}): {ops} operations, {git_objects} git objects");
     Ok(())
-}
-
-/// Asks the daemon to pull the repo's state from a peer.
-async fn pull(dir: &ConfigDir, repo_id: &RepoId, path: &PathBuf) -> Result<(u64, u64)> {
-    let Some(mut client) = ControlClient::connect(dir).await? else {
-        bail!("the jj-mesh daemon is not running");
-    };
-    client
-        .send(&Request::JoinRepo {
-            repo: repo_id.clone(),
-            path: std::fs::canonicalize(path)?,
-        })
-        .await?;
-    match client.recv(Some(JOIN_WAIT)).await? {
-        Response::Joined { ops, git_objects } => Ok((ops, git_objects)),
-        Response::Error(message) => bail!(message),
-        other => bail!("unexpected response from the daemon: {other:?}"),
-    }
 }
 
 /// Runs a jj command, surfacing its stderr on failure.

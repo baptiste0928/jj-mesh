@@ -5,8 +5,9 @@
 //! requests are one request/response exchange; hosting a pairing gets two
 //! responses (the ticket, then the outcome) on one connection.
 //!
-//! The daemon is the only holder of the machine-key endpoint, so both live
-//! peer state and pairing are only reachable through here.
+//! The daemon is the only holder of the machine-key endpoint and the only
+//! writer of the mesh state, so live peer state, pairing and every mesh
+//! mutation go through here.
 
 use std::{
     fs::{self, File, TryLockError},
@@ -27,7 +28,7 @@ use tracing::{debug, info, warn};
 
 use super::{hub::SyncHub, pairing::Pairing, peers::PeerSet, repos::RepoSet};
 use crate::{
-    config::{Config, ConfigDir, ConfigEdit, Peer, RepoId},
+    config::{ConfigDir, MeshState, Peer, Repo, RepoId},
     net::{
         pair,
         wire::{read_message, write_message},
@@ -47,6 +48,14 @@ const JOIN_TIMEOUT: Duration = Duration::from_mins(1);
 /// Time budget for a join's initial repo pull; it may transfer an entire
 /// repository.
 const JOIN_PULL_TIMEOUT: Duration = Duration::from_mins(30);
+
+/// Time budget the CLI grants quick mutating requests (add, remove).
+pub const MUTATE_WAIT: Duration = Duration::from_secs(10);
+
+/// Time budget the CLI grants a whole join request: the pull budget plus a
+/// margin for validation and registration. Kept here next to the pull
+/// budget so the two cannot drift apart.
+pub const JOIN_WAIT: Duration = JOIN_PULL_TIMEOUT.saturating_add(Duration::from_mins(1));
 
 /// Hard cap on a pairing window: bounds how long the unknown-endpoint pair
 /// ALPN stays exposed when a host CLI is left waiting unattended.
@@ -70,9 +79,19 @@ pub enum Request {
     /// [`Response::Paired`] or [`Response::Error`].
     PairJoin { ticket: String, name: String },
     /// Pull a mesh repo's full state into a freshly initialized local repo
-    /// at `path` (see `jj-mesh join`). Answered with [`Response::Joined`]
-    /// or [`Response::Error`].
-    JoinRepo { repo: RepoId, path: PathBuf },
+    /// at `path` and register it under `name` (see `jj-mesh join`). Answered
+    /// with [`Response::Joined`] or [`Response::Error`].
+    JoinRepo {
+        repo: RepoId,
+        name: String,
+        path: PathBuf,
+    },
+    /// Register the repo at `path` under `name`, with a fresh id. Answered
+    /// with [`Response::RepoAdded`] or [`Response::Error`].
+    AddRepo { name: String, path: PathBuf },
+    /// Remove a paired peer, disconnecting it. Answered with
+    /// [`Response::PeerRemoved`] or [`Response::Error`].
+    RemovePeer { name: String },
 }
 
 /// A daemon answer to a [`Request`].
@@ -81,16 +100,20 @@ pub enum Response {
     Status(Status),
     /// The pairing ticket to transmit to the other machine.
     PairTicket(String),
-    /// Pairing succeeded and the peer is saved in the configuration.
+    /// Pairing succeeded and the peer is saved in the mesh state.
     Paired {
         name: String,
         endpoint: EndpointId,
     },
-    /// The join pull completed.
+    /// The join pull completed and the repo is registered.
     Joined {
         ops: u64,
         git_objects: u64,
     },
+    /// The repo is registered under this generated id.
+    RepoAdded(RepoId),
+    /// The peer is removed from the mesh state.
+    PeerRemoved(EndpointId),
     /// The request failed.
     Error(String),
 }
@@ -152,7 +175,7 @@ pub enum Route {
     Relay { url: String },
 }
 
-/// A repo registered in the configuration.
+/// A registered repo.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct RepoStatus {
     pub name: String,
@@ -188,7 +211,7 @@ pub struct ControlContext {
     pub peers: Arc<PeerSet>,
     pub repos: Arc<RepoSet>,
     pub hub: Arc<SyncHub>,
-    pub config: Arc<Mutex<Config>>,
+    pub state: Arc<Mutex<MeshState>>,
     pub pairing: Arc<Pairing>,
 }
 
@@ -203,9 +226,28 @@ impl ControlContext {
         }
     }
 
-    /// Clones the current configuration.
-    fn config(&self) -> Config {
-        self.config.lock().unwrap().clone()
+    /// Clones the current mesh state.
+    fn state(&self) -> MeshState {
+        self.state.lock().unwrap().clone()
+    }
+
+    /// Mutates the mesh state: persists the change to `peers.json` and then
+    /// aligns the peer and repo sets with it. Nothing is committed (in
+    /// memory or on disk) when the mutation or the save fails. The lock is
+    /// deliberately held across the set syncs, so concurrent mutations
+    /// apply their syncs in commit order.
+    fn update_state<T>(&self, mutate: impl FnOnce(&mut MeshState) -> Result<T>) -> Result<T> {
+        let mut state = self.state.lock().unwrap();
+
+        let mut next = state.clone();
+        let value = mutate(&mut next)?;
+        next.save(&self.dir)?;
+        *state = next;
+
+        self.peers.sync(&state);
+        self.repos.sync(&state);
+
+        Ok(value)
     }
 }
 
@@ -302,7 +344,11 @@ async fn handle_client(mut stream: UnixStream, ctx: Arc<ControlContext>) {
         Request::Status => respond(&mut stream, &Response::Status(ctx.status())).await,
         Request::PairHost { name } => pair_host(&mut stream, &ctx, &name).await,
         Request::PairJoin { ticket, name } => pair_join(&mut stream, &ctx, &ticket, &name).await,
-        Request::JoinRepo { repo, path } => join_repo(&mut stream, &ctx, repo, &path).await,
+        Request::JoinRepo { repo, name, path } => {
+            join_repo(&mut stream, &ctx, repo, &name, &path).await
+        }
+        Request::AddRepo { name, path } => add_repo(&mut stream, &ctx, name, path).await,
+        Request::RemovePeer { name } => remove_peer(&mut stream, &ctx, &name).await,
     };
 
     if let Err(err) = served {
@@ -337,7 +383,7 @@ async fn pair_host(stream: &mut UnixStream, ctx: &ControlContext, name: &str) ->
 
     let (mut read_half, mut write_half) = stream.split();
     let result = tokio::select! {
-        result = window.wait_for_peer(name, || ctx.config()) => result,
+        result = window.wait_for_peer(name, || ctx.state()) => result,
         () = tokio::time::sleep(WINDOW_TIMEOUT) => Err(eyre!(
             "the pairing window expired after {} minutes",
             WINDOW_TIMEOUT.as_secs() / 60,
@@ -351,7 +397,7 @@ async fn pair_host(stream: &mut UnixStream, ctx: &ControlContext, name: &str) ->
     // Persist before confirming: the `paired` close is the joiner's commit
     // signal, so the host must never send it for a peer it did not save.
     let response = match result {
-        Ok((peer, conn)) => match persist_peer(&ctx.dir, &peer) {
+        Ok((peer, conn)) => match persist_peer(ctx, &peer) {
             Ok(()) => {
                 pair::confirm_paired(&conn);
                 info!(peer = %peer.name, "paired");
@@ -384,7 +430,7 @@ async fn pair_join(
 
     let exchange = async {
         let ticket: pair::PairTicket = ticket.parse()?;
-        pair::join(&ctx.endpoint, &ticket, name, &ctx.config()).await
+        pair::join(&ctx.endpoint, &ticket, name, &ctx.state()).await
     };
     let result = tokio::select! {
         result = tokio::time::timeout(JOIN_TIMEOUT, exchange) => result.unwrap_or_else(|_| {
@@ -397,7 +443,7 @@ async fn pair_join(
     };
 
     let persisted = result.and_then(|peer| {
-        persist_peer(&ctx.dir, &peer)?;
+        persist_peer(ctx, &peer)?;
         Ok(peer)
     });
     let response = match persisted {
@@ -415,16 +461,44 @@ async fn pair_join(
 }
 
 /// Pulls a mesh repo's full state into the freshly initialized repo at
-/// `path`, from a connected peer that announced the repo. The repo is not
-/// registered here yet (the CLI does that afterwards), so the pull runs on
-/// an ad-hoc repo handle in this connection's task.
+/// `path`, from a connected peer that announced the repo, then registers it
+/// under `name`. The pull runs on an ad-hoc repo handle in this connection's
+/// task, as the repo set only manages it once registered.
 async fn join_repo(
     stream: &mut UnixStream,
     ctx: &ControlContext,
     repo_id: RepoId,
+    name: &str,
     path: &std::path::Path,
 ) -> Result<()> {
-    let response = match join_pull(ctx, &repo_id, path).await {
+    let joined = async {
+        // Fail before the (long) pull when the registration cannot succeed.
+        // Only the re-validation inside `update_state` below is
+        // authoritative: the lock is released during the pull.
+        {
+            let state = ctx.state.lock().unwrap();
+            if let Some(existing) = state.repo_name(&repo_id) {
+                bail!("repo {repo_id} is already registered here as `{existing}`");
+            }
+            state.validate_new_repo(name, path)?;
+        }
+
+        let outcome = join_pull(ctx, &repo_id, path).await?;
+
+        ctx.update_state(|state| {
+            state.add_repo(
+                name.to_owned(),
+                Repo {
+                    id: repo_id.clone(),
+                    path: path.to_owned(),
+                },
+            )
+        })?;
+        Ok::<_, color_eyre::Report>(outcome)
+    }
+    .await;
+
+    let response = match joined {
         Ok((ops, git_objects)) => Response::Joined { ops, git_objects },
         Err(err) => Response::Error(format!("{err:#}")),
     };
@@ -446,9 +520,9 @@ async fn join_pull(
         );
     }
 
-    let path = path.to_owned();
+    let repo_path = path.to_owned();
     let repo = tokio::task::spawn_blocking(move || -> Result<_> {
-        Ok(Arc::new(JjRepo::discover(&path)?.open()?))
+        Ok(Arc::new(JjRepo::discover(&repo_path)?.open()?))
     })
     .await
     .wrap_err("repo open task failed")??;
@@ -490,22 +564,59 @@ async fn join_pull(
     Err(last_error)
 }
 
-/// Registers a paired peer in the configuration; a no-op when the endpoint
-/// is already registered (idempotent re-pair). The daemon's own config
-/// watcher picks the change up and starts connecting to the new peer.
-fn persist_peer(dir: &ConfigDir, peer: &pair::PairedPeer) -> Result<()> {
-    let mut edit = ConfigEdit::from_config(dir)?;
-    if edit.config().peer_name(&peer.endpoint).is_some() {
-        return Ok(());
-    }
+/// Registers the repo at `path` under `name` with a fresh id.
+async fn add_repo(
+    stream: &mut UnixStream,
+    ctx: &ControlContext,
+    name: String,
+    path: PathBuf,
+) -> Result<()> {
+    let result = ctx.update_state(|state| {
+        let id = RepoId::generate();
+        state.add_repo(
+            name.clone(),
+            Repo {
+                id: id.clone(),
+                path,
+            },
+        )?;
+        Ok(id)
+    });
 
-    edit.add_peer(
-        peer.name.clone(),
-        Peer {
-            endpoint: peer.endpoint,
-        },
-    )?;
-    edit.save()
+    let response = match result {
+        Ok(id) => Response::RepoAdded(id),
+        Err(err) => Response::Error(format!("{err:#}")),
+    };
+    respond(stream, &response).await
+}
+
+/// Removes a paired peer; the peer set disconnects it immediately.
+async fn remove_peer(stream: &mut UnixStream, ctx: &ControlContext, name: &str) -> Result<()> {
+    let response = match ctx.update_state(|state| state.remove_peer(name)) {
+        Ok(peer) => {
+            info!(peer = %name, "peer removed");
+            Response::PeerRemoved(peer.endpoint)
+        }
+        Err(err) => Response::Error(format!("{err:#}")),
+    };
+    respond(stream, &response).await
+}
+
+/// Registers a paired peer in the mesh state; a no-op when the endpoint is
+/// already registered (idempotent re-pair). The peer set starts connecting
+/// as part of the update.
+fn persist_peer(ctx: &ControlContext, peer: &pair::PairedPeer) -> Result<()> {
+    ctx.update_state(|state| {
+        if state.peer_name(&peer.endpoint).is_some() {
+            return Ok(());
+        }
+        state.add_peer(
+            peer.name.clone(),
+            Peer {
+                endpoint: peer.endpoint,
+            },
+        )
+    })
 }
 
 /// Resolves when the client closes its end of the connection.
@@ -586,4 +697,25 @@ pub fn query_status_blocking(dir: &ConfigDir) -> Result<Option<Status>> {
         .enable_all()
         .build()?
         .block_on(query_status(dir))
+}
+
+/// Sends one request and returns the daemon's answer, for CLI commands with
+/// no tokio runtime of their own. Errors when no daemon is running, and
+/// turns [`Response::Error`] into an error, so callers only match their
+/// success variant.
+pub fn request_blocking(dir: &ConfigDir, request: &Request, limit: Duration) -> Result<Response> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?
+        .block_on(async {
+            let Some(mut client) = ControlClient::connect(dir).await? else {
+                bail!("the jj-mesh daemon is not running; start it with `jj-mesh daemon` first");
+            };
+
+            client.send(request).await?;
+            match client.recv(Some(limit)).await? {
+                Response::Error(message) => bail!("{message}"),
+                response => Ok(response),
+            }
+        })
 }

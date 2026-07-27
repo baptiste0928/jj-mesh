@@ -4,7 +4,7 @@ use clap::Args;
 use color_eyre::eyre::Result;
 
 use crate::{
-    config::{Config, ConfigDir, MachineKey},
+    config::{ConfigDir, MachineKey, MeshState},
     daemon::control::{self, ConnectionStatus, Route},
 };
 
@@ -97,26 +97,32 @@ fn watch_summary(watch: &control::WatchStatus) -> String {
     }
 }
 
-/// Strips control characters from daemon-provided text before it reaches
-/// the terminal: error messages embed bytes read from repo files, which
-/// could otherwise smuggle escape sequences.
+/// Strips control and invisible characters from daemon-provided text before
+/// it reaches the terminal: error messages embed bytes read from repo files,
+/// which could otherwise smuggle escape sequences.
 fn sanitize(text: &str) -> String {
     text.chars()
-        .map(|c| if c.is_control() { '?' } else { c })
+        .map(|c| {
+            if crate::config::is_confusable(c) {
+                '?'
+            } else {
+                c
+            }
+        })
         .collect()
 }
 
-/// Prints the static configuration when no daemon is running.
+/// Prints the stored mesh state when no daemon is running.
 fn print_static(dir: &ConfigDir) -> Result<()> {
     let key = MachineKey::from_config(dir)?;
-    let config = Config::from_config(dir)?;
+    let state = MeshState::load(dir)?;
 
     println!("daemon: not running");
     println!("local endpoint id: {}", key.endpoint_id());
     println!(
-        "{} paired peer(s), {} repo(s) configured",
-        config.peers.len(),
-        config.repos.len(),
+        "{} paired peer(s), {} repo(s) registered",
+        state.peers.len(),
+        state.repos.len(),
     );
 
     Ok(())

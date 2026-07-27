@@ -1,5 +1,4 @@
-//! Debounced directory watching, shared by the config reloader and the
-//! per-repo op-heads watchers.
+//! Debounced directory watching, used by the per-repo op-heads watchers.
 //!
 //! Conditions that silently kill a notify watch are turned into errors so
 //! callers can rebuild it instead of waiting on a dead channel forever:
@@ -79,17 +78,10 @@ impl DirWatcher {
         })
     }
 
-    /// Waits for the next change, debouncing event bursts. Errors when the
-    /// watch is dead and must be rebuilt.
-    pub async fn changed(&mut self) -> Result<()> {
-        let signal = self.signals.recv().await;
-        Self::consume(signal)?;
-        self.debounce().await
-    }
-
-    /// Like [`Self::changed`], but gives up after `idle` without an event
-    /// and returns `Ok(false)`, letting the caller run a liveness check:
-    /// some watch deaths (unmounts) produce no event at all.
+    /// Waits for the next change, debouncing event bursts, but gives up
+    /// after `idle` without an event and returns `Ok(false)`, letting the
+    /// caller run a liveness check: some watch deaths (unmounts) produce no
+    /// event at all. Errors when the watch is dead and must be rebuilt.
     pub async fn changed_or_idle(&mut self, idle: Duration) -> Result<bool> {
         let Ok(signal) = tokio::time::timeout(idle, self.signals.recv()).await else {
             return Ok(false);
@@ -147,10 +139,8 @@ mod tests {
 
         fs::write(tmp.path().join("file"), "x").unwrap();
 
-        tokio::time::timeout(Duration::from_secs(5), watch.changed())
-            .await
-            .expect("no change detected")
-            .unwrap();
+        let changed = watch.changed_or_idle(Duration::from_secs(5)).await.unwrap();
+        assert!(changed, "no change detected");
     }
 
     #[tokio::test]
@@ -162,9 +152,7 @@ mod tests {
 
         fs::remove_dir(&dir).unwrap();
 
-        let outcome = tokio::time::timeout(Duration::from_secs(5), watch.changed())
-            .await
-            .expect("removal not reported");
+        let outcome = watch.changed_or_idle(Duration::from_secs(5)).await;
         assert!(outcome.is_err(), "removal must surface as a watch error");
     }
 

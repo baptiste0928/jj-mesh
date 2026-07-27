@@ -2,9 +2,9 @@
 //!
 //! Maintains persistent connections to every paired peer (allowlisted at
 //! accept), watches every registered repo for op head changes and announces
-//! them to peers, reloads the configuration when it changes, and serves
-//! live state on the control socket. Fetching announced operations plugs
-//! in next.
+//! them to peers, and serves live state on the control socket. The daemon
+//! owns the mesh state (`peers.json`): every mutation arrives through the
+//! control socket and is persisted here.
 
 pub mod control;
 mod hub;
@@ -20,7 +20,7 @@ use std::{
 use color_eyre::eyre::{Result, eyre};
 use iroh::Endpoint;
 use tokio::sync::Semaphore;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 use self::{
     control::{ControlContext, ControlServer},
@@ -30,7 +30,7 @@ use self::{
     repos::RepoSet,
 };
 use crate::{
-    config::{Config, ConfigDir, ConfigWatcher, MachineKey},
+    config::{ConfigDir, MachineKey, MeshState},
     net::{bind_endpoint, pair, sync},
 };
 
@@ -50,8 +50,7 @@ pub(crate) fn base_alpns() -> Vec<Vec<u8>> {
 /// Runs the daemon until SIGINT or SIGTERM.
 pub async fn run(dir: &ConfigDir) -> Result<()> {
     let key = MachineKey::from_config(dir)?;
-    let config = Config::from_config(dir)?;
-    let watcher = ConfigWatcher::new(dir)?;
+    let state = MeshState::load(dir)?;
 
     // Binding the control socket first doubles as the single-daemon guard.
     let server = ControlServer::bind(dir)?;
@@ -65,10 +64,10 @@ pub async fn run(dir: &ConfigDir) -> Result<()> {
         key.endpoint_id(),
         hub.clone(),
     ));
-    peers.sync(&config);
+    peers.sync(&state);
     let repos = Arc::new(RepoSet::new(hub.clone()));
-    repos.sync(&config);
-    let config = Arc::new(Mutex::new(config));
+    repos.sync(&state);
+    let state = Arc::new(Mutex::new(state));
     let pairing = Arc::new(Pairing::new(endpoint.clone()));
 
     let ctx = Arc::new(ControlContext {
@@ -76,20 +75,19 @@ pub async fn run(dir: &ConfigDir) -> Result<()> {
         endpoint: endpoint.clone(),
         started: Instant::now(),
         peers: peers.clone(),
-        repos: repos.clone(),
-        hub: hub.clone(),
-        config: config.clone(),
+        repos,
+        hub,
+        state,
         pairing: pairing.clone(),
     });
 
     let mut tasks = tokio::task::JoinSet::new();
     tasks.spawn(async move { server.serve(ctx).await });
-    tasks.spawn(accept_loop(endpoint.clone(), peers.clone(), pairing));
-    tasks.spawn(reload_loop(watcher, dir.clone(), peers, repos, config));
+    tasks.spawn(accept_loop(endpoint.clone(), peers, pairing));
 
-    // A subsystem ending on its own would leave a zombie daemon (no config
-    // reloads, or no inbound connections) that still looks healthy: treat
-    // it as fatal instead.
+    // A subsystem ending on its own would leave a zombie daemon (no control
+    // socket, or no inbound connections) that still looks healthy: treat it
+    // as fatal instead.
     let outcome = tokio::select! {
         () = wait_for_shutdown() => {
             info!("shutting down");
@@ -141,32 +139,6 @@ async fn accept_loop(endpoint: Endpoint, peers: Arc<PeerSet>, pairing: Arc<Pairi
                 Err(_) => debug!("incoming handshake timed out"),
             }
         });
-    }
-}
-
-/// Reloads the configuration whenever it changes on disk.
-async fn reload_loop(
-    mut watcher: ConfigWatcher,
-    dir: ConfigDir,
-    peers: Arc<PeerSet>,
-    repos: Arc<RepoSet>,
-    config: Arc<Mutex<Config>>,
-) {
-    loop {
-        if let Err(err) = watcher.changed().await {
-            warn!("config watcher failed: {err}");
-            return;
-        }
-
-        match Config::from_config(&dir) {
-            Ok(new) => {
-                info!("configuration changed, reloading");
-                peers.sync(&new);
-                repos.sync(&new);
-                *config.lock().unwrap() = new;
-            }
-            Err(err) => warn!("keeping previous configuration: {err:#}"),
-        }
     }
 }
 

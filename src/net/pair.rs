@@ -13,7 +13,7 @@
 //!    [`Message::Reject`]
 //! 3. joiner -> host: [`Message::Done`], or [`Message::Reject`]
 //!
-//! Each side validates the announced peer against its own configuration
+//! Each side validates the announced peer against its own mesh state
 //! before answering, so no side persists a peer the other refused. The host
 //! persists the peer before confirming with the `paired` close (the joiner's
 //! commit signal, see [`confirm_paired`]), so it can never confirm a peer it
@@ -34,7 +34,7 @@ use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq as _;
 
 use super::wire::{read_message, write_message};
-use crate::config::Config;
+use crate::config::MeshState;
 
 /// ALPN of the pairing protocol.
 pub const ALPN: &[u8] = b"jj-mesh/pair/0";
@@ -161,7 +161,7 @@ pub async fn pair_with(
     conn: &Connection,
     ticket: &PairTicket,
     local_name: &str,
-    config: &Config,
+    state: &MeshState,
 ) -> Result<Option<PairedPeer>> {
     let Ok((mut send, mut recv)) = conn.accept_bi().await else {
         return Ok(None);
@@ -190,10 +190,10 @@ pub async fn pair_with(
     // Re-pairing an already-registered machine is idempotent, keeping its
     // stored name: accepting a peer we already trust gives an attacker
     // nothing, and lets a half-paired joiner recover by retrying.
-    let name = if let Some(existing) = config.peer_name(&endpoint) {
+    let name = if let Some(existing) = state.peer_name(&endpoint) {
         existing.to_owned()
     } else {
-        if let Err(err) = config.validate_new_peer(&hello, &endpoint) {
+        if let Err(err) = state.validate_new_peer(&hello, &endpoint) {
             send_reject(conn, &mut send, &err.to_string(), REJECT_LINGER).await;
             return Err(err.wrap_err("cannot pair"));
         }
@@ -236,7 +236,7 @@ pub async fn join(
     endpoint: &Endpoint,
     ticket: &PairTicket,
     local_name: &str,
-    config: &Config,
+    state: &MeshState,
 ) -> Result<PairedPeer> {
     ensure!(
         ticket.addr.id != endpoint.secret_key().public(),
@@ -267,10 +267,10 @@ pub async fn join(
 
     // Mirror of the host's idempotent re-pairing: a host we already have
     // registered keeps its stored name.
-    let name = if let Some(existing) = config.peer_name(&host_endpoint) {
+    let name = if let Some(existing) = state.peer_name(&host_endpoint) {
         existing.to_owned()
     } else {
-        if let Err(err) = config.validate_new_peer(&name, &host_endpoint) {
+        if let Err(err) = state.validate_new_peer(&name, &host_endpoint) {
             send_reject(&conn, &mut send, &err.to_string(), REJECT_LINGER).await;
             return Err(err.wrap_err("cannot pair"));
         }
@@ -300,11 +300,12 @@ pub async fn join(
 }
 
 /// Makes a peer-supplied reason safe to print: it arrives before any trust
-/// is established, so control characters (terminal escapes) are stripped.
+/// is established, so control and invisible characters (terminal escapes,
+/// bidi overrides) are stripped.
 fn sanitize(reason: &str) -> String {
     reason
         .chars()
-        .filter(|c| !c.is_control())
+        .filter(|c| !crate::config::is_confusable(*c))
         .take(200)
         .collect()
 }

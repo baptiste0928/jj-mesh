@@ -28,7 +28,7 @@ use super::{
     hub::{Inbox, PeerAnnounce, SyncHub},
 };
 use crate::{
-    config::{Config, RepoId},
+    config::{MeshState, RepoId},
     repo::{JjRepo, MeshRepo, transfer},
     watch::DirWatcher,
 };
@@ -69,7 +69,7 @@ const MAX_ANNOUNCED_HEADS: usize = 64;
 /// publication pause while a fetch runs).
 const FETCH_TIMEOUT: Duration = Duration::from_mins(30);
 
-/// The set of managed repos, synced from the configuration.
+/// The set of managed repos, synced from the mesh state.
 #[derive(Debug)]
 pub struct RepoSet {
     hub: Arc<SyncHub>,
@@ -110,16 +110,16 @@ impl RepoSet {
         }
     }
 
-    /// Aligns the managed repos with the configuration: spawns tasks for
+    /// Aligns the managed repos with the mesh state: spawns tasks for
     /// new repos and shuts down removed ones. A repo whose path changed is
     /// respawned; a renamed one keeps its task.
-    pub fn sync(&self, config: &Config) {
+    pub fn sync(&self, state: &MeshState) {
         let mut desired: BTreeMap<&RepoId, (&str, &Path)> = BTreeMap::new();
-        for (name, repo) in &config.repos {
+        for (name, repo) in &state.repos {
             let previous = desired.insert(&repo.id, (name.as_str(), repo.path.as_path()));
             if let Some((shadowed, _)) = previous {
-                // Ids collide only in a hand-edited config; nothing else
-                // reports it, so at least leave a trace.
+                // Ids are generated, so a collision means a corrupted state
+                // file; nothing else reports it, so at least leave a trace.
                 warn!(
                     id = %repo.id,
                     "repos `{shadowed}` and `{name}` share the same id; only `{name}` is watched",
@@ -461,16 +461,16 @@ mod tests {
         }
     }
 
-    fn config_with(name: &str, path: &Path) -> Config {
-        let mut config = Config::default();
-        config.repos.insert(
+    fn state_with(name: &str, path: &Path) -> MeshState {
+        let mut state = MeshState::default();
+        state.repos.insert(
             name.to_owned(),
             Repo {
                 id: RepoId::generate(),
                 path: path.to_owned(),
             },
         );
-        config
+        state
     }
 
     #[tokio::test]
@@ -479,7 +479,7 @@ mod tests {
         let dir = fx.init_repo("a");
 
         let set = RepoSet::new(Arc::new(SyncHub::new()));
-        set.sync(&config_with("a", &dir));
+        set.sync(&state_with("a", &dir));
 
         wait_for(&set, |s| {
             matches!(
@@ -512,7 +512,7 @@ mod tests {
         })
         .await;
 
-        set.sync(&Config::default());
+        set.sync(&MeshState::default());
         assert!(set.statuses().is_empty());
     }
 
@@ -524,7 +524,7 @@ mod tests {
         let dir = fx.init_repo("a");
 
         let set = RepoSet::new(Arc::new(SyncHub::new()));
-        set.sync(&config_with("a", &dir));
+        set.sync(&state_with("a", &dir));
         wait_for(&set, |s| {
             matches!(
                 s,
@@ -582,7 +582,7 @@ mod tests {
     async fn reports_failure_for_invalid_repo() {
         let fx = Fixture::new();
         let set = RepoSet::new(Arc::new(SyncHub::new()));
-        set.sync(&config_with("ghost", &fx.path().join("missing")));
+        set.sync(&state_with("ghost", &fx.path().join("missing")));
 
         wait_for(&set, |s| {
             matches!(
