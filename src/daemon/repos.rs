@@ -24,6 +24,7 @@ use jj_lib::{object_id::ObjectId as _, op_store::OperationId};
 use tracing::{debug, info, warn};
 
 use super::{
+    backoff::Backoff,
     control,
     hub::{Inbox, PeerAnnounce, SyncHub},
 };
@@ -223,7 +224,7 @@ struct RepoTask {
 
 /// Opens and watches one repo forever, reopening with backoff on failure.
 async fn run_repo(task: RepoTask) {
-    let mut backoff = BACKOFF_MIN;
+    let mut backoff = Backoff::new(BACKOFF_MIN, BACKOFF_MAX);
 
     loop {
         task.set_state(RepoState::Opening);
@@ -236,14 +237,14 @@ async fn run_repo(task: RepoTask) {
         task.hub.repo_closed(&task.name, &task.id);
 
         if started.elapsed() >= STABLE_WATCH {
-            backoff = BACKOFF_MIN;
+            backoff.reset();
         }
+        let delay = backoff.next_delay();
         task.set_state(RepoState::Backoff {
-            until: Instant::now() + backoff,
+            until: Instant::now() + delay,
             error: truncated_error(&err),
         });
-        tokio::time::sleep(backoff).await;
-        backoff = (backoff * 2).min(BACKOFF_MAX);
+        tokio::time::sleep(delay).await;
     }
 }
 

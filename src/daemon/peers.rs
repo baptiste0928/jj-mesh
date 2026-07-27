@@ -16,7 +16,7 @@ use iroh::{Endpoint, EndpointId, TransportAddr, endpoint::Connection};
 use tokio::sync::{Semaphore, mpsc};
 use tracing::{debug, info};
 
-use super::{control, hub::SyncHub};
+use super::{backoff::Backoff, control, hub::SyncHub};
 use crate::{
     config::{Membership, MeshState},
     net::{sync, wire},
@@ -260,7 +260,7 @@ struct PeerTask {
 
 /// Maintains the connection to one peer forever.
 async fn run_peer(mut task: PeerTask) {
-    let mut backoff = BACKOFF_MIN;
+    let mut backoff = Backoff::new(BACKOFF_MIN, BACKOFF_MAX);
     // Delay to respect before the next attempt, from a previous failure.
     let mut delay = None;
 
@@ -283,7 +283,7 @@ async fn run_peer(mut task: PeerTask) {
             None => task.establish().await,
         };
         let Some((conn, outbound)) = established else {
-            delay = Some(next_backoff(&mut backoff));
+            delay = Some(backoff.next_delay());
             continue;
         };
 
@@ -293,9 +293,9 @@ async fn run_peer(mut task: PeerTask) {
         info!(peer = %task.name, "peer disconnected");
 
         if held.elapsed() >= STABLE_UPTIME {
-            backoff = BACKOFF_MIN;
+            backoff.reset();
         } else {
-            delay = Some(next_backoff(&mut backoff));
+            delay = Some(backoff.next_delay());
         }
     }
 }
@@ -454,16 +454,4 @@ impl PeerTask {
     fn set_state(&self, state: PeerState) {
         *self.state.lock().unwrap() = state;
     }
-}
-
-/// Returns the jittered delay to wait and advances the backoff.
-fn next_backoff(backoff: &mut Duration) -> Duration {
-    let delay = jitter(*backoff);
-    *backoff = (*backoff * 2).min(BACKOFF_MAX);
-    delay
-}
-
-/// Jitters a delay by ±20% so peers don't reconnect in lockstep.
-fn jitter(base: Duration) -> Duration {
-    base.mul_f64(rand::random_range(0.8..1.2))
 }

@@ -1,41 +1,34 @@
-//! Daemon control socket.
-//!
-//! The CLI talks to the running daemon over a unix socket with
-//! length-prefixed postcard messages (see [`crate::net::wire`]). Most
-//! requests are one request/response exchange; hosting a pairing gets two
-//! responses (the ticket, then the outcome) on one connection.
-//!
-//! The daemon is the only holder of the machine-key endpoint and the only
-//! writer of the mesh state, so live peer state, pairing and every
-//! user-driven mesh mutation go through here. Gossip-driven mutations
-//! reach the same store from the daemon's membership loop.
+//! Server side of the control socket: the listener, the per-connection
+//! request handlers, and the daemon context they act on.
 
 use std::{
     fs::{self, File, TryLockError},
-    io,
     path::PathBuf,
     sync::Arc,
     time::{Duration, Instant},
 };
 
 use color_eyre::eyre::{Result, WrapErr as _, bail, eyre};
-use iroh::{Endpoint, EndpointId};
-use serde::{Deserialize, Serialize};
+use iroh::Endpoint;
 use tokio::{
     io::{AsyncRead, AsyncReadExt as _},
     net::{UnixListener, UnixStream},
 };
 use tracing::{debug, info, warn};
 
-use super::{
-    hub::{JoinSource, SyncHub},
-    pairing::Pairing,
-    peers::PeerSet,
-    repos::RepoSet,
-    store::MeshStore,
+use super::protocol::{
+    CLIENT_TIMEOUT, ConflictStatus, JOIN_PULL_TIMEOUT, MAX_MESSAGE_SIZE, Request, Response, Status,
 };
 use crate::{
     config::{ConfigDir, MeshState, Repo, RepoId},
+    daemon::{
+        backoff::Backoff,
+        hub::{JoinSource, SyncHub},
+        pairing::Pairing,
+        peers::PeerSet,
+        repos::RepoSet,
+        store::MeshStore,
+    },
     net::{
         pair,
         wire::{read_message, write_message},
@@ -43,26 +36,8 @@ use crate::{
     repo::{JjRepo, transfer},
 };
 
-/// Maximum accepted size of a control message.
-const MAX_MESSAGE_SIZE: u32 = 1 << 20;
-
-/// Time budget for the quick parts of an exchange (request, status answer).
-const CLIENT_TIMEOUT: Duration = Duration::from_secs(2);
-
 /// Time budget for a whole join exchange, from dialing to completion.
 const JOIN_TIMEOUT: Duration = Duration::from_mins(1);
-
-/// Time budget for a join's initial repo pull; it may transfer an entire
-/// repository.
-const JOIN_PULL_TIMEOUT: Duration = Duration::from_mins(30);
-
-/// Time budget the CLI grants quick mutating requests (add, remove).
-pub const MUTATE_WAIT: Duration = Duration::from_secs(10);
-
-/// Time budget the CLI grants a whole join request: the pull budget plus a
-/// margin for validation and registration. Kept here next to the pull
-/// budget so the two cannot drift apart.
-pub const JOIN_WAIT: Duration = JOIN_PULL_TIMEOUT.saturating_add(Duration::from_mins(1));
 
 /// Hard cap on a pairing window: bounds how long the unknown-endpoint pair
 /// ALPN stays exposed when a host CLI is left waiting unattended.
@@ -71,161 +46,6 @@ const WINDOW_TIMEOUT: Duration = Duration::from_mins(15);
 /// Initial retry delay after an accept error, escalating to the max.
 const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
 const ACCEPT_ERROR_BACKOFF_MAX: Duration = Duration::from_secs(5);
-
-/// A request from the CLI to the daemon.
-#[derive(Debug, Serialize, Deserialize)]
-pub enum Request {
-    /// Report the daemon state; answered with [`Response::Status`].
-    Status,
-    /// Host a pairing: open the window and issue a ticket. Answered with
-    /// [`Response::PairTicket`] immediately, then [`Response::Paired`] or
-    /// [`Response::Error`] once the exchange concludes. The window closes
-    /// when the requesting client disconnects.
-    PairHost { name: String },
-    /// Join a pairing hosted by another machine. Answered with
-    /// [`Response::Paired`] or [`Response::Error`].
-    PairJoin { ticket: String, name: String },
-    /// Pull the full state of the mesh repo named `name` into a freshly
-    /// initialized local repo at `path` and register it (see `jj-mesh
-    /// join`). Answered with [`Response::Joined`] or [`Response::Error`].
-    JoinRepo { name: String, path: PathBuf },
-    /// Register the repo at `path` under `name`, with a fresh id. Answered
-    /// with [`Response::RepoAdded`] or [`Response::Error`].
-    AddRepo { name: String, path: PathBuf },
-    /// Retire a repo name from the mesh, unregistering it everywhere (its
-    /// files are left alone). Answered with [`Response::RepoForgotten`] or
-    /// [`Response::Error`].
-    ForgetRepo { name: String },
-    /// Remove a paired peer (by name, or endpoint id when names are
-    /// ambiguous), disconnecting it. Answered with
-    /// [`Response::PeerRemoved`] or [`Response::Error`].
-    RemovePeer { peer: String },
-}
-
-/// A daemon answer to a [`Request`].
-#[derive(Debug, Serialize, Deserialize)]
-pub enum Response {
-    Status(Status),
-    /// The pairing ticket to transmit to the other machine.
-    PairTicket(String),
-    /// Pairing succeeded and the peer is saved in the mesh state.
-    Paired {
-        name: String,
-        endpoint: EndpointId,
-    },
-    /// The join pull completed and the repo is registered.
-    Joined {
-        ops: u64,
-        git_objects: u64,
-    },
-    /// The repo is registered (with a freshly generated internal id).
-    RepoAdded,
-    /// The repo is retired from the mesh; `was_local` tells whether it was
-    /// registered on this machine.
-    RepoForgotten {
-        was_local: bool,
-    },
-    /// The peer is removed from the mesh state.
-    PeerRemoved(EndpointId),
-    /// The request failed.
-    Error(String),
-}
-
-/// Live daemon state, answering [`Request::Status`].
-#[derive(Debug, Serialize, Deserialize)]
-pub struct Status {
-    /// This machine's endpoint id.
-    pub endpoint: EndpointId,
-    /// Seconds since the daemon started.
-    pub uptime_secs: u64,
-    /// State of every configured peer.
-    pub peers: Vec<PeerStatus>,
-    /// Repos registered on this machine.
-    pub repos: Vec<RepoStatus>,
-    /// Mesh repos not registered here, joinable by name.
-    pub available: Vec<String>,
-    /// Repo names contested by peers announcing a different repo.
-    pub conflicts: Vec<ConflictStatus>,
-}
-
-/// A repo name contested by a peer: it announces a different repo (by id)
-/// under a name registered here. Sync with that peer is suspended for the
-/// repo until one side renames or removes it.
-#[derive(Debug, Serialize, Deserialize)]
-pub struct ConflictStatus {
-    pub repo: String,
-    pub peer: EndpointId,
-}
-
-/// Live state of one configured peer.
-#[derive(Debug, Serialize, Deserialize)]
-pub struct PeerStatus {
-    pub name: String,
-    pub endpoint: EndpointId,
-    pub connection: ConnectionStatus,
-}
-
-/// State of the persistent connection to a peer.
-#[derive(Debug, Serialize, Deserialize)]
-pub enum ConnectionStatus {
-    /// Dialing, or waiting for the peer to dial us.
-    Connecting,
-    /// Connection established.
-    Connected {
-        /// The selected network path, when already known.
-        path: Option<PathInfo>,
-        /// Seconds since the connection was established.
-        since_secs: u64,
-    },
-    /// Last attempt failed; waiting before redialing.
-    Backoff {
-        /// Seconds until the next attempt.
-        retry_in_secs: u64,
-    },
-}
-
-/// The selected network path of a peer connection.
-#[derive(Debug, Serialize, Deserialize)]
-pub struct PathInfo {
-    pub route: Route,
-    /// Round-trip time on this path, in milliseconds.
-    pub rtt_ms: u64,
-}
-
-/// How traffic reaches the peer.
-#[derive(Debug, Serialize, Deserialize)]
-pub enum Route {
-    /// Hole-punched direct path to this socket address.
-    Direct { addr: String },
-    /// Traffic goes through this relay.
-    Relay { url: String },
-}
-
-/// A registered repo.
-#[derive(Debug, Serialize, Deserialize)]
-pub struct RepoStatus {
-    pub name: String,
-    pub path: PathBuf,
-    pub watch: WatchStatus,
-}
-
-/// State of the op-heads watch on a repo.
-#[derive(Debug, Serialize, Deserialize)]
-pub enum WatchStatus {
-    /// The repo is being opened.
-    Opening,
-    /// Watching for op head changes.
-    Watching {
-        /// Current number of op heads (more than one means divergence).
-        op_heads: u64,
-        /// Seconds since the last observed change, if any since starting.
-        last_change_secs: Option<u64>,
-        /// Seconds since operations were last fetched from a peer.
-        last_sync_secs: Option<u64>,
-    },
-    /// Opening or watching failed; waiting before retrying.
-    Failed { error: String, retry_in_secs: u64 },
-}
 
 /// Everything the control handlers need from the daemon.
 #[derive(Debug)]
@@ -334,20 +154,19 @@ impl ControlServer {
 
     /// Serves control requests forever.
     pub async fn serve(self, ctx: Arc<ControlContext>) -> ! {
-        let mut error_backoff = ACCEPT_ERROR_BACKOFF;
+        let mut backoff = Backoff::new(ACCEPT_ERROR_BACKOFF, ACCEPT_ERROR_BACKOFF_MAX);
 
         loop {
             match self.listener.accept().await {
                 Ok((stream, _)) => {
-                    error_backoff = ACCEPT_ERROR_BACKOFF;
+                    backoff.reset();
                     tokio::spawn(handle_client(stream, ctx.clone()));
                 }
                 Err(err) => {
                     // Persistent errors (e.g. fd exhaustion) escalate the
                     // retry delay instead of hot-logging forever.
                     warn!("control socket accept failed: {err}");
-                    tokio::time::sleep(error_backoff).await;
-                    error_backoff = (error_backoff * 2).min(ACCEPT_ERROR_BACKOFF_MAX);
+                    tokio::time::sleep(backoff.next_delay()).await;
                 }
             }
         }
@@ -642,93 +461,4 @@ async fn client_gone(read: &mut (impl AsyncRead + Unpin)) {
             Ok(_) => {}
         }
     }
-}
-
-/// Client side of the control socket.
-#[derive(Debug)]
-pub struct ControlClient {
-    stream: UnixStream,
-}
-
-impl ControlClient {
-    /// Connects to the daemon serving this configuration, or `None` when no
-    /// daemon is running.
-    pub async fn connect(dir: &ConfigDir) -> Result<Option<Self>> {
-        let path = dir.socket_path();
-
-        match UnixStream::connect(&path).await {
-            Ok(stream) => Ok(Some(ControlClient { stream })),
-            Err(err)
-                if matches!(
-                    err.kind(),
-                    io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
-                ) =>
-            {
-                Ok(None)
-            }
-            Err(err) => Err(err).wrap_err_with(|| format!("cannot connect to {}", path.display())),
-        }
-    }
-
-    /// Sends a request.
-    pub async fn send(&mut self, request: &Request) -> Result<()> {
-        write_message(&mut self.stream, request, MAX_MESSAGE_SIZE).await
-    }
-
-    /// Receives the next response, bounded by `limit` when given.
-    pub async fn recv(&mut self, limit: Option<Duration>) -> Result<Response> {
-        let read = read_message(&mut self.stream, MAX_MESSAGE_SIZE);
-        match limit {
-            Some(limit) => tokio::time::timeout(limit, read)
-                .await
-                .map_err(|_| eyre!("the daemon did not answer"))?,
-            None => read.await,
-        }
-    }
-}
-
-/// Queries the status of the daemon serving this configuration.
-///
-/// Returns `None` when no daemon is running; errors when a daemon is
-/// listening but does not answer properly.
-pub async fn query_status(dir: &ConfigDir) -> Result<Option<Status>> {
-    let Some(mut client) = ControlClient::connect(dir).await? else {
-        return Ok(None);
-    };
-
-    client.send(&Request::Status).await?;
-    match client.recv(Some(CLIENT_TIMEOUT)).await? {
-        Response::Status(status) => Ok(Some(status)),
-        other => bail!("unexpected response from the daemon: {other:?}"),
-    }
-}
-
-/// Blocking convenience over [`query_status`] for CLI commands that have no
-/// tokio runtime of their own.
-pub fn query_status_blocking(dir: &ConfigDir) -> Result<Option<Status>> {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?
-        .block_on(query_status(dir))
-}
-
-/// Sends one request and returns the daemon's answer, for CLI commands with
-/// no tokio runtime of their own. Errors when no daemon is running, and
-/// turns [`Response::Error`] into an error, so callers only match their
-/// success variant.
-pub fn request_blocking(dir: &ConfigDir, request: &Request, limit: Duration) -> Result<Response> {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?
-        .block_on(async {
-            let Some(mut client) = ControlClient::connect(dir).await? else {
-                bail!("the jj-mesh daemon is not running; start it with `jj-mesh daemon` first");
-            };
-
-            client.send(request).await?;
-            match client.recv(Some(limit)).await? {
-                Response::Error(message) => bail!("{message}"),
-                response => Ok(response),
-            }
-        })
 }

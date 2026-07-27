@@ -10,6 +10,7 @@
 //! when no daemon is running.
 
 use std::{
+    borrow::Borrow,
     cmp,
     collections::BTreeMap,
     fmt, fs, io,
@@ -44,7 +45,7 @@ pub const MAX_MESH_REPOS: usize = 1024;
 /// local change, so a record beyond this is corrupted or hostile: without
 /// the cap, a record parked at `u64::MAX` could never be superseded again,
 /// permanently freezing a machine out of the mesh.
-const MAX_PEER_VERSION: u64 = 1 << 32;
+const MAX_RECORD_VERSION: u64 = 1 << 32;
 
 /// Checks that a peer or repo name is usable; `kind` names it in errors.
 /// Also applied to names arriving from remote machines (announcements),
@@ -227,7 +228,7 @@ impl MeshState {
             "the mesh already has {MAX_MESH_PEERS} machines",
         );
 
-        let version = self.bumped_version(&endpoint)?;
+        let version = bumped_version(&self.peers, &endpoint)?;
         self.peers.insert(
             endpoint,
             Peer {
@@ -243,28 +244,13 @@ impl MeshState {
     /// The tombstone propagates the removal through the gossip.
     pub fn remove_peer(&mut self, selector: &str) -> Result<EndpointId> {
         let endpoint = self.resolve_peer(selector)?;
-        let version = self.bumped_version(&endpoint)?;
+        let version = bumped_version(&self.peers, &endpoint)?;
 
         let peer = self.peers.get_mut(&endpoint).expect("resolved above");
         peer.version = version;
         peer.status = PeerStatus::Removed;
 
         Ok(endpoint)
-    }
-
-    /// The version a local change to this record must carry to outrank the
-    /// stored one. Refuses to go past [`MAX_PEER_VERSION`]: a saturating
-    /// bump would make the record unchangeable, so a record parked at the
-    /// ceiling is reported instead of silently freezing the peer out.
-    fn bumped_version(&self, endpoint: &EndpointId) -> Result<u64> {
-        let version = self.peers.get(endpoint).map_or(0, |peer| peer.version);
-        ensure!(
-            version < MAX_PEER_VERSION,
-            "the record of {endpoint} is corrupted (version {version}); \
-             remove it from peers.json on every machine",
-        );
-
-        Ok(version + 1)
     }
 
     /// Resolves an alive peer from a name or a full endpoint id. Names are
@@ -309,7 +295,7 @@ impl MeshState {
             "the mesh already has {MAX_MESH_REPOS} repos",
         );
 
-        let version = self.bumped_repo_version(&name)?;
+        let version = bumped_version(&self.mesh_repos, &name)?;
         self.mesh_repos.insert(
             name.clone(),
             MeshRepo {
@@ -338,7 +324,7 @@ impl MeshState {
             "repo `{name}` is already forgotten",
         );
 
-        let version = self.bumped_repo_version(name)?;
+        let version = bumped_version(&self.mesh_repos, name)?;
         self.mesh_repos.insert(
             name.to_owned(),
             MeshRepo {
@@ -348,19 +334,6 @@ impl MeshState {
         );
 
         Ok(self.repos.remove(name).is_some())
-    }
-
-    /// The version a local change to a mesh repo record must carry to
-    /// outrank the stored one; see [`Self::bumped_version`].
-    fn bumped_repo_version(&self, name: &str) -> Result<u64> {
-        let version = self.mesh_repos.get(name).map_or(0, |repo| repo.version);
-        ensure!(
-            version < MAX_PEER_VERSION,
-            "the mesh record of `{name}` is corrupted (version {version}); \
-             remove it from peers.json on every machine",
-        );
-
-        Ok(version + 1)
     }
 
     /// The membership this machine gossips: every peer record (tombstones
@@ -393,7 +366,7 @@ impl MeshState {
         for (endpoint, record) in &remote.peers {
             // Strictly below the ceiling: a record *at* it could never be
             // superseded by a local change, freezing the machine's status.
-            if endpoint == local || record.version >= MAX_PEER_VERSION {
+            if endpoint == local || record.version >= MAX_RECORD_VERSION {
                 continue;
             }
             if let PeerStatus::Alive { name } = &record.status
@@ -401,37 +374,20 @@ impl MeshState {
             {
                 continue;
             }
-
-            match self.peers.get(endpoint) {
-                Some(ours) if record_rank(record) > record_rank(ours) => {
-                    self.peers.insert(*endpoint, record.clone());
-                }
-                Some(_) => {}
-                None if self.peers.len() < MAX_MESH_PEERS => {
-                    self.peers.insert(*endpoint, record.clone());
-                }
-                None => debug!("dropping gossiped peer {endpoint}: the mesh is full"),
+            if should_adopt(&self.peers, endpoint, record, MAX_MESH_PEERS) {
+                self.peers.insert(*endpoint, record.clone());
             }
         }
 
         for (name, record) in &remote.repos {
-            if validate_name("repo", name).is_err() || record.version >= MAX_PEER_VERSION {
+            if validate_name("repo", name).is_err() || record.version >= MAX_RECORD_VERSION {
                 continue;
             }
-
-            let adopt = match self.mesh_repos.get(name) {
-                // Two unrelated repos claiming one name is a conflict only
-                // the user can settle, but the list must still converge, so
-                // the ranking decides it everywhere the same way. The
-                // sync-level conflict (see `daemon::hub`) surfaces it.
-                Some(ours) => mesh_repo_rank(record) > mesh_repo_rank(ours),
-                None if self.mesh_repos.len() < MAX_MESH_REPOS => true,
-                None => {
-                    debug!(repo = %name, "dropping gossiped repo: the mesh repo list is full");
-                    false
-                }
-            };
-            if !adopt {
+            // Two unrelated repos claiming one name is a conflict only the
+            // user can settle, but the list must still converge, so the
+            // ranking decides it everywhere the same way. The sync-level
+            // conflict (see `daemon::hub`) surfaces it.
+            if !should_adopt(&self.mesh_repos, name, record, MAX_MESH_REPOS) {
                 continue;
             }
 
@@ -445,21 +401,50 @@ impl MeshState {
     }
 }
 
-/// Total order on peer records deciding which one a merge keeps: higher
-/// version first, removal beating alive on ties, then the smaller name (so
-/// equal-version renames converge mesh-wide instead of ping-ponging).
-fn record_rank(peer: &Peer) -> (u64, bool, cmp::Reverse<&str>) {
-    (
-        peer.version,
-        peer.name().is_none(),
-        cmp::Reverse(peer.name().unwrap_or("")),
-    )
+/// A gossip-replicated versioned register (peer or mesh repo record). The
+/// higher version wins; ties go to the retired state (tombstone), then to
+/// the smaller payload, so every machine converges on the same record
+/// without clocks. [`Peer`] and [`MeshRepo`] are the two implementors.
+trait Register: Clone {
+    /// Bumped on every local change, so the change outranks other machines.
+    fn version(&self) -> u64;
+    /// Whether this record outranks `other` and should replace it on merge.
+    fn outranks(&self, other: &Self) -> bool;
 }
 
-/// The same total order for mesh repo records: higher version first,
-/// forgetting beating presence on ties, then the smaller id.
-fn mesh_repo_rank(repo: &MeshRepo) -> (u64, bool, cmp::Reverse<Option<&RepoId>>) {
-    (repo.version, repo.id().is_none(), cmp::Reverse(repo.id()))
+/// The version a local change to the record under `key` must carry to
+/// outrank the stored one. Refuses to pass [`MAX_RECORD_VERSION`]: a
+/// saturating bump would make the record unchangeable, so one parked at the
+/// ceiling is reported instead of silently freezing its subject out.
+fn bumped_version<K, Q, V>(map: &BTreeMap<K, V>, key: &Q) -> Result<u64>
+where
+    K: Ord + Borrow<Q>,
+    Q: Ord + fmt::Display + ?Sized,
+    V: Register,
+{
+    let version = map.get(key).map_or(0, V::version);
+    ensure!(
+        version < MAX_RECORD_VERSION,
+        "the mesh record of `{key}` is corrupted (version {version}); \
+         remove it from peers.json on every machine",
+    );
+
+    Ok(version + 1)
+}
+
+/// Whether a gossiped `record` should be adopted into `map` under `key`: it
+/// must outrank what we hold, and a key we do not know is only added while
+/// the map is below `cap`, so a peer cannot grow our state without bound.
+fn should_adopt<K: Ord, V: Register>(
+    map: &BTreeMap<K, V>,
+    key: &K,
+    record: &V,
+    cap: usize,
+) -> bool {
+    match map.get(key) {
+        Some(ours) => record.outranks(ours),
+        None => map.len() < cap,
+    }
 }
 
 /// A machine's record in the mesh, replicated by the membership gossip as
@@ -481,6 +466,25 @@ impl Peer {
             PeerStatus::Alive { name } => Some(name),
             PeerStatus::Removed => None,
         }
+    }
+}
+
+impl Register for Peer {
+    fn version(&self) -> u64 {
+        self.version
+    }
+
+    /// Higher version first, removal beating alive on ties, then the smaller
+    /// name (so equal-version renames converge instead of ping-ponging).
+    fn outranks(&self, other: &Self) -> bool {
+        fn rank(peer: &Peer) -> (u64, bool, cmp::Reverse<&str>) {
+            (
+                peer.version,
+                peer.name().is_none(),
+                cmp::Reverse(peer.name().unwrap_or("")),
+            )
+        }
+        rank(self) > rank(other)
     }
 }
 
@@ -521,6 +525,21 @@ impl MeshRepo {
             MeshRepoStatus::Present { id } => Some(id),
             MeshRepoStatus::Forgotten => None,
         }
+    }
+}
+
+impl Register for MeshRepo {
+    fn version(&self) -> u64 {
+        self.version
+    }
+
+    /// Higher version first, forgetting beating presence on ties, then the
+    /// smaller id.
+    fn outranks(&self, other: &Self) -> bool {
+        fn rank(repo: &MeshRepo) -> (u64, bool, cmp::Reverse<Option<&RepoId>>) {
+            (repo.version, repo.id().is_none(), cmp::Reverse(repo.id()))
+        }
+        rank(self) > rank(other)
     }
 }
 
@@ -788,7 +807,7 @@ mod tests {
         // superseded, locking the machine out of the mesh for good. The
         // ceiling itself must be refused too: a record *at* it leaves the
         // local bump no headroom.
-        for version in [u64::MAX, MAX_PEER_VERSION] {
+        for version in [u64::MAX, MAX_RECORD_VERSION] {
             let mut state = MeshState::default();
             state.merge_membership(
                 &Membership {

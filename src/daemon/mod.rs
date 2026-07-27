@@ -6,6 +6,7 @@
 //! owns the mesh state (`peers.json`): every mutation arrives through the
 //! control socket or the membership gossip, and is persisted here.
 
+mod backoff;
 pub mod control;
 mod hub;
 mod pairing;
