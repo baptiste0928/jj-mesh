@@ -1,7 +1,7 @@
 //! Owner of the daemon's authoritative mesh state.
 //!
 //! Every mutation, whether driven by the control socket or by membership
-//! gossip, funnels through [`MeshStore::update`]: persist to `peers.json`,
+//! gossip, funnels through [`MeshStore::update`]: persist to `mesh.json`,
 //! commit in memory, align the live peer and repo sets, and broadcast the
 //! membership when it changed. Owning the sets and the hub is what makes
 //! that guarantee structural rather than a convention on callers.
@@ -62,7 +62,7 @@ impl MeshStore {
         self.hub.publish_membership(state.membership());
     }
 
-    /// Mutates the state: persists the change to `peers.json`, aligns the
+    /// Mutates the state: persists the change to `mesh.json`, aligns the
     /// peer and repo sets with it, and broadcasts the membership if it
     /// changed. Nothing is committed (in memory or on disk) when the
     /// mutation or the save fails, and a mutation that changes nothing

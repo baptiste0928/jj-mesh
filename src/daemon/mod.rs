@@ -3,7 +3,7 @@
 //! Maintains persistent connections to every paired peer (allowlisted at
 //! accept), watches every registered repo for op head changes and announces
 //! them to peers, and serves live state on the control socket. The daemon
-//! owns the mesh state (`peers.json`): every mutation arrives through the
+//! owns the mesh state (`mesh.json`): every mutation arrives through the
 //! control socket or the membership gossip, and is persisted here.
 
 mod backoff;

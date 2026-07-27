@@ -64,7 +64,7 @@ Each machine stores everything mesh-related in its config directory
 (`~/.config/jj-mesh`), split in three files by ownership:
 
 - **The identity key**, in its own file, only ever read by the daemon.
-- **`peers.json`**, this machine's copy of the mesh state, in two parts: what
+- **`mesh.json`**, this machine's copy of the mesh state, in two parts: what
   is replicated by the gossip (peer records, tombstones included, and the
   mesh-wide repo list) and what is strictly local (the repos registered
   here, with their paths). It is owned and written exclusively by the

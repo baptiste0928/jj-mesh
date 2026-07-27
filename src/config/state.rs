@@ -1,4 +1,4 @@
-//! Mesh state file (`peers.json`).
+//! Mesh state file (`mesh.json`).
 //!
 //! This file holds the machine's copy of the mesh state, in two parts:
 //! what is replicated across the mesh by the membership gossip (the peer
@@ -107,10 +107,10 @@ pub struct MeshState {
 }
 
 impl MeshState {
-    /// Loads `peers.json` from the configuration directory, defaulting to an
+    /// Loads `mesh.json` from the configuration directory, defaulting to an
     /// empty state if the file does not exist yet.
     pub fn load(dir: &ConfigDir) -> Result<Self> {
-        let path = dir.peers_file();
+        let path = dir.mesh_file();
 
         match fs::read(&path) {
             Ok(bytes) => serde_json::from_slice(&bytes)
@@ -125,7 +125,7 @@ impl MeshState {
     /// Readers never see a partial file, and the state survives a crash once
     /// this returns; pairing relies on that to only confirm saved peers.
     pub fn save(&self, dir: &ConfigDir) -> Result<()> {
-        let path = dir.peers_file();
+        let path = dir.mesh_file();
         let json = serde_json::to_vec_pretty(self).wrap_err("cannot encode mesh state")?;
 
         let mut tmp = tempfile::NamedTempFile::new_in(dir.path())
@@ -426,7 +426,7 @@ where
     ensure!(
         version < MAX_RECORD_VERSION,
         "the mesh record of `{key}` is corrupted (version {version}); \
-         remove it from peers.json on every machine",
+         remove it from mesh.json on every machine",
     );
 
     Ok(version + 1)

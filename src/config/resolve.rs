@@ -86,8 +86,8 @@ impl ConfigDir {
     /// Get the path to the mesh state file.
     ///
     /// There is no guarantee that the file exists.
-    pub fn peers_file(&self) -> PathBuf {
-        self.path.join("peers.json")
+    pub fn mesh_file(&self) -> PathBuf {
+        self.path.join("mesh.json")
     }
 
     /// Get the path to the daemon control socket.
