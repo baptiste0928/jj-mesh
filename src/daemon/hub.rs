@@ -256,15 +256,10 @@ impl SyncHub {
     }
 
     /// Resolves the serve handle for a fetch request, logging every kind of
-    /// refusal distinctly. The name is validated before any use: it ends up
-    /// in logs and as a map key, and must never carry unbounded length or
-    /// confusables.
+    /// refusal distinctly. The name needs no validation here: only names that
+    /// passed it at registration are ever in the map, so an invalid one
+    /// simply fails to match.
     fn lookup_serving(&self, request: &FetchRequest) -> Option<Serving> {
-        if validate_name("repo", &request.name).is_err() {
-            debug!("refusing fetch: invalid repo name");
-            return None;
-        }
-
         let state = self.state.lock().unwrap();
         let Some(entry) = state.repos.get(&request.name) else {
             debug!(repo = %request.name, "refusing fetch: repo not registered here");

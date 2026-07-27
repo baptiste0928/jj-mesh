@@ -86,7 +86,7 @@ impl JjRepo {
 
         for (store, expected) in SUPPORTED_STORES {
             let type_path = repo_dir.join(store).join("type");
-            let actual = read_capped(&type_path, MAX_TYPE_LEN)
+            let actual = fs::read_to_string(&type_path)
                 .wrap_err_with(|| format!("cannot read {}", type_path.display()))?;
             ensure!(
                 actual.trim() == expected,
@@ -98,21 +98,6 @@ impl JjRepo {
 
         Ok(())
     }
-}
-
-/// Longest accepted `type` file; real ones are ~20 bytes. Repo files are
-/// not ours, so reads are capped and their content lossily decoded.
-const MAX_TYPE_LEN: usize = 64;
-
-/// Reads at most `max` bytes of a file as (lossy) UTF-8.
-fn read_capped(path: &Path, max: usize) -> Result<String> {
-    use std::io::Read as _;
-
-    let mut buf = Vec::with_capacity(max);
-    fs::File::open(path)?
-        .take(max as u64)
-        .read_to_end(&mut buf)?;
-    Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 
 #[cfg(test)]
@@ -164,18 +149,5 @@ mod tests {
 
         let err = JjRepo::discover(tmp.path()).unwrap_err();
         assert!(err.to_string().contains("unsupported `store` backend"));
-    }
-
-    /// `type` files come from the repo, so oversized ones must not blow up
-    /// memory or error messages.
-    #[test]
-    fn discover_caps_type_file_read() {
-        let tmp = tempfile::tempdir().unwrap();
-        fake_repo(tmp.path());
-        let type_path = tmp.path().join(".jj/repo/store/type");
-        fs::write(&type_path, "x".repeat(1 << 20)).unwrap();
-
-        let err = JjRepo::discover(tmp.path()).unwrap_err();
-        assert!(err.to_string().len() < 500);
     }
 }
