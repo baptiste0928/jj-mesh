@@ -13,5 +13,5 @@ mod state;
 
 pub use key::MachineKey;
 pub use resolve::ConfigDir;
-pub(crate) use state::is_confusable;
 pub use state::{MeshState, Peer, Repo, RepoId};
+pub(crate) use state::{is_confusable, validate_name};

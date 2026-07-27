@@ -351,10 +351,21 @@ fn walk_tree(
 
 // --- Fetcher side ---
 
+/// Makes a peer-supplied error message safe to surface to the user: bounded
+/// and stripped of characters that could hide or reorder terminal output.
+fn sanitize_peer_error(message: &str) -> String {
+    message
+        .chars()
+        .filter(|c| !crate::config::is_confusable(*c))
+        .take(200)
+        .collect()
+}
+
 /// Fetches the given op heads from a peer over the stream pair and applies
 /// them locally in crash-safe order.
 pub async fn fetch(
     repo: &Arc<MeshRepo>,
+    name: &str,
     repo_id: &RepoId,
     wants: &[OperationId],
     send: &mut (impl AsyncWrite + Unpin),
@@ -365,7 +376,8 @@ pub async fn fetch(
     let haves = sample_haves(repo, &local_heads).await?;
 
     let request = FetchRequest {
-        repo: repo_id.clone(),
+        name: name.to_owned(),
+        id: repo_id.clone(),
         wants: wants.iter().map(|id| id.as_bytes().to_vec()).collect(),
         haves: haves.iter().map(|id| id.as_bytes().to_vec()).collect(),
     };
@@ -537,7 +549,9 @@ async fn receive_ops(
                 ensure_batch_reachable(wants, &batch)?;
                 return Ok(batch);
             }
-            OpFrame::Error { message } => bail!("peer refused fetch: {message}"),
+            OpFrame::Error { message } => {
+                bail!("peer refused fetch: {}", sanitize_peer_error(&message))
+            }
         }
     }
     bail!("too many op frames");
@@ -634,7 +648,9 @@ async fn receive_git_objects(
                     .wrap_err("git write task failed")??;
                 return Ok(total);
             }
-            GitFrame::Error { message } => bail!("peer failed git phase: {message}"),
+            GitFrame::Error { message } => {
+                bail!("peer failed git phase: {}", sanitize_peer_error(&message))
+            }
         }
     }
 }
@@ -1043,6 +1059,7 @@ mod tests {
 
         let outcome = fetch(
             fetcher,
+            "test",
             &crate::config::RepoId::generate(),
             wants,
             &mut client_tx,
@@ -1221,6 +1238,7 @@ mod tests {
 
         let err = fetch(
             &repo,
+            "test",
             &crate::config::RepoId::generate(),
             &[want],
             &mut client_tx,

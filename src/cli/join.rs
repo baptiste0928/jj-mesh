@@ -8,28 +8,25 @@
 use std::{path::PathBuf, process::Command};
 
 use clap::Args;
-use color_eyre::eyre::{Result, WrapErr as _, bail, ensure, eyre};
+use color_eyre::eyre::{Result, WrapErr as _, bail, ensure};
 
 use crate::{
-    config::{ConfigDir, MeshState, RepoId},
+    config::{ConfigDir, MeshState},
     daemon::control::{self, Request, Response},
 };
 
 /// Join a repo another machine added to the mesh
 ///
-/// Find the repo id with `jj-mesh status` on the machine that has the
+/// Find the repo name with `jj-mesh status` on the machine that has the
 /// repo. The daemon must be running and connected to that machine.
 #[derive(Debug, Args)]
 pub struct JoinArgs {
-    /// Mesh id of the repo (32 hex characters)
-    repo_id: String,
+    /// Name of the repo in the mesh
+    name: String,
 
-    /// Directory to create the repo in (must not exist yet)
-    path: PathBuf,
-
-    /// Name of the repo in the mesh (defaults to the directory name)
-    #[arg(long)]
-    name: Option<String>,
+    /// Directory to create the repo in (must not exist yet; defaults to
+    /// the repo name in the current directory)
+    path: Option<PathBuf>,
 
     /// This machine's workspace name in the repo (defaults to the
     /// hostname). Must differ from every other machine's.
@@ -39,31 +36,18 @@ pub struct JoinArgs {
 
 /// Runs the `join` command.
 pub fn run(args: JoinArgs, dir: &ConfigDir) -> Result<()> {
-    let repo_id = RepoId::try_from(args.repo_id).map_err(|err| eyre!(err))?;
-
-    ensure!(
-        !args.path.exists(),
-        "{} already exists; join creates the directory itself",
-        args.path.display(),
-    );
-    let name = match &args.name {
-        Some(name) => name.clone(),
-        None => args
-            .path
-            .file_name()
-            .ok_or_else(|| eyre!("cannot derive a name from the path, use --name"))?
-            .to_string_lossy()
-            .into_owned(),
-    };
+    let name = args.name;
+    let path = args.path.unwrap_or_else(|| PathBuf::from(&name));
 
     // Best-effort pre-checks against the stored state, so an obviously
     // doomed join fails before anything is created on disk; the daemon
     // re-validates authoritatively before registering.
-    let state = MeshState::load(dir)?;
-    if let Some(existing) = state.repo_name(&repo_id) {
-        bail!("repo {repo_id} is already registered here as `{existing}`");
-    }
-    state.validate_new_repo(&name, &args.path)?;
+    MeshState::load(dir)?.validate_new_repo(&name, &path)?;
+    ensure!(
+        !path.exists(),
+        "{} already exists; join creates the directory itself",
+        path.display(),
+    );
 
     let workspace = match args.workspace {
         Some(name) => name,
@@ -72,20 +56,19 @@ pub fn run(args: JoinArgs, dir: &ConfigDir) -> Result<()> {
 
     // Fresh repo with a machine-unique workspace name, using the user's
     // own jj (their config applies to the repo from the start).
-    jj(None, &["git", "init", &args.path.to_string_lossy()])?;
-    jj(Some(&args.path), &["workspace", "rename", &workspace])?;
+    jj(None, &["git", "init", &path.to_string_lossy()])?;
+    jj(Some(&path), &["workspace", "rename", &workspace])?;
 
-    println!("Pulling repo {repo_id} from the mesh...");
+    println!("Pulling repo `{name}` from the mesh...");
     let request = Request::JoinRepo {
-        repo: repo_id.clone(),
         name: name.clone(),
-        path: std::fs::canonicalize(&args.path)?,
+        path: std::fs::canonicalize(&path)?,
     };
     let pulled = control::request_blocking(dir, &request, control::JOIN_WAIT);
     let response = pulled.wrap_err_with(|| {
         format!(
             "the repo directory {} was created but not registered; remove it before retrying",
-            args.path.display(),
+            path.display(),
         )
     })?;
     let Response::Joined { ops, git_objects } = response else {
@@ -94,9 +77,9 @@ pub fn run(args: JoinArgs, dir: &ConfigDir) -> Result<()> {
 
     // Any jj command merges the fresh workspace into the pulled history;
     // doing it here leaves the repo ready to use.
-    jj(Some(&args.path), &["status"])?;
+    jj(Some(&path), &["status"])?;
 
-    println!("Joined `{name}` ({repo_id}): {ops} operations, {git_objects} git objects");
+    println!("Joined `{name}`: {ops} operations, {git_objects} git objects");
     Ok(())
 }
 

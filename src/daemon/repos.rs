@@ -14,7 +14,7 @@
 
 use std::{
     collections::BTreeMap,
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -69,17 +69,17 @@ const MAX_ANNOUNCED_HEADS: usize = 64;
 /// publication pause while a fetch runs).
 const FETCH_TIMEOUT: Duration = Duration::from_mins(30);
 
-/// The set of managed repos, synced from the mesh state.
+/// The set of managed repos, synced from the mesh state and keyed by their
+/// mesh-wide name.
 #[derive(Debug)]
 pub struct RepoSet {
     hub: Arc<SyncHub>,
-    repos: Mutex<BTreeMap<RepoId, RepoHandle>>,
+    repos: Mutex<BTreeMap<String, RepoHandle>>,
 }
 
 /// Book-keeping for one repo task.
 #[derive(Debug)]
 struct RepoHandle {
-    name: String,
     id: RepoId,
     path: PathBuf,
     state: Arc<Mutex<RepoState>>,
@@ -110,55 +110,33 @@ impl RepoSet {
         }
     }
 
-    /// Aligns the managed repos with the mesh state: spawns tasks for
-    /// new repos and shuts down removed ones. A repo whose path changed is
-    /// respawned; a renamed one keeps its task.
+    /// Aligns the managed repos with the mesh state: spawns tasks for new
+    /// repos and shuts down removed ones. A repo whose path or id changed
+    /// is respawned.
     pub fn sync(&self, state: &MeshState) {
-        let mut desired: BTreeMap<&RepoId, (&str, &Path)> = BTreeMap::new();
-        for (name, repo) in &state.repos {
-            let previous = desired.insert(&repo.id, (name.as_str(), repo.path.as_path()));
-            if let Some((shadowed, _)) = previous {
-                // Ids are generated, so a collision means a corrupted state
-                // file; nothing else reports it, so at least leave a trace.
-                warn!(
-                    id = %repo.id,
-                    "repos `{shadowed}` and `{name}` share the same id; only `{name}` is watched",
-                );
-            }
-        }
-
         let mut repos = self.repos.lock().unwrap();
 
-        repos.retain(|id, handle| {
-            let Some((name, path)) = desired.get(id) else {
-                info!(repo = %handle.name, "removing repo");
+        repos.retain(|name, handle| {
+            let keep = state
+                .repos
+                .get(name)
+                .is_some_and(|repo| handle.path == repo.path && handle.id == repo.id);
+            if !keep {
+                info!(repo = %name, "removing repo watch");
                 handle.task.abort();
-                self.hub.unregister_repo(id);
-                return false;
-            };
-
-            if handle.path != *path {
-                info!(repo = %handle.name, "repo moved, restarting its watch");
-                handle.task.abort();
-                self.hub.unregister_repo(id);
-                return false;
+                self.hub.unregister_repo(name);
             }
-
-            if handle.name != *name {
-                info!(old = %handle.name, new = %name, "renaming repo");
-                (*name).clone_into(&mut handle.name);
-            }
-            true
+            keep
         });
 
-        for (id, (name, path)) in desired {
-            repos.entry(id.clone()).or_insert_with(|| {
-                info!(repo = %name, path = %path.display(), "managing repo");
-                let announcements = self.hub.register_repo(id.clone());
+        for (name, repo) in &state.repos {
+            repos.entry(name.clone()).or_insert_with(|| {
+                info!(repo = %name, path = %repo.path.display(), "managing repo");
+                let announcements = self.hub.register_repo(name.clone(), repo.id.clone());
                 spawn_repo(
-                    id.clone(),
-                    name.to_owned(),
-                    path.to_owned(),
+                    repo.id.clone(),
+                    name.clone(),
+                    repo.path.clone(),
                     self.hub.clone(),
                     announcements,
                 )
@@ -171,8 +149,8 @@ impl RepoSet {
         let repos = self.repos.lock().unwrap();
 
         repos
-            .values()
-            .map(|handle| {
+            .iter()
+            .map(|(name, handle)| {
                 let watch = match &*handle.state.lock().unwrap() {
                     RepoState::Opening => control::WatchStatus::Opening,
                     RepoState::Watching {
@@ -191,8 +169,7 @@ impl RepoSet {
                 };
 
                 control::RepoStatus {
-                    name: handle.name.clone(),
-                    id: handle.id.clone(),
+                    name: name.clone(),
                     path: handle.path.clone(),
                     watch,
                 }
@@ -213,7 +190,7 @@ fn spawn_repo(
 
     let task = tokio::spawn(run_repo(RepoTask {
         id: id.clone(),
-        name: name.clone(),
+        name,
         path: path.clone(),
         state: state.clone(),
         hub,
@@ -221,7 +198,6 @@ fn spawn_repo(
     }));
 
     RepoHandle {
-        name,
         id,
         path,
         state,
@@ -251,7 +227,7 @@ async fn run_repo(task: RepoTask) {
         warn!(repo = %task.name, "repo watch failed: {err:#}");
         // The stores may be stale (moved disk, replaced repo): stop
         // serving fetches from them until the reopen succeeds.
-        task.hub.repo_closed(&task.id);
+        task.hub.repo_closed(&task.name, &task.id);
 
         if started.elapsed() >= STABLE_WATCH {
             backoff = BACKOFF_MIN;
@@ -286,7 +262,7 @@ impl RepoTask {
         let repo = Arc::new(repo);
         // Fetch serving is dispatched by the hub, never by this loop: a
         // fetch below may block on the very peer being served.
-        self.hub.repo_opened(&self.id, repo.clone());
+        self.hub.repo_opened(&self.name, &self.id, repo.clone());
 
         // Watch before the first read: changes racing the setup produce at
         // worst a no-change wakeup.
@@ -300,7 +276,7 @@ impl RepoTask {
         // Publishing on watch start doubles as anti-entropy: changes made
         // while the watch was down are absorbed into the baseline above and
         // would otherwise never be announced.
-        self.hub.publish(&self.id, wire_heads(&heads));
+        self.hub.publish(&self.name, &self.id, wire_heads(&heads));
         self.set_state(RepoState::Watching {
             op_heads: heads.len(),
             last_change,
@@ -338,7 +314,7 @@ impl RepoTask {
                 heads = new;
                 last_change = Some(Instant::now());
                 info!(repo = %self.name, op_heads = heads.len(), "op heads changed");
-                self.hub.publish(&self.id, wire_heads(&heads));
+                self.hub.publish(&self.name, &self.id, wire_heads(&heads));
             }
             self.set_state(RepoState::Watching {
                 op_heads: heads.len(),
@@ -407,7 +383,7 @@ impl RepoTask {
             .connection(&peer)
             .ok_or_else(|| eyre!("peer is no longer connected"))?;
         let (mut send, mut recv) = conn.open_bi().await?;
-        let fetch = transfer::fetch(repo, &self.id, wants, &mut send, &mut recv);
+        let fetch = transfer::fetch(repo, &self.name, &self.id, wants, &mut send, &mut recv);
         let outcome = tokio::time::timeout(FETCH_TIMEOUT, fetch)
             .await
             .map_err(|_| eyre!("fetch timed out"))??;
@@ -461,7 +437,7 @@ mod tests {
         }
     }
 
-    fn state_with(name: &str, path: &Path) -> MeshState {
+    fn state_with(name: &str, path: &std::path::Path) -> MeshState {
         let mut state = MeshState::default();
         state.repos.insert(
             name.to_owned(),

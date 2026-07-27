@@ -45,10 +45,10 @@ pub fn run(args: AddArgs, dir: &ConfigDir) -> Result<()> {
         path: repo.root().to_owned(),
     };
     let response = control::request_blocking(dir, &request, control::MUTATE_WAIT)?;
-    let Response::RepoAdded(id) = response else {
+    let Response::RepoAdded = response else {
         bail!("unexpected response from the daemon: {response:?}");
     };
 
-    println!("Added repo `{name}` ({id}) at {}", repo.root().display());
+    println!("Added repo `{name}` at {}", repo.root().display());
     Ok(())
 }

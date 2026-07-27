@@ -26,7 +26,12 @@ use tokio::{
 };
 use tracing::{debug, info, warn};
 
-use super::{hub::SyncHub, pairing::Pairing, peers::PeerSet, repos::RepoSet};
+use super::{
+    hub::{JoinSource, SyncHub},
+    pairing::Pairing,
+    peers::PeerSet,
+    repos::RepoSet,
+};
 use crate::{
     config::{ConfigDir, MeshState, Peer, Repo, RepoId},
     net::{
@@ -78,14 +83,10 @@ pub enum Request {
     /// Join a pairing hosted by another machine. Answered with
     /// [`Response::Paired`] or [`Response::Error`].
     PairJoin { ticket: String, name: String },
-    /// Pull a mesh repo's full state into a freshly initialized local repo
-    /// at `path` and register it under `name` (see `jj-mesh join`). Answered
-    /// with [`Response::Joined`] or [`Response::Error`].
-    JoinRepo {
-        repo: RepoId,
-        name: String,
-        path: PathBuf,
-    },
+    /// Pull the full state of the mesh repo named `name` into a freshly
+    /// initialized local repo at `path` and register it (see `jj-mesh
+    /// join`). Answered with [`Response::Joined`] or [`Response::Error`].
+    JoinRepo { name: String, path: PathBuf },
     /// Register the repo at `path` under `name`, with a fresh id. Answered
     /// with [`Response::RepoAdded`] or [`Response::Error`].
     AddRepo { name: String, path: PathBuf },
@@ -110,8 +111,8 @@ pub enum Response {
         ops: u64,
         git_objects: u64,
     },
-    /// The repo is registered under this generated id.
-    RepoAdded(RepoId),
+    /// The repo is registered (with a freshly generated internal id).
+    RepoAdded,
     /// The peer is removed from the mesh state.
     PeerRemoved(EndpointId),
     /// The request failed.
@@ -129,6 +130,17 @@ pub struct Status {
     pub peers: Vec<PeerStatus>,
     /// Repos registered on this machine.
     pub repos: Vec<RepoStatus>,
+    /// Repo names contested by peers announcing a different repo.
+    pub conflicts: Vec<ConflictStatus>,
+}
+
+/// A repo name contested by a peer: it announces a different repo (by id)
+/// under a name registered here. Sync with that peer is suspended for the
+/// repo until one side renames or removes it.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ConflictStatus {
+    pub repo: String,
+    pub peer: EndpointId,
 }
 
 /// Live state of one configured peer.
@@ -179,7 +191,6 @@ pub enum Route {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct RepoStatus {
     pub name: String,
-    pub id: RepoId,
     pub path: PathBuf,
     pub watch: WatchStatus,
 }
@@ -218,11 +229,23 @@ pub struct ControlContext {
 impl ControlContext {
     /// Snapshots the daemon state.
     fn status(&self) -> Status {
+        let peers = self.peers.statuses();
+        // Conflicts recorded for a since-unpaired peer are dropped: they
+        // can no longer be acted on, and the endpoint is not ours to show.
+        let conflicts = self
+            .hub
+            .conflicts()
+            .into_iter()
+            .filter(|(_, peer)| peers.iter().any(|status| &status.endpoint == peer))
+            .map(|(repo, peer)| ConflictStatus { repo, peer })
+            .collect();
+
         Status {
             endpoint: self.endpoint.secret_key().public(),
             uptime_secs: self.started.elapsed().as_secs(),
-            peers: self.peers.statuses(),
+            peers,
             repos: self.repos.statuses(),
+            conflicts,
         }
     }
 
@@ -344,9 +367,7 @@ async fn handle_client(mut stream: UnixStream, ctx: Arc<ControlContext>) {
         Request::Status => respond(&mut stream, &Response::Status(ctx.status())).await,
         Request::PairHost { name } => pair_host(&mut stream, &ctx, &name).await,
         Request::PairJoin { ticket, name } => pair_join(&mut stream, &ctx, &ticket, &name).await,
-        Request::JoinRepo { repo, name, path } => {
-            join_repo(&mut stream, &ctx, repo, &name, &path).await
-        }
+        Request::JoinRepo { name, path } => join_repo(&mut stream, &ctx, &name, &path).await,
         Request::AddRepo { name, path } => add_repo(&mut stream, &ctx, name, path).await,
         Request::RemovePeer { name } => remove_peer(&mut stream, &ctx, &name).await,
     };
@@ -460,30 +481,32 @@ async fn pair_join(
     respond(&mut write_half, &response).await
 }
 
-/// Pulls a mesh repo's full state into the freshly initialized repo at
-/// `path`, from a connected peer that announced the repo, then registers it
-/// under `name`. The pull runs on an ad-hoc repo handle in this connection's
-/// task, as the repo set only manages it once registered.
+/// Pulls the mesh repo named `name` into the freshly initialized repo at
+/// `path`, from a connected peer that announced it, then registers it. The
+/// repo's mesh id is adopted from the announcements. The pull runs on an
+/// ad-hoc repo handle in this connection's task, as the repo set only
+/// manages it once registered.
 async fn join_repo(
     stream: &mut UnixStream,
     ctx: &ControlContext,
-    repo_id: RepoId,
     name: &str,
     path: &std::path::Path,
 ) -> Result<()> {
     let joined = async {
+        let (repo_id, sources) = ctx.hub.join_sources(name)?;
+
         // Fail before the (long) pull when the registration cannot succeed.
         // Only the re-validation inside `update_state` below is
         // authoritative: the lock is released during the pull.
         {
             let state = ctx.state.lock().unwrap();
-            if let Some(existing) = state.repo_name(&repo_id) {
-                bail!("repo {repo_id} is already registered here as `{existing}`");
-            }
             state.validate_new_repo(name, path)?;
+            if let Some(existing) = state.repo_name(&repo_id) {
+                bail!("`{name}` is the repo already registered here as `{existing}`");
+            }
         }
 
-        let outcome = join_pull(ctx, &repo_id, path).await?;
+        let outcome = join_pull(ctx, name, &repo_id, sources, path).await?;
 
         ctx.update_state(|state| {
             state.add_repo(
@@ -507,18 +530,12 @@ async fn join_repo(
 
 async fn join_pull(
     ctx: &ControlContext,
+    name: &str,
     repo_id: &RepoId,
+    sources: Vec<JoinSource>,
     path: &std::path::Path,
 ) -> Result<(u64, u64)> {
     use jj_lib::op_store::OperationId;
-
-    let sources = ctx.hub.announced_by(repo_id);
-    if sources.is_empty() {
-        bail!(
-            "no connected peer announces repo {repo_id}; check that the \
-             other machine's daemon is running and the id is correct"
-        );
-    }
 
     let repo_path = path.to_owned();
     let repo = tokio::task::spawn_blocking(move || -> Result<_> {
@@ -539,7 +556,8 @@ async fn join_pull(
 
         let pull = async {
             let (mut send, mut recv) = conn.open_bi().await?;
-            let outcome = transfer::fetch(&repo, repo_id, &wants, &mut send, &mut recv).await?;
+            let outcome =
+                transfer::fetch(&repo, name, repo_id, &wants, &mut send, &mut recv).await?;
             let _ = send.finish();
             Ok::<_, color_eyre::Report>(outcome)
         };
@@ -572,19 +590,17 @@ async fn add_repo(
     path: PathBuf,
 ) -> Result<()> {
     let result = ctx.update_state(|state| {
-        let id = RepoId::generate();
         state.add_repo(
             name.clone(),
             Repo {
-                id: id.clone(),
+                id: RepoId::generate(),
                 path,
             },
-        )?;
-        Ok(id)
+        )
     });
 
     let response = match result {
-        Ok(id) => Response::RepoAdded(id),
+        Ok(()) => Response::RepoAdded,
         Err(err) => Response::Error(format!("{err:#}")),
     };
     respond(stream, &response).await

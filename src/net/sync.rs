@@ -14,17 +14,23 @@ use super::wire::{read_message, write_message};
 use crate::config::RepoId;
 
 /// ALPN of the sync protocol.
-pub const ALPN: &[u8] = b"jj-mesh/sync/0";
+pub const ALPN: &[u8] = b"jj-mesh/sync/1";
 
 /// Cap on announce messages; a legitimate one carries a handful of head
 /// ids, and the peer, while authenticated, is not trusted with our memory.
 const MAX_ANNOUNCE_SIZE: u32 = 64 * 1024;
 
 /// Advertises the current op heads of one repo.
+///
+/// Repos are identified mesh-wide by their name; the id rides along so a
+/// receiver can detect two different repos contesting one name (see
+/// [`crate::daemon::hub`]) instead of silently merging them.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Announce {
-    /// Mesh-wide id of the repo.
-    pub repo: RepoId,
+    /// Mesh-wide name of the repo.
+    pub name: String,
+    /// The sender's id for the repo, for conflict detection.
+    pub id: RepoId,
     /// Publish sequence for this repo, monotonically increasing within the
     /// sender's daemon run. Streams have no cross-stream ordering, so the
     /// receiver uses it to discard reordered announcements; it forgets the
@@ -86,7 +92,12 @@ pub const MAX_GIT_HAVES: usize = 4096;
 /// what the server sends back.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct FetchRequest {
-    pub repo: RepoId,
+    /// Mesh-wide name of the repo.
+    pub name: String,
+    /// The fetcher's id for the repo; the server refuses a mismatch, the
+    /// backstop against transferring data between unrelated repos that
+    /// contest one name.
+    pub id: RepoId,
     pub wants: Vec<Vec<u8>>,
     pub haves: Vec<Vec<u8>>,
 }

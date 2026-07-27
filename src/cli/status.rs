@@ -53,11 +53,29 @@ fn print_live(status: &control::Status) {
         let width = name_width(status.repos.iter().map(|r| r.name.as_str()));
         for repo in &status.repos {
             println!(
-                "  {:width$}  {}  ({})  id={}",
+                "  {:width$}  {}  ({})",
                 repo.name,
                 watch_summary(&repo.watch),
                 repo.path.display(),
-                repo.id,
+            );
+        }
+    }
+
+    if !status.conflicts.is_empty() {
+        println!();
+        println!("name conflicts:");
+        for conflict in &status.conflicts {
+            // Peers are keyed by endpoint in the conflict; show their
+            // human name when we have it.
+            let peer = status
+                .peers
+                .iter()
+                .find(|peer| peer.endpoint == conflict.peer)
+                .map_or_else(|| conflict.peer.to_string(), |peer| peer.name.clone());
+            println!(
+                "  `{}`: peer {peer} last announced a different repo under \
+                 this name; it is not synced with that peer",
+                conflict.repo,
             );
         }
     }

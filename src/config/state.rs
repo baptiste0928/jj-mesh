@@ -26,7 +26,9 @@ use super::ConfigDir;
 const MAX_NAME_LEN: usize = 64;
 
 /// Checks that a peer or repo name is usable; `kind` names it in errors.
-fn validate_name(kind: &str, name: &str) -> Result<()> {
+/// Also applied to names arriving from remote machines (announcements),
+/// which must never carry unbounded length or confusable characters.
+pub(crate) fn validate_name(kind: &str, name: &str) -> Result<()> {
     ensure!(!name.is_empty(), "{kind} name cannot be empty");
     ensure!(
         name.len() <= MAX_NAME_LEN,
