@@ -69,6 +69,12 @@ const MAX_ANNOUNCED_HEADS: usize = 64;
 /// publication pause while a fetch runs).
 const FETCH_TIMEOUT: Duration = Duration::from_mins(30);
 
+/// Delay before retrying a fetch that failed. The announcement was already
+/// consumed, so without this a transient failure (a peer momentarily busy,
+/// a dropped stream) would strand the change until the peer next announces
+/// or reconnects. Kept coarse: the failures it covers are not urgent.
+const FETCH_RETRY: Duration = Duration::from_secs(30);
+
 /// The set of managed repos, synced from the mesh state and keyed by their
 /// mesh-wide name.
 #[derive(Debug)]
@@ -283,6 +289,12 @@ impl RepoTask {
             last_sync,
         });
 
+        // When set, the time to wake and retry fetches that failed and were
+        // requeued into the inbox. Requeued heads are re-drained on any
+        // wake, so this is only a fallback that fires when nothing else
+        // would wake the task first.
+        let mut retry_at: Option<Instant> = None;
+
         loop {
             tokio::select! {
                 changed = watch.changed_or_idle(LIVENESS_INTERVAL) => {
@@ -293,17 +305,28 @@ impl RepoTask {
                     }
                 }
                 () = self.announcements.changed() => {}
+                () = sleep_until(retry_at) => {}
             }
 
             // Announcements are handled before the head re-read below:
             // fetching updates the heads, so the re-read then picks the
             // change up in this same iteration and the baseline update
             // suppresses the watcher events our own writes caused.
+            let mut retry = false;
             for announce in self.announcements.drain() {
-                if self.handle_announce(&repo, &announce).await? == Some(true) {
-                    last_sync = Some(Instant::now());
+                match self.handle_announce(&repo, &announce).await? {
+                    Handled::Fetched => last_sync = Some(Instant::now()),
+                    Handled::Failed => {
+                        // Put the heads back so this task retries them; a
+                        // newer announcement or a reconnect supersedes them.
+                        self.announcements
+                            .requeue(announce.peer, announce.seq, announce.heads);
+                        retry = true;
+                    }
+                    Handled::Idle => {}
                 }
             }
+            retry_at = retry.then(|| Instant::now() + FETCH_RETRY);
 
             // Heads are re-read and the inbox drained on every wake: both
             // are cheap, wakes are debounced or rare, and the select above
@@ -324,20 +347,19 @@ impl RepoTask {
         }
     }
 
-    /// Handles a peer's head announcement: fetches announced heads that
-    /// are missing locally. Returns whether anything was fetched (`None`
-    /// for malformed announcements).
+    /// Handles a peer's head announcement: fetches announced heads that are
+    /// missing locally.
     async fn handle_announce(
         &self,
         repo: &Arc<MeshRepo>,
         announce: &PeerAnnounce,
-    ) -> Result<Option<bool>> {
+    ) -> Result<Handled> {
         let id_len = repo.root_operation_id().as_bytes().len();
         if announce.heads.len() > MAX_ANNOUNCED_HEADS
             || announce.heads.iter().any(|head| head.len() != id_len)
         {
             debug!(repo = %self.name, peer = %announce.peer, "ignoring malformed announcement");
-            return Ok(None);
+            return Ok(Handled::Idle);
         }
 
         let mut missing = Vec::new();
@@ -349,11 +371,11 @@ impl RepoTask {
         }
         if missing.is_empty() {
             debug!(repo = %self.name, peer = %announce.peer, "in sync with peer");
-            return Ok(Some(false));
+            return Ok(Handled::Idle);
         }
 
-        // Sync failures must not kill the watch: the repo is fine, the
-        // peer or network is not. The next announcement retries.
+        // Sync failures must not kill the watch: the repo is fine, the peer
+        // or network is not. The caller requeues for a later retry.
         match self.fetch_missing(repo, announce.peer, &missing).await {
             Ok(outcome) => {
                 info!(
@@ -361,11 +383,11 @@ impl RepoTask {
                     ops = outcome.ops, objects = outcome.git_objects,
                     "synced from peer",
                 );
-                Ok(Some(true))
+                Ok(Handled::Fetched)
             }
             Err(err) => {
                 warn!(repo = %self.name, peer = %announce.peer, "sync failed: {err:#}");
-                Ok(Some(false))
+                Ok(Handled::Failed)
             }
         }
     }
@@ -393,6 +415,25 @@ impl RepoTask {
 
     fn set_state(&self, state: RepoState) {
         *self.state.lock().unwrap() = state;
+    }
+}
+
+/// Outcome of handling one peer announcement.
+enum Handled {
+    /// New operations were fetched and applied.
+    Fetched,
+    /// Nothing to do: already in sync, or the announcement was malformed.
+    Idle,
+    /// A fetch was attempted but failed; the heads are worth retrying.
+    Failed,
+}
+
+/// Sleeps until `deadline`, or never when it is `None`, so an optional
+/// retry deadline can sit in a `select!` uniformly.
+async fn sleep_until(deadline: Option<Instant>) {
+    match deadline {
+        Some(at) => tokio::time::sleep_until(at.into()).await,
+        None => std::future::pending().await,
     }
 }
 

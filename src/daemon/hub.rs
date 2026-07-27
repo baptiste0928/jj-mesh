@@ -54,6 +54,11 @@ const ANNOUNCE_TIMEOUT: Duration = Duration::from_secs(10);
 #[derive(Debug)]
 pub struct PeerAnnounce {
     pub peer: EndpointId,
+    /// Sequence it was drained at, so a failed fetch can [requeue] the
+    /// heads without clobbering a newer announcement.
+    ///
+    /// [requeue]: Inbox::requeue
+    pub seq: u64,
     pub heads: Vec<Vec<u8>>,
 }
 
@@ -551,11 +556,29 @@ impl Inbox {
         slots
             .iter_mut()
             .filter_map(|(peer, slot)| {
-                slot.heads
-                    .take()
-                    .map(|heads| PeerAnnounce { peer: *peer, heads })
+                slot.heads.take().map(|heads| PeerAnnounce {
+                    peer: *peer,
+                    seq: slot.seq,
+                    heads,
+                })
             })
             .collect()
+    }
+
+    /// Restores heads a fetch failed to apply, so the next drain retries
+    /// them. A newer announcement arriving meanwhile supersedes them (it
+    /// bumps the slot past `seq`), and a fresh connection drops the slot
+    /// entirely, so the retry never resurrects stale or revoked state. Does
+    /// not notify: the retry is driven by the repo task's own timer, which
+    /// avoids hot-looping against a peer that keeps failing.
+    pub fn requeue(&self, peer: EndpointId, seq: u64, heads: Vec<Vec<u8>>) {
+        let mut slots = self.slots.lock().unwrap();
+        if let Some(slot) = slots.get_mut(&peer)
+            && slot.seq == seq
+            && slot.heads.is_none()
+        {
+            slot.heads = Some(heads);
+        }
     }
 }
 
@@ -666,6 +689,31 @@ mod tests {
         // rejected even when it arrives afterwards.
         hub.route(peer, announce("a", &id, 1, vec![vec![1; 64]]));
         assert!(inbox.drain().is_empty());
+    }
+
+    #[tokio::test]
+    async fn requeue_retries_failed_heads_until_superseded() {
+        let hub = SyncHub::new();
+        let id = RepoId::generate();
+        let inbox = hub.register_repo("a".to_owned(), id.clone());
+        let peer = iroh::SecretKey::generate().public();
+
+        hub.route(peer, announce("a", &id, 1, vec![vec![1; 64]]));
+        let drained = inbox.drain();
+        assert_eq!(drained.len(), 1);
+
+        // A failed fetch requeues the drained heads; the next drain retries.
+        inbox.requeue(peer, drained[0].seq, drained[0].heads.clone());
+        let retried = inbox.drain();
+        assert_eq!(retried.len(), 1);
+        assert_eq!(retried[0].heads, vec![vec![1; 64]]);
+
+        // A newer announcement supersedes a stale requeue.
+        hub.route(peer, announce("a", &id, 2, vec![vec![2; 64]]));
+        inbox.requeue(peer, 1, vec![vec![1; 64]]);
+        let latest = inbox.drain();
+        assert_eq!(latest.len(), 1);
+        assert_eq!(latest[0].heads, vec![vec![2; 64]]);
     }
 
     #[tokio::test]
