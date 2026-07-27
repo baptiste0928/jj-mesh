@@ -130,6 +130,25 @@ pub fn parse_view(bytes: &[u8]) -> Result<ViewMeta> {
         ids.add_target(git_ref.target.as_ref())
             .wrap_err_with(|| format!("git ref {}", git_ref.name))?;
     }
+    // Reading an unmigrated view (one an honest jj never writes, since it
+    // always marks views migrated) runs jj's pre-0.34 Git-tracking tag
+    // migration, which asserts the "git" remote holds no tags yet before
+    // moving `refs/tags/*` there. A peer could otherwise craft a view that
+    // panics jj's reader once stored.
+    if !view.has_git_refs_migrated_to_remote_tags {
+        let has_tag_refs = view
+            .git_refs
+            .iter()
+            .any(|git_ref| matches!(git_ref.name.strip_prefix("refs/tags/"), Some(name) if !name.is_empty()));
+        let git_remote_has_tags = view
+            .remote_views
+            .iter()
+            .any(|remote| remote.name == "git" && !remote.tags.is_empty());
+        ensure!(
+            !(has_tag_refs && git_remote_has_tags),
+            "unmigrated view collides with jj's Git-tracking tag migration",
+        );
+    }
     ids.add(&view.git_head_legacy);
     ids.add_target(view.git_head.as_ref())
         .wrap_err("git head")?;
@@ -412,5 +431,38 @@ mod tests {
         };
         let err = parse_view(&view.encode_to_vec()).unwrap_err();
         assert!(format!("{err:#}").contains("refs/tags/"), "{err:#}");
+
+        // An unmigrated view with both a `refs/tags/*` git ref and tags
+        // already in the "git" remote (jj's migration asserts the remote is
+        // empty before moving the ref there).
+        let view = proto::View {
+            has_git_refs_migrated_to_remote_tags: false,
+            git_refs: vec![proto::GitRef {
+                name: "refs/tags/v1".to_owned(),
+                target: Some(proto::RefTarget {
+                    value: Some(proto::ref_target::Value::Conflict(proto::RefConflict {
+                        removes: vec![],
+                        adds: vec![proto::ref_conflict::Term {
+                            value: Some(vec![1; 20]),
+                        }],
+                    })),
+                }),
+                ..Default::default()
+            }],
+            remote_views: vec![proto::RemoteView {
+                name: "git".to_owned(),
+                bookmarks: vec![],
+                tags: vec![proto::RemoteRef {
+                    name: "v1".to_owned(),
+                    target_terms: vec![proto::RefTargetTerm {
+                        value: Some(vec![1; 20]),
+                    }],
+                    state: 1,
+                }],
+            }],
+            ..Default::default()
+        };
+        let err = parse_view(&view.encode_to_vec()).unwrap_err();
+        assert!(format!("{err:#}").contains("migration"), "{err:#}");
     }
 }
