@@ -120,8 +120,7 @@ impl JjRepo {
         // pointing to the main workspace's repo directory.
         ensure!(
             self.repo_dir().is_dir(),
-            "{} is a secondary workspace sharing another repo's storage; \
-             add the main workspace instead",
+            "{} is a secondary workspace, add the main workspace instead",
             self.root.display(),
         );
 
@@ -181,14 +180,9 @@ pub fn jj_version_warning(version: Option<&str>) -> Option<String> {
     match version {
         Some(version) if jj_version_supported(version) => None,
         Some(version) => Some(format!(
-            "jj {version} found on PATH; jj-mesh supports the jj \
-             {SUPPORTED_JJ_SERIES} series, syncing repos written by another \
-             series may misbehave"
+            "unsupported jj {version} found on PATH (supported: {SUPPORTED_JJ_SERIES})"
         )),
-        None => Some(format!(
-            "cannot determine the local jj version (is jj on PATH?); \
-             jj-mesh supports the jj {SUPPORTED_JJ_SERIES} series"
-        )),
+        None => Some("jj not found in PATH".to_owned()),
     }
 }
 

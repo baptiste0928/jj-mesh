@@ -13,6 +13,7 @@ use service_manager::{
     ServiceStatus, ServiceStatusCtx, ServiceStopCtx, ServiceUninstallCtx,
 };
 
+use super::ui;
 use crate::config::ConfigDir;
 
 /// Seconds before the service is restarted after a failure.
@@ -81,14 +82,14 @@ pub fn run(args: ServiceArgs, dir: &ConfigDir) -> Result<()> {
             manager
                 .start(ServiceStartCtx { label })
                 .wrap_err("cannot start the service")?;
-            println!("jj-mesh daemon service started");
+            println!("{}", ui::good("jj-mesh daemon service started"));
             Ok(())
         }
         ServiceCommand::Stop => {
             manager
                 .stop(ServiceStopCtx { label })
                 .wrap_err("cannot stop the service")?;
-            println!("jj-mesh daemon service stopped");
+            println!("{}", ui::good("jj-mesh daemon service stopped"));
             Ok(())
         }
         ServiceCommand::Restart => restart(&*manager, &label),
@@ -126,7 +127,7 @@ fn restart(manager: &dyn ServiceManager, label: &ServiceLabel) -> Result<()> {
         "the service started but died (status: {status:?}); check its logs",
     );
 
-    println!("jj-mesh daemon service restarted");
+    println!("{}", ui::good("jj-mesh daemon service restarted"));
     Ok(())
 }
 
@@ -187,12 +188,6 @@ fn install(
     }
     args.push(OsString::from("run-daemon"));
 
-    let command = std::iter::once(program.as_os_str())
-        .chain(args.iter().map(OsString::as_os_str))
-        .map(|part| part.to_string_lossy().into_owned())
-        .collect::<Vec<_>>()
-        .join(" ");
-
     manager
         .install(ServiceInstallCtx {
             label: label.clone(),
@@ -221,21 +216,12 @@ fn install(
         .status();
 
     println!("Created {}", service_file(&label)?.display());
-    println!("  command: {command}");
 
     manager
         .start(ServiceStartCtx { label })
         .wrap_err("installed the service, but cannot start it")?;
 
-    println!("Enabled and started the service");
-    #[cfg(target_os = "linux")]
-    {
-        println!("View its logs with: journalctl --user -u jj-mesh");
-        println!(
-            "Note: on machines without a graphical session, run `loginctl enable-linger` once \
-             so the service also runs while logged out"
-        );
-    }
+    println!("{}", ui::good("Service enabled and started"));
 
     Ok(())
 }
@@ -249,8 +235,8 @@ fn uninstall(manager: &dyn ServiceManager, label: ServiceLabel) -> Result<()> {
         .uninstall(ServiceUninstallCtx { label })
         .wrap_err("cannot uninstall the service")?;
 
-    println!("Stopped the service");
-    println!("Removed {}", file.display());
+    println!("{}", ui::good("Stopped the service"));
+    println!("{}", ui::good(format_args!("Removed {}", file.display())));
     Ok(())
 }
 
@@ -296,6 +282,6 @@ fn service_file(label: &ServiceLabel) -> Result<PathBuf> {
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         let _ = label;
-        color_eyre::eyre::bail!("unsupported platform for user services");
+        bail!("unsupported platform for user services");
     }
 }

@@ -5,14 +5,19 @@
 //! repo's full state from a peer and register it, and lets jj merge the
 //! fresh workspace into the replicated history.
 
-use std::{path::PathBuf, process::Command};
+use std::{
+    path::{Path, PathBuf},
+    process::Command,
+    time::Duration,
+};
 
 use clap::{Args, ValueHint};
 use clap_complete::ArgValueCandidates;
 use color_eyre::eyre::{Result, WrapErr as _, bail, ensure};
+use indicatif::{HumanBytes, ProgressBar, ProgressStyle};
 
 use crate::{
-    cli::complete,
+    cli::{complete, ui},
     config::{ConfigDir, MeshState},
     daemon::control::{self, CloneProgress, Request, Response},
 };
@@ -32,7 +37,7 @@ pub struct CloneArgs {
 
     /// Directory to create the repo in (defaults to the repo name)
     ///
-    /// The target directly must not exist before the clone. There is currently
+    /// The target directory must not exist before the clone. There is currently
     /// no way of adding a previous clone back into the mesh.
     #[arg(value_hint = ValueHint::DirPath)]
     path: Option<PathBuf>,
@@ -51,13 +56,16 @@ pub fn run(args: CloneArgs, dir: &ConfigDir) -> Result<()> {
     let name = args.name;
     let path = args.path.unwrap_or_else(|| PathBuf::from(&name));
 
-    // Best-effort pre-check against the stored state, so an obviously
-    // doomed clone fails before anything is created on disk; the daemon
-    // re-validates authoritatively before registering.
+    // Best-effort pre-checks, so an obviously doomed clone fails before
+    // anything is created on disk: the daemon must be up (it is only
+    // contacted once the local repo exists), and the stored state must
+    // accept the repo (the daemon re-validates authoritatively before
+    // registering).
+    control::ensure_daemon_blocking(dir)?;
     MeshState::load(dir)?.validate_new_repo(&name, &path)?;
     ensure!(
         !path.exists(),
-        "{} already exists; clone creates the directory itself",
+        "{} already exists (clone creates the directory)",
         path.display(),
     );
 
@@ -80,29 +88,24 @@ pub fn run(args: CloneArgs, dir: &ConfigDir) -> Result<()> {
         name: name.clone(),
         path: std::fs::canonicalize(&path)?,
     };
-    // The progress line only makes sense on a terminal: redirected output
-    // would collect thousands of carriage-returned fragments.
-    let tty = std::io::IsTerminal::is_terminal(&std::io::stdout());
-    let mut progressing = false;
+
+    let bar = ProgressBar::new_spinner().with_style(spinner_style());
+    bar.set_message("Contacting peers...");
+    bar.enable_steady_tick(Duration::from_millis(100));
+    let mut counted = false;
     let pulled =
         control::request_streaming_blocking(dir, &request, control::CLONE_IDLE_WAIT, |progress| {
-            if tty {
-                progressing = true;
-                show_progress(&progress);
-            }
+            show_progress(&bar, &progress, &mut counted);
         });
-    // The progress line is overwritten in place; finish it before anything
-    // else (the outcome or an error report) prints.
-    if progressing {
-        println!();
-    }
+
+    bar.finish_and_clear();
     let response = pulled.wrap_err_with(|| {
         format!(
-            "the repo directory {} was created but not registered; remove it before retrying",
+            "the repo directory {} was created but not registered, remove it before retrying",
             path.display(),
         )
     })?;
-    let Response::Cloned { ops, git_objects } = response else {
+    let Response::Cloned { .. } = response else {
         bail!("unexpected response from the daemon: {response:?}");
     };
 
@@ -117,67 +120,80 @@ pub fn run(args: CloneArgs, dir: &ConfigDir) -> Result<()> {
         return Err(err);
     }
 
-    println!("Cloned `{name}`: {ops} operations, {git_objects} git objects");
+    println!(
+        "{}",
+        ui::good(format_args!("Cloned `{name}` in {}", path.display())),
+    );
     Ok(())
 }
 
-/// Renders a progress frame in place on the current line.
-fn show_progress(progress: &CloneProgress) {
-    use std::io::Write as _;
+/// Template while a phase has no known end: a spinner and a message.
+fn spinner_style() -> ProgressStyle {
+    ProgressStyle::with_template("{spinner:.cyan} {msg}").expect("static template")
+}
 
+/// Template once a phase's total is known: `prefix` names the phase and
+/// source peer, `msg` carries the unit (and byte count for git objects).
+fn counted_style() -> ProgressStyle {
+    ProgressStyle::with_template("{spinner:.cyan} {prefix} {bar:24.cyan/blue} {pos}/{len} {msg}")
+        .expect("static template")
+}
+
+/// Applies a progress frame to the bar, switching templates as phases and
+/// totals come and go; `counted` remembers which template is active.
+fn show_progress(bar: &ProgressBar, progress: &CloneProgress, counted: &mut bool) {
     use crate::repo::transfer::TransferPhase;
 
     let CloneProgress { peer, transfer } = progress;
-    let (current, bytes) = (transfer.current, transfer.bytes);
-    let line = if peer.is_empty() {
-        // Seeded state before the daemon picked a source peer.
-        "Contacting peers...".to_owned()
-    } else {
-        match (transfer.phase, transfer.total) {
-            (TransferPhase::Ops, Some(total)) => {
-                format!("Pulling history from `{peer}`: {current}/{total} operations")
-            }
-            (TransferPhase::Ops, None) => {
-                format!("Pulling history from `{peer}`: {current} operations")
-            }
-            (TransferPhase::Git, Some(total)) => format!(
-                "Pulling files from `{peer}`: {current}/{total} objects ({})",
-                human_bytes(bytes),
-            ),
-            (TransferPhase::Git, None) => {
-                format!("Pulling files from `{peer}`: {}", human_bytes(bytes))
-            }
-            (TransferPhase::Apply, _) => "Writing the repo...".to_owned(),
+    let mut spin = |message: String| {
+        if std::mem::take(counted) {
+            bar.set_style(spinner_style());
         }
+        bar.set_message(message);
     };
-    // Clear-to-end covers a new line shorter than the previous one.
-    print!("\r{line}\x1b[K");
-    let _ = std::io::stdout().flush();
-}
 
-/// Formats a byte count for the progress line.
-fn human_bytes(bytes: u64) -> String {
-    const KIB: u64 = 1 << 10;
-    const MIB: u64 = 1 << 20;
-    if bytes < KIB {
-        format!("{bytes} B")
-    } else if bytes < MIB {
-        format!("{} KiB", bytes / KIB)
-    } else {
-        format!("{}.{} MiB", bytes / MIB, (bytes % MIB) * 10 / MIB)
+    if peer.is_empty() {
+        // Seeded state before the daemon picked a source peer.
+        return spin("Contacting peers...".to_owned());
+    }
+    match (transfer.phase, transfer.total) {
+        (TransferPhase::Apply, _) => spin("Writing the repo...".to_owned()),
+        (TransferPhase::Ops, None) => spin(format!(
+            "Pulling history from `{peer}`: {} operations",
+            transfer.current,
+        )),
+        (TransferPhase::Git, None) => spin(format!(
+            "Pulling files from `{peer}`: {}",
+            HumanBytes(transfer.bytes),
+        )),
+        (phase, Some(total)) => {
+            if !std::mem::replace(counted, true) {
+                bar.set_style(counted_style());
+            }
+            bar.set_length(total);
+            bar.set_position(transfer.current);
+            match phase {
+                TransferPhase::Ops => {
+                    bar.set_prefix(format!("Pulling history from `{peer}`"));
+                    bar.set_message("operations");
+                }
+                TransferPhase::Git => {
+                    bar.set_prefix(format!("Pulling files from `{peer}`"));
+                    bar.set_message(format!("objects ({})", HumanBytes(transfer.bytes)));
+                }
+                TransferPhase::Apply => unreachable!("handled above"),
+            }
+        }
     }
 }
 
 /// Runs a jj command, surfacing its stderr on failure.
-fn jj(dir: Option<&PathBuf>, args: &[&str]) -> Result<()> {
+fn jj(dir: Option<&Path>, args: &[&str]) -> Result<()> {
     let mut command = Command::new("jj");
     if let Some(dir) = dir {
         command.current_dir(dir);
     }
-    let out = command
-        .args(args)
-        .output()
-        .wrap_err("cannot run jj (is it installed?)")?;
+    let out = command.args(args).output().wrap_err("cannot run jj")?;
     ensure!(
         out.status.success(),
         "jj {} failed:\n{}",

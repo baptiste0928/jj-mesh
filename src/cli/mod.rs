@@ -6,6 +6,7 @@ mod repo;
 mod run_daemon;
 mod service;
 mod status;
+mod ui;
 
 use std::path::PathBuf;
 
@@ -17,7 +18,7 @@ use crate::config::ConfigDir;
 /// Peer-to-peer synchronization of jj repositories
 ///
 /// `jj-mesh` keeps copies of Jujutsu (https://jj-vcs.dev) repositories in
-/// sync across your machines. It is similar to  `jj workspaces`, but across
+/// sync across your machines. It is similar to `jj workspaces`, but across
 /// computers: each machine has its own working copy, and a background daemon
 /// replicates commits and the jj operation log directly between paired
 /// machines, with no central server.

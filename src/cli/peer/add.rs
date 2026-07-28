@@ -11,8 +11,9 @@ use clap::Args;
 use color_eyre::eyre::{Result, bail};
 
 use crate::{
+    cli::ui,
     config::ConfigDir,
-    daemon::control::{ControlClient, PAIR_TICKET_TTL, Request, Response},
+    daemon::control::{ControlClient, Request, Response},
     net::pair::PairTicket,
 };
 
@@ -31,8 +32,8 @@ const TICKET_TIMEOUT: Duration = Duration::from_secs(45);
 pub struct AddArgs {
     /// Pairing ticket printed by `jj-mesh peer add` on the other machine
     ///
-    /// If omitted, a ticket will be generated. The ticket can be once, and
-    /// expires after 3 minutes.
+    /// If omitted, a ticket will be generated. The ticket can be used once,
+    /// and expires after 3 minutes.
     ticket: Option<String>,
 
     /// Name announced to the other machine (defaults to the hostname)
@@ -54,12 +55,7 @@ pub fn run(args: AddArgs, dir: &ConfigDir) -> Result<()> {
 
 /// Dispatches to the hosting or joining side of the pairing.
 async fn pair(ticket: Option<String>, name: String, dir: &ConfigDir) -> Result<()> {
-    let Some(mut client) = ControlClient::connect(dir).await? else {
-        bail!(
-            "the jj-mesh daemon is not running; start it with `jj-mesh service \
-             start` (or set it up with `jj-mesh service install`)"
-        );
-    };
+    let mut client = ControlClient::connect_required(dir).await?;
 
     match ticket {
         Some(ticket) => join(&mut client, ticket, name).await,
@@ -74,13 +70,16 @@ async fn host(client: &mut ControlClient, name: String) -> Result<()> {
 
     match client.recv(Some(TICKET_TIMEOUT)).await? {
         Response::PairTicket(ticket) => {
-            println!("To pair, run this on the other machine:\n");
-            println!("    jj-mesh peer add {ticket}\n");
+            println!("Run this on the other machine to pair:\n");
             println!(
-                "The ticket is valid for {} minutes, for a single pairing; \
-                 running `jj-mesh peer add` again replaces it. The new peer \
-                 will show up in `jj-mesh status`.",
-                PAIR_TICKET_TTL.as_secs() / 60,
+                "    {}\n",
+                ui::heading(format_args!("jj-mesh peer add {ticket}"))
+            );
+            println!(
+                "{}",
+                ui::dim(
+                    "The paired machine will have access to all repos from the mesh. The ticket is valid for 3 minutes.",
+                ),
             );
             Ok(())
         }
@@ -98,8 +97,8 @@ async fn join(client: &mut ControlClient, ticket: String, name: String) -> Resul
     client.send(&Request::PairJoin { ticket, name }).await?;
 
     match client.recv(None).await? {
-        Response::Paired { name, endpoint } => {
-            println!("Paired with `{name}` ({endpoint})");
+        Response::Paired { name, .. } => {
+            println!("{}", ui::good(format_args!("Paired with `{name}`")));
             Ok(())
         }
         Response::Error(err) => bail!("pairing failed: {err}"),

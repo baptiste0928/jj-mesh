@@ -1,13 +1,13 @@
 //! `jj-mesh repo remove`: retire a repo from the whole mesh.
 
-use std::io::{BufRead as _, IsTerminal as _, Write as _};
+use std::io::{BufRead as _, IsTerminal as _};
 
 use clap::Args;
 use clap_complete::ArgValueCandidates;
 use color_eyre::eyre::{Result, bail};
 
 use crate::{
-    cli::complete,
+    cli::{complete, ui},
     config::ConfigDir,
     daemon::control::{self, Request, Response},
 };
@@ -43,9 +43,12 @@ pub fn run(args: RemoveArgs, dir: &ConfigDir) -> Result<()> {
         bail!("unexpected response from the daemon: {response:?}");
     };
 
-    println!("Removed repo `{name}` from the mesh");
+    println!(
+        "{}",
+        ui::good(format_args!("Removed repo `{name}` from the mesh"))
+    );
     if was_local {
-        println!("It is no longer synchronized here; its files are untouched.");
+        println!("Files on this machine are left untouched.");
     }
     Ok(())
 }
@@ -54,11 +57,10 @@ pub fn run(args: RemoveArgs, dir: &ConfigDir) -> Result<()> {
 /// stderr, so it stays visible when stdout is redirected.
 fn confirm(name: &str) -> Result<bool> {
     if !std::io::stdin().is_terminal() {
-        bail!("refusing to remove `{name}` without a terminal to confirm on; pass --yes");
+        bail!("pass --yes to confirm removal of `{name}`");
     }
 
     eprint!("Remove `{name}` from every machine on the mesh? [y/N] ");
-    std::io::stderr().flush()?;
     let mut answer = String::new();
     std::io::stdin().lock().read_line(&mut answer)?;
 

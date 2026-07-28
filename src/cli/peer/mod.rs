@@ -13,7 +13,6 @@ use crate::config::ConfigDir;
 /// Paired machines have full access to the repositories added to the mesh.
 /// After adding a machine, use `jj-mesh repo` to manage the repositories.
 #[derive(Debug, Args)]
-#[command(arg_required_else_help = true)]
 pub struct PeerArgs {
     #[command(subcommand)]
     command: PeerCommand,

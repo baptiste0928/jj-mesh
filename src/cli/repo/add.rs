@@ -6,6 +6,7 @@ use clap::{Args, ValueHint};
 use color_eyre::eyre::{Result, bail, eyre};
 
 use crate::{
+    cli::ui,
     config::ConfigDir,
     daemon::control::{self, Request, Response},
     repo::JjRepo,
@@ -50,6 +51,12 @@ pub fn run(args: AddArgs, dir: &ConfigDir) -> Result<()> {
         bail!("unexpected response from the daemon: {response:?}");
     };
 
-    println!("Added repo `{name}` at {}", repo.root().display());
+    println!(
+        "{}",
+        ui::good(format_args!(
+            "Added repo `{name}` at {}",
+            repo.root().display()
+        ))
+    );
     Ok(())
 }

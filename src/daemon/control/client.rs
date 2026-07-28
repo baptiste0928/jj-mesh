@@ -4,7 +4,7 @@
 
 use std::{io, time::Duration};
 
-use color_eyre::eyre::{Result, WrapErr as _, bail, eyre};
+use color_eyre::eyre::{Report, Result, WrapErr as _, bail, eyre};
 use tokio::net::UnixStream;
 
 use super::protocol::{CLIENT_TIMEOUT, CloneProgress, MAX_MESSAGE_SIZE, Request, Response, Status};
@@ -12,6 +12,25 @@ use crate::{
     config::ConfigDir,
     net::wire::{read_message, write_message},
 };
+
+/// Error of every command that needs the daemon when none is running.
+///
+/// The CLI entry point recognizes this type and reports it as a plain
+/// message rather than an error report: not having started the daemon yet
+/// is an expected situation, not a failure to debug.
+#[derive(Debug)]
+pub struct DaemonNotRunning;
+
+impl std::fmt::Display for DaemonNotRunning {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "The jj-mesh daemon is not running. Install it with `jj-mesh service install`."
+        )
+    }
+}
+
+impl std::error::Error for DaemonNotRunning {}
 
 /// Client side of the control socket.
 #[derive(Debug)]
@@ -39,6 +58,15 @@ impl ControlClient {
         }
     }
 
+    /// Connects to the daemon serving this configuration; errors with
+    /// [`DaemonNotRunning`] when none is. Every command that needs the
+    /// daemon connects through here, so they all fail the same way.
+    pub async fn connect_required(dir: &ConfigDir) -> Result<Self> {
+        Self::connect(dir)
+            .await?
+            .ok_or_else(|| Report::new(DaemonNotRunning))
+    }
+
     /// Sends a request.
     pub async fn send(&mut self, request: &Request) -> Result<()> {
         write_message(&mut self.stream, request, MAX_MESSAGE_SIZE).await
@@ -58,27 +86,36 @@ impl ControlClient {
 
 /// Queries the status of the daemon serving this configuration.
 ///
-/// Returns `None` when no daemon is running; errors when a daemon is
-/// listening but does not answer properly.
-pub async fn query_status(dir: &ConfigDir) -> Result<Option<Status>> {
-    let Some(mut client) = ControlClient::connect(dir).await? else {
-        return Ok(None);
-    };
+/// Errors when no daemon is running, or when one is listening but does not
+/// answer properly.
+pub async fn query_status(dir: &ConfigDir) -> Result<Status> {
+    let mut client = ControlClient::connect_required(dir).await?;
 
     client.send(&Request::Status).await?;
     match client.recv(Some(CLIENT_TIMEOUT)).await? {
-        Response::Status(status) => Ok(Some(status)),
+        Response::Status(status) => Ok(status),
         other => bail!("unexpected response from the daemon: {other:?}"),
     }
 }
 
 /// Blocking convenience over [`query_status`] for CLI commands that have no
 /// tokio runtime of their own.
-pub fn query_status_blocking(dir: &ConfigDir) -> Result<Option<Status>> {
+pub fn query_status_blocking(dir: &ConfigDir) -> Result<Status> {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?
         .block_on(query_status(dir))
+}
+
+/// Checks that a daemon is running, erroring with [`DaemonNotRunning`]
+/// otherwise: for commands that want to fail fast before doing local work
+/// they would otherwise have to undo.
+pub fn ensure_daemon_blocking(dir: &ConfigDir) -> Result<()> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?
+        .block_on(ControlClient::connect_required(dir))
+        .map(drop)
 }
 
 /// Sends one request and returns the daemon's answer, for CLI commands with
@@ -103,12 +140,7 @@ pub fn request_streaming_blocking(
         .enable_all()
         .build()?
         .block_on(async {
-            let Some(mut client) = ControlClient::connect(dir).await? else {
-                bail!(
-                    "the jj-mesh daemon is not running; start it with `jj-mesh \
-                     service start` (or set it up with `jj-mesh service install`)"
-                );
-            };
+            let mut client = ControlClient::connect_required(dir).await?;
 
             client.send(request).await?;
             loop {

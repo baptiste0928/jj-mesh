@@ -5,7 +5,7 @@ use clap_complete::ArgValueCandidates;
 use color_eyre::eyre::{Result, bail};
 
 use crate::{
-    cli::complete,
+    cli::{complete, ui},
     config::ConfigDir,
     daemon::control::{self, Request, Response},
 };
@@ -25,10 +25,10 @@ pub fn run(args: RemoveArgs, dir: &ConfigDir) -> Result<()> {
     let RemoveArgs { peer } = args;
     let request = Request::RemovePeer { peer: peer.clone() };
     let response = control::request_blocking(dir, &request, control::MUTATE_WAIT)?;
-    let Response::PeerRemoved(endpoint) = response else {
+    let Response::PeerRemoved(_) = response else {
         bail!("unexpected response from the daemon: {response:?}");
     };
 
-    println!("Removed peer `{peer}` ({endpoint})");
+    println!("{}", ui::good(format_args!("Removed peer `{peer}`")));
     Ok(())
 }

@@ -3,42 +3,35 @@
 use clap::Args;
 use color_eyre::eyre::Result;
 
+use super::ui::{self, display_path, format_duration, name_width, sanitize};
 use crate::{
-    config::{ConfigDir, MachineKey, MeshState},
+    config::ConfigDir,
     daemon::control::{self, ConnectionStatus, PeerReport, Route},
     net::sync::RepoHealthState,
 };
 
-/// Show the the daemon state and the live mesh status
+/// Show the daemon state and the live mesh status
 #[derive(Debug, Args)]
 pub struct StatusArgs {}
 
 /// Runs the `status` command.
 pub fn run(_args: StatusArgs, dir: &ConfigDir) -> Result<()> {
-    match control::query_status_blocking(dir)? {
-        Some(status) => print_live(&status),
-        None => print_static(dir)?,
-    }
+    let status = control::query_status_blocking(dir)?;
 
-    Ok(())
-}
-
-/// Prints the live status reported by the daemon.
-fn print_live(status: &control::Status) {
     println!(
-        "daemon: running (uptime {})",
+        "daemon: {} (uptime {})",
+        ui::good("running"),
         format_duration(status.uptime_secs)
     );
-    println!("local endpoint id: {}", status.endpoint);
     if let Some(warning) = crate::repo::jj_version_warning(status.jj_version.as_deref()) {
-        println!("warning: {warning}");
+        println!("{} {warning}", ui::warn("warning:"));
     }
 
     println!();
     if status.peers.is_empty() {
         println!("no paired peers");
     } else {
-        println!("peers:");
+        println!("{}", ui::heading("peers:"));
         let width = name_width(status.peers.iter().map(|p| p.name.as_str()));
         for peer in &status.peers {
             println!(
@@ -53,82 +46,74 @@ fn print_live(status: &control::Status) {
     if status.repos.is_empty() {
         println!("no repos added");
     } else {
-        println!("repos:");
+        println!("{}", ui::heading("repos:"));
         let width = name_width(status.repos.iter().map(|r| r.name.as_str()));
-        for repo in &status.repos {
+        let paths: Vec<String> = status.repos.iter().map(|r| display_path(&r.path)).collect();
+        let path_width = name_width(paths.iter().map(String::as_str));
+        for (repo, path) in status.repos.iter().zip(&paths) {
             println!(
-                "  {:width$}  {}  ({})",
+                "  {:width$}  {}  {}",
                 repo.name,
+                ui::dim(format_args!("{path:path_width$}")),
                 watch_summary(&repo.watch),
-                repo.path.display(),
             );
         }
     }
-
     if !status.available.is_empty() {
         println!();
-        println!("available mesh repos (clone with `jj-mesh repo clone <name>`):");
-        for name in &status.available {
-            println!("  {name}");
-        }
+        println!(
+            "  {}",
+            ui::dim(format_args!("(available: {})", status.available.join(", ")))
+        );
     }
 
-    if !status.conflicts.is_empty() {
+    let issues = collect_issues(&status);
+    if !issues.is_empty() {
         println!();
-        println!("name conflicts:");
-        for conflict in &status.conflicts {
-            println!(
-                "  `{}`: peer {} last announced a different repo under \
-                 this name; it is not synced with that peer",
-                conflict.repo, conflict.peer,
-            );
+        println!("{}", ui::warn("issues:").bold());
+        for issue in &issues {
+            println!("  {issue}");
         }
     }
 
-    if !status.paused.is_empty() {
-        println!();
-        println!("paused repos:");
-        for paused in &status.paused {
-            println!(
-                "  `{}`: this machine and {} both have a colocated instance; \
-                 fetching is paused until only one remains (see `jj-mesh repo \
-                 clone --help`)",
-                paused.repo,
-                paused.peers.join(", "),
-            );
-        }
-    }
-
-    print_peer_reports(status);
+    Ok(())
 }
 
-/// Prints each connected peer's self-reported health, if any.
-fn print_peer_reports(status: &control::Status) {
-    if status.peer_reports.is_empty() {
-        return;
+/// Gathers everything that needs the user's attention into one list:
+/// local name conflicts and pauses, plus the problems connected peers
+/// report about their own instances. Healthy peer reports stay silent.
+fn collect_issues(status: &control::Status) -> Vec<String> {
+    let mut issues = Vec::new();
+
+    for conflict in &status.conflicts {
+        issues.push(format!(
+            "`{}`: peer {} announced a different repo under the same name",
+            conflict.repo, conflict.peer,
+        ));
     }
-    println!();
-    println!("peer health:");
+    for paused in &status.paused {
+        issues.push(format!(
+            "`{}`: this machine and {} both have a colocated instance",
+            paused.repo,
+            paused.peers.join(", "),
+        ));
+    }
     for PeerReport { peer, report } in &status.peer_reports {
-        let jj = match &report.jj_version {
-            Some(jj) => sanitize(jj),
-            None => "not found".to_owned(),
-        };
-        println!(
-            "  {peer} (jj-mesh {}, jj {jj})",
-            sanitize(&report.daemon_version),
-        );
-        let width = name_width(report.repos.iter().map(|r| r.name.as_str()));
+        if report.jj_version.is_none() {
+            issues.push(format!("{peer}: jj not found on that machine"));
+        }
         for repo in &report.repos {
-            let health = match repo.state {
-                RepoHealthState::Ok => "ok",
-                RepoHealthState::Failed => "error (see that machine's status)",
+            let problem = match repo.state {
+                RepoHealthState::Ok => continue,
+                RepoHealthState::Failed => "sync error (see that machine's status)",
                 RepoHealthState::Missing => "directory missing on that machine",
-                RepoHealthState::Paused => "paused (colocation conflict)",
+                RepoHealthState::Paused => "paused there (colocation conflict)",
             };
-            println!("    {:width$}  {health}", sanitize(&repo.name));
+            issues.push(format!("`{}` on {peer}: {problem}", sanitize(&repo.name)));
         }
     }
+
+    issues
 }
 
 /// One-line description of a repo watch.
@@ -136,78 +121,40 @@ fn watch_summary(watch: &control::WatchStatus) -> String {
     match watch {
         control::WatchStatus::Opening => "opening".to_owned(),
         control::WatchStatus::Watching {
-            op_heads,
-            last_change_secs,
-            last_sync_secs,
+            last_change_secs, ..
         } => {
-            let changed = match last_change_secs {
-                Some(secs) => format!(", changed {} ago", format_duration(*secs)),
+            let synced = match last_change_secs {
+                Some(secs) => format!(" (synced {} ago)", format_duration(*secs)),
                 None => String::new(),
             };
-            let synced = match last_sync_secs {
-                Some(secs) => format!(", synced {} ago", format_duration(*secs)),
-                None => String::new(),
-            };
-            let divergent = match op_heads {
-                2.. => format!(", {op_heads} divergent heads"),
-                _ => String::new(),
-            };
-            format!("watching{changed}{synced}{divergent}")
+            format!("{}{synced}", ui::good("watching"))
         }
         control::WatchStatus::Failed {
             error,
             retry_in_secs,
         } => format!(
-            "error: {} (retry in {})",
+            "{} {} (retry in {})",
+            ui::bad("error:"),
             sanitize(error),
             format_duration(*retry_in_secs)
         ),
         control::WatchStatus::Missing { retry_in_secs } => format!(
-            "directory missing; unmounted, or deleted without `jj-mesh repo \
-             forget` (retry in {})",
+            "{} (retry in {})",
+            ui::warn("directory missing"),
             format_duration(*retry_in_secs)
         ),
     }
 }
 
-/// Strips control and invisible characters from daemon-provided text before
-/// it reaches the terminal: error messages embed bytes read from repo files,
-/// which could otherwise smuggle escape sequences.
-fn sanitize(text: &str) -> String {
-    text.chars()
-        .map(|c| {
-            if crate::config::is_confusable(c) {
-                '?'
-            } else {
-                c
-            }
-        })
-        .collect()
-}
-
-/// Prints the stored mesh state when no daemon is running.
-fn print_static(dir: &ConfigDir) -> Result<()> {
-    let key = MachineKey::from_config(dir)?;
-    let state = MeshState::load(dir)?;
-
-    println!("daemon: not running");
-    println!("local endpoint id: {}", key.endpoint_id());
-    println!(
-        "{} paired peer(s), {} repo(s) registered",
-        state.alive_peers().count(),
-        state.repos.len(),
-    );
-
-    Ok(())
-}
-
 /// One-line description of a peer connection.
 fn connection_summary(connection: &ConnectionStatus) -> String {
     match connection {
-        ConnectionStatus::Connecting => "connecting".to_owned(),
-        ConnectionStatus::Backoff { retry_in_secs } => {
-            format!("unreachable (retry in {})", format_duration(*retry_in_secs))
-        }
+        ConnectionStatus::Connecting => ui::warn("connecting").to_string(),
+        ConnectionStatus::Backoff { retry_in_secs } => format!(
+            "{} (retry in {})",
+            ui::bad("unreachable"),
+            format_duration(*retry_in_secs)
+        ),
         ConnectionStatus::Connected { path, since_secs } => {
             let route = match path {
                 Some(control::PathInfo {
@@ -220,33 +167,11 @@ fn connection_summary(connection: &ConnectionStatus) -> String {
                 }) => format!("relay {url} (rtt {rtt_ms} ms)"),
                 None => "path pending".to_owned(),
             };
-            format!("connected {route}, up {}", format_duration(*since_secs))
+            format!(
+                "{} {route}, up {}",
+                ui::good("connected"),
+                format_duration(*since_secs)
+            )
         }
-    }
-}
-
-/// Formats a duration in seconds compactly (`43s`, `12m 3s`, `2h 4m`...).
-fn format_duration(secs: u64) -> String {
-    match secs {
-        s if s < 60 => format!("{s}s"),
-        s if s < 3600 => format!("{}m {}s", s / 60, s % 60),
-        s if s < 86400 => format!("{}h {}m", s / 3600, (s % 3600) / 60),
-        s => format!("{}d {}h", s / 86400, (s % 86400) / 3600),
-    }
-}
-
-/// Width of the longest name, for column alignment.
-fn name_width<'a>(names: impl Iterator<Item = &'a str>) -> usize {
-    names.map(str::len).max().unwrap_or(0)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn sanitize_strips_escape_sequences() {
-        assert_eq!(sanitize("plain text"), "plain text");
-        assert_eq!(sanitize("a\x1b[2Kb\r\nc"), "a?[2Kb??c");
     }
 }

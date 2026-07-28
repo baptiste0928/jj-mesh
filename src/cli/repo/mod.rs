@@ -13,7 +13,7 @@ use crate::config::ConfigDir;
 /// Manage the repos synchronized on the mesh
 ///
 /// Registered repos will be synced on the mesh and available for other
-/// machines to clone. Use `jj-mesh` status to list the repos currently
+/// machines to clone. Use `jj-mesh status` to list the repos currently
 /// available on the mesh.
 #[derive(Debug, Args)]
 pub struct RepoArgs {
