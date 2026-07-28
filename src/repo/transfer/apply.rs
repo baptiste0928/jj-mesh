@@ -1,6 +1,7 @@
 //! Applying a validated batch, in the crash-safe order: keep refs, views
-//! and ops (parents first), change-id extras, the colocated ref mirror, and
-//! only then the op head publication that makes anything visible to jj.
+//! and ops (parents first, persisted with one batched durability sync),
+//! change-id extras, the colocated ref mirror, and only then the op head
+//! publication that makes anything visible to jj.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -41,12 +42,16 @@ pub(super) fn apply(
         .collect();
     write_keep_refs(repo, &new_commit_heads)?;
 
+    // Staged unsynced and persisted with one parallel sync pass, instead
+    // of a serial fsync per file (a join stages the whole op log here).
+    let mut writes = repo.raw_write_batch();
     for view in &batch.views {
-        repo.write_view_bytes(&view.id, &view.bytes)?;
+        writes.write_view_bytes(&view.id, &view.bytes)?;
     }
     for op in &batch.ops {
-        repo.write_operation_bytes(&op.id, &op.bytes)?;
+        writes.write_operation_bytes(&op.id, &op.bytes)?;
     }
+    writes.persist()?;
 
     // Materialize change-id extras for the new commits eagerly instead of
     // relying on jj's lazy import fallback.
