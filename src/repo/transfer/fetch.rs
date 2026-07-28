@@ -136,6 +136,25 @@ pub async fn fetch(
     // The apply's keep refs now protect the pack's commits.
     drop(pack_keep);
 
+    // Index the published heads, so the next jj command loads the commit
+    // index instead of building it (which after a join means indexing the
+    // entire replicated history). Best-effort: jj rebuilds lazily anyway,
+    // so a failure here must not fail an otherwise complete fetch.
+    if !published.is_empty() {
+        let repo = repo.clone();
+        let heads = published.clone();
+        let build = tokio::task::spawn_blocking(move || {
+            for head in &heads {
+                if let Err(err) = repo.build_commit_index(head) {
+                    tracing::warn!("cannot index synced operation: {err:#}");
+                }
+            }
+        });
+        if let Err(err) = build.await {
+            tracing::warn!("index build task failed: {err}");
+        }
+    }
+
     Ok(FetchOutcome {
         published,
         ops: ops_received,

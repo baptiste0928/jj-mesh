@@ -2,7 +2,8 @@
 //!
 //! [`MeshRepo`] wraps a [`RepoLoader`] and exposes op-head enumeration, op
 //! DAG walking, op/view transfer primitives and the git backend. It never
-//! loads a full repo, so the commit index is never built or read.
+//! loads a full repo; the commit index is only touched by the explicit
+//! post-sync build (see [`MeshRepo::build_commit_index`]).
 //!
 //! Invariants:
 //! - Ops and views replicate as raw stored bytes under the sender's ids.
@@ -36,6 +37,7 @@ use jj_lib::{
     repo::{RepoLoader, StoreFactories},
     settings::UserSettings,
 };
+use pollster::FutureExt as _;
 
 use super::JjRepo;
 
@@ -121,6 +123,30 @@ impl MeshRepo {
     /// Reads an operation.
     pub async fn read_operation(&self, id: &OperationId) -> Result<Operation> {
         Ok(self.loader.op_store().read_operation(id).await?)
+    }
+
+    /// Builds the commit index at the given operation, incrementally from
+    /// the nearest indexed ancestor operation (the same build `jj debug
+    /// reindex` runs, minus the wipe). Syncs call it after publishing an
+    /// op head so the user's next jj command loads the index instead of
+    /// building it; after a join that build would cover the entire
+    /// replicated history. Blocking.
+    pub fn build_commit_index(&self, id: &OperationId) -> Result<()> {
+        use jj_lib::default_index::DefaultIndexStore;
+
+        let Some(index_store) = self.loader.index_store().downcast_ref::<DefaultIndexStore>()
+        else {
+            // Another index backend indexes on its own terms.
+            return Ok(());
+        };
+        let data = self.loader.op_store().read_operation(id).block_on()?;
+        let operation =
+            jj_lib::operation::Operation::new(self.loader.op_store().clone(), id.clone(), data);
+        index_store
+            .build_index_at_operation(&operation, self.loader.store())
+            .block_on()
+            .wrap_err_with(|| format!("cannot build commit index at {}", id.hex()))?;
+        Ok(())
     }
 
     /// Reads a view.

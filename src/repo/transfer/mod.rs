@@ -474,6 +474,13 @@ mod tests {
         assert_eq!(outcome.published, wants);
         assert!(outcome.git_objects > 0);
 
+        // The commit index was built for the published head: the fetch, not
+        // the user's next jj command, paid for indexing the pulled history.
+        let op_link = b
+            .join(".jj/repo/index/op_links")
+            .join(outcome.published[0].hex());
+        assert!(op_link.is_file(), "missing index op link {op_link:?}");
+
         // The objects landed as one pack, not loose, and the `.keep` file
         // protecting it was removed once the apply published.
         let pack_dir = rb
