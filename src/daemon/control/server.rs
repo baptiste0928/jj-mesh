@@ -376,8 +376,19 @@ async fn join_pull(
 
         let pull = async {
             let (mut send, mut recv) = conn.open_bi().await?;
-            let outcome =
-                transfer::fetch(&repo, name, repo_id, &wants, &mut send, &mut recv).await?;
+            // A join pulls a whole history: the pack format reuses the
+            // server's on-disk deltas and lands as one pack file here,
+            // instead of writing every object loose.
+            let outcome = transfer::fetch(
+                &repo,
+                name,
+                repo_id,
+                &wants,
+                crate::net::sync::GitTransferFormat::Pack,
+                &mut send,
+                &mut recv,
+            )
+            .await?;
             let _ = send.finish();
             Ok::<_, color_eyre::Report>(outcome)
         };

@@ -13,13 +13,15 @@ use jj_lib::{
 use pollster::FutureExt as _;
 use tokio::io::{AsyncRead, AsyncWrite};
 
-use super::{FetchOutcome, OpBatch, StoredOp, StoredView, apply::apply, to_gix_id, to_gix_kind};
+use super::{
+    FetchOutcome, OpBatch, StoredOp, StoredView, apply::apply, pack, to_gix_id, to_gix_kind,
+};
 use crate::{
     config::{RepoId, sanitize},
     net::{
         sync::{
-            FetchRequest, GitFrame, GitRequest, MAX_GIT_FRAME_SIZE, MAX_GIT_HAVES,
-            MAX_OP_FRAME_SIZE, MAX_WANTS, OpFrame,
+            FetchRequest, GitFrame, GitRequest, GitTransferFormat, MAX_GIT_FRAME_SIZE,
+            MAX_GIT_HAVES, MAX_OP_FRAME_SIZE, MAX_WANTS, OpFrame,
         },
         wire::{read_message, write_message},
     },
@@ -40,12 +42,15 @@ const GIT_WRITE_BYTES: usize = 32 << 20;
 const MAX_OP_FRAMES: usize = 1 << 20;
 
 /// Fetches the given op heads from a peer over the stream pair and applies
-/// them locally in crash-safe order.
+/// them locally in crash-safe order. `format` picks how git objects travel
+/// (joins request a pack, incremental syncs stay loose, see
+/// [`GitTransferFormat`]).
 pub async fn fetch(
     repo: &Arc<MeshRepo>,
     name: &str,
     repo_id: &RepoId,
     wants: &[OperationId],
+    format: GitTransferFormat,
     send: &mut (impl AsyncWrite + Unpin),
     recv: &mut (impl AsyncRead + Unpin),
 ) -> Result<FetchOutcome> {
@@ -96,12 +101,29 @@ pub async fn fetch(
         .await
         .wrap_err("git check task failed")??
     };
+    // A pack of nothing is not a valid transfer; an empty want set falls
+    // back to the loose exchange, which the server answers with `Done`.
+    let format = if missing.is_empty() {
+        GitTransferFormat::Loose
+    } else {
+        format
+    };
     let git_request = GitRequest {
         wants: missing.iter().map(|id| id.as_bytes().to_vec()).collect(),
         haves: git_haves.iter().map(|id| id.as_bytes().to_vec()).collect(),
+        format,
     };
     write_message(send, &git_request, MAX_GIT_FRAME_SIZE).await?;
-    let git_objects = receive_git_objects(repo, recv).await?;
+    // The keep guard holds a received pack against git GC until the apply
+    // writes the keep refs that take over; it is released below, and on any
+    // early return or abandoned fetch by its own drop.
+    let (git_objects, pack_keep) = match format {
+        GitTransferFormat::Loose => (receive_git_objects(repo, recv).await?, None),
+        GitTransferFormat::Pack => {
+            let (objects, keep) = receive_git_pack(repo, recv).await?;
+            (objects, Some(keep))
+        }
+    };
 
     // Nothing threw: objects are on disk, batch is closed and verified.
     let published = {
@@ -111,6 +133,8 @@ pub async fn fetch(
             .await
             .wrap_err("apply task failed")??
     };
+    // The apply's keep refs now protect the pack's commits.
+    drop(pack_keep);
 
     Ok(FetchOutcome {
         published,
@@ -294,11 +318,62 @@ async fn receive_git_objects(
                     .wrap_err("git write task failed")??;
                 return Ok(total);
             }
+            GitFrame::Pack { .. } => bail!("peer sent a pack chunk in a loose transfer"),
             GitFrame::Error { message } => {
                 bail!("peer failed git phase: {}", sanitize(&message))
             }
         }
     }
+}
+
+/// Receives the git phase in the pack format: frames stream one packfile
+/// into a blocking ingest task, which indexes it into `objects/pack` (see
+/// [`pack::ingest_pack`] for the verification done there). Returns how many
+/// objects the pack carried and the `.keep` file protecting it.
+async fn receive_git_pack(
+    repo: &Arc<MeshRepo>,
+    recv: &mut (impl AsyncRead + Unpin),
+) -> Result<(usize, pack::PackKeep)> {
+    let (tx, rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+    let ingest = {
+        let repo = repo.clone();
+        tokio::task::spawn_blocking(move || {
+            let git = repo.git_backend().git_repo();
+            pack::ingest_pack(&git, pack::ChunkReader::new(rx))
+        })
+    };
+
+    let mut failed = None;
+    loop {
+        match read_message(recv, MAX_GIT_FRAME_SIZE).await? {
+            GitFrame::Pack { chunk } => {
+                // A closed channel means the ingest died; its own error is
+                // reported after the join below.
+                if tx.send(chunk).await.is_err() {
+                    break;
+                }
+            }
+            GitFrame::Done => break,
+            GitFrame::Error { message } => {
+                failed = Some(format!("peer failed git phase: {}", sanitize(&message)));
+                break;
+            }
+            GitFrame::Object { .. } => {
+                failed = Some("peer sent a loose object in a pack transfer".to_owned());
+                break;
+            }
+        }
+    }
+
+    // Closing the channel ends the ingest's stream; on a clean `Done` it
+    // finishes the pack, otherwise it fails on the truncation.
+    drop(tx);
+    let outcome = ingest.await.wrap_err("pack ingest task failed")?;
+    if let Some(message) = failed {
+        bail!("{message}");
+    }
+    let outcome = outcome?;
+    Ok((outcome.objects, outcome.keep))
 }
 
 /// Writes a chunk of verified objects into the loose odb on a blocking

@@ -15,11 +15,12 @@ use pollster::FutureExt as _;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tracing::debug;
 
+use super::pack;
 use crate::{
     net::{
         sync::{
-            FetchRequest, GitFrame, GitRequest, MAX_GIT_FRAME_SIZE, MAX_GIT_HAVES, MAX_HAVES,
-            MAX_OP_FRAME_SIZE, MAX_WANTS, OpFrame, WireObjectKind,
+            FetchRequest, GitFrame, GitRequest, GitTransferFormat, MAX_GIT_FRAME_SIZE,
+            MAX_GIT_HAVES, MAX_HAVES, MAX_OP_FRAME_SIZE, MAX_WANTS, OpFrame, WireObjectKind,
         },
         wire::{read_message, write_message},
     },
@@ -139,7 +140,7 @@ fn validate_request(repo: &MeshRepo, request: &FetchRequest) -> Result<(), Strin
 }
 
 /// Serves the git phase: answers the fetcher's commit wants with the raw
-/// object closure, stopping at its haves.
+/// object closure, stopping at its haves, in the requested format.
 async fn serve_git_phase(
     repo: &Arc<MeshRepo>,
     send: &mut (impl AsyncWrite + Unpin),
@@ -164,6 +165,18 @@ async fn serve_git_phase(
         return Ok(());
     }
 
+    match request.format {
+        GitTransferFormat::Loose => serve_git_loose(repo, request, send).await,
+        GitTransferFormat::Pack => serve_git_pack(repo, request, send).await,
+    }
+}
+
+/// Serves the git phase in the loose format: one object per frame.
+async fn serve_git_loose(
+    repo: &Arc<MeshRepo>,
+    request: GitRequest,
+    send: &mut (impl AsyncWrite + Unpin),
+) -> Result<()> {
     // The closure walk is blocking git I/O; it streams objects through a
     // bounded channel so huge closures never sit in memory at once.
     let (tx, mut rx) =
@@ -171,8 +184,14 @@ async fn serve_git_phase(
     let walk = {
         let repo = repo.clone();
         tokio::task::spawn_blocking(move || {
-            let outcome = walk_git_closure(&repo, &request, |object| {
-                tx.blocking_send(Ok(object))
+            let git = repo.git_backend().git_repo();
+            let outcome = walk_git_closure(&repo, &request, |id, kind| {
+                let object = git
+                    .find_object(id)
+                    .wrap_err_with(|| format!("missing object {id}"))?;
+                // `detach()` moves the object's buffer out instead of
+                // copying it, which matters for large blobs.
+                tx.blocking_send(Ok((id, kind, object.detach().data)))
                     .map_err(|_| eyre!("fetcher went away"))
             });
             if let Err(err) = outcome {
@@ -211,14 +230,74 @@ async fn serve_git_phase(
     Ok(())
 }
 
+/// Serves the git phase in the pack format: the walk collects the closure's
+/// ids without loading blob contents, then the pack pipeline streams one
+/// packfile in chunks.
+async fn serve_git_pack(
+    repo: &Arc<MeshRepo>,
+    request: GitRequest,
+    send: &mut (impl AsyncWrite + Unpin),
+) -> Result<()> {
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<Vec<u8>>>(8);
+    let walk = {
+        let repo = repo.clone();
+        tokio::task::spawn_blocking(move || {
+            let outcome = (|| -> Result<()> {
+                let mut ids = Vec::new();
+                walk_git_closure(&repo, &request, |id, _kind| {
+                    ids.push(id);
+                    Ok(())
+                })?;
+                let git = repo.git_backend().git_repo();
+                pack::write_pack(&git, ids, |chunk| {
+                    tx.blocking_send(Ok(chunk))
+                        .map_err(|_| eyre!("fetcher went away"))
+                })
+            })();
+            if let Err(err) = outcome {
+                let _ = tx.blocking_send(Err(err));
+            }
+        })
+    };
+
+    let mut served = 0usize;
+    let mut failed = None;
+    while let Some(chunk) = rx.recv().await {
+        match chunk {
+            Ok(chunk) => {
+                served += chunk.len();
+                write_message(send, &GitFrame::Pack { chunk }, MAX_GIT_FRAME_SIZE).await?;
+            }
+            Err(err) => {
+                failed = Some(format!("cannot build pack: {err:#}"));
+                break;
+            }
+        }
+    }
+    walk.await.wrap_err("pack build task failed")?;
+
+    let last = match failed {
+        Some(message) => GitFrame::Error { message },
+        None => GitFrame::Done,
+    };
+    write_message(send, &last, MAX_GIT_FRAME_SIZE).await?;
+    debug!(bytes = served, "served git phase (pack)");
+    Ok(())
+}
+
 /// Walks the object closure of the wanted commits, stopping at haves, and
-/// emits every object once. Trees and blobs the fetcher already has (those
-/// reachable from its have commits) are pruned, so a sync transfers only the
-/// objects the change actually introduced, not the whole working tree.
+/// emits every object's id once. Trees and blobs the fetcher already has
+/// (those reachable from its have commits) are pruned, so a sync transfers
+/// only the objects the change actually introduced, not the whole working
+/// tree.
+///
+/// Only ids are emitted: blob contents are never loaded here, and each
+/// format reads what it needs (the loose server per object, the pack
+/// pipeline itself).
 fn walk_git_closure(
     repo: &MeshRepo,
     request: &GitRequest,
-    mut emit: impl FnMut((gix::ObjectId, WireObjectKind, Vec<u8>)) -> Result<()>,
+    mut emit: impl FnMut(gix::ObjectId, WireObjectKind) -> Result<()>,
 ) -> Result<()> {
     let git = repo.git_backend().git_repo();
     let haves: HashSet<gix::ObjectId> = request
@@ -272,10 +351,7 @@ fn walk_git_closure(
     // the fetcher's missing-commit check relies on when retrying.
     for (commit, tree) in commits.iter().rev() {
         walk_tree(&git, *tree, &mut seen, &mut emit)?;
-        let object = git
-            .find_object(*commit)
-            .wrap_err_with(|| format!("missing object {commit}"))?;
-        emit((*commit, WireObjectKind::Commit, object.detach().data))?;
+        emit(*commit, WireObjectKind::Commit)?;
     }
     for id in extras {
         walk_tree(&git, id, &mut seen, &mut emit)?;
@@ -288,33 +364,39 @@ fn walk_tree(
     git: &gix::Repository,
     root: gix::ObjectId,
     seen: &mut HashSet<gix::ObjectId>,
-    emit: &mut impl FnMut((gix::ObjectId, WireObjectKind, Vec<u8>)) -> Result<()>,
+    emit: &mut impl FnMut(gix::ObjectId, WireObjectKind) -> Result<()>,
 ) -> Result<()> {
-    let mut stack = vec![root];
-    while let Some(id) = stack.pop() {
+    let mut stack = vec![(root, None::<WireObjectKind>)];
+    while let Some((id, known_kind)) = stack.pop() {
         if !seen.insert(id) {
+            continue;
+        }
+        // Blobs are leaves: their kind is known from the tree entry that
+        // named them, so they are emitted without ever being loaded.
+        if known_kind == Some(WireObjectKind::Blob) {
+            emit(id, WireObjectKind::Blob)?;
             continue;
         }
         let object = git
             .find_object(id)
             .wrap_err_with(|| format!("missing object {id}"))?;
-        // `detach()` moves the object's buffer out instead of copying it,
-        // which matters for large blobs.
         match object.kind {
             gix::object::Kind::Tree => {
                 let tree = object.try_into_tree().map_err(|err| eyre!("{err}"))?;
                 for entry in tree.iter() {
                     let entry = entry.map_err(|err| eyre!("{err}"))?;
+                    let mode = entry.mode();
                     // Gitlink (submodule) entries point at commits in a
                     // different repository; they are not ours to send.
-                    if entry.mode().is_commit() {
+                    if mode.is_commit() {
                         continue;
                     }
-                    stack.push(entry.oid().to_owned());
+                    let kind = (!mode.is_tree()).then_some(WireObjectKind::Blob);
+                    stack.push((entry.oid().to_owned(), kind));
                 }
-                emit((id, WireObjectKind::Tree, tree.detach().data))?;
+                emit(id, WireObjectKind::Tree)?;
             }
-            gix::object::Kind::Blob => emit((id, WireObjectKind::Blob, object.detach().data))?,
+            gix::object::Kind::Blob => emit(id, WireObjectKind::Blob)?,
             gix::object::Kind::Commit => {
                 // A tree entry cannot be a commit, but a tag can point at
                 // one; treat it as a boundary (it was either walked as a
@@ -323,8 +405,8 @@ fn walk_tree(
             gix::object::Kind::Tag => {
                 let tag = object.try_into_tag().map_err(|err| eyre!("{err}"))?;
                 let target = tag.target_id().map_err(|err| eyre!("{err}"))?.detach();
-                stack.push(target);
-                emit((id, WireObjectKind::Tag, tag.detach().data))?;
+                stack.push((target, None));
+                emit(id, WireObjectKind::Tag)?;
             }
         }
     }

@@ -10,12 +10,13 @@ data-encoding = "2.11.0"
 etcetera = "0.11.0"
 gethostname = "1.0.2"
 gix = { version = "0.85.0", default-features = false }
+gix-pack = "0.72.0"
 iroh = "1.0.3"
 jj-lib = "=0.43.0" # Exact pin since jj's on-disk formats are internal and may change between releases
 notify = "7.0.0"
 pollster = "0.4.0"
 postcard = { version = "1.1.3", features = ["use-std"] }
-prost = "0.14.3" # Same version as jj-lib's, to decode its op store protos
+prost = "0.14.3" # Same version as jj-lib, to decode the op store protos
 rand = "0.10.2"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.145"
@@ -34,8 +35,6 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
 
 [features]
-# Test-only construction hooks: hermetic localhost endpoints and the jj
-# fixture. Enabled for this crate's own tests via the self dev-dependency.
 test-util = []
 
 [dev-dependencies]

@@ -134,9 +134,9 @@ pub async fn recv_uni(stream: &mut RecvStream) -> Result<UniMessage> {
 // 2. server:  [`OpFrame`]s, views before the ops referencing them, ops in
 //    parents-first order, terminated by `OpFrame::Done`
 // 3. fetcher: [`GitRequest`] (commits referenced by the new views that are
-//    missing locally, plus have samples)
-// 4. server:  [`GitFrame`]s carrying raw git objects, terminated by
-//    `GitFrame::Done`
+//    missing locally, plus have samples, and the transfer format)
+// 4. server:  [`GitFrame`]s terminated by `GitFrame::Done`: raw git objects
+//    in the loose format, or chunks of one git packfile in the pack format
 //
 // The fetcher then applies everything locally in crash-safe order; nothing
 // is written before the peer's data is fully validated per object.
@@ -202,6 +202,21 @@ pub enum OpFrame {
 pub struct GitRequest {
     pub wants: Vec<Vec<u8>>,
     pub haves: Vec<Vec<u8>>,
+    /// How the server should send the objects.
+    pub format: GitTransferFormat,
+}
+
+/// Git object transfer formats.
+///
+/// Loose sends one hash-verified object per frame and suits incremental
+/// syncs, whose few objects exist only loose on the server anyway. Pack
+/// streams one packfile, letting the server reuse the deltas of its
+/// on-disk packs and the fetcher index the objects into a single pack
+/// instead of thousands of loose files; joins request it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum GitTransferFormat {
+    Loose,
+    Pack,
 }
 
 #[cfg(test)]
@@ -285,11 +300,16 @@ mod tests {
 #[derive(Debug, Serialize, Deserialize)]
 pub enum GitFrame {
     /// One raw git object; `id` is verified against the data on receipt.
+    /// Only sent in the loose format.
     Object {
         id: Vec<u8>,
         kind: WireObjectKind,
         data: Vec<u8>,
     },
+    /// One chunk of the packfile stream. Only sent in the pack format; the
+    /// pack's own trailer checksum and the per-object hashing done while
+    /// indexing verify the content.
+    Pack { chunk: Vec<u8> },
     /// End of the git phase.
     Done,
     /// The server cannot serve the git phase.

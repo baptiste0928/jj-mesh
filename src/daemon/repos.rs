@@ -528,7 +528,15 @@ impl RepoTask {
             .connection(&peer)
             .ok_or_else(|| eyre!("peer is no longer connected"))?;
         let (mut send, mut recv) = conn.open_bi().await?;
-        let fetch = transfer::fetch(repo, &self.name, &self.id, wants, &mut send, &mut recv);
+        let fetch = transfer::fetch(
+            repo,
+            &self.name,
+            &self.id,
+            wants,
+            crate::net::sync::GitTransferFormat::Loose,
+            &mut send,
+            &mut recv,
+        );
         let outcome = tokio::time::timeout(FETCH_TIMEOUT, fetch)
             .await
             .map_err(|_| eyre!("fetch timed out"))??;

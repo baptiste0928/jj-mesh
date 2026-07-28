@@ -6,12 +6,15 @@
 //! bytes and keep their sender-side ids (see the `mesh` module docs for
 //! why re-hashing them is impossible). Peer-supplied data is authenticated
 //! but untrusted: op and view bytes are validated structurally before
-//! anything is written, git objects are hash-verified before writing, and
-//! replicated bytes can never replace already-stored objects.
+//! anything is written, git objects are hash-verified before writing
+//! (loose frames against their claimed id, packed objects while indexing
+//! the pack), and replicated bytes can never replace already-stored
+//! objects (loose writes skip existing ids; pack ids are content hashes).
 //!
 //! The engine splits along its two sides and the apply step:
 //! - [`serve`] answers a fetch (read-only): the op-log delta, then the git
-//!   object closure the fetcher lacks.
+//!   object closure the fetcher lacks, loose or as one packfile (see
+//!   [`crate::net::sync::GitTransferFormat`]).
 //! - [`fetch`] pulls and validates that delta, then hands it to [`apply`],
 //!   which writes it in the crash-safe order: git objects, anti-GC keep
 //!   refs, views and ops (parents first), change-id extras, the colocated
@@ -22,6 +25,7 @@
 
 mod apply;
 mod fetch;
+mod pack;
 mod serve;
 
 use std::collections::HashMap;
@@ -98,7 +102,7 @@ mod tests {
     use super::*;
     use crate::{
         net::{
-            sync::{FetchRequest, MAX_OP_FRAME_SIZE, OpFrame},
+            sync::{FetchRequest, GitTransferFormat, MAX_OP_FRAME_SIZE, OpFrame},
             wire::{read_message, write_message},
         },
         repo::{JjRepo, MeshRepo},
@@ -135,6 +139,16 @@ mod tests {
         server: &Arc<MeshRepo>,
         wants: &[OperationId],
     ) -> FetchOutcome {
+        sync_once_as(fetcher, server, wants, GitTransferFormat::Loose).await
+    }
+
+    /// [`sync_once`] with an explicit git transfer format.
+    async fn sync_once_as(
+        fetcher: &Arc<MeshRepo>,
+        server: &Arc<MeshRepo>,
+        wants: &[OperationId],
+        format: GitTransferFormat,
+    ) -> FetchOutcome {
         let (client, remote) = tokio::io::duplex(1 << 20);
         let (mut client_rx, mut client_tx) = tokio::io::split(client);
         let (mut server_rx, mut server_tx) = tokio::io::split(remote);
@@ -154,6 +168,7 @@ mod tests {
             "test",
             &crate::config::RepoId::generate(),
             wants,
+            format,
             &mut client_tx,
             &mut client_rx,
         )
@@ -383,6 +398,7 @@ mod tests {
             "test",
             &crate::config::RepoId::generate(),
             &[want],
+            GitTransferFormat::Loose,
             &mut client_tx,
             &mut client_rx,
         )
@@ -437,21 +453,53 @@ mod tests {
     }
 
     /// The join flow: a freshly initialized non-colocated repo with a
-    /// renamed workspace pulls the full mesh state; jj then merges the
-    /// fresh workspace into the replicated history on the next command.
+    /// renamed workspace pulls the full mesh state as a pack; jj then
+    /// merges the fresh workspace into the replicated history on the next
+    /// command.
     #[tokio::test]
     async fn join_pull_into_fresh_repo() {
         let fx = Fixture::new();
         let a = fx.init_repo("a");
-        fx.jj(&a, &["bookmark", "create", "main", "-r", "@"]);
+        // Real file content so the pack carries blobs and trees.
+        fs::write(a.join("file.txt"), "mesh content\n").unwrap();
+        fx.jj(&a, &["commit", "-m", "add file"]);
+        fx.jj(&a, &["bookmark", "create", "main", "-r", "@-"]);
         fx.jj(&a, &["new", "-m", "second"]);
 
         let b = init_join_repo(&fx, "b", "machine-b");
 
         let (ra, rb) = (open(&a), open(&b));
         let wants = ra.op_heads().await.unwrap();
-        let outcome = sync_once(&rb, &ra, &wants).await;
+        let outcome = sync_once_as(&rb, &ra, &wants, GitTransferFormat::Pack).await;
         assert_eq!(outcome.published, wants);
+        assert!(outcome.git_objects > 0);
+
+        // The objects landed as one pack, not loose, and the `.keep` file
+        // protecting it was removed once the apply published.
+        let pack_dir = rb
+            .git_backend()
+            .git_repo()
+            .objects
+            .store_ref()
+            .path()
+            .join("pack");
+        let names: Vec<std::path::PathBuf> = fs::read_dir(&pack_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        let has_ext = |ext: &str| {
+            names
+                .iter()
+                .any(|name| name.extension().is_some_and(|e| e == ext))
+        };
+        assert!(
+            has_ext("pack") && has_ext("idx"),
+            "expected a pack and its index, got {names:?}",
+        );
+        assert!(
+            !has_ext("keep"),
+            "keep file must be removed after apply: {names:?}",
+        );
 
         // Divergent by construction: init ops are not mesh ancestors.
         assert_eq!(rb.op_heads().await.unwrap().len(), 2);
@@ -526,6 +574,26 @@ mod tests {
         // And the mesh settles: a's jj command produced nothing new to
         // sync, so no import ops ping-pong between the machines.
         assert!(!sync_missing(&rb, &ra).await, "unexpected op churn on a");
+    }
+
+    /// A pack header's object count must be rejected before gix sizes its
+    /// delta tree from it: unchecked, the twelve bytes below name a
+    /// multi-gigabyte allocation, and running out of memory aborts the
+    /// process instead of failing the fetch.
+    #[test]
+    fn rejects_pack_header_declaring_absurd_object_count() {
+        let fx = Fixture::new();
+        let dir = fx.init_repo("a");
+        let git = open(&dir).git_backend().git_repo();
+
+        let mut header = Vec::from(*b"PACK");
+        header.extend_from_slice(&2u32.to_be_bytes());
+        header.extend_from_slice(&u32::MAX.to_be_bytes());
+
+        let Err(err) = pack::ingest_pack(&git, std::io::Cursor::new(header)) else {
+            panic!("an absurd object count must be refused");
+        };
+        assert!(err.to_string().contains("over the"), "{err:#}");
     }
 
     /// Repos containing gitlink (submodule) tree entries must sync: the
