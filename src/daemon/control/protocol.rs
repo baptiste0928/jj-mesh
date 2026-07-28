@@ -22,22 +22,27 @@ pub const MUTATE_WAIT: Duration = Duration::from_secs(10);
 /// CLI tells the user; the daemon enforces it.
 pub const PAIR_TICKET_TTL: Duration = Duration::from_mins(3);
 
-/// Time budget for a join's initial repo pull; it may transfer an entire
+/// Time budget for a clone's initial repo pull; it may transfer an entire
 /// repository.
-pub(super) const JOIN_PULL_TIMEOUT: Duration = Duration::from_mins(30);
+pub(super) const CLONE_PULL_TIMEOUT: Duration = Duration::from_mins(30);
 
-/// Cadence at which the daemon re-sends the latest join progress. Sent
+/// Cadence at which the daemon re-sends the latest clone progress. Sent
 /// unconditionally, changed or not: the frames double as the liveness
-/// signal behind [`JOIN_IDLE_WAIT`].
-pub(super) const JOIN_PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
+/// signal behind [`CLONE_IDLE_WAIT`].
+pub(super) const CLONE_PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
 
-/// Time budget the CLI grants between join frames, not the whole exchange:
-/// the daemon heartbeats progress every [`JOIN_PROGRESS_INTERVAL`] while
-/// the join runs, so a silent daemon is a dead one. The exchange as a
-/// whole stays bounded by the daemon's own [`JOIN_PULL_TIMEOUT`].
-pub const JOIN_IDLE_WAIT: Duration = Duration::from_secs(30);
+/// Time budget the CLI grants between clone frames, not the whole exchange:
+/// the daemon heartbeats progress every [`CLONE_PROGRESS_INTERVAL`] while
+/// the clone runs, so a silent daemon is a dead one. The exchange as a
+/// whole stays bounded by the daemon's own [`CLONE_PULL_TIMEOUT`].
+pub const CLONE_IDLE_WAIT: Duration = Duration::from_secs(30);
 
 /// A request from the CLI to the daemon.
+///
+/// Postcard encodes variants by position: existing ones must keep their
+/// position *and meaning* (renames are fine), and new ones are only
+/// appended, so an exchange stays semantically sound across a CLI/daemon
+/// version skew.
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Request {
     /// Report the daemon state; answered with [`Response::Status`].
@@ -52,25 +57,34 @@ pub enum Request {
     /// [`Response::Paired`] or [`Response::Error`].
     PairJoin { ticket: String, name: String },
     /// Pull the full state of the mesh repo named `name` into a freshly
-    /// initialized local repo at `path` and register it (see `jj-mesh
-    /// join`). Answered with a stream of [`Response::JoinProgress`] frames
-    /// ending in [`Response::Joined`] or [`Response::Error`]; disconnecting
+    /// initialized local repo at `path` and register it (see `jj-mesh repo
+    /// clone`). Answered with a stream of [`Response::CloneProgress`] frames
+    /// ending in [`Response::Cloned`] or [`Response::Error`]; disconnecting
     /// cancels the pull.
-    JoinRepo { name: String, path: PathBuf },
+    CloneRepo { name: String, path: PathBuf },
     /// Register the repo at `path` under `name`, with a fresh id. Answered
     /// with [`Response::RepoAdded`] or [`Response::Error`].
     AddRepo { name: String, path: PathBuf },
     /// Retire a repo name from the mesh, unregistering it everywhere (its
-    /// files are left alone). Answered with [`Response::RepoForgotten`] or
+    /// files are left alone). Answered with [`Response::RepoRemoved`] or
     /// [`Response::Error`].
-    ForgetRepo { name: String },
+    RemoveRepo { name: String },
     /// Remove a paired peer (by name, or endpoint id when names are
     /// ambiguous), disconnecting it. Answered with
     /// [`Response::PeerRemoved`] or [`Response::Error`].
     RemovePeer { peer: String },
+    /// Unregister a repo on this machine only (its files are left alone);
+    /// the mesh keeps the repo and it stays clonable here. Answered with
+    /// [`Response::RepoForgotten`] or [`Response::Error`].
+    ForgetRepo { name: String },
 }
 
 /// A daemon answer to a [`Request`].
+///
+/// Postcard encodes variants by position: existing ones must keep their
+/// position *and meaning* (renames are fine), and new ones are only
+/// appended, so an exchange stays semantically sound across a CLI/daemon
+/// version skew.
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Response {
     Status(Status),
@@ -81,8 +95,8 @@ pub enum Response {
         name: String,
         endpoint: EndpointId,
     },
-    /// The join pull completed and the repo is registered.
-    Joined {
+    /// The clone pull completed and the repo is registered.
+    Cloned {
         ops: u64,
         git_objects: u64,
     },
@@ -90,23 +104,26 @@ pub enum Response {
     RepoAdded,
     /// The repo is retired from the mesh; `was_local` tells whether it was
     /// registered on this machine.
-    RepoForgotten {
+    RepoRemoved {
         was_local: bool,
     },
     /// The peer is removed from the mesh state.
     PeerRemoved(EndpointId),
     /// The request failed.
     Error(String),
-    /// Progress of an in-flight join pull, re-sent at least every
-    /// [`JOIN_PROGRESS_INTERVAL`] until the terminal answer. Last in the
-    /// enum so the older variants keep their postcard discriminants across
-    /// a CLI/daemon version skew.
-    JoinProgress(JoinProgress),
+    /// Progress of an in-flight clone pull, re-sent at least every
+    /// [`CLONE_PROGRESS_INTERVAL`] until the terminal answer.
+    CloneProgress(CloneProgress),
+    /// The repo is unregistered on this machine, at this path; the mesh
+    /// still has it.
+    RepoForgotten {
+        path: PathBuf,
+    },
 }
 
-/// A snapshot of a running join pull, for progress display.
+/// A snapshot of a running clone pull, for progress display.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct JoinProgress {
+pub struct CloneProgress {
     /// Paired name of the peer being pulled from, empty while the daemon
     /// has not picked one yet. Counters restart when the daemon falls back
     /// to another source peer.
@@ -133,7 +150,7 @@ pub struct Status {
     pub peers: Vec<PeerStatus>,
     /// Repos registered on this machine.
     pub repos: Vec<RepoStatus>,
-    /// Mesh repos not registered here, joinable by name.
+    /// Mesh repos not registered here, clonable by name.
     pub available: Vec<String>,
     /// Repo names contested by peers announcing a different repo.
     pub conflicts: Vec<ConflictStatus>,
@@ -146,7 +163,7 @@ pub struct Status {
 
 /// A repo paused by a colocation conflict: this machine's instance and the
 /// named peers' all have a user-visible `.git`, which a mesh repo supports
-/// on at most one machine (see `jj-mesh join`'s docs). The repo fetches
+/// on at most one machine (see `jj-mesh repo clone`'s docs). The repo fetches
 /// from nobody until only one colocated instance remains visible.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct PausedStatus {
@@ -243,6 +260,6 @@ pub enum WatchStatus {
     /// Opening or watching failed; waiting before retrying.
     Failed { error: String, retry_in_secs: u64 },
     /// The repo directory is gone (unmounted disk, or deleted without
-    /// `jj-mesh forget`); retried in the background.
+    /// `jj-mesh repo forget`); retried in the background.
     Missing { retry_in_secs: u64 },
 }

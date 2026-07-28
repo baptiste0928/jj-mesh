@@ -9,7 +9,7 @@ use crate::{
     net::sync::RepoHealthState,
 };
 
-/// Show the daemon state and the live mesh status
+/// Show the the daemon state and the live mesh status
 #[derive(Debug, Args)]
 pub struct StatusArgs {}
 
@@ -67,7 +67,7 @@ fn print_live(status: &control::Status) {
 
     if !status.available.is_empty() {
         println!();
-        println!("available mesh repos (join with `jj-mesh join <name>`):");
+        println!("available mesh repos (clone with `jj-mesh repo clone <name>`):");
         for name in &status.available {
             println!("  {name}");
         }
@@ -91,8 +91,8 @@ fn print_live(status: &control::Status) {
         for paused in &status.paused {
             println!(
                 "  `{}`: this machine and {} both have a colocated instance; \
-                 fetching is paused until only one remains (see `jj-mesh join \
-                 --help`)",
+                 fetching is paused until only one remains (see `jj-mesh repo \
+                 clone --help`)",
                 paused.repo,
                 paused.peers.join(", "),
             );
@@ -163,8 +163,8 @@ fn watch_summary(watch: &control::WatchStatus) -> String {
             format_duration(*retry_in_secs)
         ),
         control::WatchStatus::Missing { retry_in_secs } => format!(
-            "directory missing; unmounted, or deleted without `jj-mesh forget` \
-             (retry in {})",
+            "directory missing; unmounted, or deleted without `jj-mesh repo \
+             forget` (retry in {})",
             format_duration(*retry_in_secs)
         ),
     }
@@ -201,8 +201,8 @@ fn print_static(dir: &ConfigDir) -> Result<()> {
     Ok(())
 }
 
-/// One-line description of a peer connection, shared with `jj-mesh peers`.
-pub(super) fn connection_summary(connection: &ConnectionStatus) -> String {
+/// One-line description of a peer connection.
+fn connection_summary(connection: &ConnectionStatus) -> String {
     match connection {
         ConnectionStatus::Connecting => "connecting".to_owned(),
         ConnectionStatus::Backoff { retry_in_secs } => {
@@ -226,7 +226,7 @@ pub(super) fn connection_summary(connection: &ConnectionStatus) -> String {
 }
 
 /// Formats a duration in seconds compactly (`43s`, `12m 3s`, `2h 4m`...).
-pub(super) fn format_duration(secs: u64) -> String {
+fn format_duration(secs: u64) -> String {
     match secs {
         s if s < 60 => format!("{s}s"),
         s if s < 3600 => format!("{}m {}s", s / 60, s % 60),
@@ -236,7 +236,7 @@ pub(super) fn format_duration(secs: u64) -> String {
 }
 
 /// Width of the longest name, for column alignment.
-pub(super) fn name_width<'a>(names: impl Iterator<Item = &'a str>) -> usize {
+fn name_width<'a>(names: impl Iterator<Item = &'a str>) -> usize {
     names.map(str::len).max().unwrap_or(0)
 }
 

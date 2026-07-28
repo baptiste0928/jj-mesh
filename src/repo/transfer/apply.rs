@@ -43,7 +43,7 @@ pub(super) fn apply(
     write_keep_refs(repo, &new_commit_heads)?;
 
     // Staged unsynced and persisted with one parallel sync pass, instead
-    // of a serial fsync per file (a join stages the whole op log here).
+    // of a serial fsync per file (a clone stages the whole op log here).
     let mut writes = repo.raw_write_batch();
     for view in &batch.views {
         writes.write_view_bytes(&view.id, &view.bytes)?;

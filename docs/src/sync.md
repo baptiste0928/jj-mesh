@@ -90,12 +90,12 @@ working copy's parent. With a second collocated checkout the two machines
 permanently disagree on that single field: every synced operation makes jj
 re-import the local HEAD as a working-copy move, which resurrects rewritten
 commits as divergent changes and ping-pongs `import git head` operations
-across the mesh. This is why joins never collocate; only the machine that
+across the mesh. This is why clones never collocate; only the machine that
 originally added the repo gets git interop.
 
-## Joining a repo
+## Cloning a repo
 
-`jj-mesh join` bootstraps a repo onto a new machine: it creates a fresh
+`jj-mesh repo clone` bootstraps a repo onto a new machine: it creates a fresh
 non-collocated jj repo (see above), gives its workspace a machine-unique
 name (mesh machines must never share one), and pulls the repo's full state
 from a peer that advertises it.

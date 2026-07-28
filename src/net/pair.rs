@@ -330,7 +330,7 @@ pub async fn join(
                 && close.reason.as_ref() == PAIRED_REASON => {}
         reason => bail!(
             "connection lost before pairing completed ({reason}); \
-             check `jj-mesh peers` on the other machine before retrying",
+             check `jj-mesh status` on the other machine before retrying",
         ),
     }
 

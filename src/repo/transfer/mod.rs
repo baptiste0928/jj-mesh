@@ -95,7 +95,7 @@ pub enum TransferPhase {
     /// Pulling the git objects the new views reference.
     Git,
     /// Writing everything into the local repo (and indexing it after a
-    /// join, which can rival the transfer for large histories).
+    /// clone, which can rival the transfer for large histories).
     Apply,
 }
 
@@ -189,9 +189,9 @@ mod tests {
         assert!(cp.success());
     }
 
-    /// Initializes a fresh repo as `jj-mesh join` does: non-colocated,
+    /// Initializes a fresh repo as `jj-mesh repo clone` does: non-colocated,
     /// with a machine-unique workspace name.
-    fn init_join_repo(fx: &Fixture, name: &str, workspace: &str) -> std::path::PathBuf {
+    fn init_clone_repo(fx: &Fixture, name: &str, workspace: &str) -> std::path::PathBuf {
         let dir = fx.path().join(name);
         fx.jj(fx.path(), &["git", "init", "--no-colocate", name]);
         fx.jj(&dir, &["workspace", "rename", workspace]);
@@ -285,7 +285,7 @@ mod tests {
         // jj itself must accept the synced repo: log walks commits, which
         // requires the git objects and the change-id extras. The fork
         // shares the workspace name with `a` (real machines never do; the
-        // join flow assigns unique names), so b's working copy is
+        // clone flow assigns unique names), so b's working copy is
         // legitimately stale and skipped here.
         fx.jj(&b, &["op", "log", "--ignore-working-copy"]);
         fx.jj(&b, &["log", "-r", "all()", "--ignore-working-copy"]);
@@ -522,12 +522,12 @@ mod tests {
         assert!(!gone.status.success(), "deleted bookmark must propagate");
     }
 
-    /// The join flow: a freshly initialized non-colocated repo with a
+    /// The clone flow: a freshly initialized non-colocated repo with a
     /// renamed workspace pulls the full mesh state as a pack; jj then
     /// merges the fresh workspace into the replicated history on the next
     /// command.
     #[tokio::test]
-    async fn join_pull_into_fresh_repo() {
+    async fn clone_pull_into_fresh_repo() {
         let fx = Fixture::new();
         let a = fx.init_repo("a");
         // Real file content so the pack carries blobs and trees.
@@ -536,7 +536,7 @@ mod tests {
         fx.jj(&a, &["bookmark", "create", "main", "-r", "@-"]);
         fx.jj(&a, &["new", "-m", "second"]);
 
-        let b = init_join_repo(&fx, "b", "machine-b");
+        let b = init_clone_repo(&fx, "b", "machine-b");
 
         let (ra, rb) = (open(&a), open(&b));
         let wants = ra.op_heads().await.unwrap();
@@ -600,7 +600,7 @@ mod tests {
 
     /// Rewriting synced ancestors of another machine's working copy
     /// (describe, squash, sign) must arrive as a clean rebase of the tip,
-    /// not as divergent changes. This holds only because joined repos are
+    /// not as divergent changes. This holds only because cloned repos are
     /// never colocated: the view's `git_head` mirrors the colocated
     /// `.git`'s machine-local HEAD, and a second colocated checkout makes
     /// jj re-import its own HEAD after every sync, resurrecting the
@@ -611,10 +611,10 @@ mod tests {
         let fx = Fixture::new();
         // The adding machine keeps jj's default (colocated) layout.
         let a = fx.init_repo("a");
-        let b = init_join_repo(&fx, "b", "machine-b");
+        let b = init_clone_repo(&fx, "b", "machine-b");
         let (ra, rb) = (open(&a), open(&b));
         sync_missing(&rb, &ra).await;
-        // Merge the join divergence on b and settle both sides.
+        // Merge the clone divergence on b and settle both sides.
         fx.jj(&b, &["status"]);
         sync_missing(&ra, &rb).await;
         fx.jj(&a, &["status"]);
@@ -677,14 +677,14 @@ mod tests {
     /// A pack-format fetch with a progress sink must report the phases in
     /// order with exact totals: the op counts the server announced, and
     /// the git object count read from the pack header, both fully reached.
-    /// The join scenario is the one the progress display exists for.
+    /// The clone scenario is the one the progress display exists for.
     #[tokio::test]
     async fn progress_reports_phases_and_exact_totals() {
         let fx = Fixture::new();
         let a = fx.init_repo("a");
         fs::write(a.join("file.txt"), "mesh content\n").unwrap();
         fx.jj(&a, &["commit", "-m", "add file"]);
-        let b = init_join_repo(&fx, "b", "machine-b");
+        let b = init_clone_repo(&fx, "b", "machine-b");
 
         let (ra, rb) = (open(&a), open(&b));
         let wants = ra.op_heads().await.unwrap();

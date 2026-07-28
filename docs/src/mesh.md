@@ -28,7 +28,7 @@ a machine you no longer trust means rotating what it had access to.
 
 Repos are advertised exactly like machines, and their mesh records are
 versioned registers too: registering a repo on one machine makes it visible,
-and joinable by its name, everywhere, and forgetting one retires the name
+and clonable by its name, everywhere, and removing one retires the name
 mesh-wide (every machine stops syncing it, none of them touch its files).
 The name can then be reused, since the re-registration outranks the
 tombstone. Repos also carry a random internal id, used to catch the
@@ -44,7 +44,7 @@ a state file that grows until it can no longer be exchanged at all.
 ## Pairing
 
 Pairing is how a machine enters the mesh, and the only moment a connection
-from an unknown endpoint is accepted. A member (`jj-mesh pair`) opens a
+from an unknown endpoint is accepted. A member (`jj-mesh peer add`) opens a
 pairing window and prints a *ticket*: its address plus a fresh one-time
 secret, which the user carries out-of-band (copy/paste) to the joining
 machine. The secret proves the joiner holds the ticket; the machine identities

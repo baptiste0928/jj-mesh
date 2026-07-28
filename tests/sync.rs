@@ -5,12 +5,12 @@ mod harness;
 use std::fs;
 
 use harness::{
-    TestMesh, add_and_join, connect, descriptions, init_join_repo, op_heads, wait_converged,
+    TestMesh, add_and_clone, connect, descriptions, init_clone_repo, op_heads, wait_converged,
 };
 
-/// Joining a repo added on another machine pulls its full history.
+/// Cloning a repo added on another machine pulls its full history.
 #[tokio::test(flavor = "multi_thread")]
-async fn join_pulls_full_history() {
+async fn clone_pulls_full_history() {
     let mesh = TestMesh::new();
     let a = mesh.machine("machine-a").await;
     let b = mesh.machine("machine-b").await;
@@ -24,11 +24,11 @@ async fn join_pulls_full_history() {
         .jj(&dir_a, &["bookmark", "create", "main", "-r", "@-"]);
     a.add_repo("proj", &dir_a).await;
 
-    // B joins it by name, as `jj-mesh join` does: fresh repo with a
+    // B clones it by name, as `jj-mesh repo clone` does: fresh repo with a
     // machine-unique workspace, merged by the next jj command.
     b.wait_available("proj").await;
-    let dir_b = init_join_repo(&mesh, "proj-b", "machine-b");
-    b.join_repo("proj", &dir_b).await;
+    let dir_b = init_clone_repo(&mesh, "proj-b", "machine-b");
+    b.clone_repo("proj", &dir_b).await;
     mesh.jj.jj(&dir_b, &["status"]);
     wait_converged(&dir_a, &dir_b).await;
 
@@ -48,7 +48,7 @@ async fn commits_replicate_both_ways() {
     let b = mesh.machine("machine-b").await;
     connect(&a, &b).await;
     let dir_a = mesh.jj.init_repo("proj");
-    let dir_b = add_and_join(&mesh, &a, &b, &dir_a, "proj").await;
+    let dir_b = add_and_clone(&mesh, &a, &b, &dir_a, "proj").await;
 
     // A commit on A arrives on B.
     fs::write(dir_a.join("a.txt"), "a\n").unwrap();
@@ -71,7 +71,7 @@ async fn concurrent_commits_reconcile() {
     let b = mesh.machine("machine-b").await;
     connect(&a, &b).await;
     let dir_a = mesh.jj.init_repo("proj");
-    let dir_b = add_and_join(&mesh, &a, &b, &dir_a, "proj").await;
+    let dir_b = add_and_clone(&mesh, &a, &b, &dir_a, "proj").await;
 
     // Both sides commit within the watch debounce, so the op logs
     // typically diverge before the daemons exchange the heads; both

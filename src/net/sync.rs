@@ -51,7 +51,7 @@ pub struct Announce {
     pub heads: Vec<Vec<u8>>,
     /// Whether the sender's instance of the repo is colocated (has a
     /// user-visible `.git`). A mesh repo supports at most one colocated
-    /// instance (see `jj-mesh join`'s docs); receivers use this to detect
+    /// instance (see `jj-mesh repo clone`'s docs); receivers use this to detect
     /// a second one and pause the repo instead of corrupting its history.
     pub colocated: bool,
 }
@@ -184,7 +184,7 @@ pub fn compress_payload(bytes: &[u8]) -> Result<Vec<u8>> {
     // One-shot rather than streaming: the payload length is known, so zstd
     // sizes its context to the input instead of allocating a full
     // streaming workspace per call (payloads are mostly a few hundred
-    // bytes, and a join compresses one per op and view). Level 0 selects
+    // bytes, and a clone compresses one per op and view). Level 0 selects
     // zstd's default (3), a good size/speed balance.
     Ok(zstd::bulk::compress(bytes, 0)?)
 }
@@ -261,7 +261,7 @@ pub struct GitRequest {
 /// syncs, whose few objects exist only loose on the server anyway. Pack
 /// streams one packfile, letting the server reuse the deltas of its
 /// on-disk packs and the fetcher index the objects into a single pack
-/// instead of thousands of loose files; joins request it.
+/// instead of thousands of loose files; clones request it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GitTransferFormat {
     Loose,

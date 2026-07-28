@@ -15,7 +15,7 @@
 //! registered repo but whose id differs means two unrelated repos contest
 //! the name: it is never synced (that would merge unrelated histories) and
 //! the conflict is surfaced through the status. Announcements for names not
-//! registered here are remembered for `join`. Disconnecting a peer closes
+//! registered here are remembered for `clone`. Disconnecting a peer closes
 //! its connection through the hub: revocation must sever announcements even
 //! when it races connection setup.
 //!
@@ -81,8 +81,13 @@ pub struct SyncHub {
 struct HubState {
     repos: BTreeMap<String, RepoEntry>,
     peers: BTreeMap<EndpointId, PeerSender>,
+    /// Announcement sequence, monotonic across every repo for the whole
+    /// daemon run. Shared rather than per repo so a repo forgotten and
+    /// cloned again keeps outranking its old announcements: receivers only
+    /// reset their per-repo watermark when the connection drops.
+    announce_seq: u64,
     /// Latest announcement per peer for repo names not registered here.
-    /// Peers replay all their repos on connect, so this is how `join`
+    /// Peers replay all their repos on connect, so this is how `clone`
     /// learns a repo's id and heads and who serves it. Bounded; stale
     /// entries are healed like any announcement.
     orphans: BTreeMap<String, BTreeMap<EndpointId, OrphanAnnounce>>,
@@ -110,9 +115,9 @@ struct OrphanAnnounce {
     colocated: bool,
 }
 
-/// A peer that can serve a `join` of an unregistered repo, with the op
+/// A peer that can serve a `clone` of an unregistered repo, with the op
 /// heads it claims.
-pub type JoinSource = (EndpointId, Vec<Vec<u8>>);
+pub type CloneSource = (EndpointId, Vec<Vec<u8>>);
 
 /// Hub-side state of one registered repo.
 #[derive(Debug)]
@@ -121,8 +126,8 @@ struct RepoEntry {
     /// requests: a name match with a different id is a conflict, never a
     /// sync.
     id: RepoId,
-    /// Sequence of the latest publish, stamped into announcements so
-    /// receivers can discard reordered ones. Monotonic per daemon run.
+    /// Sequence of the latest publish (drawn from [`HubState::announce_seq`]),
+    /// stamped into announcements so receivers can discard reordered ones.
     seq: u64,
     /// Latest published op heads, replayed to connecting peers. `None`
     /// until the repo task first publishes (repo not opened yet).
@@ -332,9 +337,54 @@ impl SyncHub {
         serving
     }
 
-    /// Removes a repo registration.
+    /// Removes a repo registration (a local forget, a mesh-wide removal,
+    /// or a same-name replacement).
+    ///
+    /// The peers' last announcements move back to the orphan store, so the
+    /// repo stays immediately clonable here: peers only re-announce on a
+    /// head change or a reconnect, which could otherwise be arbitrarily
+    /// far away. A retraction (an announcement with no heads) also goes
+    /// out, so peers holding a colocation pause or a name conflict against
+    /// this instance release it instead of staying stuck until this
+    /// machine disconnects.
     pub fn unregister_repo(&self, name: &str) {
-        self.state.lock().unwrap().repos.remove(name);
+        let mut state = self.state.lock().unwrap();
+        let Some(entry) = state.repos.remove(name) else {
+            return;
+        };
+
+        for (peer, heads) in entry.inbox.snapshot() {
+            let held = state
+                .orphans
+                .values()
+                .filter(|peers| peers.contains_key(&peer))
+                .count();
+            if held >= MAX_ORPHAN_REPOS_PER_PEER {
+                continue;
+            }
+            state.orphans.entry(name.to_owned()).or_default().insert(
+                peer,
+                OrphanAnnounce {
+                    id: entry.id.clone(),
+                    heads,
+                    colocated: entry.colocated_peers.contains(&peer),
+                },
+            );
+        }
+
+        if entry.published.is_some() {
+            state.announce_seq += 1;
+            let retraction = Announce {
+                name: name.to_owned(),
+                id: entry.id,
+                seq: state.announce_seq,
+                heads: Vec::new(),
+                colocated: false,
+            };
+            for sender in state.peers.values() {
+                sender.outbox.push_announce(retraction.clone());
+            }
+        }
     }
 
     /// Publishes a repo's current op heads: cached for peers that connect
@@ -343,10 +393,12 @@ impl SyncHub {
     /// task of a replaced same-name repo announcing the wrong heads.
     pub fn publish(&self, name: &str, id: &RepoId, heads: Vec<Vec<u8>>) {
         let mut state = self.state.lock().unwrap();
+        state.announce_seq += 1;
+        let seq = state.announce_seq;
         let Some(entry) = state.repos.get_mut(name).filter(|entry| &entry.id == id) else {
             return;
         };
-        entry.seq += 1;
+        entry.seq = seq;
         entry.published = Some(heads.clone());
 
         let announce = Announce {
@@ -453,8 +505,13 @@ impl SyncHub {
     }
 
     /// Routes an inbound announcement to its repo's inbox; announcements
-    /// for unregistered names are remembered for `join`, and a registered
+    /// for unregistered names are remembered for `clone`, and a registered
     /// name announced with a different id is recorded as a conflict.
+    ///
+    /// An announcement without heads is a retraction (the peer forgot its
+    /// instance; a held repo always has at least one op head): it releases
+    /// everything attributed to the peer for the name, like a disconnect
+    /// scoped to one repo.
     pub fn route(&self, peer: EndpointId, announce: Announce) {
         // Repo names arriving from peers are validated before any use:
         // they end up in logs and as map keys, and must never carry
@@ -463,21 +520,33 @@ impl SyncHub {
             debug!(peer = %peer, "dropping announcement with an invalid repo name");
             return;
         }
+        let retraction = announce.heads.is_empty();
 
         let mut state = self.state.lock().unwrap();
         let Some(entry) = state.repos.get_mut(&announce.name) else {
+            if retraction {
+                state.orphans.retain(|name, peers| {
+                    if *name == announce.name {
+                        peers.remove(&peer);
+                    }
+                    !peers.is_empty()
+                });
+                return;
+            }
             let known = state
                 .orphans
                 .get(&announce.name)
                 .is_some_and(|peers| peers.contains_key(&peer));
-            let held = state
-                .orphans
-                .values()
-                .filter(|peers| peers.contains_key(&peer))
-                .count();
-            if !known && held >= MAX_ORPHAN_REPOS_PER_PEER {
-                debug!(peer = %peer, "dropping announcement: too many unregistered repos");
-                return;
+            if !known {
+                let held = state
+                    .orphans
+                    .values()
+                    .filter(|peers| peers.contains_key(&peer))
+                    .count();
+                if held >= MAX_ORPHAN_REPOS_PER_PEER {
+                    debug!(peer = %peer, "dropping announcement: too many unregistered repos");
+                    return;
+                }
             }
             state.orphans.entry(announce.name).or_default().insert(
                 peer,
@@ -489,6 +558,13 @@ impl SyncHub {
             );
             return;
         };
+
+        if retraction {
+            entry.conflicts.remove(&peer);
+            entry.colocated_peers.remove(&peer);
+            entry.inbox.retract(peer, announce.seq);
+            return;
+        }
 
         if entry.id != announce.id {
             if !entry.conflicts.contains_key(&peer) {
@@ -521,12 +597,12 @@ impl SyncHub {
         entry.inbox.offer(peer, announce.seq, announce.heads);
     }
 
-    /// Resolves a `join` of the repo named `name`: the id every connected
+    /// Resolves a `clone` of the repo named `name`: the id every connected
     /// announcing peer agrees on, and each peer's claimed heads. Errors
     /// when nobody announces the name, or when peers disagree on the id
     /// (unrelated repos contesting one name, which only the user can
     /// resolve).
-    pub fn join_sources(&self, name: &str) -> Result<(RepoId, Vec<JoinSource>)> {
+    pub fn clone_sources(&self, name: &str) -> Result<(RepoId, Vec<CloneSource>)> {
         let state = self.state.lock().unwrap();
         let sources: Vec<(EndpointId, OrphanAnnounce)> = state
             .orphans
@@ -550,7 +626,7 @@ impl SyncHub {
         ensure!(
             sources.iter().all(|(_, announce)| announce.id == id),
             "peers announce different repos under the name `{name}`; \
-             resolve the conflict before joining",
+             resolve the conflict before cloning",
         );
 
         Ok((
@@ -646,13 +722,16 @@ pub struct Inbox {
     notify: Notify,
 }
 
-/// One peer's slot: the highest announcement sequence seen, and the heads
-/// not yet drained (`None` once consumed; the watermark stays to fend off
-/// reordered stale announcements arriving after a drain).
+/// One peer's slot: the highest announcement sequence seen and its heads.
+/// The heads survive draining (marked `drained`), so the peer's last known
+/// state can be demoted to an orphan announcement when the repo is
+/// unregistered, and the watermark fends off reordered stale
+/// announcements arriving after a drain.
 #[derive(Debug)]
 struct Slot {
     seq: u64,
-    heads: Option<Vec<Vec<u8>>>,
+    heads: Vec<Vec<u8>>,
+    drained: bool,
 }
 
 impl Inbox {
@@ -667,7 +746,8 @@ impl Inbox {
                 peer,
                 Slot {
                     seq,
-                    heads: Some(heads),
+                    heads,
+                    drained: false,
                 },
             );
         }
@@ -677,6 +757,36 @@ impl Inbox {
     /// Drops a peer's slot (its connection is gone).
     fn forget(&self, peer: &EndpointId) {
         self.slots.lock().unwrap().remove(peer);
+    }
+
+    /// Records a retraction: the watermark advances and the heads clear,
+    /// so a reordered pre-retraction announcement stays rejected while a
+    /// later re-registration's announcements come through.
+    fn retract(&self, peer: EndpointId, seq: u64) {
+        let mut slots = self.slots.lock().unwrap();
+        if slots.get(&peer).is_some_and(|slot| slot.seq >= seq) {
+            return;
+        }
+        slots.insert(
+            peer,
+            Slot {
+                seq,
+                heads: Vec::new(),
+                drained: true,
+            },
+        );
+    }
+
+    /// The last announced heads of every peer, drained or not, for
+    /// demotion to orphan announcements on unregistration. Peers that
+    /// retracted the repo (no heads) are not included.
+    fn snapshot(&self) -> Vec<(EndpointId, Vec<Vec<u8>>)> {
+        let slots = self.slots.lock().unwrap();
+        slots
+            .iter()
+            .filter(|(_, slot)| !slot.heads.is_empty())
+            .map(|(peer, slot)| (*peer, slot.heads.clone()))
+            .collect()
     }
 
     /// Resolves when an announcement may be waiting. Consumers should
@@ -692,12 +802,14 @@ impl Inbox {
         let mut slots = self.slots.lock().unwrap();
         slots
             .iter_mut()
-            .filter_map(|(peer, slot)| {
-                slot.heads.take().map(|heads| PeerAnnounce {
+            .filter(|(_, slot)| !slot.drained)
+            .map(|(peer, slot)| {
+                slot.drained = true;
+                PeerAnnounce {
                     peer: *peer,
                     seq: slot.seq,
-                    heads,
-                })
+                    heads: slot.heads.clone(),
+                }
             })
             .collect()
     }
@@ -712,9 +824,10 @@ impl Inbox {
         let mut slots = self.slots.lock().unwrap();
         if let Some(slot) = slots.get_mut(&peer)
             && slot.seq == seq
-            && slot.heads.is_none()
+            && slot.drained
         {
-            slot.heads = Some(heads);
+            slot.heads = heads;
+            slot.drained = false;
         }
     }
 }
@@ -877,18 +990,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn remembers_unregistered_announcements_for_join() {
+    async fn remembers_unregistered_announcements_for_clone() {
         let hub = SyncHub::new();
         let id = RepoId::generate();
         let peer = iroh::SecretKey::generate().public();
 
-        // Not offered as a join source while the peer is not connected.
+        // Not offered as a clone source while the peer is not connected.
         hub.route(peer, announce("a", &id, 1, vec![vec![1; 64]]));
-        assert!(hub.join_sources("a").is_err());
+        assert!(hub.clone_sources("a").is_err());
 
         // Registering the repo claims the orphan entry.
         let inbox = hub.register_repo("a".to_owned(), id.clone());
-        assert!(hub.join_sources("a").is_err());
+        assert!(hub.clone_sources("a").is_err());
         hub.route(peer, announce("a", &id, 2, vec![vec![2; 64]]));
         assert_eq!(inbox.drain().len(), 1);
     }
@@ -1026,6 +1139,69 @@ mod tests {
         assert!(hub.is_paused("a"));
         hub.peer_disconnected(&peer);
         assert!(!hub.is_paused("a"));
+
+        // And so does a retraction (the peer forgot its instance).
+        hub.route(peer, colocated(1));
+        assert!(hub.is_paused("a"));
+        hub.route(peer, announce("a", &id, 2, vec![]));
+        assert!(!hub.is_paused("a"));
+    }
+
+    /// A repo unregistered locally keeps its peers' last announcements as
+    /// orphans, so the name stays clonable without waiting for the (idle)
+    /// peers to announce again.
+    #[tokio::test]
+    async fn unregister_demotes_announcements_to_orphans() {
+        let hub = SyncHub::new();
+        let id = RepoId::generate();
+        let inbox = hub.register_repo("a".to_owned(), id.clone());
+        let peer = iroh::SecretKey::generate().public();
+
+        hub.route(peer, announce("a", &id, 1, vec![vec![1; 64]]));
+        // Draining (a completed fetch) must not lose the heads.
+        assert_eq!(inbox.drain().len(), 1);
+        hub.unregister_repo("a");
+
+        // Re-registering under a different id seeds a conflict from the
+        // demoted entry, proving the announcement survived.
+        hub.register_repo("a".to_owned(), RepoId::generate());
+        assert_eq!(hub.conflicts(), vec![("a".to_owned(), peer)]);
+    }
+
+    /// A retraction releases everything attributed to the peer for the
+    /// name, while reordered pre-retraction announcements stay rejected.
+    #[tokio::test]
+    async fn retraction_releases_peer_state() {
+        let hub = SyncHub::new();
+        let id = RepoId::generate();
+        let inbox = hub.register_repo("a".to_owned(), id.clone());
+        let peer = iroh::SecretKey::generate().public();
+
+        // A retraction clears even a conflicting peer's entry.
+        hub.route(
+            peer,
+            announce("a", &RepoId::generate(), 1, vec![vec![1; 64]]),
+        );
+        assert_eq!(hub.conflicts().len(), 1);
+        hub.route(peer, announce("a", &RepoId::generate(), 2, vec![]));
+        assert!(hub.conflicts().is_empty());
+
+        // A stale pre-retraction announcement stays rejected...
+        hub.route(peer, announce("a", &id, 1, vec![vec![1; 64]]));
+        assert!(inbox.drain().is_empty());
+        // ...while a later one (a re-clone on the peer) comes through.
+        hub.route(peer, announce("a", &id, 3, vec![vec![2; 64]]));
+        assert_eq!(inbox.drain().len(), 1);
+
+        // A retraction of an unregistered name clears the orphan entry:
+        // registering the name no longer seeds a conflict from it.
+        hub.route(
+            peer,
+            announce("b", &RepoId::generate(), 4, vec![vec![1; 64]]),
+        );
+        hub.route(peer, announce("b", &RepoId::generate(), 5, vec![]));
+        hub.register_repo("b".to_owned(), RepoId::generate());
+        assert!(hub.conflicts().is_empty());
     }
 
     #[tokio::test]
@@ -1038,7 +1214,7 @@ mod tests {
         hub.route(peer, announce("a\u{202E}b", &id, 1, vec![vec![1; 64]]));
         assert!(inbox.drain().is_empty());
         hub.route(peer, announce("", &id, 1, vec![vec![1; 64]]));
-        assert!(hub.join_sources("").is_err());
+        assert!(hub.clone_sources("").is_err());
     }
 
     #[test]

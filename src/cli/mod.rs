@@ -1,15 +1,8 @@
 //! Command-line interface for `jj-mesh`.
-//!
-//! Each subcommand lives in its own module, holding its clap arguments and
-//! entry point. Networked commands build their own tokio runtime; config-only
-//! commands stay synchronous.
 
-mod add;
-mod daemon;
-mod forget;
-mod join;
-mod pair;
-mod peers;
+mod peer;
+mod repo;
+mod run_daemon;
 mod service;
 mod status;
 
@@ -20,17 +13,27 @@ use color_eyre::eyre::Result;
 
 use crate::config::ConfigDir;
 
-/// Peer-to-peer synchronization of jj repos across personal machines
+/// Peer-to-peer synchronization of jj repositories
 ///
-/// Each machine works in its own jj workspace of a shared logical repo, and
-/// changes are replicated in the background by syncing git objects and the jj
-/// operation log directly between peers.
+/// `jj-mesh` keeps copies of Jujutsu (https://jj-vcs.dev) repositories in
+/// sync across your machines. It is similar to  `jj workspaces`, but across
+/// computers: each machine has its own working copy, and a background daemon
+/// replicates commits and the jj operation log directly between paired
+/// machines, with no central server.
+///
+/// Getting started:
+///   1. Install the background service:  jj-mesh service install
+///   2. Pair with another machine:       jj-mesh peer add
+///   3. Put a repo on the mesh:          jj-mesh repo add <PATH>
+///   4. Clone it on the other machine:   jj-mesh repo clone <NAME>
+///
+/// Use `jj-mesh status` to inspect peers, repos, and synchronization status.
 #[derive(Debug, Parser)]
-#[command(name = "jj-mesh", version)]
+#[command(name = "jj-mesh", version, verbatim_doc_comment)]
 pub struct Cli {
     /// Custom configuration directory
     ///
-    /// Configuration is stored in `$XDG_CONFIG_HOME/jj-mesh` by default.
+    /// Configuration is stored in `~/.config/jj-mesh` by default.
     #[arg(long, short = 'C', global = true, value_name = "DIR")]
     config_dir: Option<PathBuf>,
 
@@ -40,14 +43,14 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    Add(add::AddArgs),
-    Daemon(daemon::DaemonArgs),
-    Forget(forget::ForgetArgs),
-    Join(join::JoinArgs),
-    Pair(pair::PairArgs),
-    Peers(peers::PeersArgs),
+    Repo(repo::RepoArgs),
+    Peer(peer::PeerArgs),
     Service(service::ServiceArgs),
     Status(status::StatusArgs),
+    // Hidden: this is what the installed service runs; users manage the
+    // daemon through `jj-mesh service`.
+    #[command(hide = true)]
+    RunDaemon(run_daemon::RunDaemonArgs),
 }
 
 /// Entry point of the `jj-mesh` CLI
@@ -56,13 +59,10 @@ pub fn run() -> Result<()> {
     let dir = ConfigDir::new(cli.config_dir)?;
 
     match cli.command {
-        Command::Add(args) => add::run(args, &dir),
-        Command::Daemon(args) => daemon::run(args, &dir),
-        Command::Forget(args) => forget::run(&args, &dir),
-        Command::Join(args) => join::run(args, &dir),
-        Command::Pair(args) => pair::run(args, &dir),
-        Command::Peers(args) => peers::run(args, &dir),
+        Command::Repo(args) => repo::run(args, &dir),
+        Command::Peer(args) => peer::run(args, &dir),
         Command::Service(args) => service::run(args, &dir),
         Command::Status(args) => status::run(args, &dir),
+        Command::RunDaemon(args) => run_daemon::run(args, &dir),
     }
 }

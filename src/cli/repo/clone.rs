@@ -1,15 +1,9 @@
-//! `jj-mesh join`: bootstrap a mesh repo onto this machine.
+//! `jj-mesh repo clone`: bootstrap a mesh repo onto this machine.
 //!
 //! Creates a fresh jj repo, gives its workspace a machine-unique name
 //! (mesh machines must never share one), asks the daemon to pull the mesh
 //! repo's full state from a peer and register it, and lets jj merge the
 //! fresh workspace into the replicated history.
-//!
-//! The repo is never colocated: the view's `git_head` is single-valued
-//! but mirrors machine-local state (the colocated `.git`'s HEAD), so a
-//! mesh repo supports at most one colocated checkout. A second one makes
-//! every jj command re-import the local HEAD as a working-copy move,
-//! resurrecting rewritten commits as divergent changes.
 
 use std::{path::PathBuf, process::Command};
 
@@ -18,40 +12,48 @@ use color_eyre::eyre::{Result, WrapErr as _, bail, ensure};
 
 use crate::{
     config::{ConfigDir, MeshState},
-    daemon::control::{self, JoinProgress, Request, Response},
+    daemon::control::{self, CloneProgress, Request, Response},
 };
 
-/// Join a repo another machine added to the mesh
+/// Clone a repo from another machine
 ///
-/// Find the repo name with `jj-mesh status` on the machine that has the
-/// repo. The daemon must be running and connected to that machine.
+/// The repo must have been added to the mesh with `jj-mesh repo add`.
+///
+/// Note that due to a limitation of `jj`, only one instance of each repo across
+/// the mesh can be co-located. This command will clone the repo without
+/// co-location enabled.
 #[derive(Debug, Args)]
-pub struct JoinArgs {
+pub struct CloneArgs {
     /// Name of the repo in the mesh
     name: String,
 
-    /// Directory to create the repo in (must not exist yet; defaults to
-    /// the repo name in the current directory)
+    /// Directory to create the repo in (defaults to the repo name)
+    ///
+    /// The target directly must not exist before the clone. There is currently
+    /// no way of adding a previous clone back into the mesh.
     path: Option<PathBuf>,
 
     /// This machine's workspace name in the repo (defaults to the
-    /// hostname). Must differ from every other machine's.
+    /// hostname)
+    ///
+    /// We assign a workspace for each copy of the repo across the mesh, so the
+    /// current head of each machine is displayed in `jj log`.
     #[arg(long)]
     workspace: Option<String>,
 }
 
-/// Runs the `join` command.
-pub fn run(args: JoinArgs, dir: &ConfigDir) -> Result<()> {
+/// Runs the `repo clone` command.
+pub fn run(args: CloneArgs, dir: &ConfigDir) -> Result<()> {
     let name = args.name;
     let path = args.path.unwrap_or_else(|| PathBuf::from(&name));
 
     // Best-effort pre-check against the stored state, so an obviously
-    // doomed join fails before anything is created on disk; the daemon
+    // doomed clone fails before anything is created on disk; the daemon
     // re-validates authoritatively before registering.
     MeshState::load(dir)?.validate_new_repo(&name, &path)?;
     ensure!(
         !path.exists(),
-        "{} already exists; join creates the directory itself",
+        "{} already exists; clone creates the directory itself",
         path.display(),
     );
 
@@ -70,7 +72,7 @@ pub fn run(args: JoinArgs, dir: &ConfigDir) -> Result<()> {
     jj(Some(&path), &["workspace", "rename", &workspace])?;
 
     println!("Pulling repo `{name}` from the mesh...");
-    let request = Request::JoinRepo {
+    let request = Request::CloneRepo {
         name: name.clone(),
         path: std::fs::canonicalize(&path)?,
     };
@@ -79,7 +81,7 @@ pub fn run(args: JoinArgs, dir: &ConfigDir) -> Result<()> {
     let tty = std::io::IsTerminal::is_terminal(&std::io::stdout());
     let mut progressing = false;
     let pulled =
-        control::request_streaming_blocking(dir, &request, control::JOIN_IDLE_WAIT, |progress| {
+        control::request_streaming_blocking(dir, &request, control::CLONE_IDLE_WAIT, |progress| {
             if tty {
                 progressing = true;
                 show_progress(&progress);
@@ -96,25 +98,32 @@ pub fn run(args: JoinArgs, dir: &ConfigDir) -> Result<()> {
             path.display(),
         )
     })?;
-    let Response::Joined { ops, git_objects } = response else {
+    let Response::Cloned { ops, git_objects } = response else {
         bail!("unexpected response from the daemon: {response:?}");
     };
 
     // Any jj command merges the fresh workspace into the pulled history;
-    // doing it here leaves the repo ready to use.
-    jj(Some(&path), &["status"])?;
+    // doing it here leaves the repo ready to use. A re-clone after
+    // `repo forget` finds the previous instance's same-name workspace in
+    // the pulled history, which leaves the fresh working copy stale:
+    // recover it rather than fail a clone that already succeeded.
+    if let Err(err) = jj(Some(&path), &["status"])
+        && jj(Some(&path), &["workspace", "update-stale"]).is_err()
+    {
+        return Err(err);
+    }
 
-    println!("Joined `{name}`: {ops} operations, {git_objects} git objects");
+    println!("Cloned `{name}`: {ops} operations, {git_objects} git objects");
     Ok(())
 }
 
 /// Renders a progress frame in place on the current line.
-fn show_progress(progress: &JoinProgress) {
+fn show_progress(progress: &CloneProgress) {
     use std::io::Write as _;
 
     use crate::repo::transfer::TransferPhase;
 
-    let JoinProgress { peer, transfer } = progress;
+    let CloneProgress { peer, transfer } = progress;
     let (current, bytes) = (transfer.current, transfer.bytes);
     let line = if peer.is_empty() {
         // Seeded state before the daemon picked a source peer.

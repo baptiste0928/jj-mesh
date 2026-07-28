@@ -119,7 +119,7 @@ impl Machine {
         client.send(request).await.unwrap();
         loop {
             match client.recv(Some(WAIT_TIMEOUT)).await.unwrap() {
-                Response::JoinProgress(_) => {}
+                Response::CloneProgress(_) => {}
                 response => return response,
             }
         }
@@ -160,7 +160,7 @@ impl Machine {
         }
     }
 
-    /// Issues a pairing ticket on this machine, as `jj-mesh pair` would.
+    /// Issues a pairing ticket on this machine, as `jj-mesh peer add` would.
     pub async fn host_pairing(&self) -> String {
         match self
             .request(&Request::PairHost {
@@ -174,7 +174,7 @@ impl Machine {
     }
 
     /// Pairs this machine (hosting) with `other` (joining), through both
-    /// control sockets, as `jj-mesh pair` would. Each side announces its
+    /// control sockets, as `jj-mesh peer add` would. Each side announces its
     /// own name and stores the peer under the peer's announced one.
     pub async fn pair_with(&self, other: &Machine) {
         let ticket = self.host_pairing().await;
@@ -190,7 +190,7 @@ impl Machine {
         assert!(matches!(joined, Response::Paired { .. }), "{joined:?}");
     }
 
-    /// Registers the repo at `path` under `name`, as `jj-mesh add` would.
+    /// Registers the repo at `path` under `name`, as `jj-mesh repo add` would.
     pub async fn add_repo(&self, name: &str, path: &Path) {
         let added = self
             .request(&Request::AddRepo {
@@ -211,7 +211,7 @@ impl Machine {
         .await;
     }
 
-    /// Waits until the mesh repo `name` is joinable on this machine.
+    /// Waits until the mesh repo `name` is clonable on this machine.
     pub async fn wait_available(&self, name: &str) {
         self.wait(&format!("{name} available"), |s| {
             s.available.iter().any(|repo| repo == name)
@@ -219,22 +219,22 @@ impl Machine {
         .await;
     }
 
-    /// Joins the mesh repo `name` into `path` (which must be a freshly
-    /// initialized repo, see [`init_join_repo`]), retrying while the
+    /// Clones the mesh repo `name` into `path` (which must be a freshly
+    /// initialized repo, see [`init_clone_repo`]), retrying while the
     /// daemon still lacks a usable source announcement.
-    pub async fn join_repo(&self, name: &str, path: &Path) {
-        let request = Request::JoinRepo {
+    pub async fn clone_repo(&self, name: &str, path: &Path) {
+        let request = Request::CloneRepo {
             name: name.to_owned(),
             path: std::fs::canonicalize(path).unwrap(),
         };
         let deadline = tokio::time::Instant::now() + WAIT_TIMEOUT;
         loop {
             match self.try_streaming_request(&request).await {
-                Response::Joined { .. } => return,
+                Response::Cloned { .. } => return,
                 Response::Error(message) => {
                     assert!(
                         tokio::time::Instant::now() < deadline,
-                        "{}: join of `{name}` kept failing: {message}",
+                        "{}: clone of `{name}` kept failing: {message}",
                         self.name,
                     );
                     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -253,9 +253,9 @@ pub async fn connect(a: &Machine, b: &Machine) {
     b.wait_peer_connected(&a.name).await;
 }
 
-/// Initializes a fresh repo for [`Machine::join_repo`] as `jj-mesh join`
+/// Initializes a fresh repo for [`Machine::clone_repo`] as `jj-mesh repo clone`
 /// would: non-colocated, with a machine-unique workspace name.
-pub fn init_join_repo(mesh: &TestMesh, dir_name: &str, workspace: &str) -> std::path::PathBuf {
+pub fn init_clone_repo(mesh: &TestMesh, dir_name: &str, workspace: &str) -> std::path::PathBuf {
     let path = mesh.jj.path().join(dir_name);
     mesh.jj
         .jj(mesh.jj.path(), &["git", "init", "--no-colocate", dir_name]);
@@ -263,10 +263,10 @@ pub fn init_join_repo(mesh: &TestMesh, dir_name: &str, workspace: &str) -> std::
     path
 }
 
-/// Registers the repo at `dir` under `name` on `on`, joins it from `from`
-/// into a fresh repo, and waits until both are in sync. Returns the joined
+/// Registers the repo at `dir` under `name` on `on`, clones it from `from`
+/// into a fresh repo, and waits until both are in sync. Returns the cloned
 /// repo's path.
-pub async fn add_and_join(
+pub async fn add_and_clone(
     mesh: &TestMesh,
     on: &Machine,
     from: &Machine,
@@ -276,13 +276,13 @@ pub async fn add_and_join(
     on.add_repo(name, dir).await;
     from.wait_available(name).await;
 
-    let joined = init_join_repo(mesh, &format!("{name}-on-{}", from.name), &from.name);
-    from.join_repo(name, &joined).await;
+    let cloned = init_clone_repo(mesh, &format!("{name}-on-{}", from.name), &from.name);
+    from.clone_repo(name, &cloned).await;
     // Any jj command merges the fresh workspace into the pulled history;
     // its operations then flow back until both sides agree.
-    mesh.jj.jj(&joined, &["status"]);
-    wait_converged(dir, &joined).await;
-    joined
+    mesh.jj.jj(&cloned, &["status"]);
+    wait_converged(dir, &cloned).await;
+    cloned
 }
 
 /// The descriptions of every commit in the repo at `dir`, one per line.

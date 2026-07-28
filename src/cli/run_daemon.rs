@@ -1,19 +1,18 @@
-//! `jj-mesh daemon`: run the sync daemon in the foreground.
+//! `jj-mesh run-daemon`: run the sync daemon in the foreground.
+//!
+//! It can be run directly (with `RUST_LOG`) for debugging purposes.
 
 use clap::Args;
 use color_eyre::eyre::Result;
 
 use crate::{config::ConfigDir, daemon};
 
-/// Run the sync daemon
-///
-/// Maintains connections to the paired machines and synchronizes the
-/// registered repos until stopped. Logging is controlled with `RUST_LOG`.
+/// Run the sync daemon in the foreground
 #[derive(Debug, Args)]
-pub struct DaemonArgs {}
+pub struct RunDaemonArgs {}
 
-/// Runs the `daemon` command.
-pub fn run(_args: DaemonArgs, dir: &ConfigDir) -> Result<()> {
+/// Runs the `run-daemon` command.
+pub fn run(_args: RunDaemonArgs, dir: &ConfigDir) -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::builder()

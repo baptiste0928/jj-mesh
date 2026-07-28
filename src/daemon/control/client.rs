@@ -7,7 +7,7 @@ use std::{io, time::Duration};
 use color_eyre::eyre::{Result, WrapErr as _, bail, eyre};
 use tokio::net::UnixStream;
 
-use super::protocol::{CLIENT_TIMEOUT, JoinProgress, MAX_MESSAGE_SIZE, Request, Response, Status};
+use super::protocol::{CLIENT_TIMEOUT, CloneProgress, MAX_MESSAGE_SIZE, Request, Response, Status};
 use crate::{
     config::ConfigDir,
     net::wire::{read_message, write_message},
@@ -90,27 +90,30 @@ pub fn request_blocking(dir: &ConfigDir, request: &Request, limit: Duration) -> 
 }
 
 /// Like [`request_blocking`], for requests answered by a progress stream:
-/// `on_progress` sees every [`Response::JoinProgress`] frame, and the first
+/// `on_progress` sees every [`Response::CloneProgress`] frame, and the first
 /// terminal response is returned. `idle` bounds the gap between frames,
 /// not the whole exchange; the daemon heartbeats progress while it works.
 pub fn request_streaming_blocking(
     dir: &ConfigDir,
     request: &Request,
     idle: Duration,
-    mut on_progress: impl FnMut(JoinProgress),
+    mut on_progress: impl FnMut(CloneProgress),
 ) -> Result<Response> {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?
         .block_on(async {
             let Some(mut client) = ControlClient::connect(dir).await? else {
-                bail!("the jj-mesh daemon is not running; start it with `jj-mesh daemon` first");
+                bail!(
+                    "the jj-mesh daemon is not running; start it with `jj-mesh \
+                     service start` (or set it up with `jj-mesh service install`)"
+                );
             };
 
             client.send(request).await?;
             loop {
                 match client.recv(Some(idle)).await? {
-                    Response::JoinProgress(progress) => on_progress(progress),
+                    Response::CloneProgress(progress) => on_progress(progress),
                     Response::Error(message) => bail!("{message}"),
                     response => return Ok(response),
                 }

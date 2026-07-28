@@ -50,10 +50,13 @@ const INGEST_SAMPLE_INTERVAL: std::time::Duration = std::time::Duration::from_mi
 
 /// Fetches the given op heads from a peer over the stream pair and applies
 /// them locally in crash-safe order. `format` picks how git objects travel
-/// (joins request a pack, incremental syncs stay loose, see
+/// (clones request a pack, incremental syncs stay loose, see
 /// [`GitTransferFormat`]); `progress` receives live counters as the phases
 /// advance.
-#[expect(clippy::too_many_arguments, reason = "half are the repo/stream plumbing")]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "half are the repo/stream plumbing"
+)]
 pub async fn fetch(
     repo: &Arc<MeshRepo>,
     name: &str,
@@ -148,7 +151,7 @@ pub async fn fetch(
     drop(pack_keep);
 
     // Index the published heads, so the next jj command loads the commit
-    // index instead of building it (which after a join means indexing the
+    // index instead of building it (which after a clone means indexing the
     // entire replicated history). Best-effort: jj rebuilds lazily anyway,
     // so a failure here must not fail an otherwise complete fetch.
     if !published.is_empty() {

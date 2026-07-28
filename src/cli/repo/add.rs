@@ -1,4 +1,4 @@
-//! `jj-mesh add`: register a repo on the mesh.
+//! `jj-mesh repo add`: register a repo on the mesh.
 
 use std::path::PathBuf;
 
@@ -13,8 +13,8 @@ use crate::{
 
 /// Add a repo to the mesh
 ///
-/// The repo starts being synchronized with the paired machines. The daemon
-/// must be running.
+/// The repo will be made available for other machines to clone with
+/// `jj-mesh repo clone`, and any changes will be synced across the mesh.
 #[derive(Debug, Args)]
 pub struct AddArgs {
     /// Path inside the jj repo to add (defaults to the current directory)
@@ -25,7 +25,7 @@ pub struct AddArgs {
     name: Option<String>,
 }
 
-/// Runs the `add` command.
+/// Runs the `repo add` command.
 pub fn run(args: AddArgs, dir: &ConfigDir) -> Result<()> {
     let path = args.path.unwrap_or_else(|| PathBuf::from("."));
     let repo = JjRepo::discover(&path)?;

@@ -111,7 +111,7 @@ enum RepoState {
         error: String,
     },
     /// The repo directory itself is gone: an unmounted disk, or a repo the
-    /// user deleted without `jj-mesh forget`. Retried like a backoff, but
+    /// user deleted without `jj-mesh repo forget`. Retried like a backoff, but
     /// surfaced distinctly so the status can suggest the fix.
     Missing {
         until: Instant,
@@ -310,7 +310,7 @@ async fn run_repo(task: RepoTask) {
         let delay = backoff.next_delay();
         let until = Instant::now() + delay;
         // A missing repo directory is not a repo problem to diagnose but a
-        // gone repo (unmounted disk, or deleted without `jj-mesh forget`):
+        // gone repo (unmounted disk, or deleted without `jj-mesh repo forget`):
         // surfaced as its own state so the status can suggest the fix. The
         // stat runs on a blocking thread; a hung mount is one of the very
         // conditions being probed.
@@ -732,7 +732,7 @@ mod tests {
     }
 
     /// A path with no repo directory at all is `Missing` (the state that
-    /// suggests `jj-mesh forget`), not a generic failure.
+    /// suggests `jj-mesh repo forget`), not a generic failure.
     #[tokio::test]
     async fn reports_missing_for_absent_repo_dir() {
         let fx = Fixture::new();

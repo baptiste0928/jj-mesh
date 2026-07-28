@@ -58,7 +58,7 @@ pub async fn serve(
     }
 
     // Stream the delta through a bounded channel so the whole op-log delta
-    // never sits in memory at once: a join pulls the entire log. The walk is
+    // never sits in memory at once: a clone pulls the entire log. The walk is
     // bulk store I/O, so it runs on a blocking thread; each view is sent
     // before the first op referencing it, and ops stay parents-first.
     let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<OpFrame>>(OP_STREAM_BUFFER);

@@ -131,12 +131,15 @@ impl MeshRepo {
     /// the nearest indexed ancestor operation (the same build `jj debug
     /// reindex` runs, minus the wipe). Syncs call it after publishing an
     /// op head so the user's next jj command loads the index instead of
-    /// building it; after a join that build would cover the entire
+    /// building it; after a clone that build would cover the entire
     /// replicated history. Blocking.
     pub fn build_commit_index(&self, id: &OperationId) -> Result<()> {
         use jj_lib::default_index::DefaultIndexStore;
 
-        let Some(index_store) = self.loader.index_store().downcast_ref::<DefaultIndexStore>()
+        let Some(index_store) = self
+            .loader
+            .index_store()
+            .downcast_ref::<DefaultIndexStore>()
         else {
             // Another index backend indexes on its own terms.
             return Ok(());
@@ -379,7 +382,7 @@ fn read_raw(dir: &Path, id: &impl ObjectId) -> Result<Vec<u8>> {
 /// persisted together: one parallel sync pass over all staged files, then
 /// the atomic renames into place. This replaces the per-file fsync of
 /// jj's own store writes, which dominates apply time for large batches
-/// (a join replicates the whole op log), while preserving jj's
+/// (a clone replicates the whole op log), while preserving jj's
 /// sync-before-rename order: an object observed under its final id
 /// always holds durable, complete content, so an interrupted batch can
 /// be retried with the existing objects skipped.

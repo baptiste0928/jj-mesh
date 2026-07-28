@@ -1,4 +1,4 @@
-//! `jj-mesh pair`: register another machine as a peer.
+//! `jj-mesh peer add`: register another machine as a peer.
 //!
 //! Pairing always runs through the daemon, which owns the machine-key
 //! endpoint: the CLI drives it over the control socket. Hosting only asks
@@ -20,16 +20,19 @@ use crate::{
 /// its relay connection to come up).
 const TICKET_TIMEOUT: Duration = Duration::from_secs(45);
 
-/// Pair with another machine, registering each other as sync peers
+/// Pair with another machine, adding it to the mesh
 ///
-/// Run without arguments on one machine to print a pairing ticket, then run
-/// with that ticket on the other machine. Both machines add each other to
-/// their peer list. The daemon must be running on both machines.
+/// Run this command on one machine to print a pairing ticket, then run it again
+/// with the ticket on the other machine. Each ticket can only be used once.
+///
+/// When a machine gets added to the mesh, it gets access to all synced
+/// repositories and can sync from any of the machines already in the mesh.
 #[derive(Debug, Args)]
-pub struct PairArgs {
-    /// Pairing ticket printed by `jj-mesh pair` on the other machine
+pub struct AddArgs {
+    /// Pairing ticket printed by `jj-mesh peer add` on the other machine
     ///
-    /// If omitted, generate a ticket for the other machine to redeem.
+    /// If omitted, a ticket will be generated. The ticket can be once, and
+    /// expires after 3 minutes.
     ticket: Option<String>,
 
     /// Name announced to the other machine (defaults to the hostname)
@@ -37,8 +40,8 @@ pub struct PairArgs {
     name: Option<String>,
 }
 
-/// Runs the `pair` command.
-pub fn run(args: PairArgs, dir: &ConfigDir) -> Result<()> {
+/// Runs the `peer add` command.
+pub fn run(args: AddArgs, dir: &ConfigDir) -> Result<()> {
     let name = args
         .name
         .unwrap_or_else(|| gethostname::gethostname().to_string_lossy().into_owned());
@@ -52,7 +55,10 @@ pub fn run(args: PairArgs, dir: &ConfigDir) -> Result<()> {
 /// Dispatches to the hosting or joining side of the pairing.
 async fn pair(ticket: Option<String>, name: String, dir: &ConfigDir) -> Result<()> {
     let Some(mut client) = ControlClient::connect(dir).await? else {
-        bail!("the jj-mesh daemon is not running; start it with `jj-mesh daemon` first");
+        bail!(
+            "the jj-mesh daemon is not running; start it with `jj-mesh service \
+             start` (or set it up with `jj-mesh service install`)"
+        );
     };
 
     match ticket {
@@ -69,11 +75,11 @@ async fn host(client: &mut ControlClient, name: String) -> Result<()> {
     match client.recv(Some(TICKET_TIMEOUT)).await? {
         Response::PairTicket(ticket) => {
             println!("To pair, run this on the other machine:\n");
-            println!("    jj-mesh pair {ticket}\n");
+            println!("    jj-mesh peer add {ticket}\n");
             println!(
                 "The ticket is valid for {} minutes, for a single pairing; \
-                 running `jj-mesh pair` again replaces it. The new peer will \
-                 show up in `jj-mesh status`.",
+                 running `jj-mesh peer add` again replaces it. The new peer \
+                 will show up in `jj-mesh status`.",
                 PAIR_TICKET_TTL.as_secs() / 60,
             );
             Ok(())

@@ -3,13 +3,14 @@
 use std::{
     ffi::OsString,
     path::{Path, PathBuf},
+    time::{Duration, Instant},
 };
 
 use clap::{Args, Subcommand};
-use color_eyre::eyre::{Result, WrapErr as _, ensure};
+use color_eyre::eyre::{Result, WrapErr as _, bail, ensure};
 use service_manager::{
     RestartPolicy, ServiceInstallCtx, ServiceLabel, ServiceLevel, ServiceManager, ServiceStartCtx,
-    ServiceStopCtx, ServiceUninstallCtx,
+    ServiceStatus, ServiceStatusCtx, ServiceStopCtx, ServiceUninstallCtx,
 };
 
 use crate::config::ConfigDir;
@@ -17,11 +18,25 @@ use crate::config::ConfigDir;
 /// Seconds before the service is restarted after a failure.
 const RESTART_DELAY_SECS: u32 = 5;
 
-/// Manage the daemon as a user service
+/// How long `restart` waits for the service to leave or reach the running
+/// state. Stopping is asynchronous on launchd, and starting reports
+/// success as soon as the process forks, so both transitions are verified
+/// by polling rather than trusted.
+const RESTART_WAIT: Duration = Duration::from_secs(10);
+
+/// Delay after a verified start before re-checking that the service is
+/// still up, to catch a daemon that exits right away (bad binary, another
+/// instance holding the lock).
+const RESTART_SETTLE: Duration = Duration::from_secs(1);
+
+/// Install and manage the background service
 ///
-/// Installs a service running `jj-mesh daemon` (a systemd user unit on
-/// Linux, a launchd agent on macOS), so the mesh stays connected in the
-/// background and across reboots.
+/// `jj-mesh` requires a background daemon to run to keep connection with the
+/// mesh and sync changes. We provide commands to install and manage it as
+/// a user service (with systemd on Linux, launchd on macOS).
+///
+/// If you wish to manage the service manually, you should run the daemon with
+/// `jj-mesh run-daemon`.
 #[derive(Debug, Args)]
 pub struct ServiceArgs {
     #[command(subcommand)]
@@ -32,11 +47,11 @@ pub struct ServiceArgs {
 enum ServiceCommand {
     /// Install and start the daemon service
     Install {
-        /// Program path written into the service (defaults to the running
-        /// jj-mesh binary)
+        /// Program path written into the service (defaults to current binary)
         ///
-        /// Pass a path that stays stable across updates when the install
-        /// location changes, e.g. `~/.nix-profile/bin/jj-mesh`.
+        /// If the binary location is not stable across updates, you can pass
+        /// another stable path here. For example, you'll want to use
+        /// `~/.nix-profile/bin/jj-mesh` if you are using Nix.
         #[arg(long, value_name = "PATH")]
         program: Option<PathBuf>,
     },
@@ -46,6 +61,8 @@ enum ServiceCommand {
     Start,
     /// Stop the daemon service
     Stop,
+    /// Restart the daemon service
+    Restart,
 }
 
 /// Runs the `service` command.
@@ -74,6 +91,76 @@ pub fn run(args: ServiceArgs, dir: &ConfigDir) -> Result<()> {
             println!("jj-mesh daemon service stopped");
             Ok(())
         }
+        ServiceCommand::Restart => restart(&*manager, &label),
+    }
+}
+
+/// Stops and starts the service, verifying both transitions: `stop` can
+/// fail or land asynchronously (launchd), and `start` reports success as
+/// soon as the process forks, so trusting the exit codes could print
+/// "restarted" while no daemon runs (or the old one still does).
+fn restart(manager: &dyn ServiceManager, label: &ServiceLabel) -> Result<()> {
+    stop_quietly(manager, label);
+    wait_status(manager, label, "stop", |status| {
+        status != &ServiceStatus::Running
+    })?;
+
+    manager
+        .start(ServiceStartCtx {
+            label: label.clone(),
+        })
+        .wrap_err("cannot start the service")?;
+    wait_status(manager, label, "start", |status| {
+        status == &ServiceStatus::Running
+    })?;
+    // A daemon that dies right after starting still reports running for an
+    // instant; re-check once it had time to fail.
+    std::thread::sleep(RESTART_SETTLE);
+    let status = manager
+        .status(ServiceStatusCtx {
+            label: label.clone(),
+        })
+        .wrap_err("cannot query the service status")?;
+    ensure!(
+        status == ServiceStatus::Running,
+        "the service started but died (status: {status:?}); check its logs",
+    );
+
+    println!("jj-mesh daemon service restarted");
+    Ok(())
+}
+
+/// Stops the service, ignoring failures: stopping a service that is not
+/// running errors harmlessly, and the callers verify the state they need
+/// afterwards.
+fn stop_quietly(manager: &dyn ServiceManager, label: &ServiceLabel) {
+    let _ = manager.stop(ServiceStopCtx {
+        label: label.clone(),
+    });
+}
+
+/// Polls the service status until `reached` accepts it, bounded by
+/// [`RESTART_WAIT`]; `what` names the awaited transition in errors.
+fn wait_status(
+    manager: &dyn ServiceManager,
+    label: &ServiceLabel,
+    what: &str,
+    reached: impl Fn(&ServiceStatus) -> bool,
+) -> Result<()> {
+    let deadline = Instant::now() + RESTART_WAIT;
+    loop {
+        let status = manager
+            .status(ServiceStatusCtx {
+                label: label.clone(),
+            })
+            .wrap_err("cannot query the service status")?;
+        if reached(&status) {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            bail!("the service did not {what} (status: {status:?})");
+        }
+        std::thread::sleep(Duration::from_millis(200));
     }
 }
 
@@ -98,7 +185,7 @@ fn install(
         args.push(OsString::from("--config-dir"));
         args.push(dir.path().into());
     }
-    args.push(OsString::from("daemon"));
+    args.push(OsString::from("run-daemon"));
 
     let command = std::iter::once(program.as_os_str())
         .chain(args.iter().map(OsString::as_os_str))
@@ -124,6 +211,15 @@ fn install(
         })
         .wrap_err("cannot install the service")?;
 
+    // A reinstall rewrites the unit file, but systemd keeps serving the
+    // cached one (with a possibly stale ExecStart) until told to reload;
+    // `service-manager` never does. Best effort: a failure only means the
+    // cache heals on the next reboot or manual reload.
+    #[cfg(target_os = "linux")]
+    let _ = std::process::Command::new("systemctl")
+        .args(["--user", "daemon-reload"])
+        .status();
+
     println!("Created {}", service_file(&label)?.display());
     println!("  command: {command}");
 
@@ -146,10 +242,7 @@ fn install(
 
 /// Stops the service if running, then removes it.
 fn uninstall(manager: &dyn ServiceManager, label: ServiceLabel) -> Result<()> {
-    // Best effort: stopping fails harmlessly when the service is not running.
-    let _ = manager.stop(ServiceStopCtx {
-        label: label.clone(),
-    });
+    stop_quietly(manager, &label);
 
     let file = service_file(&label)?;
     manager
@@ -163,18 +256,22 @@ fn uninstall(manager: &dyn ServiceManager, label: ServiceLabel) -> Result<()> {
 
 /// Checks that a path can be embedded in a service definition.
 ///
-/// `service-manager` writes systemd units without any quoting, so a path
-/// with whitespace silently corrupts `ExecStart`, and control characters
-/// (newlines) could inject arbitrary unit directives. systemd also refuses
-/// non-absolute paths outside its fixed `/usr` search path.
+/// `service-manager` writes systemd units without any quoting or escaping,
+/// so a path with whitespace silently corrupts `ExecStart`, control
+/// characters (newlines) could inject arbitrary unit directives, `%` is
+/// rewritten by systemd's specifier expansion, and the XML metacharacters
+/// would break the launchd plist. systemd also refuses non-absolute paths
+/// outside its fixed `/usr` search path.
 fn validate_service_path(what: &str, path: &Path) -> Result<()> {
     ensure!(path.is_absolute(), "{what} must be absolute: {path:?}");
 
     let text = path.as_os_str().to_string_lossy();
     ensure!(
-        !text.chars().any(|c| c.is_whitespace() || c.is_control()),
-        "{what} must not contain whitespace or control characters, \
-         as it is written unquoted into the service definition: {path:?}",
+        !text
+            .chars()
+            .any(|c| c.is_whitespace() || c.is_control() || "%<>&\"'".contains(c)),
+        "{what} must not contain whitespace, control characters or any of \
+         `%<>&\"'`, as it is written unescaped into the service definition: {path:?}",
     );
 
     Ok(())

@@ -101,7 +101,7 @@ pub struct MeshState {
     /// Repos registered on this machine, keyed by their mesh-wide name.
     pub repos: BTreeMap<String, Repo>,
     /// Every repo the mesh knows, registered here or not. Includes
-    /// tombstones (forgotten repos), which gossip must remember so a
+    /// tombstones (removed repos), which gossip must remember so a
     /// machine that missed the removal cannot resurrect the name.
     pub mesh_repos: BTreeMap<String, MeshRepo>,
 }
@@ -199,7 +199,7 @@ impl MeshState {
         self.mesh_repos.get(name).and_then(MeshRepo::id)
     }
 
-    /// The repo names the mesh knows, in use (not forgotten).
+    /// The repo names the mesh knows, in use (not removed).
     pub fn mesh_repo_names(&self) -> impl Iterator<Item = &str> {
         self.mesh_repos
             .iter()
@@ -209,13 +209,13 @@ impl MeshState {
 
     /// Checks that registering `name` with this id agrees with the mesh: a
     /// name the mesh already knows may only be registered with its id (that
-    /// is what a join does), since anything else forks the name into two
+    /// is what a clone does), since anything else forks the name into two
     /// unrelated repos.
     pub fn ensure_mesh_id(&self, name: &str, id: &RepoId) -> Result<()> {
         if let Some(mesh_id) = self.mesh_repo_id(name)
             && mesh_id != id
         {
-            bail!("a repo named `{name}` already exists in the mesh; join it instead");
+            bail!("a repo named `{name}` already exists in the mesh; clone it instead");
         }
 
         Ok(())
@@ -271,7 +271,7 @@ impl MeshState {
             [endpoint] => return Ok(*endpoint),
             [_, _, ..] => bail!(
                 "several peers are named `{selector}`; use the endpoint id \
-                 (see `jj-mesh peers`)"
+                 (see `jj-mesh status`)"
             ),
             [] => {}
         }
@@ -322,14 +322,14 @@ impl MeshState {
     /// unregisters the repo here. The tombstone propagates the removal, so
     /// every machine stops syncing the repo; none of them touch its files.
     /// Returns whether the repo was registered on this machine.
-    pub fn forget_repo(&mut self, name: &str) -> Result<bool> {
+    pub fn remove_repo(&mut self, name: &str) -> Result<bool> {
         ensure!(
             self.mesh_repos.contains_key(name) || self.repos.contains_key(name),
             "no repo named `{name}` in the mesh",
         );
         ensure!(
             self.mesh_repo_id(name).is_some() || self.repos.contains_key(name),
-            "repo `{name}` is already forgotten",
+            "repo `{name}` is already removed",
         );
 
         let version = bumped_version(&self.mesh_repos, name)?;
@@ -337,11 +337,22 @@ impl MeshState {
             name.to_owned(),
             MeshRepo {
                 version,
-                status: MeshRepoStatus::Forgotten,
+                status: MeshRepoStatus::Removed,
             },
         );
 
         Ok(self.repos.remove(name).is_some())
+    }
+
+    /// Unregisters a repo on this machine only, returning its record. The
+    /// mesh record is untouched: the other machines keep syncing the repo
+    /// among themselves, and it stays clonable here (that is also the only
+    /// way back in, since re-adding it would fork the name).
+    pub fn forget_repo(&mut self, name: &str) -> Result<Repo> {
+        match self.repos.remove(name) {
+            Some(repo) => Ok(repo),
+            None => bail!("no repo named `{name}` is registered on this machine"),
+        }
     }
 
     /// The membership this machine gossips: every peer record (tombstones
@@ -357,11 +368,11 @@ impl MeshState {
     /// endpoint: records about ourselves are not ours to store.
     ///
     /// Peer and mesh repo records are versioned registers: the higher
-    /// version wins, and ties resolve to the retired state (removed,
-    /// forgotten), then to the smaller name or id, so every machine
-    /// converges on the same record without clocks. Adopting a forgotten
-    /// repo also unregisters it here: that is how the removal reaches the
-    /// machines that hold it.
+    /// version wins, and ties resolve to the retired state (removed),
+    /// then to the smaller name or id, so every machine converges on the
+    /// same record without clocks. Adopting a removed repo also
+    /// unregisters it here: that is how the removal reaches the machines
+    /// that hold it.
     ///
     /// The merged maps are capped: a peer is authenticated but not trusted
     /// to grow our state file (which we must keep gossipable) without
@@ -400,10 +411,10 @@ impl MeshState {
             }
 
             self.mesh_repos.insert(name.clone(), record.clone());
-            // A repo forgotten mesh-wide stops being synced here; its
+            // A repo removed mesh-wide stops being synced here; its
             // files stay where they are.
             if record.id().is_none() && self.repos.remove(name).is_some() {
-                debug!(repo = %name, "repo forgotten on the mesh; no longer syncing it");
+                debug!(repo = %name, "repo removed from the mesh; no longer syncing it");
             }
         }
     }
@@ -523,14 +534,14 @@ pub struct MeshRepo {
     pub status: MeshRepoStatus,
 }
 
-/// Whether a repo name is in use on the mesh. `Forgotten` is a tombstone:
+/// Whether a repo name is in use on the mesh. `Removed` is a tombstone:
 /// remembering it is what keeps a machine that missed the removal from
 /// resurrecting the name.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MeshRepoStatus {
     Present { id: RepoId },
-    Forgotten,
+    Removed,
 }
 
 impl MeshRepo {
@@ -538,7 +549,7 @@ impl MeshRepo {
     pub fn id(&self) -> Option<&RepoId> {
         match &self.status {
             MeshRepoStatus::Present { id } => Some(id),
-            MeshRepoStatus::Forgotten => None,
+            MeshRepoStatus::Removed => None,
         }
     }
 }
@@ -548,7 +559,7 @@ impl Register for MeshRepo {
         self.version
     }
 
-    /// Higher version first, forgetting beating presence on ties, then the
+    /// Higher version first, removal beating presence on ties, then the
     /// smaller id.
     fn outranks(&self, other: &Self) -> bool {
         fn rank(repo: &MeshRepo) -> (u64, bool, cmp::Reverse<Option<&RepoId>>) {
@@ -861,7 +872,7 @@ mod tests {
         };
 
         // Both machines must settle on the same id whichever they held
-        // first, or their "available repos" and add/join guards disagree
+        // first, or their "available repos" and add/clone guards disagree
         // forever.
         let mut holding_low = MeshState::default();
         holding_low
@@ -910,7 +921,7 @@ mod tests {
     }
 
     #[test]
-    fn adding_a_repo_known_to_the_mesh_requires_joining() {
+    fn adding_a_repo_known_to_the_mesh_requires_cloning() {
         let mut state = MeshState::default();
         state
             .mesh_repos
@@ -925,11 +936,11 @@ mod tests {
                 },
             )
             .unwrap_err();
-        assert!(err.to_string().contains("join"), "{err:#}");
+        assert!(err.to_string().contains("clone"), "{err:#}");
     }
 
     #[test]
-    fn forgetting_a_repo_tombstones_it_and_frees_the_name() {
+    fn removing_a_repo_tombstones_it_and_frees_the_name() {
         let mut state = MeshState::default();
         let repo = |id: &RepoId| Repo {
             id: id.clone(),
@@ -938,7 +949,7 @@ mod tests {
 
         let first = RepoId::generate();
         state.add_repo("proj".to_owned(), repo(&first)).unwrap();
-        assert!(state.forget_repo("proj").unwrap(), "it was registered here");
+        assert!(state.remove_repo("proj").unwrap(), "it was registered here");
 
         // The name is retired, not deleted: it stays as a tombstone so a
         // machine that missed the removal cannot resurrect it.
@@ -946,14 +957,50 @@ mod tests {
         assert_eq!(state.mesh_repo_id("proj"), None);
         assert_eq!(state.mesh_repo_names().count(), 0);
         assert!(state.mesh_repos.contains_key("proj"));
-        assert!(state.forget_repo("proj").is_err());
-        assert!(state.forget_repo("nope").is_err());
+        assert!(state.remove_repo("proj").is_err());
+        assert!(state.remove_repo("nope").is_err());
 
         // And the name can be reused, superseding the tombstone.
         let second = RepoId::generate();
         state.add_repo("proj".to_owned(), repo(&second)).unwrap();
         assert_eq!(state.mesh_repo_id("proj"), Some(&second));
         assert!(state.mesh_repos["proj"].version > 2);
+    }
+
+    #[test]
+    fn forgetting_locally_keeps_the_mesh_record() {
+        let mut state = MeshState::default();
+        let id = RepoId::generate();
+        state
+            .add_repo(
+                "proj".to_owned(),
+                Repo {
+                    id: id.clone(),
+                    path: "/p".into(),
+                },
+            )
+            .unwrap();
+
+        let repo = state.forget_repo("proj").unwrap();
+        assert_eq!(repo.path, PathBuf::from("/p"));
+        assert!(state.repos.is_empty());
+        assert!(state.forget_repo("proj").is_err());
+
+        // The mesh still knows the repo: it stays clonable here, and only
+        // a clone (bringing the mesh id) can register it again; a plain
+        // re-add generates a fresh id and would fork the name.
+        assert_eq!(state.mesh_repo_id("proj"), Some(&id));
+        assert_eq!(state.mesh_repo_names().count(), 1);
+        let err = state
+            .add_repo(
+                "proj".to_owned(),
+                Repo {
+                    id: RepoId::generate(),
+                    path: repo.path,
+                },
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("clone"), "{err:#}");
     }
 
     #[test]
@@ -972,17 +1019,17 @@ mod tests {
             )
             .unwrap();
 
-        // Another machine forgot the repo: we stop syncing it, and a stale
+        // Another machine removed the repo: we stop syncing it, and a stale
         // announcement of the old record cannot bring it back.
-        let forgotten = MeshRepo {
+        let removed = MeshRepo {
             version: state.mesh_repos["proj"].version + 1,
-            status: MeshRepoStatus::Forgotten,
+            status: MeshRepoStatus::Removed,
         };
         let membership = |record: MeshRepo| Membership {
             peers: BTreeMap::new(),
             repos: BTreeMap::from([("proj".to_owned(), record)]),
         };
-        state.merge_membership(&membership(forgotten), &local);
+        state.merge_membership(&membership(removed), &local);
         assert!(state.repos.is_empty());
         assert_eq!(state.mesh_repo_id("proj"), None);
 

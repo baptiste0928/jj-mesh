@@ -4,12 +4,12 @@ mod harness;
 
 use std::fs;
 
-use harness::{TestMesh, add_and_join, connect, descriptions, wait_converged};
+use harness::{TestMesh, add_and_clone, connect, descriptions, init_clone_repo, wait_converged};
 use jj_mesh::daemon::control::{Request, Response};
 
 /// Machines that never paired directly learn about each other through
 /// gossip: they connect on their own, repos added anywhere become
-/// joinable everywhere, and forgetting a repo retires it mesh-wide.
+/// clonable everywhere, and removing a repo retires it mesh-wide.
 #[tokio::test(flavor = "multi_thread")]
 async fn membership_gossips_transitively() {
     // Only A-B and B-C are paired.
@@ -24,30 +24,86 @@ async fn membership_gossips_transitively() {
     c.wait_peer_connected("machine-a").await;
     a.wait_peer_connected("machine-c").await;
 
-    // C joins a repo added on A and receives its commits.
+    // C clones a repo added on A and receives its commits.
     let dir_a = mesh.jj.init_repo("proj");
-    let dir_c = add_and_join(&mesh, &a, &c, &dir_a, "proj").await;
+    let dir_c = add_and_clone(&mesh, &a, &c, &dir_a, "proj").await;
     fs::write(dir_a.join("file.txt"), "hello\n").unwrap();
     mesh.jj.jj(&dir_a, &["commit", "-m", "from a"]);
     wait_converged(&dir_a, &dir_c).await;
     assert!(descriptions(&mesh, &dir_c).contains("from a"));
 
-    // Forgetting the repo on A gossips a tombstone that unregisters it
+    // Removing the repo on A gossips a tombstone that unregisters it
     // everywhere, including on C where it is registered.
-    let forgotten = a
+    let removed = a
+        .request(&Request::RemoveRepo {
+            name: "proj".to_owned(),
+        })
+        .await;
+    assert!(
+        matches!(removed, Response::RepoRemoved { was_local: true }),
+        "{removed:?}",
+    );
+    assert!(a.status().await.repos.is_empty());
+    c.wait("proj removed", |s| {
+        s.repos.is_empty() && s.available.is_empty()
+    })
+    .await;
+}
+
+/// Forgetting a repo locally unregisters it on that machine only: the
+/// mesh keeps the repo, it can be cloned again right away (the daemon
+/// keeps the peers' announcements), and sync resumes in both directions
+/// afterwards (announcement sequences survive the re-registration).
+#[tokio::test(flavor = "multi_thread")]
+async fn forgetting_locally_keeps_the_repo_clonable() {
+    let mesh = TestMesh::new();
+    let a = mesh.machine("machine-a").await;
+    let b = mesh.machine("machine-b").await;
+    connect(&a, &b).await;
+
+    let dir_a = mesh.jj.init_repo("proj");
+    let dir_b = add_and_clone(&mesh, &a, &b, &dir_a, "proj").await;
+
+    // Sync some traffic first, so B's announcement sequence has advanced
+    // by the time it forgets the repo.
+    fs::write(dir_b.join("file.txt"), "hello\n").unwrap();
+    mesh.jj.jj(&dir_b, &["commit", "-m", "before forget"]);
+    wait_converged(&dir_a, &dir_b).await;
+
+    let forgotten = b
         .request(&Request::ForgetRepo {
             name: "proj".to_owned(),
         })
         .await;
     assert!(
-        matches!(forgotten, Response::RepoForgotten { was_local: true }),
+        matches!(forgotten, Response::RepoForgotten { .. }),
         "{forgotten:?}",
     );
-    assert!(a.status().await.repos.is_empty());
-    c.wait("proj forgotten", |s| {
-        s.repos.is_empty() && s.available.is_empty()
+
+    // B no longer syncs the repo (and forgetting again is an error)...
+    b.wait("proj forgotten locally", |s| {
+        s.repos.is_empty() && s.available == ["proj"]
     })
     .await;
+    assert_eq!(a.status().await.repos.len(), 1);
+    let again = b
+        .try_request(&Request::ForgetRepo {
+            name: "proj".to_owned(),
+        })
+        .await;
+    assert!(matches!(again, Response::Error(_)), "{again:?}");
+
+    // ...but the repo clones again into a fresh directory and catches up...
+    let dir_b2 = init_clone_repo(&mesh, "proj-again", "machine-b-again");
+    b.clone_repo("proj", &dir_b2).await;
+    wait_converged(&dir_a, &dir_b2).await;
+    assert!(descriptions(&mesh, &dir_b2).contains("before forget"));
+
+    // ...and changes flow in both directions afterwards.
+    fs::write(dir_b2.join("after.txt"), "hello\n").unwrap();
+    mesh.jj.jj(&dir_b2, &["commit", "-m", "after forget"]);
+    wait_converged(&dir_a, &dir_b2).await;
+    assert!(descriptions(&mesh, &dir_a).contains("after forget"));
 }
 
 /// Pairing requires the ticket secret, and a failed attempt never

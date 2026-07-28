@@ -4,7 +4,7 @@ mod harness;
 
 use std::fs;
 
-use harness::{TestMesh, add_and_join, connect, descriptions, op_heads, wait_converged};
+use harness::{TestMesh, add_and_clone, connect, descriptions, op_heads, wait_converged};
 
 /// Commits made while a machine's daemon was down are exchanged after
 /// restart: the histories diverged offline, converge on reconnect, and
@@ -16,7 +16,7 @@ async fn offline_machine_catches_up() {
     let mut b = mesh.machine("machine-b").await;
     connect(&a, &b).await;
     let dir_a = mesh.jj.init_repo("proj");
-    let dir_b = add_and_join(&mesh, &a, &b, &dir_a, "proj").await;
+    let dir_b = add_and_clone(&mesh, &a, &b, &dir_a, "proj").await;
 
     // Commits land on both sides while B's daemon is down, so the op
     // logs genuinely diverge.

@@ -5,7 +5,7 @@ mod harness;
 
 use std::fs;
 
-use harness::{TestMesh, add_and_join, connect, descriptions, wait_converged};
+use harness::{TestMesh, add_and_clone, connect, descriptions, wait_converged};
 use jj_mesh::net::sync::RepoHealthState;
 
 /// Converting a second instance of a mesh repo to colocated pauses sync on
@@ -18,11 +18,11 @@ async fn second_colocated_instance_pauses_sync() {
     let b = mesh.machine("machine-b").await;
     connect(&a, &b).await;
 
-    // A's instance is colocated (jj's default init layout); B joins with
+    // A's instance is colocated (jj's default init layout); B clones with
     // the supported non-colocated layout.
     let dir_a = mesh.jj.init_repo("proj");
     assert!(dir_a.join(".git").is_dir());
-    let dir_b = add_and_join(&mesh, &a, &b, &dir_a, "proj").await;
+    let dir_b = add_and_clone(&mesh, &a, &b, &dir_a, "proj").await;
     assert!(!dir_b.join(".git").exists());
 
     // Convert B's instance to colocated, the way such conversions happen
@@ -82,7 +82,7 @@ async fn peers_report_their_health() {
     connect(&a, &b).await;
 
     let dir_a = mesh.jj.init_repo("proj");
-    add_and_join(&mesh, &a, &b, &dir_a, "proj").await;
+    add_and_clone(&mesh, &a, &b, &dir_a, "proj").await;
 
     a.wait("B's health report", |s| {
         s.peer_reports.iter().any(|r| {
