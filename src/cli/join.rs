@@ -63,7 +63,10 @@ pub fn run(args: JoinArgs, dir: &ConfigDir) -> Result<()> {
     // Fresh repo with a machine-unique workspace name, using the user's
     // own jj (their config applies to the repo from the start). Never
     // colocated (see the module docs), whatever the user's `git.colocate`.
-    jj(None, &["git", "init", "--no-colocate", &path.to_string_lossy()])?;
+    jj(
+        None,
+        &["git", "init", "--no-colocate", &path.to_string_lossy()],
+    )?;
     jj(Some(&path), &["workspace", "rename", &workspace])?;
 
     println!("Pulling repo `{name}` from the mesh...");

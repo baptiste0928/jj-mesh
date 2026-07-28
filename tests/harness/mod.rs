@@ -97,7 +97,7 @@ impl Machine {
     }
 
     /// Connects a control client, as the CLI would.
-    pub async fn client(&self) -> ControlClient {
+    async fn client(&self) -> ControlClient {
         ControlClient::connect(&self.config_dir())
             .await
             .unwrap()
@@ -146,21 +146,27 @@ impl Machine {
         }
     }
 
+    /// Issues a pairing ticket on this machine, as `jj-mesh pair` would.
+    pub async fn host_pairing(&self) -> String {
+        match self
+            .request(&Request::PairHost {
+                name: self.name.clone(),
+            })
+            .await
+        {
+            Response::PairTicket(ticket) => ticket,
+            other => panic!("{}: expected a pairing ticket, got {other:?}", self.name),
+        }
+    }
+
     /// Pairs this machine (hosting) with `other` (joining), through both
     /// control sockets, as `jj-mesh pair` would. Each side announces its
     /// own name and stores the peer under the peer's announced one.
     pub async fn pair_with(&self, other: &Machine) {
-        let mut host = self.client().await;
-        host.send(&Request::PairHost {
-            name: self.name.clone(),
-        })
-        .await
-        .unwrap();
-        let ticket = match host.recv(Some(WAIT_TIMEOUT)).await.unwrap() {
-            Response::PairTicket(ticket) => ticket,
-            other => panic!("expected a pairing ticket, got {other:?}"),
-        };
+        let ticket = self.host_pairing().await;
 
+        // The host persists the peer before confirming, so a `Paired`
+        // answer to the joiner means both sides are registered.
         let joined = other
             .request(&Request::PairJoin {
                 ticket,
@@ -168,8 +174,6 @@ impl Machine {
             })
             .await;
         assert!(matches!(joined, Response::Paired { .. }), "{joined:?}");
-        let hosted = host.recv(Some(WAIT_TIMEOUT)).await.unwrap();
-        assert!(matches!(hosted, Response::Paired { .. }), "{hosted:?}");
     }
 
     /// Registers the repo at `path` under `name`, as `jj-mesh add` would.

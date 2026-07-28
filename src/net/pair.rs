@@ -45,11 +45,17 @@ const TICKET_PREFIX: &str = "jjmesh-pair-";
 /// Maximum accepted size of a protocol message.
 const MAX_MESSAGE_SIZE: u32 = 4096;
 
+/// Host-side budget for a connection to open its stream and present its
+/// `Hello`. This pre-secret phase is the only part an attacker without the
+/// ticket can stretch, and one stalled connection occupies one of the few
+/// exchange slots, so it gets a much shorter deadline than the exchange.
+const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// How long a rejecting side waits for the peer to close before giving up.
 const REJECT_LINGER: Duration = Duration::from_secs(5);
 
 /// Linger for rejections of unauthenticated attempts: anyone can trigger
-/// those, so the courtesy has to be cheap to keep a window responsive.
+/// those, so the courtesy has to be cheap to keep pairing responsive.
 const REJECT_LINGER_BRIEF: Duration = Duration::from_secs(1);
 
 /// Close reason confirming a successful pairing to the joiner.
@@ -72,6 +78,11 @@ impl PairTicket {
             addr,
             secret: PairSecret::generate(),
         }
+    }
+
+    /// Whether `other` is the same issued ticket (same secret).
+    pub(crate) fn matches(&self, other: &PairTicket) -> bool {
+        self.secret.verify(&other.secret)
     }
 }
 
@@ -151,8 +162,9 @@ enum Message {
 /// pairing ALPN with `ticket` outstanding.
 ///
 /// Returns `Ok(None)` when the attempt failed without needing user action
-/// (invalid ticket, connection trouble) and waiting should continue. Errors
-/// are terminal: the user must intervene before pairing can proceed.
+/// (invalid ticket, connection trouble). Errors mean an attempt by the
+/// ticket holder itself failed (it was sent the reason); the caller
+/// decides whether the ticket stays redeemable.
 ///
 /// On success the connection is left open: the caller must persist the peer
 /// and then call [`confirm_paired`]. Closing any other way (including by
@@ -163,13 +175,24 @@ pub async fn pair_with(
     local_name: &str,
     state: &MeshState,
 ) -> Result<Option<PairedPeer>> {
-    let Ok((mut send, mut recv)) = conn.accept_bi().await else {
-        return Ok(None);
+    let opening = tokio::time::timeout(HELLO_TIMEOUT, async {
+        let (send, mut recv) = conn.accept_bi().await.ok()?;
+        let hello = read_message(&mut recv, MAX_MESSAGE_SIZE).await;
+        Some((send, recv, hello))
+    })
+    .await;
+    let (mut send, mut recv, hello) = match opening {
+        Ok(Some(opened)) => opened,
+        Ok(None) => return Ok(None),
+        Err(_timeout) => {
+            conn.close(0u32.into(), b"timeout");
+            return Ok(None);
+        }
     };
 
     // Joiners that don't speak the protocol or hold the wrong secret are
     // dismissed without stopping the host.
-    let hello = match read_message(&mut recv, MAX_MESSAGE_SIZE).await {
+    let hello = match hello {
         Ok(Message::Hello {
             secret: proof,
             name,
@@ -218,11 +241,26 @@ pub async fn pair_with(
         ),
         Ok(msg) => bail!("unexpected message from peer: {msg:?}"),
         // Connection lost mid-exchange: let the joiner retry with the same
-        // ticket instead of tearing the window down.
+        // ticket instead of failing the attempt for good.
         Err(_) => return Ok(None),
     }
 
     Ok(Some(PairedPeer { name, endpoint }))
+}
+
+/// Host side for connections arriving while no ticket is outstanding:
+/// answers the joiner's opening stream with a rejection, so it sees a
+/// readable reason instead of a transport error.
+pub async fn reject_attempt(conn: &Connection, reason: &str) {
+    // The joiner's Hello is left unread but its stream is kept open until
+    // the linger, so the joiner's write cannot fail before it reads the
+    // rejection.
+    match tokio::time::timeout(HELLO_TIMEOUT, conn.accept_bi()).await {
+        Ok(Ok((mut send, _recv))) => {
+            send_reject(conn, &mut send, reason, REJECT_LINGER_BRIEF).await;
+        }
+        Ok(Err(_)) | Err(_) => conn.close(0u32.into(), b"timeout"),
+    }
 }
 
 /// Confirms a successful pairing to the joiner.
@@ -285,7 +323,7 @@ pub async fn join(
 
     // The host closes with "paired" once it has persisted the peer; any
     // other close (including the code-0 close of a dropped connection, e.g.
-    // the host cancelling its window) means the host did not register us.
+    // the host revoking the ticket) means the host did not register us.
     match conn.closed().await {
         ConnectionError::ApplicationClosed(close)
             if close.error_code == VarInt::from_u32(0)

@@ -16,6 +16,10 @@ pub(super) const CLIENT_TIMEOUT: Duration = Duration::from_secs(2);
 /// Time budget the CLI grants quick mutating requests (add, remove).
 pub const MUTATE_WAIT: Duration = Duration::from_secs(10);
 
+/// How long an issued pairing ticket stays valid. Kept here because the
+/// CLI tells the user; the daemon enforces it.
+pub const PAIR_TICKET_TTL: Duration = Duration::from_mins(3);
+
 /// Time budget for a join's initial repo pull; it may transfer an entire
 /// repository.
 pub(super) const JOIN_PULL_TIMEOUT: Duration = Duration::from_mins(30);
@@ -30,10 +34,11 @@ pub const JOIN_WAIT: Duration = JOIN_PULL_TIMEOUT.saturating_add(Duration::from_
 pub enum Request {
     /// Report the daemon state; answered with [`Response::Status`].
     Status,
-    /// Host a pairing: open the window and issue a ticket. Answered with
-    /// [`Response::PairTicket`] immediately, then [`Response::Paired`] or
-    /// [`Response::Error`] once the exchange concludes. The window closes
-    /// when the requesting client disconnects.
+    /// Host a pairing: issue a fresh one-time ticket, revoking any
+    /// outstanding one. Answered with [`Response::PairTicket`] or
+    /// [`Response::Error`]. The exchange itself runs in the daemon; the
+    /// ticket is valid for [`PAIR_TICKET_TTL`] or until redeemed or
+    /// replaced.
     PairHost { name: String },
     /// Join a pairing hosted by another machine. Answered with
     /// [`Response::Paired`] or [`Response::Error`].

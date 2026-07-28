@@ -505,7 +505,13 @@ mod tests {
         // b rewrites the middle of the stack; jj rebases the tip.
         fx.jj(
             &b,
-            &["describe", "-r", "subject(\"change-B\")", "-m", "change-B-upd"],
+            &[
+                "describe",
+                "-r",
+                "subject(\"change-B\")",
+                "-m",
+                "change-B-upd",
+            ],
         );
         sync_missing(&ra, &rb).await;
 

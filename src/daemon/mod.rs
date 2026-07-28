@@ -49,10 +49,12 @@ const GOSSIP_INTERVAL: std::time::Duration = std::time::Duration::from_mins(5);
 /// instead of waiting out the transport-level timeout.
 const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// The ALPNs the daemon always serves. The pairing window adds the pair
-/// ALPN on top of these for its lifetime.
-pub(crate) fn base_alpns() -> Vec<Vec<u8>> {
-    vec![sync::ALPN.to_vec()]
+/// The ALPNs the daemon serves. The pairing ALPN is always among them:
+/// pairing is gated by the one-time ticket, not by ALPN exposure, and
+/// unknown endpoints can complete handshakes on the sync ALPN anyway
+/// (they are refused post-handshake by the peer allowlist).
+fn alpns() -> Vec<Vec<u8>> {
+    vec![sync::ALPN.to_vec(), pair::ALPN.to_vec()]
 }
 
 /// A running daemon: all subsystems spawned, endpoint bound, control
@@ -74,7 +76,7 @@ impl Daemon {
         // guard.
         let server = ControlServer::bind(dir)?;
 
-        let endpoint = bind_endpoint(&key, base_alpns(), options).await?;
+        let endpoint = bind_endpoint(&key, alpns(), options).await?;
         info!("daemon started, endpoint id {}", key.endpoint_id());
 
         let hub = Arc::new(SyncHub::new());
@@ -93,7 +95,11 @@ impl Daemon {
             repos.clone(),
             hub.clone(),
         ));
-        let pairing = Arc::new(Pairing::new(endpoint.clone(), options.uses_relays()));
+        let pairing = Arc::new(Pairing::new(
+            endpoint.clone(),
+            options.uses_relays(),
+            store.clone(),
+        ));
 
         let ctx = Arc::new(ControlContext {
             endpoint: endpoint.clone(),
@@ -155,7 +161,8 @@ pub async fn run(dir: &ConfigDir) -> Result<()> {
 
 /// Accepts incoming connections and routes them by ALPN: sync connections
 /// to their peer task (the `PeerSet` refuses unpaired endpoints), pairing
-/// connections to the open pairing window.
+/// connections to a pairing exchange (refused unless a ticket is
+/// outstanding).
 async fn accept_loop(endpoint: Endpoint, peers: Arc<PeerSet>, pairing: Arc<Pairing>) {
     // Identity is only known after the handshake, so anyone can start one:
     // bound how many run concurrently.
@@ -175,10 +182,16 @@ async fn accept_loop(endpoint: Endpoint, peers: Arc<PeerSet>, pairing: Arc<Pairi
         let peers = peers.clone();
         let pairing = pairing.clone();
         tokio::spawn(async move {
-            let _permit = permit;
+            // The permit is captured by the task and released when it
+            // ends, covering the whole handshake.
             match tokio::time::timeout(HANDSHAKE_TIMEOUT, connecting).await {
                 Ok(Ok(conn)) if conn.alpn() == sync::ALPN => peers.route_inbound(conn),
-                Ok(Ok(conn)) if conn.alpn() == pair::ALPN => pairing.route_inbound(conn),
+                Ok(Ok(conn)) if conn.alpn() == pair::ALPN => {
+                    // The exchange outlives the handshake phase; release
+                    // the permit and let pairing bound its own work.
+                    drop(permit);
+                    pairing.serve_inbound(conn).await;
+                }
                 Ok(Ok(conn)) => {
                     debug!("closing connection with unexpected ALPN");
                     conn.close(0u32.into(), b"unexpected alpn");

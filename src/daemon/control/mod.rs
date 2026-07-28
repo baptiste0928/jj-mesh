@@ -1,9 +1,9 @@
 //! Daemon control socket.
 //!
 //! The CLI talks to the running daemon over a unix socket with
-//! length-prefixed postcard messages (see [`crate::net::wire`]). Most
-//! requests are one request/response exchange; hosting a pairing gets two
-//! responses (the ticket, then the outcome) on one connection.
+//! length-prefixed postcard messages (see [`crate::net::wire`]). Every
+//! request is one request/response exchange; joining a pairing merely keeps
+//! its connection open so the daemon notices a cancelling client.
 //!
 //! The daemon is the only holder of the machine-key endpoint and the only
 //! writer of the mesh state, so live peer state, pairing and every

@@ -4,7 +4,7 @@ mod harness;
 
 use std::fs;
 
-use harness::{TestMesh, WAIT_TIMEOUT, add_and_join, connect, descriptions, wait_converged};
+use harness::{TestMesh, add_and_join, connect, descriptions, wait_converged};
 use jj_mesh::daemon::control::{Request, Response};
 
 /// Machines that never paired directly learn about each other through
@@ -51,23 +51,14 @@ async fn membership_gossips_transitively() {
 }
 
 /// Pairing requires the ticket secret, and a failed attempt never
-/// persists a peer nor burns the host's window.
+/// persists a peer nor burns the host's ticket.
 #[tokio::test(flavor = "multi_thread")]
 async fn pairing_requires_the_ticket_secret() {
     let mesh = TestMesh::new();
     let a = mesh.machine("machine-a").await;
     let b = mesh.machine("machine-b").await;
 
-    let mut host = a.client().await;
-    host.send(&Request::PairHost {
-        name: "machine-a".to_owned(),
-    })
-    .await
-    .unwrap();
-    let ticket = match host.recv(Some(WAIT_TIMEOUT)).await.unwrap() {
-        Response::PairTicket(ticket) => ticket,
-        other => panic!("expected a ticket, got {other:?}"),
-    };
+    let ticket = a.host_pairing().await;
 
     // A join with a tampered secret is rejected; nobody is paired.
     let rejected = b
@@ -80,7 +71,7 @@ async fn pairing_requires_the_ticket_secret() {
     assert!(a.status().await.peers.is_empty());
     assert!(b.status().await.peers.is_empty());
 
-    // The window survives the bad attempt: the original ticket works.
+    // The ticket survives the bad attempt: the original one works.
     let joined = b
         .request(&Request::PairJoin {
             ticket,
@@ -88,8 +79,6 @@ async fn pairing_requires_the_ticket_secret() {
         })
         .await;
     assert!(matches!(joined, Response::Paired { .. }), "{joined:?}");
-    let hosted = host.recv(Some(WAIT_TIMEOUT)).await.unwrap();
-    assert!(matches!(hosted, Response::Paired { .. }), "{hosted:?}");
     a.wait_peer_connected("machine-b").await;
     b.wait_peer_connected("machine-a").await;
 }
@@ -102,18 +91,9 @@ async fn pairing_ticket_is_single_use() {
     let b = mesh.machine("machine-b").await;
     let c = mesh.machine("machine-c").await;
 
-    let mut host = a.client().await;
-    host.send(&Request::PairHost {
-        name: "machine-a".to_owned(),
-    })
-    .await
-    .unwrap();
-    let ticket = match host.recv(Some(WAIT_TIMEOUT)).await.unwrap() {
-        Response::PairTicket(ticket) => ticket,
-        other => panic!("expected a ticket, got {other:?}"),
-    };
+    let ticket = a.host_pairing().await;
 
-    // B pairs with the ticket, which concludes the window.
+    // B pairs with the ticket, which redeems it.
     let joined = b
         .request(&Request::PairJoin {
             ticket: ticket.clone(),
@@ -121,8 +101,6 @@ async fn pairing_ticket_is_single_use() {
         })
         .await;
     assert!(matches!(joined, Response::Paired { .. }), "{joined:?}");
-    let hosted = host.recv(Some(WAIT_TIMEOUT)).await.unwrap();
-    assert!(matches!(hosted, Response::Paired { .. }), "{hosted:?}");
     a.wait_peer_connected("machine-b").await;
 
     // Reusing the ticket is refused; the third machine is not paired.
@@ -135,6 +113,69 @@ async fn pairing_ticket_is_single_use() {
     assert!(matches!(reused, Response::Error(_)), "{reused:?}");
     assert!(c.status().await.peers.is_empty());
     assert_eq!(a.status().await.peers.len(), 1);
+}
+
+/// A failed attempt by the ticket holder (here: announcing an unacceptable
+/// name) does not burn the ticket: fixing the problem and retrying with
+/// the same ticket works.
+#[tokio::test(flavor = "multi_thread")]
+async fn failed_attempt_keeps_the_ticket_valid() {
+    let mesh = TestMesh::new();
+    let a = mesh.machine("machine-a").await;
+    let b = mesh.machine("machine-b").await;
+
+    let ticket = a.host_pairing().await;
+
+    let rejected = b
+        .try_request(&Request::PairJoin {
+            ticket: ticket.clone(),
+            name: String::new(),
+        })
+        .await;
+    assert!(matches!(rejected, Response::Error(_)), "{rejected:?}");
+    assert!(a.status().await.peers.is_empty());
+
+    let joined = b
+        .request(&Request::PairJoin {
+            ticket,
+            name: "machine-b".to_owned(),
+        })
+        .await;
+    assert!(matches!(joined, Response::Paired { .. }), "{joined:?}");
+    a.wait_peer_connected("machine-b").await;
+}
+
+/// Hosting again replaces the outstanding ticket: only the newest one is
+/// valid.
+#[tokio::test(flavor = "multi_thread")]
+async fn rehosting_replaces_the_ticket() {
+    let mesh = TestMesh::new();
+    let a = mesh.machine("machine-a").await;
+    let b = mesh.machine("machine-b").await;
+
+    let stale = a.host_pairing().await;
+    let fresh = a.host_pairing().await;
+
+    // The replaced ticket is dead, and rejecting it does not burn the
+    // fresh one...
+    let rejected = b
+        .try_request(&Request::PairJoin {
+            ticket: stale,
+            name: "machine-b".to_owned(),
+        })
+        .await;
+    assert!(matches!(rejected, Response::Error(_)), "{rejected:?}");
+    assert!(a.status().await.peers.is_empty());
+
+    // ...while the fresh one pairs.
+    let joined = b
+        .request(&Request::PairJoin {
+            ticket: fresh,
+            name: "machine-b".to_owned(),
+        })
+        .await;
+    assert!(matches!(joined, Response::Paired { .. }), "{joined:?}");
+    a.wait_peer_connected("machine-b").await;
 }
 
 /// Flips a bit in the ticket's trailing bytes, which hold the secret (the

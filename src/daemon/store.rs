@@ -11,7 +11,10 @@ use std::sync::{Arc, Mutex};
 use color_eyre::eyre::Result;
 
 use super::{hub::SyncHub, peers::PeerSet, repos::RepoSet};
-use crate::config::{ConfigDir, MeshState};
+use crate::{
+    config::{ConfigDir, MeshState},
+    net::pair,
+};
 
 /// The persisted mesh state and everything a change to it must reach.
 #[derive(Debug)]
@@ -60,6 +63,18 @@ impl MeshStore {
     pub fn republish_membership(&self) {
         let state = self.state.lock().unwrap();
         self.hub.publish_membership(state.membership());
+    }
+
+    /// Registers a paired peer; a no-op when the endpoint is already alive
+    /// (idempotent re-pair). The peer set starts connecting and the gossip
+    /// introduces the peer to the rest of the mesh as part of the update.
+    pub fn add_paired_peer(&self, peer: &pair::PairedPeer) -> Result<()> {
+        self.update(|state| {
+            if state.peer_name(&peer.endpoint).is_some() {
+                return Ok(());
+            }
+            state.add_peer(peer.endpoint, peer.name.clone())
+        })
     }
 
     /// Mutates the state: persists the change to `mesh.json`, aligns the

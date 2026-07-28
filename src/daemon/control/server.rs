@@ -39,10 +39,6 @@ use crate::{
 /// Time budget for a whole join exchange, from dialing to completion.
 const JOIN_TIMEOUT: Duration = Duration::from_mins(1);
 
-/// Hard cap on a pairing window: bounds how long the unknown-endpoint pair
-/// ALPN stays exposed when a host CLI is left waiting unattended.
-const WINDOW_TIMEOUT: Duration = Duration::from_mins(15);
-
 /// Initial retry delay after an accept error, escalating to the max.
 const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
 const ACCEPT_ERROR_BACKOFF_MAX: Duration = Duration::from_secs(5);
@@ -190,10 +186,10 @@ async fn handle_client(mut stream: UnixStream, ctx: Arc<ControlContext>) {
             Err(_) => return debug!("control client timed out"),
         };
 
-    // Pairing owns its stream (two responses, plus client-cancel handling);
-    // the rest return a single response and share one error conversion.
+    // PairJoin owns its stream (client-cancel handling); the rest return a
+    // single response and share one error conversion.
     let served = match request {
-        Request::PairHost { name } => pair_host(&mut stream, &ctx, &name).await,
+        Request::PairHost { name } => reply(&mut stream, pair_host(&ctx, name).await).await,
         Request::PairJoin { ticket, name } => pair_join(&mut stream, &ctx, &ticket, &name).await,
         Request::Status => reply(&mut stream, Ok(Response::Status(ctx.status()))).await,
         Request::JoinRepo { name, path } => {
@@ -230,51 +226,12 @@ async fn respond(
     .map_err(|_| eyre!("control client stopped reading"))?
 }
 
-/// Hosts a pairing: opens the window, reports the ticket, then the outcome.
-/// The window closes when this function returns: on completion, expiry, or
-/// the client disconnecting.
-async fn pair_host(stream: &mut UnixStream, ctx: &ControlContext, name: &str) -> Result<()> {
-    let mut window = match ctx.pairing.open().await {
-        Ok(window) => window,
-        Err(err) => return respond(stream, &Response::Error(format!("{err:#}"))).await,
-    };
-
-    respond(stream, &Response::PairTicket(window.ticket().to_string())).await?;
-
-    let (mut read_half, mut write_half) = stream.split();
-    let result = tokio::select! {
-        result = window.wait_for_peer(name, || ctx.state()) => result,
-        () = tokio::time::sleep(WINDOW_TIMEOUT) => Err(eyre!(
-            "the pairing window expired after {} minutes",
-            WINDOW_TIMEOUT.as_secs() / 60,
-        )),
-        () = client_gone(&mut read_half) => {
-            info!("pairing cancelled by the client");
-            return Ok(());
-        }
-    };
-
-    // Persist before confirming: the `paired` close is the joiner's commit
-    // signal, so the host must never send it for a peer it did not save.
-    let response = match result {
-        Ok((peer, conn)) => match persist_peer(ctx, &peer) {
-            Ok(()) => {
-                pair::confirm_paired(&conn);
-                info!(peer = %peer.name, "paired");
-                Response::Paired {
-                    name: peer.name,
-                    endpoint: peer.endpoint,
-                }
-            }
-            Err(err) => {
-                conn.close(0u32.into(), b"failed");
-                Response::Error(format!("cannot save the peer: {err:#}"))
-            }
-        },
-        Err(err) => Response::Error(format!("{err:#}")),
-    };
-
-    respond(&mut write_half, &response).await
+/// Hosts a pairing: issues a fresh one-time ticket, revoking any
+/// outstanding one. The exchange itself runs in the daemon once the other
+/// machine redeems the ticket.
+async fn pair_host(ctx: &ControlContext, name: String) -> Result<Response> {
+    let ticket = ctx.pairing.host(name).await?;
+    Ok(Response::PairTicket(ticket.to_string()))
 }
 
 /// Joins a pairing hosted by another machine. Aborts the exchange when the
@@ -303,7 +260,7 @@ async fn pair_join(
     };
 
     let persisted = result.and_then(|peer| {
-        persist_peer(ctx, &peer)?;
+        ctx.store.add_paired_peer(&peer)?;
         Ok(peer)
     });
     let response = match persisted {
@@ -422,19 +379,6 @@ fn remove_peer(ctx: &ControlContext, peer: &str) -> Result<Response> {
     let endpoint = ctx.update_state(|state| state.remove_peer(peer))?;
     info!(peer = %peer, "peer removed");
     Ok(Response::PeerRemoved(endpoint))
-}
-
-/// Registers a paired peer in the mesh state; a no-op when the endpoint is
-/// already alive (idempotent re-pair). The peer set starts connecting and
-/// the gossip introduces the peer to the rest of the mesh as part of the
-/// update.
-fn persist_peer(ctx: &ControlContext, peer: &pair::PairedPeer) -> Result<()> {
-    ctx.update_state(|state| {
-        if state.peer_name(&peer.endpoint).is_some() {
-            return Ok(());
-        }
-        state.add_peer(peer.endpoint, peer.name.clone())
-    })
 }
 
 /// Resolves when the client closes its end of the connection.
