@@ -21,6 +21,7 @@ use crate::{
         sync::{
             FetchRequest, GitFrame, GitRequest, GitTransferFormat, MAX_GIT_FRAME_SIZE,
             MAX_GIT_HAVES, MAX_HAVES, MAX_OP_FRAME_SIZE, MAX_WANTS, OpFrame, WireObjectKind,
+            compress_payload,
         },
         wire::{read_message, write_message},
     },
@@ -72,7 +73,7 @@ pub async fn serve(
                         let view = repo.read_view_bytes(&op.view_id)?;
                         let frame = OpFrame::View {
                             id: op.view_id.as_bytes().to_vec(),
-                            view,
+                            view: compress_payload(&view)?,
                         };
                         tx.blocking_send(Ok(frame))
                             .map_err(|_| eyre!("fetcher went away"))?;
@@ -80,7 +81,7 @@ pub async fn serve(
                     let bytes = repo.read_operation_bytes(&id)?;
                     let frame = OpFrame::Op {
                         id: id.as_bytes().to_vec(),
-                        op: bytes,
+                        op: compress_payload(&bytes)?,
                     };
                     tx.blocking_send(Ok(frame))
                         .map_err(|_| eyre!("fetcher went away"))?;
@@ -191,7 +192,8 @@ async fn serve_git_loose(
                     .wrap_err_with(|| format!("missing object {id}"))?;
                 // `detach()` moves the object's buffer out instead of
                 // copying it, which matters for large blobs.
-                tx.blocking_send(Ok((id, kind, object.detach().data)))
+                let data = compress_payload(&object.detach().data)?;
+                tx.blocking_send(Ok((id, kind, data)))
                     .map_err(|_| eyre!("fetcher went away"))
             });
             if let Err(err) = outcome {

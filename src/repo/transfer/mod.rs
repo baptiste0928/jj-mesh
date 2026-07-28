@@ -364,6 +364,8 @@ mod tests {
         let head_bytes = local_head.clone();
         let server = tokio::spawn(async move {
             use prost::Message as _;
+
+            use crate::net::sync::compress_payload;
             let _request: FetchRequest = read_message(&mut server_rx, MAX_OP_FRAME_SIZE)
                 .await
                 .unwrap();
@@ -371,18 +373,18 @@ mod tests {
             let frames = [
                 OpFrame::View {
                     id: vec![9; 64],
-                    view,
+                    view: compress_payload(&view).unwrap(),
                 },
                 // The wanted op, legitimately parented on the local head.
                 OpFrame::Op {
                     id: vec![1; 64],
-                    op: make_op(vec![head_bytes.clone()]),
+                    op: compress_payload(&make_op(vec![head_bytes.clone()])).unwrap(),
                 },
                 // The poison: parented on the local head, but nothing
                 // connects it to the want.
                 OpFrame::Op {
                     id: vec![2; 64],
-                    op: make_op(vec![head_bytes]),
+                    op: compress_payload(&make_op(vec![head_bytes])).unwrap(),
                 },
                 OpFrame::Done,
             ];

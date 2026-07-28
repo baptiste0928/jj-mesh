@@ -21,7 +21,8 @@ use crate::{
     net::{
         sync::{
             FetchRequest, GitFrame, GitRequest, GitTransferFormat, MAX_GIT_FRAME_SIZE,
-            MAX_GIT_HAVES, MAX_OP_FRAME_SIZE, MAX_WANTS, OpFrame,
+            MAX_GIT_HAVES, MAX_GIT_OBJECT_SIZE, MAX_OP_FRAME_SIZE, MAX_WANTS, OpFrame,
+            decompress_payload,
         },
         wire::{read_message, write_message},
     },
@@ -33,7 +34,8 @@ const SAMPLE_BUDGET: usize = 128;
 
 /// Git objects are written in chunks, flushed once either bound is reached,
 /// to amortize the blocking-thread hops without letting large blobs pile up
-/// in memory: the byte bound caps resident data whatever the object sizes.
+/// in memory: the byte bound caps resident (compressed) data whatever the
+/// object sizes; decompressed bytes exist one object at a time.
 const GIT_WRITE_CHUNK: usize = 256;
 const GIT_WRITE_BYTES: usize = 32 << 20;
 
@@ -181,6 +183,8 @@ async fn receive_ops(
             OpFrame::View { id, view } => {
                 ensure!(id.len() == id_len, "bad view id length ({})", id.len());
                 let id = ViewId::new(id);
+                let view = decompress_payload(&view, u64::from(MAX_OP_FRAME_SIZE))
+                    .wrap_err_with(|| format!("view {}", id.hex()))?;
                 let meta =
                     codec::parse_view(&view).wrap_err_with(|| format!("view {}", id.hex()))?;
                 if view_ids.insert(id.clone()) {
@@ -198,6 +202,8 @@ async fn receive_ops(
                     id != *repo.root_operation_id(),
                     "peer sent an op claiming the root id",
                 );
+                let op = decompress_payload(&op, u64::from(MAX_OP_FRAME_SIZE))
+                    .wrap_err_with(|| format!("op {}", id.hex()))?;
                 let meta =
                     codec::parse_operation(&op).wrap_err_with(|| format!("op {}", id.hex()))?;
                 ensure!(!op_ids.contains(&id), "op {} sent twice", id.hex());
@@ -289,20 +295,21 @@ fn referenced_commits(batch: &OpBatch) -> Vec<CommitId> {
     ids.into_iter().collect()
 }
 
-/// Receives the git phase, hash-verifying every object and writing them
-/// loose in chunks. Returns how many objects the peer sent.
+/// Receives the git phase, decompressing and hash-verifying every object
+/// and writing them loose in chunks. Returns how many objects the peer
+/// sent.
 async fn receive_git_objects(
     repo: &Arc<MeshRepo>,
     recv: &mut (impl AsyncRead + Unpin),
 ) -> Result<usize> {
-    let hash_kind = repo.git_backend().git_repo().object_hash();
     let mut chunk: Vec<(gix::ObjectId, gix::object::Kind, Vec<u8>)> = Vec::new();
     let mut chunk_bytes = 0usize;
     let mut total = 0usize;
 
     // The previous chunk writes to disk while the next one streams in;
     // awaiting it only when the next chunk is full keeps the network and
-    // the blocking writer pipelined.
+    // the blocking writer pipelined. Decompression and hashing happen on
+    // the writer's blocking thread, one object at a time.
     let mut pending: Option<tokio::task::JoinHandle<Result<()>>> = None;
 
     loop {
@@ -311,12 +318,6 @@ async fn receive_git_objects(
                 let id = gix::ObjectId::try_from(id.as_slice())
                     .map_err(|err| eyre!("bad object id: {err}"))?;
                 let kind = to_gix_kind(kind);
-                let computed = gix::objs::compute_hash(hash_kind, kind, &data)
-                    .map_err(|err| eyre!("cannot hash object: {err}"))?;
-                ensure!(
-                    computed == id,
-                    "object {id} does not match its content (hashes to {computed})",
-                );
                 chunk_bytes += data.len();
                 chunk.push((id, kind, data));
                 total += 1;
@@ -395,10 +396,13 @@ async fn receive_git_pack(
     Ok((outcome.objects, outcome.keep))
 }
 
-/// Writes a chunk of verified objects into the loose odb on a blocking
-/// thread, skipping objects already present. The ids were hash-verified
-/// against the data on receipt, so the write reuses them instead of
-/// hashing every object a second time.
+/// Decompresses, hash-verifies and writes a chunk of received objects into
+/// the loose odb on a blocking thread, skipping objects already present.
+/// Verifying establishes the id, so the write reuses it instead of hashing
+/// a second time. An object that lies about its id aborts the fetch;
+/// earlier objects of the chunk may already be written, which is harmless
+/// (each was verified, and nothing references them until the apply
+/// publishes).
 fn write_git_chunk(
     repo: &Arc<MeshRepo>,
     chunk: Vec<(gix::ObjectId, gix::object::Kind, Vec<u8>)>,
@@ -407,7 +411,16 @@ fn write_git_chunk(
     tokio::task::spawn_blocking(move || -> Result<()> {
         use gix::prelude::Write as _;
         let git = repo.git_backend().git_repo();
+        let hash_kind = git.object_hash();
         for (id, kind, data) in chunk {
+            let data = decompress_payload(&data, MAX_GIT_OBJECT_SIZE)
+                .wrap_err_with(|| format!("object {id}"))?;
+            let computed = gix::objs::compute_hash(hash_kind, kind, &data)
+                .map_err(|err| eyre!("cannot hash object: {err}"))?;
+            ensure!(
+                computed == id,
+                "object {id} does not match its content (hashes to {computed})",
+            );
             if git.has_object(id) {
                 continue;
             }
