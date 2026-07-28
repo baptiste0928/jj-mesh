@@ -67,7 +67,16 @@ pub async fn serve(
         tokio::task::spawn_blocking(move || {
             let outcome = (|| -> Result<()> {
                 let ops = repo.ancestors_until(&wants, &haves).block_on()?;
-                let mut sent_views: HashSet<ViewId> = HashSet::new();
+                // The delta is fully collected, so the phase totals are
+                // exact: every unique view is sent exactly once.
+                let views: HashSet<&ViewId> = ops.iter().map(|(_, op)| &op.view_id).collect();
+                let begin = OpFrame::Begin {
+                    ops: ops.len() as u64,
+                    views: views.len() as u64,
+                };
+                tx.blocking_send(Ok(begin))
+                    .map_err(|_| eyre!("fetcher went away"))?;
+                let mut sent_views: HashSet<ViewId> = HashSet::with_capacity(views.len());
                 for (id, op) in ops {
                     if sent_views.insert(op.view_id.clone()) {
                         let view = repo.read_view_bytes(&op.view_id)?;

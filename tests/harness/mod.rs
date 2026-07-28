@@ -111,6 +111,20 @@ impl Machine {
         client.recv(Some(WAIT_TIMEOUT)).await.unwrap()
     }
 
+    /// One request/terminal-response exchange for requests answered by a
+    /// progress stream: skips every progress frame, as the CLI's streaming
+    /// helper does. [`WAIT_TIMEOUT`] bounds each frame gap.
+    async fn try_streaming_request(&self, request: &Request) -> Response {
+        let mut client = self.client().await;
+        client.send(request).await.unwrap();
+        loop {
+            match client.recv(Some(WAIT_TIMEOUT)).await.unwrap() {
+                Response::JoinProgress(_) => {}
+                response => return response,
+            }
+        }
+    }
+
     /// One request/response exchange, panicking on a daemon error.
     pub async fn request(&self, request: &Request) -> Response {
         match self.try_request(request).await {
@@ -215,7 +229,7 @@ impl Machine {
         };
         let deadline = tokio::time::Instant::now() + WAIT_TIMEOUT;
         loop {
-            match self.try_request(&request).await {
+            match self.try_streaming_request(&request).await {
                 Response::Joined { .. } => return,
                 Response::Error(message) => {
                     assert!(

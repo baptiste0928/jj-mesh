@@ -15,9 +15,14 @@
 //! stream through the caller's channels, via [`ChunkReader`] and the chunk
 //! emit callback.
 
-use std::{io, path::PathBuf, sync::atomic::AtomicBool};
+use std::{
+    io,
+    path::PathBuf,
+    sync::atomic::{AtomicBool, Ordering},
+};
 
 use color_eyre::eyre::{Result, WrapErr as _, ensure, eyre};
+use gix::progress::{Count, Id, MessageLevel, NestedProgress, Progress, Step, StepShared, UNKNOWN};
 use tokio::sync::mpsc;
 
 /// Pack bytes are buffered into chunks of this size before each emit, so
@@ -143,6 +148,99 @@ impl<F: FnMut(Vec<u8>) -> Result<()>> io::Write for ChunkWriter<F> {
     }
 }
 
+/// Objects-indexed count shared between [`ingest_pack`]'s gix pipeline and
+/// the async receive loop, which samples it for progress display.
+#[derive(Clone, Default)]
+pub(super) struct SharedObjectCount(StepShared);
+
+impl SharedObjectCount {
+    /// The count so far.
+    pub(super) fn get(&self) -> u64 {
+        self.0.load(Ordering::Relaxed) as u64
+    }
+}
+
+/// Minimal prodash progress handed to the gix ingest pipeline: the child
+/// counting indexed objects steps the shared count, every other node and
+/// signal is discarded. Progress is display-only, so an id drift in a gix
+/// upgrade would freeze the counter, never break the ingest.
+struct IndexCountProgress {
+    objects: SharedObjectCount,
+    /// Whether this node is the objects counter.
+    active: bool,
+}
+
+impl IndexCountProgress {
+    fn root(objects: SharedObjectCount) -> Self {
+        IndexCountProgress {
+            objects,
+            active: false,
+        }
+    }
+}
+
+impl Count for IndexCountProgress {
+    fn set(&self, step: Step) {
+        if self.active {
+            self.objects.0.store(step, Ordering::Relaxed);
+        }
+    }
+
+    fn step(&self) -> Step {
+        if self.active {
+            self.objects.0.load(Ordering::Relaxed)
+        } else {
+            0
+        }
+    }
+
+    fn inc_by(&self, step: Step) {
+        if self.active {
+            self.objects.0.fetch_add(step, Ordering::Relaxed);
+        }
+    }
+
+    fn counter(&self) -> StepShared {
+        if self.active {
+            self.objects.0.clone()
+        } else {
+            StepShared::default()
+        }
+    }
+}
+
+impl Progress for IndexCountProgress {
+    fn init(&mut self, _max: Option<Step>, _unit: Option<gix::progress::Unit>) {}
+
+    fn set_name(&mut self, _name: String) {}
+
+    fn name(&self) -> Option<String> {
+        None
+    }
+
+    fn id(&self) -> Id {
+        UNKNOWN
+    }
+
+    fn message(&self, _level: MessageLevel, _message: String) {}
+}
+
+impl NestedProgress for IndexCountProgress {
+    type SubProgress = Self;
+
+    fn add_child(&mut self, name: impl Into<String>) -> Self {
+        self.add_child_with_id(name, UNKNOWN)
+    }
+
+    fn add_child_with_id(&mut self, _name: impl Into<String>, id: Id) -> Self {
+        let objects_id: Id = gix_pack::index::write::ProgressId::IndexObjects.into();
+        IndexCountProgress {
+            objects: self.objects.clone(),
+            active: id == objects_id,
+        }
+    }
+}
+
 /// What a completed pack ingestion produced.
 pub(super) struct IngestOutcome {
     /// Objects in the ingested pack.
@@ -173,7 +271,12 @@ impl Drop for PackKeep {
 
 /// Streams a pack from `read` into the repo's `objects/pack`, building its
 /// index. Blocking; nothing becomes visible unless the whole pack verifies.
-pub(super) fn ingest_pack(git: &gix::Repository, mut read: impl io::Read) -> Result<IngestOutcome> {
+/// `indexed` is stepped once per object as the index is built.
+pub(super) fn ingest_pack(
+    git: &gix::Repository,
+    mut read: impl io::Read,
+    indexed: &SharedObjectCount,
+) -> Result<IngestOutcome> {
     // The header's object count is checked before gix-pack sees it: gix
     // preallocates its delta tree from that count, so an unchecked u32
     // turns a 12-byte header into a multi-gigabyte reservation, and an
@@ -191,10 +294,11 @@ pub(super) fn ingest_pack(git: &gix::Repository, mut read: impl io::Read) -> Res
 
     let pack_dir = git.objects.store_ref().path().join("pack");
     let no_interrupt = AtomicBool::new(false);
+    let mut progress = IndexCountProgress::root(indexed.clone());
     let outcome = gix_pack::Bundle::write_to_directory(
         &mut io::BufReader::new(read),
         Some(&pack_dir),
-        &mut gix::progress::Discard,
+        &mut progress,
         &no_interrupt,
         // The mesh never generates thin packs, so there are no external
         // bases to look up.

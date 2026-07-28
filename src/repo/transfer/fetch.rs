@@ -14,7 +14,8 @@ use pollster::FutureExt as _;
 use tokio::io::{AsyncRead, AsyncWrite};
 
 use super::{
-    FetchOutcome, OpBatch, StoredOp, StoredView, apply::apply, pack, to_gix_id, to_gix_kind,
+    FetchOutcome, OpBatch, ProgressSink, StoredOp, StoredView, TransferPhase, TransferProgress,
+    apply::apply, pack, to_gix_id, to_gix_kind,
 };
 use crate::{
     config::{RepoId, sanitize},
@@ -43,10 +44,16 @@ const GIT_WRITE_BYTES: usize = 32 << 20;
 /// streams. Far above any real op log delta.
 const MAX_OP_FRAMES: usize = 1 << 20;
 
+/// How often the pack ingest's object count is sampled for progress once
+/// the stream ended and only local indexing remains.
+const INGEST_SAMPLE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
+
 /// Fetches the given op heads from a peer over the stream pair and applies
 /// them locally in crash-safe order. `format` picks how git objects travel
 /// (joins request a pack, incremental syncs stay loose, see
-/// [`GitTransferFormat`]).
+/// [`GitTransferFormat`]); `progress` receives live counters as the phases
+/// advance.
+#[expect(clippy::too_many_arguments, reason = "half are the repo/stream plumbing")]
 pub async fn fetch(
     repo: &Arc<MeshRepo>,
     name: &str,
@@ -55,6 +62,7 @@ pub async fn fetch(
     format: GitTransferFormat,
     send: &mut (impl AsyncWrite + Unpin),
     recv: &mut (impl AsyncRead + Unpin),
+    progress: ProgressSink<'_>,
 ) -> Result<FetchOutcome> {
     ensure!(!wants.is_empty() && wants.len() <= MAX_WANTS, "bad wants");
     let local_heads = repo.op_heads().await?;
@@ -68,7 +76,7 @@ pub async fn fetch(
     };
     write_message(send, &request, MAX_OP_FRAME_SIZE).await?;
 
-    let batch = receive_ops(repo, wants, recv).await?;
+    let batch = receive_ops(repo, wants, recv, progress).await?;
     let ops_received = batch.ops.len();
 
     // Everything the new views (and op predecessor records) reference and
@@ -120,14 +128,15 @@ pub async fn fetch(
     // writes the keep refs that take over; it is released below, and on any
     // early return or abandoned fetch by its own drop.
     let (git_objects, pack_keep) = match format {
-        GitTransferFormat::Loose => (receive_git_objects(repo, recv).await?, None),
+        GitTransferFormat::Loose => (receive_git_objects(repo, recv, progress).await?, None),
         GitTransferFormat::Pack => {
-            let (objects, keep) = receive_git_pack(repo, recv).await?;
+            let (objects, keep) = receive_git_pack(repo, recv, progress).await?;
             (objects, Some(keep))
         }
     };
 
     // Nothing threw: objects are on disk, batch is closed and verified.
+    progress.report(TransferProgress::start(TransferPhase::Apply));
     let published = {
         let repo = repo.clone();
         let wants = wants.to_vec();
@@ -171,6 +180,7 @@ async fn receive_ops(
     repo: &Arc<MeshRepo>,
     wants: &[OperationId],
     recv: &mut (impl AsyncRead + Unpin),
+    progress: ProgressSink<'_>,
 ) -> Result<OpBatch> {
     let id_len = repo.root_operation_id().as_bytes().len();
     let mut ops: Vec<StoredOp> = Vec::new();
@@ -178,9 +188,24 @@ async fn receive_ops(
     let mut op_ids: HashSet<OperationId> = HashSet::new();
     let mut view_ids: HashSet<ViewId> = HashSet::new();
 
+    let mut counters = TransferProgress::start(TransferPhase::Ops);
+    progress.report(counters);
+
     for _ in 0..MAX_OP_FRAMES {
         match read_message(recv, MAX_OP_FRAME_SIZE).await? {
+            OpFrame::Begin {
+                ops: total_ops,
+                views: total_views,
+            } => {
+                ensure!(counters.total.is_none(), "peer sent Begin twice");
+                ensure!(counters.current == 0, "peer sent Begin after data");
+                counters.total = Some(total_ops.saturating_add(total_views));
+                progress.report(counters);
+            }
             OpFrame::View { id, view } => {
+                counters.current += 1;
+                counters.bytes += view.len() as u64;
+                progress.report(counters);
                 ensure!(id.len() == id_len, "bad view id length ({})", id.len());
                 let id = ViewId::new(id);
                 let view = decompress_payload(&view, u64::from(MAX_OP_FRAME_SIZE))
@@ -196,6 +221,9 @@ async fn receive_ops(
                 }
             }
             OpFrame::Op { id, op } => {
+                counters.current += 1;
+                counters.bytes += op.len() as u64;
+                progress.report(counters);
                 ensure!(id.len() == id_len, "bad op id length ({})", id.len());
                 let id = OperationId::new(id);
                 ensure!(
@@ -301,10 +329,14 @@ fn referenced_commits(batch: &OpBatch) -> Vec<CommitId> {
 async fn receive_git_objects(
     repo: &Arc<MeshRepo>,
     recv: &mut (impl AsyncRead + Unpin),
+    progress: ProgressSink<'_>,
 ) -> Result<usize> {
     let mut chunk: Vec<(gix::ObjectId, gix::object::Kind, Vec<u8>)> = Vec::new();
     let mut chunk_bytes = 0usize;
     let mut total = 0usize;
+
+    let mut counters = TransferProgress::start(TransferPhase::Git);
+    progress.report(counters);
 
     // The previous chunk writes to disk while the next one streams in;
     // awaiting it only when the next chunk is full keeps the network and
@@ -315,6 +347,9 @@ async fn receive_git_objects(
     loop {
         match read_message(recv, MAX_GIT_FRAME_SIZE).await? {
             GitFrame::Object { id, kind, data } => {
+                counters.current += 1;
+                counters.bytes += data.len() as u64;
+                progress.report(counters);
                 let id = gix::ObjectId::try_from(id.as_slice())
                     .map_err(|err| eyre!("bad object id: {err}"))?;
                 let kind = to_gix_kind(kind);
@@ -350,16 +385,27 @@ async fn receive_git_objects(
 /// into a blocking ingest task, which indexes it into `objects/pack` (see
 /// [`pack::ingest_pack`] for the verification done there). Returns how many
 /// objects the pack carried and the `.keep` file protecting it.
+///
+/// Progress: the phase total is read off the pack header (its exact object
+/// count), `current` tracks the ingest's objects-indexed counter, sampled
+/// on every received chunk and, once the stream ends, on a timer while
+/// the ingest finishes resolving.
 async fn receive_git_pack(
     repo: &Arc<MeshRepo>,
     recv: &mut (impl AsyncRead + Unpin),
+    progress: ProgressSink<'_>,
 ) -> Result<(usize, pack::PackKeep)> {
+    let mut counters = TransferProgress::start(TransferPhase::Git);
+    progress.report(counters);
+
+    let indexed = pack::SharedObjectCount::default();
     let (tx, rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
-    let ingest = {
+    let mut ingest = {
         let repo = repo.clone();
+        let indexed = indexed.clone();
         tokio::task::spawn_blocking(move || {
             let git = repo.git_backend().git_repo();
-            pack::ingest_pack(&git, pack::ChunkReader::new(rx))
+            pack::ingest_pack(&git, pack::ChunkReader::new(rx), &indexed)
         })
     };
 
@@ -367,6 +413,19 @@ async fn receive_git_pack(
     loop {
         match read_message(recv, MAX_GIT_FRAME_SIZE).await? {
             GitFrame::Pack { chunk } => {
+                // The first chunk starts with the pack header, whose object
+                // count is the exact phase total. Display only: the ingest
+                // decodes and enforces the header itself.
+                if counters.bytes == 0 && chunk.len() >= 12 {
+                    let mut header = [0u8; 12];
+                    header.copy_from_slice(&chunk[..12]);
+                    if let Ok((_version, objects)) = gix::odb::pack::data::header::decode(&header) {
+                        counters.total = Some(u64::from(objects));
+                    }
+                }
+                counters.bytes += chunk.len() as u64;
+                counters.current = indexed.get();
+                progress.report(counters);
                 // A closed channel means the ingest died; its own error is
                 // reported after the join below.
                 if tx.send(chunk).await.is_err() {
@@ -386,13 +445,25 @@ async fn receive_git_pack(
     }
 
     // Closing the channel ends the ingest's stream; on a clean `Done` it
-    // finishes the pack, otherwise it fails on the truncation.
+    // finishes the pack, otherwise it fails on the truncation. Indexing
+    // (delta resolution most of all) keeps running after the last byte
+    // arrived, so keep sampling its object count while waiting.
     drop(tx);
-    let outcome = ingest.await.wrap_err("pack ingest task failed")?;
+    let outcome = loop {
+        tokio::select! {
+            outcome = &mut ingest => break outcome.wrap_err("pack ingest task failed")?,
+            () = tokio::time::sleep(INGEST_SAMPLE_INTERVAL) => {
+                counters.current = indexed.get();
+                progress.report(counters);
+            }
+        }
+    };
     if let Some(message) = failed {
         bail!("{message}");
     }
     let outcome = outcome?;
+    counters.current = indexed.get();
+    progress.report(counters);
     Ok((outcome.objects, outcome.keep))
 }
 

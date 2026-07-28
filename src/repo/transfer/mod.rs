@@ -52,6 +52,72 @@ pub struct FetchOutcome {
     pub git_objects: usize,
 }
 
+/// A snapshot of an in-flight fetch, for progress display. Serialized as
+/// part of the control protocol (see `crate::daemon::control`); the unit
+/// of `current`/`total` is phase-defined so a change of transfer
+/// representation only renumbers, never reshapes, it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TransferProgress {
+    pub phase: TransferPhase,
+    /// Progress in the phase's unit: op and view frames in [`Ops`]; in
+    /// [`Git`], objects indexed from the pack (pack format) or objects
+    /// received (loose format). Unused in [`Apply`].
+    ///
+    /// [`Ops`]: TransferPhase::Ops
+    /// [`Git`]: TransferPhase::Git
+    /// [`Apply`]: TransferPhase::Apply
+    pub current: u64,
+    /// Exact end of the phase, `None` until known: announced by the peer
+    /// for the op phase, read from the pack header for the git phase
+    /// (never known in the loose format).
+    pub total: Option<u64>,
+    /// Wire (compressed) payload bytes received so far in the phase.
+    pub bytes: u64,
+}
+
+impl TransferProgress {
+    /// Zeroed counters at the start of `phase`.
+    pub fn start(phase: TransferPhase) -> Self {
+        TransferProgress {
+            phase,
+            current: 0,
+            total: None,
+            bytes: 0,
+        }
+    }
+}
+
+/// The sequential stages of a fetch, in order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum TransferPhase {
+    /// Pulling the op-log delta.
+    Ops,
+    /// Pulling the git objects the new views reference.
+    Git,
+    /// Writing everything into the local repo (and indexing it after a
+    /// join, which can rival the transfer for large histories).
+    Apply,
+}
+
+/// Sink for [`TransferProgress`] updates, called inline from the transfer
+/// loops: implementations must be cheap and never block. The default sink
+/// discards everything.
+#[derive(Clone, Copy, Default)]
+pub struct ProgressSink<'a>(Option<&'a (dyn Fn(TransferProgress) + Send + Sync)>);
+
+impl<'a> ProgressSink<'a> {
+    pub fn new(sink: &'a (dyn Fn(TransferProgress) + Send + Sync)) -> Self {
+        ProgressSink(Some(sink))
+    }
+
+    /// Reports one snapshot.
+    fn report(self, progress: TransferProgress) {
+        if let Some(sink) = self.0 {
+            sink(progress);
+        }
+    }
+}
+
 /// A replicated operation: raw bytes to store under `id`, plus the
 /// structural metadata extracted from them.
 struct StoredOp {
@@ -171,6 +237,7 @@ mod tests {
             format,
             &mut client_tx,
             &mut client_rx,
+            ProgressSink::default(),
         )
         .await
         .unwrap();
@@ -403,6 +470,7 @@ mod tests {
             GitTransferFormat::Loose,
             &mut client_tx,
             &mut client_rx,
+            ProgressSink::default(),
         )
         .await
         .unwrap_err();
@@ -599,10 +667,95 @@ mod tests {
         header.extend_from_slice(&2u32.to_be_bytes());
         header.extend_from_slice(&u32::MAX.to_be_bytes());
 
-        let Err(err) = pack::ingest_pack(&git, std::io::Cursor::new(header)) else {
+        let indexed = pack::SharedObjectCount::default();
+        let Err(err) = pack::ingest_pack(&git, std::io::Cursor::new(header), &indexed) else {
             panic!("an absurd object count must be refused");
         };
         assert!(err.to_string().contains("over the"), "{err:#}");
+    }
+
+    /// A pack-format fetch with a progress sink must report the phases in
+    /// order with exact totals: the op counts the server announced, and
+    /// the git object count read from the pack header, both fully reached.
+    /// The join scenario is the one the progress display exists for.
+    #[tokio::test]
+    async fn progress_reports_phases_and_exact_totals() {
+        let fx = Fixture::new();
+        let a = fx.init_repo("a");
+        fs::write(a.join("file.txt"), "mesh content\n").unwrap();
+        fx.jj(&a, &["commit", "-m", "add file"]);
+        let b = init_join_repo(&fx, "b", "machine-b");
+
+        let (ra, rb) = (open(&a), open(&b));
+        let wants = ra.op_heads().await.unwrap();
+
+        let (client, remote) = tokio::io::duplex(1 << 20);
+        let (mut client_rx, mut client_tx) = tokio::io::split(client);
+        let (mut server_rx, mut server_tx) = tokio::io::split(remote);
+        let serve_task = tokio::spawn(async move {
+            let request: FetchRequest = read_message(&mut server_rx, MAX_OP_FRAME_SIZE)
+                .await
+                .unwrap();
+            serve(&ra, request, &mut server_tx, &mut server_rx)
+                .await
+                .unwrap();
+        });
+
+        let samples = std::sync::Mutex::new(Vec::<TransferProgress>::new());
+        let sink = |progress: TransferProgress| samples.lock().unwrap().push(progress);
+        let outcome = fetch(
+            &rb,
+            "test",
+            &crate::config::RepoId::generate(),
+            &wants,
+            GitTransferFormat::Pack,
+            &mut client_tx,
+            &mut client_rx,
+            ProgressSink::new(&sink),
+        )
+        .await
+        .unwrap();
+        serve_task.await.unwrap();
+        let samples = samples.into_inner().unwrap();
+
+        // The phases arrive strictly in order.
+        let mut phases: Vec<TransferPhase> = samples.iter().map(|p| p.phase).collect();
+        phases.dedup();
+        assert_eq!(
+            phases,
+            [TransferPhase::Ops, TransferPhase::Git, TransferPhase::Apply],
+        );
+
+        // Counters are monotonic within each phase.
+        for pair in samples.windows(2) {
+            if pair[0].phase == pair[1].phase {
+                assert!(pair[1].current >= pair[0].current, "{pair:?}");
+                assert!(pair[1].bytes >= pair[0].bytes, "{pair:?}");
+            }
+        }
+
+        // Op phase: the announced total is exact and reached, and covers
+        // at least the ops the fetch stored.
+        let last_ops = samples
+            .iter()
+            .rfind(|p| p.phase == TransferPhase::Ops)
+            .unwrap();
+        assert_eq!(last_ops.total, Some(last_ops.current));
+        assert!(last_ops.current >= outcome.ops as u64);
+        assert!(last_ops.bytes > 0);
+
+        // Git phase: the total comes off the pack header on the first
+        // chunk, and the indexed count reaches it once the pack landed.
+        let git: Vec<&TransferProgress> = samples
+            .iter()
+            .filter(|p| p.phase == TransferPhase::Git)
+            .collect();
+        let announced = git.iter().find(|p| p.total.is_some()).unwrap();
+        assert_eq!(announced.total, Some(outcome.git_objects as u64));
+        let last_git = git.last().unwrap();
+        assert_eq!(last_git.total, Some(last_git.current));
+        assert!(last_git.current > 0);
+        assert!(last_git.bytes > 0);
     }
 
     /// Repos containing gitlink (submodule) tree entries must sync: the

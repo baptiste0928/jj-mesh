@@ -7,7 +7,7 @@ use std::{io, time::Duration};
 use color_eyre::eyre::{Result, WrapErr as _, bail, eyre};
 use tokio::net::UnixStream;
 
-use super::protocol::{CLIENT_TIMEOUT, MAX_MESSAGE_SIZE, Request, Response, Status};
+use super::protocol::{CLIENT_TIMEOUT, JoinProgress, MAX_MESSAGE_SIZE, Request, Response, Status};
 use crate::{
     config::ConfigDir,
     net::wire::{read_message, write_message},
@@ -84,8 +84,21 @@ pub fn query_status_blocking(dir: &ConfigDir) -> Result<Option<Status>> {
 /// Sends one request and returns the daemon's answer, for CLI commands with
 /// no tokio runtime of their own. Errors when no daemon is running, and
 /// turns [`Response::Error`] into an error, so callers only match their
-/// success variant.
+/// success variant. Progress frames, if any, are dropped.
 pub fn request_blocking(dir: &ConfigDir, request: &Request, limit: Duration) -> Result<Response> {
+    request_streaming_blocking(dir, request, limit, |_| {})
+}
+
+/// Like [`request_blocking`], for requests answered by a progress stream:
+/// `on_progress` sees every [`Response::JoinProgress`] frame, and the first
+/// terminal response is returned. `idle` bounds the gap between frames,
+/// not the whole exchange; the daemon heartbeats progress while it works.
+pub fn request_streaming_blocking(
+    dir: &ConfigDir,
+    request: &Request,
+    idle: Duration,
+    mut on_progress: impl FnMut(JoinProgress),
+) -> Result<Response> {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?
@@ -95,9 +108,12 @@ pub fn request_blocking(dir: &ConfigDir, request: &Request, limit: Duration) -> 
             };
 
             client.send(request).await?;
-            match client.recv(Some(limit)).await? {
-                Response::Error(message) => bail!("{message}"),
-                response => Ok(response),
+            loop {
+                match client.recv(Some(idle)).await? {
+                    Response::JoinProgress(progress) => on_progress(progress),
+                    Response::Error(message) => bail!("{message}"),
+                    response => return Ok(response),
+                }
             }
         })
 }

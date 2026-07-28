@@ -131,7 +131,9 @@ pub async fn recv_uni(stream: &mut RecvStream) -> Result<UniMessage> {
 // A fetch runs on one bidirectional stream opened by the fetching side:
 //
 // 1. fetcher: [`FetchRequest`] (wanted op heads + have samples)
-// 2. server:  [`OpFrame`]s, views before the ops referencing them, ops in
+// 2. server:  `OpFrame::Begin` with the phase's exact frame counts (for
+//    progress display; the delta is collected before streaming anyway),
+//    then [`OpFrame`]s, views before the ops referencing them, ops in
 //    parents-first order, terminated by `OpFrame::Done`
 // 3. fetcher: [`GitRequest`] (commits referenced by the new views that are
 //    missing locally, plus have samples, and the transfer format)
@@ -229,6 +231,9 @@ pub struct FetchRequest {
 /// and the stored bytes stay verbatim.
 #[derive(Debug, Serialize, Deserialize)]
 pub enum OpFrame {
+    /// Announces the exact number of op and view frames of the phase,
+    /// sent before any of them. For progress display only.
+    Begin { ops: u64, views: u64 },
     /// A view's raw proto bytes (compressed), sent before any op
     /// referencing it.
     View { id: Vec<u8>, view: Vec<u8> },

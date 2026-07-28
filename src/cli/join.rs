@@ -18,7 +18,7 @@ use color_eyre::eyre::{Result, WrapErr as _, bail, ensure};
 
 use crate::{
     config::{ConfigDir, MeshState},
-    daemon::control::{self, Request, Response},
+    daemon::control::{self, JoinProgress, Request, Response},
 };
 
 /// Join a repo another machine added to the mesh
@@ -74,7 +74,22 @@ pub fn run(args: JoinArgs, dir: &ConfigDir) -> Result<()> {
         name: name.clone(),
         path: std::fs::canonicalize(&path)?,
     };
-    let pulled = control::request_blocking(dir, &request, control::JOIN_WAIT);
+    // The progress line only makes sense on a terminal: redirected output
+    // would collect thousands of carriage-returned fragments.
+    let tty = std::io::IsTerminal::is_terminal(&std::io::stdout());
+    let mut progressing = false;
+    let pulled =
+        control::request_streaming_blocking(dir, &request, control::JOIN_IDLE_WAIT, |progress| {
+            if tty {
+                progressing = true;
+                show_progress(&progress);
+            }
+        });
+    // The progress line is overwritten in place; finish it before anything
+    // else (the outcome or an error report) prints.
+    if progressing {
+        println!();
+    }
     let response = pulled.wrap_err_with(|| {
         format!(
             "the repo directory {} was created but not registered; remove it before retrying",
@@ -91,6 +106,53 @@ pub fn run(args: JoinArgs, dir: &ConfigDir) -> Result<()> {
 
     println!("Joined `{name}`: {ops} operations, {git_objects} git objects");
     Ok(())
+}
+
+/// Renders a progress frame in place on the current line.
+fn show_progress(progress: &JoinProgress) {
+    use std::io::Write as _;
+
+    use crate::repo::transfer::TransferPhase;
+
+    let JoinProgress { peer, transfer } = progress;
+    let (current, bytes) = (transfer.current, transfer.bytes);
+    let line = if peer.is_empty() {
+        // Seeded state before the daemon picked a source peer.
+        "Contacting peers...".to_owned()
+    } else {
+        match (transfer.phase, transfer.total) {
+            (TransferPhase::Ops, Some(total)) => {
+                format!("Pulling history from `{peer}`: {current}/{total} operations")
+            }
+            (TransferPhase::Ops, None) => {
+                format!("Pulling history from `{peer}`: {current} operations")
+            }
+            (TransferPhase::Git, Some(total)) => format!(
+                "Pulling files from `{peer}`: {current}/{total} objects ({})",
+                human_bytes(bytes),
+            ),
+            (TransferPhase::Git, None) => {
+                format!("Pulling files from `{peer}`: {}", human_bytes(bytes))
+            }
+            (TransferPhase::Apply, _) => "Writing the repo...".to_owned(),
+        }
+    };
+    // Clear-to-end covers a new line shorter than the previous one.
+    print!("\r{line}\x1b[K");
+    let _ = std::io::stdout().flush();
+}
+
+/// Formats a byte count for the progress line.
+fn human_bytes(bytes: u64) -> String {
+    const KIB: u64 = 1 << 10;
+    const MIB: u64 = 1 << 20;
+    if bytes < KIB {
+        format!("{bytes} B")
+    } else if bytes < MIB {
+        format!("{} KiB", bytes / KIB)
+    } else {
+        format!("{}.{} MiB", bytes / MIB, (bytes % MIB) * 10 / MIB)
+    }
 }
 
 /// Runs a jj command, surfacing its stderr on failure.

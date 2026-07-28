@@ -17,8 +17,8 @@ use tokio::{
 use tracing::{debug, info, warn};
 
 use super::protocol::{
-    CLIENT_TIMEOUT, ConflictStatus, JOIN_PULL_TIMEOUT, MAX_MESSAGE_SIZE, PausedStatus, PeerReport,
-    Request, Response, Status,
+    CLIENT_TIMEOUT, ConflictStatus, JOIN_PROGRESS_INTERVAL, JOIN_PULL_TIMEOUT, JoinProgress,
+    MAX_MESSAGE_SIZE, PausedStatus, PeerReport, Request, Response, Status,
 };
 use crate::{
     config::{ConfigDir, MeshState, Repo, RepoId},
@@ -224,15 +224,14 @@ async fn handle_client(mut stream: UnixStream, ctx: Arc<ControlContext>) {
             Err(_) => return debug!("control client timed out"),
         };
 
-    // PairJoin owns its stream (client-cancel handling); the rest return a
-    // single response and share one error conversion.
+    // PairJoin and JoinRepo own their stream (client-cancel handling, and
+    // progress streaming for the join); the rest return a single response
+    // and share one error conversion.
     let served = match request {
         Request::PairHost { name } => reply(&mut stream, pair_host(&ctx, name).await).await,
         Request::PairJoin { ticket, name } => pair_join(&mut stream, &ctx, &ticket, &name).await,
         Request::Status => reply(&mut stream, Ok(Response::Status(ctx.status()))).await,
-        Request::JoinRepo { name, path } => {
-            reply(&mut stream, join_repo(&ctx, &name, &path).await).await
-        }
+        Request::JoinRepo { name, path } => join_repo(&mut stream, &ctx, &name, &path).await,
         Request::AddRepo { name, path } => {
             reply(&mut stream, add_repo(&ctx, name, path).await).await
         }
@@ -318,11 +317,63 @@ async fn pair_join(
 }
 
 /// Pulls the mesh repo named `name` into the freshly initialized repo at
-/// `path`, from a connected peer that announced it, then registers it. The
-/// repo's mesh id is adopted from the announcements. The pull runs on an
-/// ad-hoc repo handle in this connection's task, as the repo set only
-/// manages it once registered.
-async fn join_repo(ctx: &ControlContext, name: &str, path: &std::path::Path) -> Result<Response> {
+/// `path`, streaming progress frames while the pull runs. Stops the pull
+/// when the client disconnects (or stops reading progress): the join only
+/// exists for the CLI that asked, and it must not register a repo behind
+/// a gone user's back. Work already handed to a blocking thread (a pack
+/// ingest, the apply) still finishes, so the directory the CLI tells the
+/// user to remove may gain more objects; it is never registered.
+async fn join_repo(
+    stream: &mut UnixStream,
+    ctx: &ControlContext,
+    name: &str,
+    path: &std::path::Path,
+) -> Result<()> {
+    let (mut read_half, mut write_half) = stream.split();
+    // Seeded before the pull so the heartbeat covers the whole handler,
+    // validation and dialing included: the CLI treats a silent gap over
+    // its idle budget as a dead daemon.
+    let progress = tokio::sync::watch::Sender::new(JoinProgress {
+        peer: String::new(),
+        transfer: transfer::TransferProgress::start(transfer::TransferPhase::Ops),
+    });
+
+    let join = join_pull_and_register(ctx, name, path, &progress);
+    tokio::pin!(join);
+    let mut heartbeat = tokio::time::interval(JOIN_PROGRESS_INTERVAL);
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    let response = loop {
+        tokio::select! {
+            result = &mut join => {
+                break result.unwrap_or_else(|err| Response::Error(format!("{err:#}")));
+            }
+            _ = heartbeat.tick() => {
+                let latest = progress.borrow().clone();
+                if respond(&mut write_half, &Response::JoinProgress(latest)).await.is_err() {
+                    // A client too stalled to drain cosmetic frames is as
+                    // gone as a disconnected one (and the failed write may
+                    // have desynced the framing anyway).
+                    info!("join cancelled: the client stopped reading");
+                    return Ok(());
+                }
+            }
+            () = client_gone(&mut read_half) => {
+                info!("join cancelled by the client");
+                return Ok(());
+            }
+        }
+    };
+    respond(&mut write_half, &response).await
+}
+
+/// The join work itself: validate, pull, register (see [`join_repo`]).
+async fn join_pull_and_register(
+    ctx: &ControlContext,
+    name: &str,
+    path: &std::path::Path,
+    progress: &tokio::sync::watch::Sender<JoinProgress>,
+) -> Result<Response> {
     let (repo_id, sources) = ctx.hub.join_sources(name)?;
 
     // Fail before the (long) pull when the registration cannot succeed. Only
@@ -337,7 +388,7 @@ async fn join_repo(ctx: &ControlContext, name: &str, path: &std::path::Path) -> 
         }
     }
 
-    let (ops, git_objects) = join_pull(ctx, name, &repo_id, sources, path).await?;
+    let (ops, git_objects) = join_pull(ctx, name, &repo_id, sources, path, progress).await?;
 
     ctx.update_state(|state| {
         state.add_repo(
@@ -357,6 +408,7 @@ async fn join_pull(
     repo_id: &RepoId,
     sources: Vec<JoinSource>,
     path: &std::path::Path,
+    progress: &tokio::sync::watch::Sender<JoinProgress>,
 ) -> Result<(u64, u64)> {
     use jj_lib::op_store::OperationId;
 
@@ -374,6 +426,24 @@ async fn join_pull(
             continue;
         };
 
+        // The transfer sink publishes latest-wins into the watch; the
+        // connection task samples and forwards it on its heartbeat. Reset
+        // to zeroed counters before dialing, so a fallback to this source
+        // is visible and a stalled dial still heartbeats fresh state.
+        let peer_name = ctx
+            .state()
+            .peer_name(&peer)
+            .map_or_else(|| peer.to_string(), str::to_owned);
+        let sink = |transfer: transfer::TransferProgress| {
+            progress.send_replace(JoinProgress {
+                peer: peer_name.clone(),
+                transfer,
+            });
+        };
+        sink(transfer::TransferProgress::start(
+            transfer::TransferPhase::Ops,
+        ));
+
         let pull = async {
             let (mut send, mut recv) = conn.open_bi().await?;
             // A join pulls a whole history: the pack format reuses the
@@ -387,6 +457,7 @@ async fn join_pull(
                 crate::net::sync::GitTransferFormat::Pack,
                 &mut send,
                 &mut recv,
+                transfer::ProgressSink::new(&sink),
             )
             .await?;
             let _ = send.finish();

@@ -536,6 +536,7 @@ impl RepoTask {
             crate::net::sync::GitTransferFormat::Loose,
             &mut send,
             &mut recv,
+            transfer::ProgressSink::default(),
         );
         let outcome = tokio::time::timeout(FETCH_TIMEOUT, fetch)
             .await

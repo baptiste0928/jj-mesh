@@ -7,7 +7,7 @@ use std::{path::PathBuf, time::Duration};
 use iroh::EndpointId;
 use serde::{Deserialize, Serialize};
 
-use crate::net::sync::StatusReport;
+use crate::{net::sync::StatusReport, repo::transfer::TransferProgress};
 
 /// Maximum accepted size of a control message.
 pub(super) const MAX_MESSAGE_SIZE: u32 = 1 << 20;
@@ -26,10 +26,16 @@ pub const PAIR_TICKET_TTL: Duration = Duration::from_mins(3);
 /// repository.
 pub(super) const JOIN_PULL_TIMEOUT: Duration = Duration::from_mins(30);
 
-/// Time budget the CLI grants a whole join request: the pull budget plus a
-/// margin for validation and registration. Kept here next to the pull
-/// budget so the two cannot drift apart.
-pub const JOIN_WAIT: Duration = JOIN_PULL_TIMEOUT.saturating_add(Duration::from_mins(1));
+/// Cadence at which the daemon re-sends the latest join progress. Sent
+/// unconditionally, changed or not: the frames double as the liveness
+/// signal behind [`JOIN_IDLE_WAIT`].
+pub(super) const JOIN_PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Time budget the CLI grants between join frames, not the whole exchange:
+/// the daemon heartbeats progress every [`JOIN_PROGRESS_INTERVAL`] while
+/// the join runs, so a silent daemon is a dead one. The exchange as a
+/// whole stays bounded by the daemon's own [`JOIN_PULL_TIMEOUT`].
+pub const JOIN_IDLE_WAIT: Duration = Duration::from_secs(30);
 
 /// A request from the CLI to the daemon.
 #[derive(Debug, Serialize, Deserialize)]
@@ -47,7 +53,9 @@ pub enum Request {
     PairJoin { ticket: String, name: String },
     /// Pull the full state of the mesh repo named `name` into a freshly
     /// initialized local repo at `path` and register it (see `jj-mesh
-    /// join`). Answered with [`Response::Joined`] or [`Response::Error`].
+    /// join`). Answered with a stream of [`Response::JoinProgress`] frames
+    /// ending in [`Response::Joined`] or [`Response::Error`]; disconnecting
+    /// cancels the pull.
     JoinRepo { name: String, path: PathBuf },
     /// Register the repo at `path` under `name`, with a fresh id. Answered
     /// with [`Response::RepoAdded`] or [`Response::Error`].
@@ -89,6 +97,22 @@ pub enum Response {
     PeerRemoved(EndpointId),
     /// The request failed.
     Error(String),
+    /// Progress of an in-flight join pull, re-sent at least every
+    /// [`JOIN_PROGRESS_INTERVAL`] until the terminal answer. Last in the
+    /// enum so the older variants keep their postcard discriminants across
+    /// a CLI/daemon version skew.
+    JoinProgress(JoinProgress),
+}
+
+/// A snapshot of a running join pull, for progress display.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JoinProgress {
+    /// Paired name of the peer being pulled from, empty while the daemon
+    /// has not picked one yet. Counters restart when the daemon falls back
+    /// to another source peer.
+    pub peer: String,
+    /// The transfer counters, straight from the pull.
+    pub transfer: TransferProgress,
 }
 
 /// Live daemon state, answering [`Request::Status`].
