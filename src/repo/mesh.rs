@@ -28,6 +28,7 @@ use std::{
 
 use color_eyre::eyre::{Result, WrapErr as _, ensure, eyre};
 use jj_lib::{
+    backend::CommitId,
     config::StackedConfig,
     git_backend::GitBackend,
     object_id::{HexPrefix, ObjectId, PrefixResolution},
@@ -255,6 +256,77 @@ impl MeshRepo {
         Ok(order)
     }
 
+    /// Proves the repo's stored formats are ones this build understands:
+    /// reads every current op head and its view through the mesh codec,
+    /// the same validation applied to replicated bytes. A repo written by
+    /// a different jj series fails here at open, with a pointed error,
+    /// instead of failing obscurely mid-sync.
+    ///
+    /// Also verifies the working-copy commits carry the `change-id` git
+    /// header: change ids replicate through the git objects alone (the
+    /// local extras table never leaves the machine), so a jj writing
+    /// without the header would sync commits whose change identity
+    /// silently diverges across the mesh. The working-copy commit is
+    /// checked because it is always jj-written; commits imported from
+    /// plain git legitimately lack the header and are consistent anyway
+    /// (their synthetic change ids derive from the commit id).
+    pub async fn self_check(&self) -> Result<()> {
+        for head in self.op_heads().await? {
+            if head == *self.root_operation_id() {
+                continue;
+            }
+            let parse = || -> Result<()> {
+                let meta = super::codec::parse_operation(&self.read_operation_bytes(&head)?)?;
+                super::codec::parse_view(&self.read_view_bytes(&meta.view_id)?)?;
+                Ok(())
+            };
+            parse().wrap_err_with(|| {
+                format!(
+                    "cannot decode op head {}; was the repo written by a jj \
+                     release other than the supported {} series?",
+                    head.hex(),
+                    super::SUPPORTED_JJ_SERIES,
+                )
+            })?;
+
+            let op = self.read_operation(&head).await?;
+            let view = self.read_view(&op.view_id).await?;
+            for wc_commit in view.wc_commit_ids.values() {
+                self.check_change_id_header(wc_commit)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Ensures a jj-written commit carries the `change-id` git header (see
+    /// [`Self::self_check`]).
+    fn check_change_id_header(&self, id: &CommitId) -> Result<()> {
+        // jj's virtual root commit is never a real git object.
+        if id.as_bytes().iter().all(|byte| *byte == 0) {
+            return Ok(());
+        }
+
+        let git = self.git_backend().git_repo();
+        let oid = gix::ObjectId::try_from(id.as_bytes())
+            .map_err(|err| eyre!("bad working-copy commit id: {err}"))?;
+        let object = git
+            .find_object(oid)
+            .map_err(|err| eyre!("cannot read working-copy commit {}: {err}", id.hex()))?;
+        let commit = object
+            .try_to_commit_ref()
+            .map_err(|err| eyre!("cannot decode working-copy commit {}: {err}", id.hex()))?;
+
+        ensure!(
+            jj_lib::git_backend::extract_change_id_from_commit(&commit).is_some(),
+            "working-copy commit {} has no change-id header, so change ids \
+             would not survive syncing; enable `git.write-change-id-header` \
+             in the jj config (the default) and run any jj command in the \
+             repo",
+            id.hex(),
+        );
+        Ok(())
+    }
+
     /// The git backend of the repo.
     pub fn git_backend(&self) -> &GitBackend {
         self.loader
@@ -342,6 +414,8 @@ mod tests {
             repo.read_view(&op.view_id).await.unwrap();
         }
         assert!(repo.git_repo_path().is_dir());
+        // A repo written by the supported jj passes the format self-check.
+        repo.self_check().await.unwrap();
 
         let absent = OperationId::new(vec![0xff; 64]);
         assert!(!repo.has_operation(&absent).await.unwrap());
@@ -399,6 +473,47 @@ mod tests {
         assert_eq!(rb.op_heads().await.unwrap(), a_heads);
         // jj itself must accept the replicated op log.
         fx.jj(&b, &["op", "log"]);
+    }
+
+    /// A repo whose jj writes commits without the change-id header must
+    /// fail the self-check: its change ids would not survive syncing.
+    #[tokio::test]
+    async fn self_check_rejects_missing_change_id_header() {
+        let fx = Fixture::new();
+        let dir = fx.init_repo("a");
+        fx.jj(
+            &dir,
+            &[
+                "config",
+                "set",
+                "--repo",
+                "git.write-change-id-header",
+                "false",
+            ],
+        );
+        // Rewrite the working-copy commit under the disabled setting.
+        fx.jj(&dir, &["new", "-m", "no header"]);
+
+        let repo = open(&dir);
+        let err = repo.self_check().await.unwrap_err();
+        assert!(
+            format!("{err:#}").contains("write-change-id-header"),
+            "{err:#}",
+        );
+
+        // Re-enabling the header heals the repo on the next jj command.
+        fx.jj(
+            &dir,
+            &[
+                "config",
+                "set",
+                "--repo",
+                "git.write-change-id-header",
+                "true",
+            ],
+        );
+        fx.jj(&dir, &["new", "-m", "healed"]);
+        open(&dir).self_check().await.unwrap();
     }
 
     /// Raw writes never replace stored history: the first write wins, and

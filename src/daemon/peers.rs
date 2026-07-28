@@ -438,6 +438,7 @@ impl PeerTask {
             let _permit = permit;
             match tokio::time::timeout(ANNOUNCE_TIMEOUT, sync::recv_uni(&mut stream)).await {
                 Ok(Ok(sync::UniMessage::Announce(announce))) => hub.route(peer, announce),
+                Ok(Ok(sync::UniMessage::Status(report))) => hub.route_status(peer, report),
                 Ok(Ok(sync::UniMessage::Membership(membership))) => {
                     // A full queue means a membership flood; dropping is
                     // safe, the next change or reconnect re-sends.

@@ -7,6 +7,8 @@ use std::{path::PathBuf, time::Duration};
 use iroh::EndpointId;
 use serde::{Deserialize, Serialize};
 
+use crate::net::sync::StatusReport;
+
 /// Maximum accepted size of a control message.
 pub(super) const MAX_MESSAGE_SIZE: u32 = 1 << 20;
 
@@ -90,12 +92,19 @@ pub enum Response {
 }
 
 /// Live daemon state, answering [`Request::Status`].
+///
+/// Anything peer-related is keyed by the peer's paired name, resolved by
+/// the daemon: the CLI displays this structure as-is.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Status {
     /// This machine's endpoint id.
     pub endpoint: EndpointId,
     /// Seconds since the daemon started.
     pub uptime_secs: u64,
+    /// The jj version found on the daemon's PATH, `None` when jj is
+    /// missing or unrecognizable. Compatibility is a warning, never an
+    /// error: the daemon cannot know which jj binary writes the repos.
+    pub jj_version: Option<String>,
     /// State of every configured peer.
     pub peers: Vec<PeerStatus>,
     /// Repos registered on this machine.
@@ -104,6 +113,31 @@ pub struct Status {
     pub available: Vec<String>,
     /// Repo names contested by peers announcing a different repo.
     pub conflicts: Vec<ConflictStatus>,
+    /// Repos whose sync is paused because a peer also holds a colocated
+    /// instance.
+    pub paused: Vec<PausedStatus>,
+    /// The latest health each connected peer reported for itself.
+    pub peer_reports: Vec<PeerReport>,
+}
+
+/// A repo paused by a colocation conflict: this machine's instance and the
+/// named peers' all have a user-visible `.git`, which a mesh repo supports
+/// on at most one machine (see `jj-mesh join`'s docs). The repo fetches
+/// from nobody until only one colocated instance remains visible.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PausedStatus {
+    pub repo: String,
+    /// Names of the peers claiming a colocated instance.
+    pub peers: Vec<String>,
+}
+
+/// One connected peer's self-reported health.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PeerReport {
+    /// The peer's paired name.
+    pub peer: String,
+    /// The report exactly as the peer sent it (sanitized on receipt).
+    pub report: StatusReport,
 }
 
 /// A repo name contested by a peer: it announces a different repo (by id)
@@ -112,7 +146,8 @@ pub struct Status {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ConflictStatus {
     pub repo: String,
-    pub peer: EndpointId,
+    /// The contesting peer's paired name.
+    pub peer: String,
 }
 
 /// Live state of one configured peer.
@@ -183,4 +218,7 @@ pub enum WatchStatus {
     },
     /// Opening or watching failed; waiting before retrying.
     Failed { error: String, retry_in_secs: u64 },
+    /// The repo directory is gone (unmounted disk, or deleted without
+    /// `jj-mesh forget`); retried in the background.
+    Missing { retry_in_secs: u64 },
 }

@@ -32,6 +32,7 @@ use self::{
 use crate::{
     config::{ConfigDir, MachineKey, Membership, MeshState},
     net::{EndpointOptions, bind_endpoint, pair, sync},
+    repo,
 };
 
 /// Maximum in-flight handshakes of not-yet-authenticated connections.
@@ -48,6 +49,15 @@ const GOSSIP_INTERVAL: std::time::Duration = std::time::Duration::from_mins(5);
 /// Handshake budget, so stalled attempts release their permit quickly
 /// instead of waiting out the transport-level timeout.
 const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How often the status report is re-broadcast without a repo state
+/// change. Also the staleness bound for the parts the repo set does not
+/// signal (colocation pauses, which flip on peer announcements).
+const STATUS_REFRESH: std::time::Duration = std::time::Duration::from_mins(1);
+
+/// Coalescing window for status changes: a failing repo can flip states
+/// quickly, and peers only care about the latest.
+const STATUS_DEBOUNCE: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// The ALPNs the daemon serves. The pairing ALPN is always among them:
 /// pairing is gated by the one-time ticket, not by ALPN exposure, and
@@ -79,6 +89,16 @@ impl Daemon {
         let endpoint = bind_endpoint(&key, alpns(), options).await?;
         info!("daemon started, endpoint id {}", key.endpoint_id());
 
+        // The local jj version is a warning signal, never a gate: the
+        // binary on the daemon's PATH is only a proxy for whichever jj
+        // actually writes the repos.
+        let jj_version = tokio::task::spawn_blocking(repo::local_jj_version)
+            .await
+            .unwrap_or(None);
+        if let Some(warning) = repo::jj_version_warning(jj_version.as_deref()) {
+            warn!("{warning}");
+        }
+
         let hub = Arc::new(SyncHub::new());
         let (gossip_tx, gossip_rx) = mpsc::channel(GOSSIP_QUEUE);
         let peers = Arc::new(PeerSet::new(
@@ -105,16 +125,18 @@ impl Daemon {
             endpoint: endpoint.clone(),
             started: Instant::now(),
             peers: peers.clone(),
-            repos,
-            hub,
+            repos: repos.clone(),
+            hub: hub.clone(),
             store: store.clone(),
             pairing: pairing.clone(),
+            jj_version: jj_version.clone(),
         });
 
         let mut tasks = tokio::task::JoinSet::new();
         tasks.spawn(async move { server.serve(ctx).await });
         tasks.spawn(accept_loop(endpoint.clone(), peers, pairing));
         tasks.spawn(membership_loop(gossip_rx, key.endpoint_id(), store.clone()));
+        tasks.spawn(status_loop(repos, hub, jj_version));
         tasks.spawn(async move {
             loop {
                 tokio::time::sleep(GOSSIP_INTERVAL).await;
@@ -200,6 +222,30 @@ async fn accept_loop(endpoint: Endpoint, peers: Arc<PeerSet>, pairing: Arc<Pairi
                 Err(_) => debug!("incoming handshake timed out"),
             }
         });
+    }
+}
+
+/// Broadcasts this machine's health to the peers: rebuilt on every repo
+/// state change (debounced) and periodically (the staleness bound for
+/// state the repo set does not signal, i.e. colocation pauses), but only
+/// published when it actually changed — an idle mesh stays silent. A
+/// report lost with its connection is replayed on reconnect.
+async fn status_loop(repos: Arc<RepoSet>, hub: Arc<SyncHub>, jj_version: Option<String>) {
+    let mut published: Option<sync::StatusReport> = None;
+    loop {
+        let report = sync::StatusReport {
+            daemon_version: env!("CARGO_PKG_VERSION").to_owned(),
+            jj_version: jj_version.clone(),
+            repos: repos.health(),
+        };
+        if published.as_ref() != Some(&report) {
+            hub.publish_status(report.clone());
+            published = Some(report);
+        }
+        tokio::select! {
+            () = repos.changed() => tokio::time::sleep(STATUS_DEBOUNCE).await,
+            () = tokio::time::sleep(STATUS_REFRESH) => {}
+        }
     }
 }
 

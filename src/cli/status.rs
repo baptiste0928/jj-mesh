@@ -5,7 +5,8 @@ use color_eyre::eyre::Result;
 
 use crate::{
     config::{ConfigDir, MachineKey, MeshState},
-    daemon::control::{self, ConnectionStatus, Route},
+    daemon::control::{self, ConnectionStatus, PeerReport, Route},
+    net::sync::RepoHealthState,
 };
 
 /// Show the daemon state and the live mesh status
@@ -29,6 +30,9 @@ fn print_live(status: &control::Status) {
         format_duration(status.uptime_secs)
     );
     println!("local endpoint id: {}", status.endpoint);
+    if let Some(warning) = crate::repo::jj_version_warning(status.jj_version.as_deref()) {
+        println!("warning: {warning}");
+    }
 
     println!();
     if status.peers.is_empty() {
@@ -73,18 +77,56 @@ fn print_live(status: &control::Status) {
         println!();
         println!("name conflicts:");
         for conflict in &status.conflicts {
-            // Peers are keyed by endpoint in the conflict; show their
-            // human name when we have it.
-            let peer = status
-                .peers
-                .iter()
-                .find(|peer| peer.endpoint == conflict.peer)
-                .map_or_else(|| conflict.peer.to_string(), |peer| peer.name.clone());
             println!(
-                "  `{}`: peer {peer} last announced a different repo under \
+                "  `{}`: peer {} last announced a different repo under \
                  this name; it is not synced with that peer",
-                conflict.repo,
+                conflict.repo, conflict.peer,
             );
+        }
+    }
+
+    if !status.paused.is_empty() {
+        println!();
+        println!("paused repos:");
+        for paused in &status.paused {
+            println!(
+                "  `{}`: this machine and {} both have a colocated instance; \
+                 fetching is paused until only one remains (see `jj-mesh join \
+                 --help`)",
+                paused.repo,
+                paused.peers.join(", "),
+            );
+        }
+    }
+
+    print_peer_reports(status);
+}
+
+/// Prints each connected peer's self-reported health, if any.
+fn print_peer_reports(status: &control::Status) {
+    if status.peer_reports.is_empty() {
+        return;
+    }
+    println!();
+    println!("peer health:");
+    for PeerReport { peer, report } in &status.peer_reports {
+        let jj = match &report.jj_version {
+            Some(jj) => sanitize(jj),
+            None => "not found".to_owned(),
+        };
+        println!(
+            "  {peer} (jj-mesh {}, jj {jj})",
+            sanitize(&report.daemon_version),
+        );
+        let width = name_width(report.repos.iter().map(|r| r.name.as_str()));
+        for repo in &report.repos {
+            let health = match repo.state {
+                RepoHealthState::Ok => "ok",
+                RepoHealthState::Failed => "error (see that machine's status)",
+                RepoHealthState::Missing => "directory missing on that machine",
+                RepoHealthState::Paused => "paused (colocation conflict)",
+            };
+            println!("    {:width$}  {health}", sanitize(&repo.name));
         }
     }
 }
@@ -118,6 +160,11 @@ fn watch_summary(watch: &control::WatchStatus) -> String {
         } => format!(
             "error: {} (retry in {})",
             sanitize(error),
+            format_duration(*retry_in_secs)
+        ),
+        control::WatchStatus::Missing { retry_in_secs } => format!(
+            "directory missing; unmounted, or deleted without `jj-mesh forget` \
+             (retry in {})",
             format_duration(*retry_in_secs)
         ),
     }

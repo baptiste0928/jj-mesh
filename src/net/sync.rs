@@ -1,10 +1,10 @@
 //! Sync protocol, multiplexed over the persistent peer connection.
 //!
-//! One-shot uni streams carry a [`UniMessage`]: op-head announcements and
-//! membership gossip. Both are idempotent latest-wins state, re-sent on
-//! every change and on peer (re)connect, so a lost or dropped message is
-//! always healed by a later one. Op negotiation and git object transfer
-//! run on bidirectional streams.
+//! One-shot uni streams carry a [`UniMessage`]: op-head announcements,
+//! membership gossip and daemon status reports. All are idempotent
+//! latest-wins state, re-sent on every change and on peer (re)connect, so a
+//! lost or dropped message is always healed by a later one. Op negotiation
+//! and git object transfer run on bidirectional streams.
 
 use color_eyre::eyre::{Result, ensure};
 use iroh::endpoint::{Connection, RecvStream};
@@ -15,7 +15,7 @@ use crate::config::{MAX_MESH_PEERS, MAX_MESH_REPOS, Membership, RepoId};
 
 /// ALPN of the sync protocol. Bumped whenever the wire format changes, so
 /// mismatched daemons refuse each other instead of mis-decoding.
-pub const ALPN: &[u8] = b"jj-mesh/sync/2";
+pub const ALPN: &[u8] = b"jj-mesh/sync/0";
 
 /// Cap on uni-stream messages. Sized for the largest legitimate message, a
 /// full membership (peer records are ~100 bytes, repo records ~100), with
@@ -28,6 +28,7 @@ const MAX_UNI_SIZE: u32 = 192 * 1024;
 pub enum UniMessage {
     Announce(Announce),
     Membership(Membership),
+    Status(StatusReport),
 }
 
 /// Advertises the current op heads of one repo.
@@ -48,6 +49,49 @@ pub struct Announce {
     pub seq: u64,
     /// Current op head ids, as raw id bytes; the receiver validates them.
     pub heads: Vec<Vec<u8>>,
+    /// Whether the sender's instance of the repo is colocated (has a
+    /// user-visible `.git`). A mesh repo supports at most one colocated
+    /// instance (see `jj-mesh join`'s docs); receivers use this to detect
+    /// a second one and pause the repo instead of corrupting its history.
+    pub colocated: bool,
+}
+
+/// One machine's self-reported health, shown by `jj-mesh status` on its
+/// peers. Ephemeral by design: only ever held for connected peers, unlike
+/// the durable, gossip-replicated membership. Compared for equality to
+/// suppress re-broadcasts of an unchanged report.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StatusReport {
+    /// The sender's jj-mesh version (its `CARGO_PKG_VERSION`).
+    pub daemon_version: String,
+    /// The jj version on the sender's PATH, when detectable.
+    pub jj_version: Option<String>,
+    /// Health of every repo registered on the sender.
+    pub repos: Vec<RepoHealth>,
+}
+
+/// Health of one repo in a [`StatusReport`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepoHealth {
+    /// Mesh-wide name of the repo.
+    pub name: String,
+    pub state: RepoHealthState,
+}
+
+/// Condensed repo state for peer consumption. Deliberately carries no
+/// detail strings: local error messages embed filesystem paths (which
+/// never leave the machine) and would make a full report outgrow the wire
+/// cap; the owning machine's own `jj-mesh status` has the details.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RepoHealthState {
+    /// Open and syncing.
+    Ok,
+    /// Cannot be opened or watched.
+    Failed,
+    /// The repo directory is gone.
+    Missing,
+    /// Sync suspended by a colocation conflict.
+    Paused,
 }
 
 /// Sends one message on a fresh uni stream.
@@ -59,16 +103,24 @@ pub async fn send_uni(conn: &Connection, message: &UniMessage) -> Result<()> {
 }
 
 /// Reads the message from an accepted uni stream, rejecting memberships
-/// too big to be legitimate before they reach the daemon: the merge caps
-/// what it stores, but a bounded message keeps the flood off the queue.
+/// and status reports too big to be legitimate before they reach the
+/// daemon: later handling caps what is stored, but a bounded message keeps
+/// the flood off the queue.
 pub async fn recv_uni(stream: &mut RecvStream) -> Result<UniMessage> {
     let message: UniMessage = read_message(stream, MAX_UNI_SIZE).await?;
 
-    if let UniMessage::Membership(membership) = &message {
-        ensure!(
-            membership.peers.len() <= MAX_MESH_PEERS && membership.repos.len() <= MAX_MESH_REPOS,
-            "membership too large",
-        );
+    match &message {
+        UniMessage::Membership(membership) => {
+            ensure!(
+                membership.peers.len() <= MAX_MESH_PEERS
+                    && membership.repos.len() <= MAX_MESH_REPOS,
+                "membership too large",
+            );
+        }
+        UniMessage::Status(report) => {
+            ensure!(report.repos.len() <= MAX_MESH_REPOS, "status too large");
+        }
+        UniMessage::Announce(_) => {}
     }
 
     Ok(message)
@@ -198,6 +250,31 @@ mod tests {
         assert!(
             encoded.len() <= super::MAX_UNI_SIZE as usize,
             "a full membership is {} bytes, over the {} byte cap",
+            encoded.len(),
+            super::MAX_UNI_SIZE,
+        );
+    }
+
+    /// Same guarantee for the status report: a machine at the repo cap with
+    /// every repo failing must still fit its report on the wire, or its
+    /// sender tasks would die and stop all announcements.
+    #[test]
+    fn a_full_status_report_fits_on_the_wire() {
+        let report = super::StatusReport {
+            daemon_version: "9".repeat(MAX_NAME_LEN),
+            jj_version: Some("9".repeat(MAX_NAME_LEN)),
+            repos: (0..MAX_MESH_REPOS)
+                .map(|n| super::RepoHealth {
+                    name: format!("{n:0>64}"),
+                    state: super::RepoHealthState::Failed,
+                })
+                .collect(),
+        };
+
+        let encoded = postcard::to_stdvec(&super::UniMessage::Status(report)).unwrap();
+        assert!(
+            encoded.len() <= super::MAX_UNI_SIZE as usize,
+            "a full status report is {} bytes, over the {} byte cap",
             encoded.len(),
             super::MAX_UNI_SIZE,
         );

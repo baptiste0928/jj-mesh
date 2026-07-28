@@ -24,7 +24,7 @@
 //! replayed (before any announcement) to every connecting peer.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -38,9 +38,11 @@ use tokio::sync::Notify;
 use tracing::{debug, warn};
 
 use crate::{
-    config::{Membership, RepoId, validate_name},
+    config::{Membership, RepoId, sanitize, validate_name},
     net::{
-        sync::{self, Announce, FetchRequest, MAX_OP_FRAME_SIZE, OpFrame, UniMessage},
+        sync::{
+            self, Announce, FetchRequest, MAX_OP_FRAME_SIZE, OpFrame, StatusReport, UniMessage,
+        },
         wire,
     },
     repo::{MeshRepo, transfer},
@@ -87,6 +89,12 @@ struct HubState {
     /// This machine's latest membership, replayed to connecting peers and
     /// broadcast on every change (see [`SyncHub::publish_membership`]).
     membership: Membership,
+    /// This machine's latest status report, replayed to connecting peers
+    /// and broadcast on every change (see [`SyncHub::publish_status`]).
+    status: Option<StatusReport>,
+    /// The latest (sanitized) status report of each connected peer.
+    /// Dropped on disconnect: stale health is worse than none.
+    reports: BTreeMap<EndpointId, StatusReport>,
 }
 
 /// Cap on unregistered repo names tracked *per peer*, so one peer (hostile
@@ -99,6 +107,7 @@ const MAX_ORPHAN_REPOS_PER_PEER: usize = 64;
 struct OrphanAnnounce {
     id: RepoId,
     heads: Vec<Vec<u8>>,
+    colocated: bool,
 }
 
 /// A peer that can serve a `join` of an unregistered repo, with the op
@@ -123,11 +132,34 @@ struct RepoEntry {
     /// An entry clears when its peer announces the matching id again or
     /// disconnects.
     conflicts: BTreeMap<EndpointId, RepoId>,
+    /// Whether the local instance of the repo is colocated, learned when
+    /// the repo task opens it.
+    local_colocated: bool,
+    /// Peers whose last announcement claimed a colocated instance. An
+    /// entry clears when its peer announces non-colocated or disconnects.
+    colocated_peers: BTreeSet<EndpointId>,
     /// Serve handle, present while the repo task has the repo open.
     /// Serving is read-only and dispatched straight from the hub: it must
     /// never depend on the repo task's loop, which may itself be blocked
     /// fetching from the very peer whose fetch we are serving.
     serving: Option<Serving>,
+}
+
+impl RepoEntry {
+    /// Whether sync is suspended for this repo: our instance and at least
+    /// one peer's are both colocated. Two colocated instances exchanging
+    /// ops pollute history (each side re-imports its machine-local git
+    /// HEAD after every sync, resurrecting rewritten commits as divergent
+    /// changes), so while paused this repo fetches from nobody — with both
+    /// conflicted sides refusing to fetch, the poisonous ops cannot land
+    /// even through a relaying third machine. Announcing and serving
+    /// non-conflicted peers stays enabled: read-only serving cannot hurt
+    /// us, and the rest of the mesh keeps syncing. Detection needs the two
+    /// colocated instances directly connected; in a relay-only topology
+    /// the conflict goes undetected.
+    fn paused(&self) -> bool {
+        self.local_colocated && !self.colocated_peers.is_empty()
+    }
 }
 
 /// What the hub needs to serve fetches for an open repo.
@@ -160,6 +192,7 @@ impl SyncHub {
         let mut state = self.state.lock().unwrap();
 
         let mut conflicts = BTreeMap::new();
+        let mut colocated_peers = BTreeSet::new();
         for (peer, announce) in state.orphans.remove(&name).unwrap_or_default() {
             if announce.id != id {
                 warn!(
@@ -167,6 +200,8 @@ impl SyncHub {
                     "peer announces a different repo under this name; not syncing with it",
                 );
                 conflicts.insert(peer, announce.id);
+            } else if announce.colocated {
+                colocated_peers.insert(peer);
             }
         }
 
@@ -178,16 +213,19 @@ impl SyncHub {
                 published: None,
                 inbox: inbox.clone(),
                 conflicts,
+                local_colocated: false,
+                colocated_peers,
                 serving: None,
             },
         );
         inbox
     }
 
-    /// Makes an opened repo servable. Called by the repo task once its
-    /// stores are open; replaces the handle from a previous open. The id
-    /// guards against a stale task of a replaced same-name repo installing
-    /// the wrong stores (aborts only land at the task's next await point).
+    /// Makes an opened repo servable and records its colocation state.
+    /// Called by the repo task once its stores are open; replaces the
+    /// handle from a previous open. The id guards against a stale task of
+    /// a replaced same-name repo installing the wrong stores (aborts only
+    /// land at the task's next await point).
     pub fn repo_opened(&self, name: &str, id: &RepoId, repo: Arc<MeshRepo>) {
         if let Some(entry) = self
             .state
@@ -197,10 +235,17 @@ impl SyncHub {
             .get_mut(name)
             .filter(|entry| &entry.id == id)
         {
+            entry.local_colocated = repo.is_colocated();
             entry.serving = Some(Serving {
                 repo,
                 permits: Arc::new(tokio::sync::Semaphore::new(MAX_SERVES)),
             });
+            if entry.paused() {
+                warn!(
+                    repo = %name,
+                    "this instance and a peer's are both colocated; sync is paused",
+                );
+            }
         }
     }
 
@@ -233,7 +278,7 @@ impl SyncHub {
         mut send: SendStream,
         mut recv: RecvStream,
     ) {
-        let Some(serving) = self.lookup_serving(&request) else {
+        let Some(serving) = self.lookup_serving(&peer, &request) else {
             return refuse_fetch(send, "repo not available");
         };
         let Ok(permit) = serving.permits.clone().try_acquire_owned() else {
@@ -259,7 +304,7 @@ impl SyncHub {
     /// refusal distinctly. The name needs no validation here: only names that
     /// passed it at registration are ever in the map, so an invalid one
     /// simply fails to match.
-    fn lookup_serving(&self, request: &FetchRequest) -> Option<Serving> {
+    fn lookup_serving(&self, peer: &EndpointId, request: &FetchRequest) -> Option<Serving> {
         let state = self.state.lock().unwrap();
         let Some(entry) = state.repos.get(&request.name) else {
             debug!(repo = %request.name, "refusing fetch: repo not registered here");
@@ -269,6 +314,14 @@ impl SyncHub {
         // name says: refuse rather than mix unrelated histories.
         if entry.id != request.id {
             debug!(repo = %request.name, "refusing fetch: repo id mismatch");
+            return None;
+        }
+        // Refused only for the conflicting peer, not repo-wide: it should
+        // not be fetching while paused itself, but an older or hostile
+        // build must still be denied the ops that feed the colocation
+        // ping-pong. Everyone else is served normally.
+        if entry.local_colocated && entry.colocated_peers.contains(peer) {
+            debug!(repo = %request.name, "refusing fetch: colocation conflict with this peer");
             return None;
         }
 
@@ -301,10 +354,22 @@ impl SyncHub {
             id: entry.id.clone(),
             seq: entry.seq,
             heads,
+            colocated: entry.local_colocated,
         };
         for sender in state.peers.values() {
             sender.outbox.push_announce(announce.clone());
         }
+    }
+
+    /// Publishes this machine's status report: cached for peers that
+    /// connect later and queued to every connected peer, coalescing with
+    /// any report still pending there.
+    pub fn publish_status(&self, report: StatusReport) {
+        let mut state = self.state.lock().unwrap();
+        for sender in state.peers.values() {
+            sender.outbox.push_status(report.clone());
+        }
+        state.status = Some(report);
     }
 
     /// Publishes this machine's membership: cached for peers that connect
@@ -329,6 +394,9 @@ impl SyncHub {
 
         let mut state = self.state.lock().unwrap();
         outbox.push_membership(state.membership.clone());
+        if let Some(report) = &state.status {
+            outbox.push_status(report.clone());
+        }
         for (name, entry) in &state.repos {
             if let Some(heads) = &entry.published {
                 outbox.push_announce(Announce {
@@ -336,6 +404,7 @@ impl SyncHub {
                     id: entry.id.clone(),
                     seq: entry.seq,
                     heads: heads.clone(),
+                    colocated: entry.local_colocated,
                 });
             }
         }
@@ -367,11 +436,13 @@ impl SyncHub {
             for entry in state.repos.values_mut() {
                 entry.inbox.forget(peer);
                 entry.conflicts.remove(peer);
+                entry.colocated_peers.remove(peer);
             }
             state.orphans.retain(|_, peers| {
                 peers.remove(peer);
                 !peers.is_empty()
             });
+            state.reports.remove(peer);
             state.peers.remove(peer)
         };
 
@@ -413,6 +484,7 @@ impl SyncHub {
                 OrphanAnnounce {
                     id: announce.id,
                     heads: announce.heads,
+                    colocated: announce.colocated,
                 },
             );
             return;
@@ -429,6 +501,23 @@ impl SyncHub {
             return;
         }
         entry.conflicts.remove(&peer);
+
+        let was_paused = entry.paused();
+        if announce.colocated {
+            entry.colocated_peers.insert(peer);
+        } else {
+            entry.colocated_peers.remove(&peer);
+        }
+        if entry.paused() && !was_paused {
+            warn!(
+                repo = %announce.name, peer = %peer,
+                "this instance and the peer's are both colocated; pausing sync \
+                 (de-colocate one side to resume)",
+            );
+        }
+        // Offered even while paused: the repo task requeues instead of
+        // fetching, so the heads are fetched once the pause lifts rather
+        // than lost until the peer's next change.
         entry.inbox.offer(peer, announce.seq, announce.heads);
     }
 
@@ -480,6 +569,60 @@ impl SyncHub {
             .repos
             .iter()
             .flat_map(|(name, entry)| entry.conflicts.keys().map(|peer| (name.clone(), *peer)))
+            .collect()
+    }
+
+    /// The repos whose sync is paused by a colocation conflict, keyed by
+    /// name, with the peers whose colocated instances cause it.
+    pub fn paused_repos(&self) -> BTreeMap<String, Vec<EndpointId>> {
+        let state = self.state.lock().unwrap();
+        state
+            .repos
+            .iter()
+            .filter(|(_, entry)| entry.paused())
+            .map(|(name, entry)| {
+                (
+                    name.clone(),
+                    entry.colocated_peers.iter().copied().collect(),
+                )
+            })
+            .collect()
+    }
+
+    /// Whether a repo's sync is paused (see [`RepoEntry::paused`]). Repo
+    /// tasks check this on every announcement they drain and requeue
+    /// instead of fetching, which is what enforces the fetch side of the
+    /// pause.
+    pub fn is_paused(&self, name: &str) -> bool {
+        let state = self.state.lock().unwrap();
+        state.repos.get(name).is_some_and(RepoEntry::paused)
+    }
+
+    /// Stores a peer's status report for `jj-mesh status`. The peer is
+    /// authenticated but its strings reach the user's terminal, so the
+    /// free-form fields are sanitized and invalid repo names dropped.
+    pub fn route_status(&self, peer: EndpointId, mut report: StatusReport) {
+        report.daemon_version = sanitize(&report.daemon_version);
+        report.jj_version = report.jj_version.as_deref().map(sanitize);
+        report
+            .repos
+            .retain(|repo| validate_name("repo", &repo.name).is_ok());
+
+        let mut state = self.state.lock().unwrap();
+        // Only connected peers may hold a slot, or a report racing its
+        // disconnect would be retained forever.
+        if state.peers.contains_key(&peer) {
+            state.reports.insert(peer, report);
+        }
+    }
+
+    /// The latest status report of every connected peer.
+    pub fn peer_reports(&self) -> Vec<(EndpointId, StatusReport)> {
+        let state = self.state.lock().unwrap();
+        state
+            .reports
+            .iter()
+            .map(|(peer, report)| (*peer, report.clone()))
             .collect()
     }
 }
@@ -588,6 +731,7 @@ struct Outbox {
 #[derive(Debug, Default)]
 struct OutboxState {
     membership: Option<Membership>,
+    status: Option<StatusReport>,
     announces: BTreeMap<String, Announce>,
 }
 
@@ -606,12 +750,21 @@ impl Outbox {
         self.notify.notify_one();
     }
 
-    /// Takes the next message, membership first: a new peer should learn
-    /// the mesh before the repo heads.
+    fn push_status(&self, report: StatusReport) {
+        self.pending.lock().unwrap().status = Some(report);
+        self.notify.notify_one();
+    }
+
+    /// Takes the next message, membership first (a new peer should learn
+    /// the mesh before anything else), then the status report, then the
+    /// repo announcements.
     fn pop(&self) -> Option<UniMessage> {
         let mut pending = self.pending.lock().unwrap();
         if let Some(membership) = pending.membership.take() {
             return Some(UniMessage::Membership(membership));
+        }
+        if let Some(report) = pending.status.take() {
+            return Some(UniMessage::Status(report));
         }
         pending
             .announces
@@ -646,6 +799,7 @@ mod tests {
             id: id.clone(),
             seq,
             heads,
+            colocated: false,
         }
     }
 
@@ -830,6 +984,50 @@ mod tests {
         assert!(hub.conflicts().iter().any(|(name, _)| name == "fresh"));
     }
 
+    /// A peer announcing a colocated instance while ours is colocated too
+    /// pauses the repo, and the pause lifts when either side stops being
+    /// colocated.
+    #[tokio::test]
+    async fn colocation_conflict_pauses_and_resumes() {
+        use crate::{repo::JjRepo, testing::Fixture};
+
+        // `jj git init` colocates by default, so the opened repo reports
+        // `is_colocated`.
+        let fx = Fixture::new();
+        let dir = fx.init_repo("a");
+        let repo = Arc::new(JjRepo::discover(&dir).unwrap().open().unwrap());
+        assert!(repo.is_colocated());
+
+        let hub = SyncHub::new();
+        let id = RepoId::generate();
+        let inbox = hub.register_repo("a".to_owned(), id.clone());
+        hub.repo_opened("a", &id, repo);
+        let peer = iroh::SecretKey::generate().public();
+
+        let colocated = |seq| Announce {
+            colocated: true,
+            ..announce("a", &id, seq, vec![vec![1; 64]])
+        };
+        hub.route(peer, colocated(1));
+        assert!(hub.is_paused("a"));
+        assert_eq!(hub.paused_repos().get("a"), Some(&vec![peer]));
+        // The heads still land in the inbox: the repo task requeues them
+        // while paused, so they are fetched once the pause lifts instead
+        // of being lost.
+        assert_eq!(inbox.drain().len(), 1);
+
+        // The peer de-colocating resumes sync with its own announcement.
+        hub.route(peer, announce("a", &id, 2, vec![vec![2; 64]]));
+        assert!(!hub.is_paused("a"));
+        assert_eq!(inbox.drain().len(), 1);
+
+        // So does the peer disconnecting.
+        hub.route(peer, colocated(3));
+        assert!(hub.is_paused("a"));
+        hub.peer_disconnected(&peer);
+        assert!(!hub.is_paused("a"));
+    }
+
     #[tokio::test]
     async fn rejects_invalid_announced_names() {
         let hub = SyncHub::new();
@@ -862,7 +1060,7 @@ mod tests {
             .iter()
             .filter_map(|message| match message {
                 UniMessage::Announce(a) => Some((a.name.as_str(), a.seq)),
-                UniMessage::Membership(_) => None,
+                UniMessage::Membership(_) | UniMessage::Status(_) => None,
             })
             .collect();
         assert!(seqs.contains(&("a", 2)) && seqs.contains(&("b", 1)));

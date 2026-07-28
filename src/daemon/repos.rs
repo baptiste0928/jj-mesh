@@ -21,6 +21,7 @@ use std::{
 
 use color_eyre::eyre::{Result, WrapErr as _, ensure, eyre};
 use jj_lib::{object_id::ObjectId as _, op_store::OperationId};
+use tokio::sync::Notify;
 use tracing::{debug, info, warn};
 
 use super::{
@@ -82,6 +83,8 @@ const FETCH_RETRY: Duration = Duration::from_secs(30);
 pub struct RepoSet {
     hub: Arc<SyncHub>,
     repos: Mutex<BTreeMap<String, RepoHandle>>,
+    /// Pinged on every repo state change, driving the status broadcast.
+    changed: Arc<Notify>,
 }
 
 /// Book-keeping for one repo task.
@@ -107,6 +110,12 @@ enum RepoState {
         until: Instant,
         error: String,
     },
+    /// The repo directory itself is gone: an unmounted disk, or a repo the
+    /// user deleted without `jj-mesh forget`. Retried like a backoff, but
+    /// surfaced distinctly so the status can suggest the fix.
+    Missing {
+        until: Instant,
+    },
 }
 
 impl RepoSet {
@@ -114,7 +123,16 @@ impl RepoSet {
         RepoSet {
             hub,
             repos: Mutex::new(BTreeMap::new()),
+            changed: Arc::new(Notify::new()),
         }
+    }
+
+    /// Resolves when any repo's state may have changed since the last
+    /// call. Wakeups coalesce (this is a [`Notify`]): consumers snapshot
+    /// [`Self::statuses`] on every wake, so a missed ping only delays,
+    /// never loses, state.
+    pub async fn changed(&self) {
+        self.changed.notified().await;
     }
 
     /// Aligns the managed repos with the mesh state: spawns tasks for new
@@ -146,9 +164,40 @@ impl RepoSet {
                     repo.path.clone(),
                     self.hub.clone(),
                     announcements,
+                    self.changed.clone(),
                 )
             });
         }
+        self.changed.notify_one();
+    }
+
+    /// Condenses every repo's state into the health report peers see.
+    /// Local detail (paths, error messages) deliberately stays out: error
+    /// strings embed filesystem paths, which never leave this machine.
+    pub fn health(&self) -> Vec<crate::net::sync::RepoHealth> {
+        use crate::net::sync::{RepoHealth, RepoHealthState};
+
+        let paused = self.hub.paused_repos();
+        let repos = self.repos.lock().unwrap();
+        repos
+            .iter()
+            .map(|(name, handle)| {
+                let state = if paused.contains_key(name) {
+                    RepoHealthState::Paused
+                } else {
+                    match &*handle.state.lock().unwrap() {
+                        // Opening is a moment, not a health state.
+                        RepoState::Opening | RepoState::Watching { .. } => RepoHealthState::Ok,
+                        RepoState::Backoff { .. } => RepoHealthState::Failed,
+                        RepoState::Missing { .. } => RepoHealthState::Missing,
+                    }
+                };
+                RepoHealth {
+                    name: name.clone(),
+                    state,
+                }
+            })
+            .collect()
     }
 
     /// Snapshots the state of every repo for the control socket.
@@ -173,6 +222,9 @@ impl RepoSet {
                         error: error.clone(),
                         retry_in_secs: until.saturating_duration_since(Instant::now()).as_secs(),
                     },
+                    RepoState::Missing { until } => control::WatchStatus::Missing {
+                        retry_in_secs: until.saturating_duration_since(Instant::now()).as_secs(),
+                    },
                 };
 
                 control::RepoStatus {
@@ -192,6 +244,7 @@ fn spawn_repo(
     path: PathBuf,
     hub: Arc<SyncHub>,
     announcements: Arc<Inbox>,
+    changed: Arc<Notify>,
 ) -> RepoHandle {
     let state = Arc::new(Mutex::new(RepoState::Opening));
 
@@ -202,6 +255,7 @@ fn spawn_repo(
         state: state.clone(),
         hub,
         announcements,
+        changed,
     }));
 
     RepoHandle {
@@ -220,9 +274,13 @@ struct RepoTask {
     state: Arc<Mutex<RepoState>>,
     hub: Arc<SyncHub>,
     announcements: Arc<Inbox>,
+    /// The repo set's change notifier, pinged on every state change.
+    changed: Arc<Notify>,
 }
 
-/// Opens and watches one repo forever, reopening with backoff on failure.
+/// Opens and watches one repo forever: reopening immediately when the
+/// watch ends because the store configuration changed, with backoff when
+/// it failed.
 async fn run_repo(task: RepoTask) {
     let mut backoff = Backoff::new(BACKOFF_MIN, BACKOFF_MAX);
 
@@ -230,7 +288,17 @@ async fn run_repo(task: RepoTask) {
         task.set_state(RepoState::Opening);
         let started = Instant::now();
 
-        let err = task.watch().await.unwrap_err();
+        let err = match task.watch().await {
+            // A reconfiguration is expected behavior, not a fault: reopen
+            // cleanly instead of sitting out a backoff unserved.
+            Ok(()) => {
+                info!(repo = %task.name, "repo store configuration changed; reopening");
+                task.hub.repo_closed(&task.name, &task.id);
+                backoff.reset();
+                continue;
+            }
+            Err(err) => err,
+        };
         warn!(repo = %task.name, "repo watch failed: {err:#}");
         // The stores may be stale (moved disk, replaced repo): stop
         // serving fetches from them until the reopen succeeds.
@@ -240,32 +308,59 @@ async fn run_repo(task: RepoTask) {
             backoff.reset();
         }
         let delay = backoff.next_delay();
-        task.set_state(RepoState::Backoff {
-            until: Instant::now() + delay,
-            error: truncated_error(&err),
-        });
+        let until = Instant::now() + delay;
+        // A missing repo directory is not a repo problem to diagnose but a
+        // gone repo (unmounted disk, or deleted without `jj-mesh forget`):
+        // surfaced as its own state so the status can suggest the fix. The
+        // stat runs on a blocking thread; a hung mount is one of the very
+        // conditions being probed.
+        let path = task.path.clone();
+        let present = tokio::task::spawn_blocking(move || crate::repo::repo_present(&path))
+            .await
+            .unwrap_or(true);
+        if present {
+            task.set_state(RepoState::Backoff {
+                until,
+                error: truncated_error(&err),
+            });
+        } else {
+            task.set_state(RepoState::Missing { until });
+        }
         tokio::time::sleep(delay).await;
     }
 }
 
 impl RepoTask {
-    /// Watches the repo's op heads until something fails, announcing local
-    /// changes through the hub, fetching announced changes from peers, and
-    /// serving peer fetches.
+    /// Watches the repo's op heads until it stops: `Ok(())` when the store
+    /// configuration changed underneath it (the caller reopens cleanly),
+    /// an error when something failed. Announces local changes through the
+    /// hub and fetches announced changes from peers; serving peer fetches
+    /// is dispatched by the hub.
     ///
     /// The head reads here are cheap single-shot store calls (one readdir),
     /// safe from async context; see the `repo::mesh` module docs. Opening
-    /// the repo is heavier (gix opens the git repo), so it runs on a
-    /// blocking thread: a hung disk must stall this repo, not the daemon.
-    async fn watch(&self) -> Result<std::convert::Infallible> {
+    /// the repo is heavier (gix opens the git repo, the self-check reads
+    /// whole views), so it runs on a blocking thread: a hung disk must
+    /// stall this repo, not the daemon.
+    async fn watch(&self) -> Result<()> {
+        use pollster::FutureExt as _;
+
         let path = self.path.clone();
-        let (jj, repo) = tokio::task::spawn_blocking(move || -> Result<(JjRepo, MeshRepo)> {
-            let jj = JjRepo::discover(&path)?;
-            let repo = jj.open()?;
-            Ok((jj, repo))
-        })
-        .await
-        .wrap_err("repo open task failed")??;
+        let (jj, repo, fingerprint) =
+            tokio::task::spawn_blocking(move || -> Result<(JjRepo, MeshRepo, _)> {
+                let jj = JjRepo::discover(&path)?;
+                // The fingerprint is captured before the open: taken after,
+                // a reconfiguration racing the open could leave stale
+                // stores behind a matching fingerprint.
+                let fingerprint = jj.fingerprint()?;
+                let repo = jj.open()?;
+                // Formats this build cannot decode fail the repo here,
+                // before it is served or announced anywhere.
+                repo.self_check().block_on()?;
+                Ok((jj, repo, fingerprint))
+            })
+            .await
+            .wrap_err("repo open task failed")??;
         let repo = Arc::new(repo);
         // Fetch serving is dispatched by the hub, never by this loop: a
         // fetch below may block on the very peer being served.
@@ -307,6 +402,24 @@ impl RepoTask {
                 }
                 () = self.announcements.changed() => {}
                 () = sleep_until(retry_at) => {}
+            }
+
+            // jj_lib resolved the store configuration once at open and
+            // never re-reads it, so a repo reconfigured underneath the
+            // daemon (converted colocation, swapped backend, replaced
+            // repo) leaves `repo` silently operating on stale stores.
+            // Re-checked on every wake: a handful of tiny reads (on a
+            // blocking thread, against hung mounts), and every failure
+            // mode below (a sync writing through a stale git path, most
+            // of all) starts with a wake.
+            let current = {
+                let jj = jj.clone();
+                tokio::task::spawn_blocking(move || jj.fingerprint())
+                    .await
+                    .wrap_err("fingerprint task failed")??
+            };
+            if current != fingerprint {
+                return Ok(());
             }
 
             // Announcements are handled before the head re-read below:
@@ -362,6 +475,15 @@ impl RepoTask {
             debug!(repo = %self.name, peer = %announce.peer, "ignoring malformed announcement");
             return Ok(Handled::Idle);
         }
+        // This check is what enforces the fetch side of the colocation
+        // pause: the hub keeps routing announcements while paused, and
+        // requeueing them here (silently, at the fetch-retry cadence)
+        // means the heads are fetched as soon as the pause lifts instead
+        // of being lost until the peer's next change.
+        if self.hub.is_paused(&self.name) {
+            debug!(repo = %self.name, "sync is paused; holding announcement");
+            return Ok(Handled::Failed);
+        }
 
         let mut missing = Vec::new();
         for head in &announce.heads {
@@ -416,6 +538,7 @@ impl RepoTask {
 
     fn set_state(&self, state: RepoState) {
         *self.state.lock().unwrap() = state;
+        self.changed.notify_one();
     }
 }
 
@@ -557,13 +680,16 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
         fx.init_repo("a");
 
-        // The dead watch must be noticed (Failed), then rebuilt (Watching);
-        // both states persist long enough for the 50ms polling to see them.
+        // The dead watch must be noticed (Failed, or Missing when the
+        // failure lands in the removed-not-yet-recreated window), then
+        // rebuilt (Watching); both states persist long enough for the 50ms
+        // polling to see them.
         wait_for(&set, |s| {
             matches!(
                 s,
                 [control::RepoStatus {
-                    watch: control::WatchStatus::Failed { .. },
+                    watch: control::WatchStatus::Failed { .. }
+                        | control::WatchStatus::Missing { .. },
                     ..
                 }]
             )
@@ -596,8 +722,10 @@ mod tests {
         .await;
     }
 
+    /// A path with no repo directory at all is `Missing` (the state that
+    /// suggests `jj-mesh forget`), not a generic failure.
     #[tokio::test]
-    async fn reports_failure_for_invalid_repo() {
+    async fn reports_missing_for_absent_repo_dir() {
         let fx = Fixture::new();
         let set = RepoSet::new(Arc::new(SyncHub::new()));
         set.sync(&state_with("ghost", &fx.path().join("missing")));
@@ -606,7 +734,91 @@ mod tests {
             matches!(
                 s,
                 [control::RepoStatus {
+                    watch: control::WatchStatus::Missing { .. },
+                    ..
+                }]
+            )
+        })
+        .await;
+    }
+
+    /// A directory that exists but is not a usable repo is a `Failed`
+    /// watch, with the open error preserved.
+    #[tokio::test]
+    async fn reports_failure_for_invalid_repo() {
+        let fx = Fixture::new();
+        let dir = fx.path().join("broken");
+        std::fs::create_dir_all(dir.join(".jj")).unwrap();
+
+        let set = RepoSet::new(Arc::new(SyncHub::new()));
+        set.sync(&state_with("broken", &dir));
+
+        wait_for(&set, |s| {
+            matches!(
+                s,
+                [control::RepoStatus {
                     watch: control::WatchStatus::Failed { .. },
+                    ..
+                }]
+            )
+        })
+        .await;
+    }
+
+    /// Changing a watched repo's store configuration must be detected on
+    /// the next wake and reopen the repo against the new configuration
+    /// instead of continuing on stale stores.
+    #[tokio::test]
+    async fn reopens_when_store_configuration_changes() {
+        let fx = Fixture::new();
+        let dir = fx.init_repo("a");
+        let repo = JjRepo::discover(&dir).unwrap();
+        let before = repo.fingerprint().unwrap();
+
+        let set = RepoSet::new(Arc::new(SyncHub::new()));
+        set.sync(&state_with("a", &dir));
+        wait_for(&set, |s| {
+            matches!(
+                s,
+                [control::RepoStatus {
+                    watch: control::WatchStatus::Watching { .. },
+                    ..
+                }]
+            )
+        })
+        .await;
+
+        // Point git_target somewhere unusable, then wake the watch with a
+        // transient file in the watched op-heads directory (jj itself can
+        // no longer run against the broken configuration): the fingerprint
+        // change must force a reopen, which fails against the broken
+        // configuration. Watching on stale stores would sail right past
+        // this.
+        let target = dir.join(".jj/repo/store/git_target");
+        let original = std::fs::read_to_string(&target).unwrap();
+        std::fs::write(&target, "does-not-exist").unwrap();
+        assert_ne!(repo.fingerprint().unwrap(), before);
+        let wake = dir.join(".jj/repo/op_heads/heads/.wake");
+        std::fs::write(&wake, "").unwrap();
+        std::fs::remove_file(&wake).unwrap();
+        wait_for(&set, |s| {
+            matches!(
+                s,
+                [control::RepoStatus {
+                    watch: control::WatchStatus::Failed { .. },
+                    ..
+                }]
+            )
+        })
+        .await;
+
+        // Restoring the configuration heals the repo on the next retry.
+        std::fs::write(&target, original).unwrap();
+        wait_for(&set, |s| {
+            matches!(
+                s,
+                [control::RepoStatus {
+                    watch: control::WatchStatus::Watching { .. },
                     ..
                 }]
             )

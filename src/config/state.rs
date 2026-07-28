@@ -182,6 +182,11 @@ impl MeshState {
             !self.repos.contains_key(name),
             "a repo named `{name}` already exists",
         );
+        // Two spellings of one directory (symlinks, `..`) must not register
+        // twice. Stored paths are canonical (see [`Self::add_repo`]), so
+        // only the candidate needs resolving; the fallback covers paths
+        // that do not resolve right now.
+        let path = canonical_path(path);
         if let Some((existing, _)) = self.repos.iter().find(|(_, r)| r.path == path) {
             bail!("{} is already added as `{existing}`", path.display());
         }
@@ -283,8 +288,11 @@ impl MeshState {
     }
 
     /// Adds a repo, rejecting duplicate names, paths and ids, and records
-    /// it in the mesh-wide repo list, superseding any tombstone.
-    pub fn add_repo(&mut self, name: String, repo: Repo) -> Result<()> {
+    /// it in the mesh-wide repo list, superseding any tombstone. The path
+    /// is stored canonicalized, whatever the caller sent, so path
+    /// comparisons never have to resolve stored entries again.
+    pub fn add_repo(&mut self, name: String, mut repo: Repo) -> Result<()> {
+        repo.path = canonical_path(&repo.path);
         self.validate_new_repo(&name, &repo.path)?;
         self.ensure_mesh_id(&name, &repo.id)?;
         if let Some(existing) = self.repo_name(&repo.id) {
@@ -399,6 +407,13 @@ impl MeshState {
             }
         }
     }
+}
+
+/// Resolves a path to its canonical form, falling back to the path as
+/// given when it does not resolve (unmounted disk, deleted repo): a path
+/// that cannot be resolved cannot silently alias another either.
+fn canonical_path(path: &Path) -> PathBuf {
+    fs::canonicalize(path).unwrap_or_else(|_| path.to_owned())
 }
 
 /// A gossip-replicated versioned register (peer or mesh repo record). The
@@ -559,7 +574,8 @@ pub struct Membership {
 pub struct Repo {
     /// Mesh-wide identifier of the repo.
     pub id: RepoId,
-    /// Local repository root (the directory containing `.jj`).
+    /// Local repository root (the directory containing `.jj`), stored
+    /// canonicalized by [`MeshState::add_repo`].
     pub path: PathBuf,
 }
 
@@ -972,6 +988,31 @@ mod tests {
 
         state.merge_membership(&membership(present(1, &id)), &local);
         assert_eq!(state.mesh_repo_id("proj"), None);
+    }
+
+    /// Registering the same directory under another spelling (here: a
+    /// symlink) is rejected: paths compare canonicalized.
+    #[test]
+    fn duplicate_paths_are_rejected_canonically() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("repo");
+        fs::create_dir_all(&real).unwrap();
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let mut state = MeshState::default();
+        state
+            .add_repo(
+                "a".to_owned(),
+                Repo {
+                    id: RepoId::generate(),
+                    path: real,
+                },
+            )
+            .unwrap();
+
+        let err = state.validate_new_repo("b", &link).unwrap_err();
+        assert!(err.to_string().contains("already added"), "{err:#}");
     }
 
     #[test]

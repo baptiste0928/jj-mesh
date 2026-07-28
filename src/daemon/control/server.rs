@@ -17,7 +17,8 @@ use tokio::{
 use tracing::{debug, info, warn};
 
 use super::protocol::{
-    CLIENT_TIMEOUT, ConflictStatus, JOIN_PULL_TIMEOUT, MAX_MESSAGE_SIZE, Request, Response, Status,
+    CLIENT_TIMEOUT, ConflictStatus, JOIN_PULL_TIMEOUT, MAX_MESSAGE_SIZE, PausedStatus, PeerReport,
+    Request, Response, Status,
 };
 use crate::{
     config::{ConfigDir, MeshState, Repo, RepoId},
@@ -53,6 +54,8 @@ pub struct ControlContext {
     pub hub: Arc<SyncHub>,
     pub store: Arc<MeshStore>,
     pub pairing: Arc<Pairing>,
+    /// The jj version found on PATH at daemon start, for status warnings.
+    pub jj_version: Option<String>,
 }
 
 impl ControlContext {
@@ -60,14 +63,46 @@ impl ControlContext {
     fn status(&self) -> Status {
         let state = self.state();
         let peers = self.peers.statuses();
-        // Conflicts recorded for a since-unpaired peer are dropped: they
-        // can no longer be acted on, and the endpoint is not ours to show.
+        // Peer-related entries are resolved to (and filtered by) the
+        // paired name: hub state recorded for a since-unpaired peer can no
+        // longer be acted on, and the endpoint is not ours to show.
+        let peer_name = |peer: &iroh::EndpointId| {
+            peers
+                .iter()
+                .find(|status| &status.endpoint == peer)
+                .map(|status| status.name.clone())
+        };
         let conflicts = self
             .hub
             .conflicts()
             .into_iter()
-            .filter(|(_, peer)| peers.iter().any(|status| &status.endpoint == peer))
-            .map(|(repo, peer)| ConflictStatus { repo, peer })
+            .filter_map(|(repo, peer)| {
+                Some(ConflictStatus {
+                    repo,
+                    peer: peer_name(&peer)?,
+                })
+            })
+            .collect();
+        let paused = self
+            .hub
+            .paused_repos()
+            .into_iter()
+            .map(|(repo, peers)| PausedStatus {
+                repo,
+                peers: peers.iter().filter_map(peer_name).collect(),
+            })
+            .filter(|paused| !paused.peers.is_empty())
+            .collect();
+        let peer_reports = self
+            .hub
+            .peer_reports()
+            .into_iter()
+            .filter_map(|(peer, report)| {
+                Some(PeerReport {
+                    peer: peer_name(&peer)?,
+                    report,
+                })
+            })
             .collect();
         // Mesh repos not registered here are joinable.
         let available = state
@@ -79,10 +114,13 @@ impl ControlContext {
         Status {
             endpoint: self.endpoint.secret_key().public(),
             uptime_secs: self.started.elapsed().as_secs(),
+            jj_version: self.jj_version.clone(),
             peers,
             repos: self.repos.statuses(),
             available,
             conflicts,
+            paused,
+            peer_reports,
         }
     }
 
@@ -195,7 +233,9 @@ async fn handle_client(mut stream: UnixStream, ctx: Arc<ControlContext>) {
         Request::JoinRepo { name, path } => {
             reply(&mut stream, join_repo(&ctx, &name, &path).await).await
         }
-        Request::AddRepo { name, path } => reply(&mut stream, add_repo(&ctx, name, path)).await,
+        Request::AddRepo { name, path } => {
+            reply(&mut stream, add_repo(&ctx, name, path).await).await
+        }
         Request::ForgetRepo { name } => reply(&mut stream, forget_repo(&ctx, &name)).await,
         Request::RemovePeer { peer } => reply(&mut stream, remove_peer(&ctx, &peer)).await,
     };
@@ -351,14 +391,25 @@ async fn join_pull(
     Err(last_error)
 }
 
-/// Registers the repo at `path` under `name` with a fresh id.
-fn add_repo(ctx: &ControlContext, name: String, path: PathBuf) -> Result<Response> {
+/// Registers the repo at `path` under `name` with a fresh id. The path is
+/// validated to be a mesh-compatible repo here, not just in the CLI: the
+/// daemon is the authority, and registering an invalid path would only
+/// surface later as a watch failure. Storing the discovered workspace root
+/// (canonicalized) also keeps two spellings of one repo from registering
+/// twice.
+async fn add_repo(ctx: &ControlContext, name: String, path: PathBuf) -> Result<Response> {
+    let root = tokio::task::spawn_blocking(move || -> Result<PathBuf> {
+        Ok(JjRepo::discover(&path)?.root().to_owned())
+    })
+    .await
+    .wrap_err("repo validation task failed")??;
+
     ctx.update_state(|state| {
         state.add_repo(
             name,
             Repo {
                 id: RepoId::generate(),
-                path,
+                path: root,
             },
         )
     })?;
