@@ -6,13 +6,17 @@
 //! - `mesh.json`: the mesh state (paired peers and registered repos), owned
 //!   and written by the daemon only; the CLI mutates it through the control
 //!   socket
+//! - `config.toml`: user-tunable daemon behavior, edited by the user and
+//!   reloaded by the daemon when it changes
 
 mod key;
 mod resolve;
+mod settings;
 mod state;
 
 pub use key::MachineKey;
 pub use resolve::ConfigDir;
+pub use settings::{RepoSettings, Settings};
 pub use state::{
     MAX_MESH_PEERS, MAX_MESH_REPOS, MAX_NAME_LEN, Membership, MeshRepo, MeshRepoStatus, MeshState,
     Peer, PeerStatus, Repo, RepoId,

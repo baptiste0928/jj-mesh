@@ -90,6 +90,13 @@ impl ConfigDir {
         self.path.join("mesh.json")
     }
 
+    /// Get the path to the daemon settings file (`config.toml`).
+    ///
+    /// There is no guarantee that the file exists.
+    pub fn settings_file(&self) -> PathBuf {
+        self.path.join("config.toml")
+    }
+
     /// Get the path to the daemon control socket.
     ///
     /// Usually `$XDG_RUNTIME_DIR/jj-mesh.sock`; kept inside custom config
