@@ -7,7 +7,7 @@
 //!   and written by the daemon only; the CLI mutates it through the control
 //!   socket
 //! - `config.toml`: user-tunable daemon behavior, edited by the user and
-//!   reloaded by the daemon when it changes
+//!   read once at daemon start
 
 mod key;
 mod resolve;

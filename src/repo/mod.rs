@@ -136,6 +136,66 @@ impl JjRepo {
     }
 }
 
+/// Cap on the child's diagnostics kept in memory. jj reports one line
+/// per file it refuses to snapshot, so on a hostile or merely enormous
+/// working copy its stderr is neither small nor ours to trust; the tail
+/// past the cap is dropped, and only the start ever reaches a log.
+const MAX_JJ_STDERR: u64 = 64 * 1024;
+
+/// Runs a jj command against the repo at `root` through the binary on
+/// PATH: it applies the user's jj configuration and takes the proper
+/// locks, which jj-mesh must not reimplement. The child is killed when
+/// `timeout` fires.
+pub async fn run_jj(root: &Path, args: &[&str], timeout: std::time::Duration) -> Result<()> {
+    tokio::time::timeout(timeout, jj_status(root, args))
+        .await
+        .map_err(|_| eyre!("jj {} timed out", args.join(" ")))?
+}
+
+/// Spawns one jj command and waits for it, failing with its (bounded,
+/// sanitized) diagnostics.
+async fn jj_status(root: &Path, args: &[&str]) -> Result<()> {
+    use tokio::io::AsyncReadExt as _;
+
+    let mut child = tokio::process::Command::new("jj")
+        // jj resolves the current directory even when given a repo, so
+        // it must be one that exists: the daemon's own cwd is whatever
+        // it was started in and may be long gone.
+        .current_dir(root)
+        .arg("--repository")
+        .arg(root)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .wrap_err("cannot run jj (is it on PATH?)")?;
+
+    let mut stderr = Vec::new();
+    if let Some(pipe) = child.stderr.take() {
+        // A full pipe would block the child forever, so it is drained
+        // even past the cap; only the head is kept.
+        let mut pipe = pipe;
+        let mut head = (&mut pipe).take(MAX_JJ_STDERR);
+        head.read_to_end(&mut stderr).await.ok();
+        tokio::io::copy(&mut pipe, &mut tokio::io::sink())
+            .await
+            .ok();
+    }
+    let status = child.wait().await.wrap_err("cannot wait for jj")?;
+
+    ensure!(
+        status.success(),
+        "jj {} failed: {}",
+        args.join(" "),
+        // Diagnostics embed bytes read from repo files: stripped of
+        // control characters and capped before they can reach a log.
+        crate::config::sanitize(String::from_utf8_lossy(&stderr).trim()),
+    );
+    Ok(())
+}
+
 /// Whether a jj repo exists at `root` (its `.jj` marker is present).
 /// Errors other than absence (permissions, I/O) count as present: the repo
 /// may be fine, only we cannot look right now.

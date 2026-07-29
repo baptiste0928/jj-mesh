@@ -1,5 +1,5 @@
-//! Filesystem watching: [`DirWatcher`] for one directory (op heads, config
-//! files), [`TreeWatcher`] for a whole working copy with ignore rules.
+//! Filesystem watching: [`DirWatcher`] for one directory (op heads),
+//! [`TreeWatcher`] for a whole working copy with ignore rules.
 //!
 //! Conditions that silently kill a notify watch are turned into errors so
 //! callers can rebuild it instead of waiting on a dead channel forever:
@@ -13,3 +13,4 @@ mod dir;
 mod tree;
 
 pub use dir::DirWatcher;
+pub use tree::TreeWatcher;

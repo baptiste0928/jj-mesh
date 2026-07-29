@@ -7,7 +7,7 @@
 //!
 //! Parsing is strict (unknown keys are errors): a typoed key silently
 //! doing nothing is worse than a load failure, which the daemon reports
-//! and survives by keeping the previous settings.
+//! and survives by falling back to the defaults.
 
 use std::{collections::BTreeMap, fs, io::ErrorKind, time::Duration};
 
