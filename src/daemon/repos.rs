@@ -18,6 +18,17 @@
 //! continuous editing snapshots at the configured cadence. The snapshot
 //! runs through the jj binary and produces a regular operation, which the
 //! op-heads watch then picks up and announces like any local change.
+//!
+//! Syncing operations from peers can leave the local working copy stale
+//! (updated by an operation the working copy never saw). When enabled,
+//! `jj workspace update-stale` runs after every sync that applied
+//! operations, and once on watch start for staleness accrued while the
+//! daemon was down — but only while the op head is single. Any jj
+//! command reconciles divergent op heads by writing a merge operation,
+//! so daemons doing this on both ends of a divergence would ping-pong
+//! fresh merge operations at each other. Divergence is left to the next
+//! actual jj activity (a user command, an auto-snapshot), whose merge
+//! then arrives here as a single head.
 
 use std::{
     collections::BTreeMap,
@@ -390,6 +401,13 @@ impl RepoTask {
             None => None,
         };
 
+        // Heal staleness accrued while the daemon was down (or right
+        // before a crash); afterwards every applied sync triggers it
+        // directly. The op-heads watch above is already live, so any
+        // operation this creates is picked up like any other.
+        if heads.len() == 1 {
+            self.update_stale(&mut tree).await;
+        }
         // Edits made while the watch was down produce no event, so the
         // working copy is snapshotted once on start for the same reason
         // the heads are published above: it is the only anti-entropy the
@@ -471,6 +489,15 @@ impl RepoTask {
                 self.hub.publish(&self.name, &self.id, wire_heads(&heads));
             }
 
+            // The applied operations may have left the working copy
+            // stale. Only a single head is caught up on (see the module
+            // docs on divergence).
+            if drained.synced && heads.len() == 1 {
+                self.update_stale(&mut tree).await;
+                // update-stale snapshots the working copy itself, so a
+                // pending snapshot has just been done.
+                snap.done();
+            }
             self.set_state(RepoState::Watching {
                 op_heads: heads.len(),
                 last_change,
@@ -631,6 +658,19 @@ impl RepoTask {
         Ok(outcome)
     }
 
+    /// Runs `jj workspace update-stale` when enabled for this repo.
+    /// Note that it snapshots the working copy before checking staleness,
+    /// so it is never free even when nothing is stale. Failures only
+    /// warn: the working copy may be locked by an ongoing command, and
+    /// the next sync retries.
+    async fn update_stale(&self, tree: &mut Option<TreeWatcher>) {
+        if !self.settings().update_stale {
+            return;
+        }
+        debug!(repo = %self.name, "checking for a stale working copy");
+        self.run_jj(&["workspace", "update-stale"], tree).await;
+    }
+
     /// Snapshots the working copy through the jj binary, which applies
     /// the user's snapshot configuration and takes the working-copy lock.
     async fn snapshot(&self, snap: &mut Snapshotting, tree: &mut Option<TreeWatcher>) {
@@ -641,7 +681,7 @@ impl RepoTask {
     }
 
     /// Runs one working-copy jj command, then drops the events it caused:
-    /// these commands write working-copy files, and letting the watcher
+    /// update-stale writes working-copy files, and letting the watcher
     /// see them would schedule a snapshot of the daemon's own work, on
     /// and on. Failures only warn, the repo is fine either way.
     async fn run_jj(&self, args: &[&str], tree: &mut Option<TreeWatcher>) {
@@ -1013,6 +1053,32 @@ mod tests {
             )
         })
         .await;
+    }
+
+    /// A stale working copy (op head advanced without updating it, which
+    /// is what applying synced operations does) is healed on watch start.
+    #[tokio::test]
+    async fn updates_stale_working_copy() {
+        let fx = Fixture::new();
+        let dir = fx.init_repo("a");
+        // Change the working-copy commit's tree without updating the
+        // working copy: jj only considers it stale when the trees differ.
+        std::fs::write(dir.join("f.txt"), "content").unwrap();
+        fx.jj(&dir, &["status"]);
+        fx.jj(&dir, &["--ignore-working-copy", "abandon", "@"]);
+        assert!(
+            !fx.jj_ok(&dir, &["status"]),
+            "the working copy must start stale for this test to mean anything",
+        );
+
+        let set = repo_set("snapshot-interval = 0\nupdate-stale = true");
+        set.sync(&state_with("a", &dir));
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !fx.jj_ok(&dir, &["status"]) {
+            assert!(Instant::now() < deadline, "working copy still stale");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
     }
 
     /// Changing a watched repo's store configuration must be detected on

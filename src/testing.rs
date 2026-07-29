@@ -36,14 +36,8 @@ impl Fixture {
     /// Runs a jj command in `dir`, panicking on failure and returning its
     /// stdout.
     pub fn jj_output(&self, dir: &Path, args: &[&str]) -> String {
-        let out = Command::new("jj")
-            .current_dir(dir)
-            .env("JJ_CONFIG", &self.config)
-            .env("JJ_USER", "Test User")
-            .env("JJ_EMAIL", "test@example.com")
-            .env("JJ_OP_HOSTNAME", "test-host")
-            .env("JJ_OP_USERNAME", "test-user")
-            .args(args)
+        let out = self
+            .jj_command(dir, args)
             .output()
             .expect("jj must be installed to run these tests");
         assert!(
@@ -52,6 +46,26 @@ impl Fixture {
             String::from_utf8_lossy(&out.stderr),
         );
         String::from_utf8(out.stdout).unwrap()
+    }
+
+    /// Runs a jj command in `dir`, returning whether it succeeded.
+    pub fn jj_ok(&self, dir: &Path, args: &[&str]) -> bool {
+        self.jj_command(dir, args)
+            .output()
+            .is_ok_and(|out| out.status.success())
+    }
+
+    /// The hermetic jj invocation shared by the runners above.
+    fn jj_command(&self, dir: &Path, args: &[&str]) -> Command {
+        let mut cmd = Command::new("jj");
+        cmd.current_dir(dir)
+            .env("JJ_CONFIG", &self.config)
+            .env("JJ_USER", "Test User")
+            .env("JJ_EMAIL", "test@example.com")
+            .env("JJ_OP_HOSTNAME", "test-host")
+            .env("JJ_OP_USERNAME", "test-user")
+            .args(args);
+        cmd
     }
 
     /// Creates a jj repo named `name` with an initial described commit.
