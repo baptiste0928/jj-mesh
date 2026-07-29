@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use clap::Args;
+use clap::{Args, ValueHint};
 use color_eyre::eyre::{Result, bail, eyre};
 
 use crate::{
@@ -18,6 +18,7 @@ use crate::{
 #[derive(Debug, Args)]
 pub struct AddArgs {
     /// Path inside the jj repo to add (defaults to the current directory)
+    #[arg(value_hint = ValueHint::DirPath)]
     path: Option<PathBuf>,
 
     /// Name of the repo in the mesh (defaults to the repo directory name)

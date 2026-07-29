@@ -1,9 +1,11 @@
 //! `jj-mesh repo forget`: unregister a repo on this machine only.
 
 use clap::Args;
+use clap_complete::ArgValueCandidates;
 use color_eyre::eyre::{Result, bail};
 
 use crate::{
+    cli::complete,
     config::ConfigDir,
     daemon::control::{self, Request, Response},
 };
@@ -18,6 +20,7 @@ use crate::{
 #[derive(Debug, Args)]
 pub struct ForgetArgs {
     /// Name of the repo in the mesh
+    #[arg(add = ArgValueCandidates::new(complete::registered_repos))]
     name: String,
 }
 

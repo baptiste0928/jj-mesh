@@ -3,9 +3,11 @@
 use std::io::{BufRead as _, IsTerminal as _, Write as _};
 
 use clap::Args;
+use clap_complete::ArgValueCandidates;
 use color_eyre::eyre::{Result, bail};
 
 use crate::{
+    cli::complete,
     config::ConfigDir,
     daemon::control::{self, Request, Response},
 };
@@ -19,6 +21,7 @@ use crate::{
 #[derive(Debug, Args)]
 pub struct RemoveArgs {
     /// Name of the repo in the mesh
+    #[arg(add = ArgValueCandidates::new(complete::mesh_repos))]
     name: String,
 
     /// Skip the confirmation prompt

@@ -7,10 +7,12 @@
 
 use std::{path::PathBuf, process::Command};
 
-use clap::Args;
+use clap::{Args, ValueHint};
+use clap_complete::ArgValueCandidates;
 use color_eyre::eyre::{Result, WrapErr as _, bail, ensure};
 
 use crate::{
+    cli::complete,
     config::{ConfigDir, MeshState},
     daemon::control::{self, CloneProgress, Request, Response},
 };
@@ -25,12 +27,14 @@ use crate::{
 #[derive(Debug, Args)]
 pub struct CloneArgs {
     /// Name of the repo in the mesh
+    #[arg(add = ArgValueCandidates::new(complete::clonable_repos))]
     name: String,
 
     /// Directory to create the repo in (defaults to the repo name)
     ///
     /// The target directly must not exist before the clone. There is currently
     /// no way of adding a previous clone back into the mesh.
+    #[arg(value_hint = ValueHint::DirPath)]
     path: Option<PathBuf>,
 
     /// This machine's workspace name in the repo (defaults to the

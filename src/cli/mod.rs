@@ -1,5 +1,6 @@
 //! Command-line interface for `jj-mesh`.
 
+mod complete;
 mod peer;
 mod repo;
 mod run_daemon;
@@ -8,7 +9,7 @@ mod status;
 
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory as _, Parser, Subcommand, ValueHint};
 use color_eyre::eyre::Result;
 
 use crate::config::ConfigDir;
@@ -34,7 +35,7 @@ pub struct Cli {
     /// Custom configuration directory
     ///
     /// Configuration is stored in `~/.config/jj-mesh` by default.
-    #[arg(long, short = 'C', global = true, value_name = "DIR")]
+    #[arg(long, short = 'C', global = true, value_name = "DIR", value_hint = ValueHint::DirPath)]
     config_dir: Option<PathBuf>,
 
     #[command(subcommand)]
@@ -55,6 +56,11 @@ enum Command {
 
 /// Entry point of the `jj-mesh` CLI
 pub fn run() -> Result<()> {
+    // Answers shell completion requests (`COMPLETE=<shell> jj-mesh ...`)
+    // and exits; a no-op on regular invocations. Must run before anything
+    // is parsed or printed.
+    clap_complete::CompleteEnv::with_factory(Cli::command).complete();
+
     let cli = Cli::parse();
     let dir = ConfigDir::new(cli.config_dir)?;
 
