@@ -189,7 +189,7 @@ fn show_progress(bar: &ProgressBar, progress: &CloneProgress, counted: &mut bool
 
 /// Runs a jj command, surfacing its stderr on failure.
 fn jj(dir: Option<&Path>, args: &[&str]) -> Result<()> {
-    let mut command = Command::new("jj");
+    let mut command = Command::new(crate::repo::jj_bin());
     if let Some(dir) = dir {
         command.current_dir(dir);
     }

@@ -142,8 +142,17 @@ impl JjRepo {
 /// past the cap is dropped, and only the start ever reaches a log.
 const MAX_JJ_STDERR: u64 = 64 * 1024;
 
-/// Runs a jj command against the repo at `root` through the binary on
-/// PATH: it applies the user's jj configuration and takes the proper
+/// The jj binary to invoke: `$JJ_BIN` when set and non-empty, otherwise
+/// `jj` from PATH. Resolved on every call so a daemon inherits its
+/// service environment and tests can override it per process.
+pub fn jj_bin() -> std::ffi::OsString {
+    std::env::var_os("JJ_BIN")
+        .filter(|bin| !bin.is_empty())
+        .unwrap_or_else(|| "jj".into())
+}
+
+/// Runs a jj command against the repo at `root` through the [`jj_bin`]
+/// binary: it applies the user's jj configuration and takes the proper
 /// locks, which jj-mesh must not reimplement. The child is killed when
 /// `timeout` fires.
 pub async fn run_jj(root: &Path, args: &[&str], timeout: std::time::Duration) -> Result<()> {
@@ -157,7 +166,7 @@ pub async fn run_jj(root: &Path, args: &[&str], timeout: std::time::Duration) ->
 async fn jj_status(root: &Path, args: &[&str]) -> Result<()> {
     use tokio::io::AsyncReadExt as _;
 
-    let mut child = tokio::process::Command::new("jj")
+    let mut child = tokio::process::Command::new(jj_bin())
         // jj resolves the current directory even when given a repo, so
         // it must be one that exists: the daemon's own cwd is whatever
         // it was started in and may be long gone.
@@ -170,7 +179,12 @@ async fn jj_status(root: &Path, args: &[&str]) -> Result<()> {
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true)
         .spawn()
-        .wrap_err("cannot run jj (is it on PATH?)")?;
+        .wrap_err_with(|| {
+            format!(
+                "cannot run {} (is it on PATH? see JJ_BIN)",
+                jj_bin().display(),
+            )
+        })?;
 
     let mut stderr = Vec::new();
     if let Some(pipe) = child.stderr.take() {
@@ -206,12 +220,12 @@ pub fn repo_present(root: &Path) -> bool {
     }
 }
 
-/// The version of the `jj` binary on PATH (`X.Y.Z`), or `None` when jj is
+/// The version of the [`jj_bin`] binary (`X.Y.Z`), or `None` when jj is
 /// not runnable or its output is unrecognized. This is a heuristic: the
 /// daemon cannot know which jj binary actually writes the repos, so the
 /// answer is only ever used to warn, never to refuse.
 pub fn local_jj_version() -> Option<String> {
-    let output = std::process::Command::new("jj")
+    let output = std::process::Command::new(jj_bin())
         .arg("--version")
         .output()
         .ok()
@@ -240,9 +254,9 @@ pub fn jj_version_warning(version: Option<&str>) -> Option<String> {
     match version {
         Some(version) if jj_version_supported(version) => None,
         Some(version) => Some(format!(
-            "unsupported jj {version} found on PATH (supported: {SUPPORTED_JJ_SERIES})"
+            "unsupported jj {version} found (supported: {SUPPORTED_JJ_SERIES})"
         )),
-        None => Some("jj not found in PATH".to_owned()),
+        None => Some("jj not found (on PATH or via JJ_BIN)".to_owned()),
     }
 }
 

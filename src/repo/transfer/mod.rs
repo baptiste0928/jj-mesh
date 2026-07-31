@@ -584,7 +584,7 @@ mod tests {
         // The next jj command merges: both workspaces coexist, and the
         // mesh history is visible from the fresh machine.
         fx.jj(&b, &["status"]);
-        let list = Command::new("jj")
+        let list = Command::new(crate::repo::jj_bin())
             .current_dir(&b)
             .env("JJ_CONFIG", "/dev/null")
             .env("JJ_USER", "Test User")

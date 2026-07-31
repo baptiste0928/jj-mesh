@@ -55,6 +55,9 @@ enum ServiceCommand {
         /// `~/.nix-profile/bin/jj-mesh` if you are using Nix.
         #[arg(long, value_name = "PATH")]
         program: Option<PathBuf>,
+        /// jj binary the daemon runs (sets `JJ_BIN` in the service)
+        #[arg(long, value_name = "PATH")]
+        jj_bin: Option<PathBuf>,
     },
     /// Stop and remove the daemon service
     Uninstall,
@@ -76,7 +79,9 @@ pub fn run(args: ServiceArgs, dir: &ConfigDir) -> Result<()> {
         .wrap_err("user services are not supported on this system")?;
 
     match args.command {
-        ServiceCommand::Install { program } => install(&*manager, label, dir, program),
+        ServiceCommand::Install { program, jj_bin } => {
+            install(&*manager, label, dir, program, jj_bin.as_deref())
+        }
         ServiceCommand::Uninstall => uninstall(&*manager, label),
         ServiceCommand::Start => {
             manager
@@ -171,12 +176,21 @@ fn install(
     label: ServiceLabel,
     dir: &ConfigDir,
     program: Option<PathBuf>,
+    jj_bin: Option<&Path>,
 ) -> Result<()> {
     let program = match program {
         Some(program) => program,
         None => std::env::current_exe().wrap_err("cannot resolve the jj-mesh binary path")?,
     };
     validate_service_path("the program path", &program)?;
+
+    let mut environment = vec![("RUST_LOG".to_owned(), "jj_mesh=info".to_owned())];
+    if let Some(jj_bin) = jj_bin {
+        // Environment values are written into the service definition just
+        // as unescaped as the paths, so they get the same restrictions.
+        validate_service_path("the jj binary path", jj_bin)?;
+        environment.push(("JJ_BIN".to_owned(), jj_bin.to_string_lossy().into_owned()));
+    }
 
     // A custom config directory is baked into the service (useful for side
     // setups); the default is resolved by the daemon at startup.
@@ -196,7 +210,7 @@ fn install(
             contents: None,
             username: None,
             working_directory: None,
-            environment: Some(vec![("RUST_LOG".to_owned(), "jj_mesh=info".to_owned())]),
+            environment: Some(environment),
             autostart: true,
             restart_policy: RestartPolicy::OnFailure {
                 delay_secs: Some(RESTART_DELAY_SECS),

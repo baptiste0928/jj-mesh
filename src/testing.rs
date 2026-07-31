@@ -57,7 +57,7 @@ impl Fixture {
 
     /// The hermetic jj invocation shared by the runners above.
     fn jj_command(&self, dir: &Path, args: &[&str]) -> Command {
-        let mut cmd = Command::new("jj");
+        let mut cmd = Command::new(crate::repo::jj_bin());
         cmd.current_dir(dir)
             .env("JJ_CONFIG", &self.config)
             .env("JJ_USER", "Test User")
