@@ -59,6 +59,13 @@
             // {
               inherit cargoArtifacts;
               JJ_MESH_COMMIT = self.shortRev or self.dirtyShortRev or "unknown";
+              nativeBuildInputs = [ pkgs.installShellFiles ];
+              postInstall = ''
+                installShellCompletion --cmd jj-mesh \
+                  --bash <(COMPLETE=bash $out/bin/jj-mesh) \
+                  --fish <(COMPLETE=fish $out/bin/jj-mesh) \
+                  --zsh <(COMPLETE=zsh $out/bin/jj-mesh)
+              '';
               meta = {
                 description = "Peer-to-peer synchronization of jj repositories";
                 license = nixpkgs.lib.licenses.isc;
