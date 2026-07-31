@@ -12,6 +12,7 @@
 
   outputs =
     {
+      self,
       nixpkgs,
       crane,
       rust-overlay,
@@ -44,6 +45,7 @@
             src = craneLib.cleanCargoSource ./.;
             strictDeps = true;
             doCheck = false; # Don't run tests on the flake
+            JJ_MESH_COMMIT = self.shortRev or self.dirtyShortRev or "unknown";
             meta = {
               description = "Bi-directional sync service for jj repositories";
               license = nixpkgs.lib.licenses.isc;

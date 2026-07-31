@@ -16,6 +16,15 @@ pub struct StatusArgs {}
 
 /// Runs the `status` command.
 pub fn run(_args: StatusArgs, dir: &ConfigDir) -> Result<()> {
+    println!(
+        "{}",
+        ui::dim(format_args!(
+            "jj-mesh {} ({})",
+            env!("CARGO_PKG_VERSION"),
+            env!("JJ_MESH_COMMIT")
+        ))
+    );
+
     let status = control::query_status_blocking(dir)?;
 
     println!(
