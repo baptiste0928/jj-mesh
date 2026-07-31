@@ -77,6 +77,24 @@ impl JjRepo {
         MeshRepo::open(self.clone())
     }
 
+    /// The name of the workspace at the repo root (`default` until it is
+    /// renamed).
+    pub fn workspace_name(&self) -> Result<String> {
+        use jj_lib::{
+            repo::StoreFactories,
+            workspace::{Workspace, default_working_copy_factories},
+        };
+
+        let workspace = Workspace::load(
+            mesh::settings()?,
+            &self.root,
+            &StoreFactories::default(),
+            &default_working_copy_factories(),
+        )
+        .wrap_err_with(|| format!("cannot load the workspace at {}", self.root.display()))?;
+        Ok(workspace.workspace_name().as_str().to_owned())
+    }
+
     /// Captures the store configuration an open repo depends on. jj_lib
     /// resolves it once at open and never re-reads it, so a daemon holding
     /// the repo open must detect drift itself: a changed fingerprint means
@@ -357,6 +375,18 @@ mod tests {
         assert!(!jj_version_supported("0.4.30"));
         assert!(!jj_version_supported("0.430.0"));
         assert!(!jj_version_supported("0.43"));
+    }
+
+    #[test]
+    fn workspace_name_follows_renames() {
+        let fixture = crate::testing::Fixture::new();
+        let dir = fixture.init_repo("proj");
+
+        let repo = JjRepo::discover(&dir).unwrap();
+        assert_eq!(repo.workspace_name().unwrap(), "default");
+
+        fixture.jj(&dir, &["workspace", "rename", "machine-a"]);
+        assert_eq!(repo.workspace_name().unwrap(), "machine-a");
     }
 
     #[test]

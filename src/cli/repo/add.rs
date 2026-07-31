@@ -25,6 +25,13 @@ pub struct AddArgs {
     /// Name of the repo in the mesh (defaults to the repo directory name)
     #[arg(long)]
     name: Option<String>,
+
+    /// This machine's workspace name in the repo (defaults to the hostname)
+    ///
+    /// We assign a workspace for each copy of the repo across the mesh, so
+    /// the current head of each machine is displayed in `jj log`.
+    #[arg(long)]
+    workspace: Option<String>,
 }
 
 /// Runs the `repo add` command.
@@ -41,6 +48,17 @@ pub fn run(args: AddArgs, dir: &ConfigDir) -> Result<()> {
             .to_string_lossy()
             .into_owned(),
     };
+
+    // Rename the machine workspace with its hostname if it's `default`
+    let workspace = match args.workspace {
+        Some(name) => Some(name),
+        None if repo.workspace_name()? == "default" => Some(super::machine_workspace_name()),
+
+        None => None,
+    };
+    if let Some(workspace) = &workspace {
+        super::jj(Some(repo.root()), &["workspace", "rename", workspace])?;
+    }
 
     let request = Request::AddRepo {
         name: name.clone(),

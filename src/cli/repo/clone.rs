@@ -2,12 +2,12 @@
 //!
 //! Creates a fresh jj repo, gives its workspace a machine-unique name
 //! (mesh machines must never share one), asks the daemon to pull the mesh
-//! repo's full state from a peer and register it, and lets jj merge the
-//! fresh workspace into the replicated history.
+//! repo's full state from a peer and register it, lets jj merge the
+//! fresh workspace into the replicated history, and starts the working
+//! copy on trunk.
 
 use std::{
     path::{Path, PathBuf},
-    process::Command,
     time::Duration,
 };
 
@@ -16,6 +16,7 @@ use clap_complete::ArgValueCandidates;
 use color_eyre::eyre::{Result, WrapErr as _, bail, ensure};
 use indicatif::{HumanBytes, ProgressBar, ProgressStyle};
 
+use super::jj;
 use crate::{
     cli::{complete, ui},
     config::{ConfigDir, MeshState},
@@ -69,10 +70,7 @@ pub fn run(args: CloneArgs, dir: &ConfigDir) -> Result<()> {
         path.display(),
     );
 
-    let workspace = match args.workspace {
-        Some(name) => name,
-        None => gethostname::gethostname().to_string_lossy().into_owned(),
-    };
+    let workspace = args.workspace.unwrap_or_else(super::machine_workspace_name);
 
     // Fresh repo with a machine-unique workspace name, using the user's
     // own jj (their config applies to the repo from the start). Never
@@ -113,11 +111,15 @@ pub fn run(args: CloneArgs, dir: &ConfigDir) -> Result<()> {
     // doing it here leaves the repo ready to use. A re-clone after
     // `repo forget` finds the previous instance's same-name workspace in
     // the pulled history, which leaves the fresh working copy stale:
-    // recover it rather than fail a clone that already succeeded.
-    if let Err(err) = jj(Some(&path), &["status"])
-        && jj(Some(&path), &["workspace", "update-stale"]).is_err()
-    {
-        return Err(err);
+    // recover it rather than fail a clone that already succeeded, and keep
+    // its recovered position instead of jumping to trunk.
+    match jj(Some(&path), &["status"]) {
+        Ok(()) => start_on_trunk(&path),
+        Err(err) => {
+            if jj(Some(&path), &["workspace", "update-stale"]).is_err() {
+                return Err(err);
+            }
+        }
     }
 
     println!(
@@ -125,6 +127,19 @@ pub fn run(args: CloneArgs, dir: &ConfigDir) -> Result<()> {
         ui::good(format_args!("Cloned `{name}` in {}", path.display())),
     );
     Ok(())
+}
+
+/// Moves the working copy from the init commit off the root (where `jj git
+/// init` left it, a confusing place to start) onto trunk; jj abandons the
+/// init commit as it is empty and undescribed. jj's stock `trunk()` only
+/// matches remote bookmarks, which a mesh-only repo has none of, so the
+/// usual bookmark names are tried as local ones next; with none of them
+/// the init position is kept. Best-effort: the clone itself succeeded.
+fn start_on_trunk(path: &Path) {
+    const LOCAL_TRUNK: &str =
+        r#"latest(bookmarks(exact:"main") | bookmarks(exact:"master") | bookmarks(exact:"trunk"))"#;
+    let _ = jj(Some(path), &["new", "latest(trunk() ~ root())"])
+        .or_else(|_| jj(Some(path), &["new", LOCAL_TRUNK]));
 }
 
 /// Template while a phase has no known end: a spinner and a message.
@@ -185,20 +200,4 @@ fn show_progress(bar: &ProgressBar, progress: &CloneProgress, counted: &mut bool
             }
         }
     }
-}
-
-/// Runs a jj command, surfacing its stderr on failure.
-fn jj(dir: Option<&Path>, args: &[&str]) -> Result<()> {
-    let mut command = Command::new(crate::repo::jj_bin());
-    if let Some(dir) = dir {
-        command.current_dir(dir);
-    }
-    let out = command.args(args).output().wrap_err("cannot run jj")?;
-    ensure!(
-        out.status.success(),
-        "jj {} failed:\n{}",
-        args.join(" "),
-        String::from_utf8_lossy(&out.stderr),
-    );
-    Ok(())
 }

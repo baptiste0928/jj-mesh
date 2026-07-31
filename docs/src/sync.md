@@ -5,8 +5,8 @@ are length-prefixed [postcard](https://docs.rs/postcard) encodings, and every
 read is bounded by the receiver: the length prefix is peer-controlled, so no
 message may allocate more than its context allows.
 
-The protocol is pull-based, in two halves: cheap *announcements* advertise
-state, and an explicit *fetch* transfers it. Pushing data would make the
+The protocol is pull-based, in two halves: cheap _announcements_ advertise
+state, and an explicit _fetch_ transfers it. Pushing data would make the
 sender responsible for knowing what the receiver needs and for retrying; with
 tiny idempotent announcements and receiver-driven fetches, the receiver
 controls exactly what enters its repo (validation lives on one side), and
@@ -27,8 +27,8 @@ never need recovery: the next change or reconnect heals them.
 A machine that sees announced heads it lacks opens a stream to that peer and
 pulls them, in two phases:
 
-1. **Op phase.** The fetcher sends the op heads it *wants* plus a sample of
-   operations it *has* (its heads and exponentially spaced ancestors, so the
+1. **Op phase.** The fetcher sends the op heads it _wants_ plus a sample of
+   operations it _has_ (its heads and exponentially spaced ancestors, so the
    response stays proportional to the actual delta even after a long
    divergence). The server walks its op log and streams back the delta of
    views and operations.
@@ -43,7 +43,7 @@ simultaneously without deadlocking.
 
 ## Raw bytes
 
-Ops and views travel as the *raw bytes* stored on the server, under their
+Ops and views travel as the _raw bytes_ stored on the server, under their
 stored ids. Re-encoding is not an option: jj computes operation and view ids
 by hashing its in-memory structures at write time, and objects written by
 older jj versions do not survive a decode + re-encode round trip with
@@ -101,7 +101,9 @@ name (mesh machines must never share one), and pulls the repo's full state
 from a peer that advertises it.
 The fresh repo's init operations are unrelated to the mesh history, so the
 pull is divergent by construction; the next jj command merges the fresh
-workspace into the replicated history.
+workspace into the replicated history. The working copy then starts on
+trunk (`trunk()`, falling back to a local `main`/`master`/`trunk` bookmark)
+rather than on the init commit off the root.
 
 ## Safety properties
 

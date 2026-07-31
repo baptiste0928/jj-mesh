@@ -68,12 +68,17 @@ static SETTINGS: LazyLock<Result<UserSettings, String>> = LazyLock::new(|| {
     UserSettings::from_config(StackedConfig::with_defaults()).map_err(|err| err.to_string())
 });
 
+/// The shared built-in-defaults jj settings (see [`SETTINGS`]).
+pub(super) fn settings() -> Result<&'static UserSettings> {
+    SETTINGS
+        .as_ref()
+        .map_err(|err| eyre!("cannot build jj settings: {err}"))
+}
+
 impl MeshRepo {
     /// Opens the stores of a validated repo.
     pub(super) fn open(repo: JjRepo) -> Result<Self> {
-        let settings = SETTINGS
-            .as_ref()
-            .map_err(|err| eyre!("cannot build jj settings: {err}"))?;
+        let settings = settings()?;
         let loader = RepoLoader::init_from_file_system(
             settings,
             &repo.repo_dir(),
