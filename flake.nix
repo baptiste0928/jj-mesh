@@ -1,5 +1,5 @@
 {
-  description = "jj-mesh: a bi-directional sync service for jj repositories";
+  description = "jj-mesh: peer-to-peer synchronization of jj repositories";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
@@ -28,6 +28,11 @@
     {
       formatter = forEachSystem (system: nixpkgs.legacyPackages.${system}.nixfmt-tree);
 
+      homeModules = rec {
+        jj-mesh = import ./home-module.nix self;
+        default = jj-mesh;
+      };
+
       packages = forEachSystem (
         system:
         let
@@ -41,17 +46,26 @@
             p: p.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml
           );
 
-          jj-mesh = craneLib.buildPackage {
+          commonArgs = {
             src = craneLib.cleanCargoSource ./.;
             strictDeps = true;
             doCheck = false; # Don't run tests on the flake
-            JJ_MESH_COMMIT = self.shortRev or self.dirtyShortRev or "unknown";
-            meta = {
-              description = "Bi-directional sync service for jj repositories";
-              license = nixpkgs.lib.licenses.isc;
-              mainProgram = "jj-mesh";
-            };
           };
+
+          cargoArtifacts = craneLib.buildDepsOnly commonArgs;
+
+          jj-mesh = craneLib.buildPackage (
+            commonArgs
+            // {
+              inherit cargoArtifacts;
+              JJ_MESH_COMMIT = self.shortRev or self.dirtyShortRev or "unknown";
+              meta = {
+                description = "Peer-to-peer synchronization of jj repositories";
+                license = nixpkgs.lib.licenses.isc;
+                mainProgram = "jj-mesh";
+              };
+            }
+          );
         in
         {
           default = jj-mesh;
