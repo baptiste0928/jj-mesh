@@ -1,7 +1,7 @@
 //! Daemon control socket.
 //!
 //! The CLI talks to the running daemon over a unix socket with
-//! length-prefixed postcard messages (see [`crate::net::wire`]). Every
+//! length-prefixed postcard messages (`net::wire` framing). Every
 //! request is one request/response exchange; joining a pairing merely keeps
 //! its connection open so the daemon notices a cancelling client.
 //!
@@ -23,4 +23,12 @@ pub use client::{
     request_blocking, request_streaming_blocking,
 };
 pub use protocol::*;
-pub use server::{ControlContext, ControlServer};
+pub(super) use server::{ControlContext, ControlServer};
+
+// Wire types embedded in protocol messages. Their home modules are
+// crate-private; this is their only public path, so protocol consumers
+// (CLI, integration tests) depend on the control vocabulary alone.
+pub use crate::{
+    net::sync::{RepoHealthState, StatusReport},
+    repo::transfer::{TransferPhase, TransferProgress},
+};

@@ -5,8 +5,8 @@ mod harness;
 
 use std::fs;
 
-use harness::{TestMesh, add_and_clone, connect, descriptions, wait_converged};
-use jj_mesh::net::sync::RepoHealthState;
+use harness::{TestMesh, add_and_clone, descriptions, wait_converged};
+use jj_mesh::daemon::control::RepoHealthState;
 
 /// Converting a second instance of a mesh repo to colocated pauses sync on
 /// both machines (instead of ping-ponging git HEAD imports), and reverting
@@ -14,15 +14,12 @@ use jj_mesh::net::sync::RepoHealthState;
 #[tokio::test(flavor = "multi_thread")]
 async fn second_colocated_instance_pauses_sync() {
     let mesh = TestMesh::new();
-    let a = mesh.machine("machine-a").await;
-    let b = mesh.machine("machine-b").await;
-    connect(&a, &b).await;
+    let (a, b) = mesh.connected_pair().await;
 
     // A's instance is colocated (jj's default init layout); B clones with
     // the supported non-colocated layout.
-    let dir_a = mesh.jj.init_repo("proj");
+    let (dir_a, dir_b) = add_and_clone(&mesh, &a, &b, "proj").await;
     assert!(dir_a.join(".git").is_dir());
-    let dir_b = add_and_clone(&mesh, &a, &b, &dir_a, "proj").await;
     assert!(!dir_b.join(".git").exists());
 
     // Convert B's instance to colocated, the way such conversions happen
@@ -33,8 +30,7 @@ async fn second_colocated_instance_pauses_sync() {
     // A change on A wakes B's repo task, which must notice the store
     // reconfiguration, reopen, and pause on the colocation conflict
     // instead of syncing.
-    fs::write(dir_a.join("a.txt"), "a\n").unwrap();
-    mesh.jj.jj(&dir_a, &["commit", "-m", "while converting"]);
+    mesh.jj.commit_file(&dir_a, "a.txt", "while converting");
     b.wait("proj paused on B", |s| {
         s.paused.iter().any(|p| p.repo == "proj")
     })
@@ -65,8 +61,7 @@ async fn second_colocated_instance_pauses_sync() {
     a.wait("proj resumed on A", |s| s.paused.is_empty()).await;
     b.wait("proj resumed on B", |s| s.paused.is_empty()).await;
 
-    fs::write(dir_a.join("a2.txt"), "a2\n").unwrap();
-    mesh.jj.jj(&dir_a, &["commit", "-m", "after resume"]);
+    mesh.jj.commit_file(&dir_a, "a2.txt", "after resume");
     wait_converged(&dir_a, &dir_b).await;
     assert!(descriptions(&mesh, &dir_b).contains("while converting"));
     assert!(descriptions(&mesh, &dir_b).contains("after resume"));
@@ -77,12 +72,8 @@ async fn second_colocated_instance_pauses_sync() {
 #[tokio::test(flavor = "multi_thread")]
 async fn peers_report_their_health() {
     let mesh = TestMesh::new();
-    let a = mesh.machine("machine-a").await;
-    let b = mesh.machine("machine-b").await;
-    connect(&a, &b).await;
-
-    let dir_a = mesh.jj.init_repo("proj");
-    add_and_clone(&mesh, &a, &b, &dir_a, "proj").await;
+    let (a, b) = mesh.connected_pair().await;
+    add_and_clone(&mesh, &a, &b, "proj").await;
 
     a.wait("B's health report", |s| {
         s.peer_reports.iter().any(|r| {

@@ -1,10 +1,10 @@
 //! Machine identity key file (`machine.key`).
 //!
 //! This private key is used by iroh to identify the machine in the p2p network
-//! and should not be shared across multiple machines. The public part is the
+//! and must not be shared across machines. The public part is the
 //! [`EndpointId`], which is used to connect to other peers.
 //!
-//! We store the key encoded in base64.
+//! The key is stored base64-encoded.
 
 use std::{
     fs,
@@ -23,8 +23,8 @@ use super::ConfigDir;
 pub struct MachineKey(SecretKey);
 
 impl MachineKey {
-    /// Loads the key from the configuration directory. A new key will be
-    /// created if not already existing.
+    /// Loads the key from the configuration directory, generating and
+    /// persisting a new one on first use.
     pub fn from_config(config: &ConfigDir) -> Result<Self> {
         let key_file = config.machine_key();
 
@@ -35,9 +35,7 @@ impl MachineKey {
         }
     }
 
-    /// Load the key from base64 encoded content.
-    ///
-    /// Iroh uses ed25519 keys which are 32 bytes in size.
+    /// Parses a base64-encoded key (32 bytes, ed25519).
     fn from_base64(content: &str) -> Result<Self> {
         let key: [u8; 32] = BASE64
             .decode(content.trim_ascii().as_bytes())
@@ -48,12 +46,12 @@ impl MachineKey {
         Ok(Self(SecretKey::from_bytes(&key)))
     }
 
-    /// Generate a new key and write it to the specified file
+    /// Generates a new key and writes it to `path`, owner-only (0600) and
+    /// refusing to overwrite an existing file.
     fn generate(path: &Path) -> Result<Self> {
         let key = SecretKey::generate();
         let encoded = BASE64.encode(&key.to_bytes());
 
-        // We write the key with chmod 600 (only owner can read/write)
         let mut options = fs::OpenOptions::new();
         options.write(true).create_new(true);
         #[cfg(unix)]

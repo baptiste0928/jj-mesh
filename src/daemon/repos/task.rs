@@ -1,38 +1,10 @@
-//! Registered repo management.
-//!
-//! One task per registered repo opens it and watches its op-heads directory:
-//! every mutating jj command atomically swaps head marker files there, so a
-//! change event means new operations to announce. The task publishes its
-//! head set through the sync hub (on change and on watch start) and fetches
-//! operations peers announce; serving peer fetches is dispatched by the hub
-//! directly (never through this task's loop, which may itself be fetching).
-//!
-//! Change detection compares the head set against the last one seen, which
-//! also absorbs event bursts and spurious wakeups. The daemon's own future
-//! head writes (the sync apply path) will update the tracked set before
-//! writing, so self-triggered events are suppressed the same way.
-//!
-//! When auto-snapshotting is enabled, the task also watches the working
-//! copy files: the first edit arms a snapshot one interval later (never
-//! immediately), and edits during the wait do not postpone it, so
-//! continuous editing snapshots at the configured cadence. The snapshot
-//! runs through the jj binary and produces a regular operation, which the
-//! op-heads watch then picks up and announces like any local change.
-//!
-//! Syncing operations from peers can leave the local working copy stale
-//! (updated by an operation the working copy never saw). When enabled,
-//! `jj workspace update-stale` runs after every sync that applied
-//! operations, and once on watch start for staleness accrued while the
-//! daemon was down — but only while the op head is single. Any jj
-//! command reconciles divergent op heads by writing a merge operation,
-//! so daemons doing this on both ends of a divergence would ping-pong
-//! fresh merge operations at each other. Divergence is left to the next
-//! actual jj activity (a user command, an auto-snapshot), whose merge
-//! then arrives here as a single head.
+//! The per-repo watch task: open, watch op heads, announce local changes,
+//! fetch announced changes from peers, and drive the optional auto-snapshot
+//! and update-stale jj runs. See the module docs in [`super`] for the
+//! overall behavior and its invariants.
 
 use std::{
-    collections::BTreeMap,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::{Duration, Instant, SystemTime},
 };
@@ -42,14 +14,15 @@ use jj_lib::{object_id::ObjectId as _, op_store::OperationId};
 use tokio::sync::Notify;
 use tracing::{debug, info, warn};
 
-use super::{
-    backoff::Backoff,
-    control,
-    hub::{Inbox, PeerAnnounce, SyncHub},
-};
+use super::{RepoHandle, RepoState};
 use crate::{
-    config::{MeshState, RepoId, Settings},
-    repo::{JjRepo, MeshRepo, transfer},
+    config::{RepoId, RepoSettings, Settings},
+    daemon::{
+        backoff::Backoff,
+        hub::{Inbox, PeerAnnounce, SyncHub},
+    },
+    net::sync::GitTransferFormat,
+    repo::{JjRepo, MeshRepo, StoreFingerprint, repo_present, run_jj, transfer},
     watch::{DirWatcher, TreeWatcher},
 };
 
@@ -99,175 +72,8 @@ const FETCH_RETRY: Duration = Duration::from_secs(30);
 /// large working copy legitimately takes a while.
 const JJ_TIMEOUT: Duration = Duration::from_mins(5);
 
-/// The set of managed repos, synced from the mesh state and keyed by their
-/// mesh-wide name.
-#[derive(Debug)]
-pub struct RepoSet {
-    hub: Arc<SyncHub>,
-    repos: Mutex<BTreeMap<String, RepoHandle>>,
-    /// Pinged on every repo state change, driving the status broadcast.
-    changed: Arc<Notify>,
-    /// Daemon settings, loaded once at start and shared with every repo
-    /// task.
-    settings: Arc<Settings>,
-}
-
-/// Book-keeping for one repo task.
-#[derive(Debug)]
-struct RepoHandle {
-    id: RepoId,
-    path: PathBuf,
-    state: Arc<Mutex<RepoState>>,
-    task: tokio::task::JoinHandle<()>,
-}
-
-/// Live state of one repo watch, shared between its task and status
-/// snapshots.
-#[derive(Debug)]
-enum RepoState {
-    Opening,
-    Watching {
-        op_heads: usize,
-        last_change: Option<SystemTime>,
-        last_sync: Option<SystemTime>,
-    },
-    Backoff {
-        until: Instant,
-        error: String,
-    },
-    /// The repo directory itself is gone: an unmounted disk, or a repo the
-    /// user deleted without `jj-mesh repo forget`. Retried like a backoff, but
-    /// surfaced distinctly so the status can suggest the fix.
-    Missing {
-        until: Instant,
-    },
-}
-
-impl RepoSet {
-    pub fn new(hub: Arc<SyncHub>, settings: Arc<Settings>) -> Self {
-        RepoSet {
-            hub,
-            repos: Mutex::new(BTreeMap::new()),
-            changed: Arc::new(Notify::new()),
-            settings,
-        }
-    }
-
-    /// Resolves when any repo's state may have changed since the last
-    /// call. Wakeups coalesce (this is a [`Notify`]): consumers snapshot
-    /// [`Self::statuses`] on every wake, so a missed ping only delays,
-    /// never loses, state.
-    pub async fn changed(&self) {
-        self.changed.notified().await;
-    }
-
-    /// Aligns the managed repos with the mesh state: spawns tasks for new
-    /// repos and shuts down removed ones. A repo whose path or id changed
-    /// is respawned.
-    pub fn sync(&self, state: &MeshState) {
-        let mut repos = self.repos.lock().unwrap();
-
-        repos.retain(|name, handle| {
-            let keep = state
-                .repos
-                .get(name)
-                .is_some_and(|repo| handle.path == repo.path && handle.id == repo.id);
-            if !keep {
-                info!(repo = %name, "removing repo watch");
-                handle.task.abort();
-                self.hub.unregister_repo(name);
-            }
-            keep
-        });
-
-        for (name, repo) in &state.repos {
-            repos.entry(name.clone()).or_insert_with(|| {
-                info!(repo = %name, path = %repo.path.display(), "managing repo");
-                let announcements = self.hub.register_repo(name.clone(), repo.id.clone());
-                spawn_repo(
-                    repo.id.clone(),
-                    name.clone(),
-                    repo.path.clone(),
-                    self.hub.clone(),
-                    announcements,
-                    self.changed.clone(),
-                    self.settings.clone(),
-                )
-            });
-        }
-        self.changed.notify_one();
-    }
-
-    /// Condenses every repo's state into the health report peers see.
-    /// Local detail (paths, error messages) deliberately stays out: error
-    /// strings embed filesystem paths, which never leave this machine.
-    pub fn health(&self) -> Vec<crate::net::sync::RepoHealth> {
-        use crate::net::sync::{RepoHealth, RepoHealthState};
-
-        let paused = self.hub.paused_repos();
-        let repos = self.repos.lock().unwrap();
-        repos
-            .iter()
-            .map(|(name, handle)| {
-                let state = if paused.contains_key(name) {
-                    RepoHealthState::Paused
-                } else {
-                    match &*handle.state.lock().unwrap() {
-                        // Opening is a moment, not a health state.
-                        RepoState::Opening | RepoState::Watching { .. } => RepoHealthState::Ok,
-                        RepoState::Backoff { .. } => RepoHealthState::Failed,
-                        RepoState::Missing { .. } => RepoHealthState::Missing,
-                    }
-                };
-                RepoHealth {
-                    name: name.clone(),
-                    state,
-                }
-            })
-            .collect()
-    }
-
-    /// Snapshots the state of every repo for the control socket.
-    pub fn statuses(&self) -> Vec<control::RepoStatus> {
-        let repos = self.repos.lock().unwrap();
-
-        repos
-            .iter()
-            .map(|(name, handle)| {
-                let watch = match &*handle.state.lock().unwrap() {
-                    RepoState::Opening => control::WatchStatus::Opening,
-                    RepoState::Watching {
-                        op_heads,
-                        last_change,
-                        last_sync,
-                    } => control::WatchStatus::Watching {
-                        op_heads: *op_heads as u64,
-                        last_change_secs: last_change
-                            .map(|at| at.elapsed().unwrap_or_default().as_secs()),
-                        last_sync_secs: last_sync
-                            .map(|at| at.elapsed().unwrap_or_default().as_secs()),
-                    },
-                    RepoState::Backoff { until, error } => control::WatchStatus::Failed {
-                        error: error.clone(),
-                        retry_in_secs: until.saturating_duration_since(Instant::now()).as_secs(),
-                    },
-                    RepoState::Missing { until } => control::WatchStatus::Missing {
-                        retry_in_secs: until.saturating_duration_since(Instant::now()).as_secs(),
-                    },
-                };
-
-                control::RepoStatus {
-                    name: name.clone(),
-                    path: handle.path.clone(),
-                    watch,
-                }
-            })
-            .collect()
-    }
-}
-
 /// Spawns the watch task for one repo.
-fn spawn_repo(
+pub(super) fn spawn_repo(
     id: RepoId,
     name: String,
     path: PathBuf,
@@ -348,7 +154,7 @@ async fn run_repo(task: RepoTask) {
         // stat runs on a blocking thread; a hung mount is one of the very
         // conditions being probed.
         let path = task.path.clone();
-        let present = tokio::task::spawn_blocking(move || crate::repo::repo_present(&path))
+        let present = tokio::task::spawn_blocking(move || repo_present(&path))
             .await
             .unwrap_or(true);
         if present {
@@ -371,7 +177,7 @@ impl RepoTask {
     /// is dispatched by the hub.
     ///
     /// The head reads here are cheap single-shot store calls (one readdir),
-    /// safe from async context; see the `repo::mesh` module docs.
+    /// safe from async context; see the [`crate::repo::MeshRepo`] docs.
     async fn watch(&self) -> Result<()> {
         let (jj, repo, fingerprint) = self.open().await?;
         // Fetch serving is dispatched by the hub, never by this loop: a
@@ -381,7 +187,7 @@ impl RepoTask {
         // Watch before the first read: changes racing the setup produce at
         // worst a no-change wakeup.
         let heads_dir = jj.op_heads_dir();
-        let mut watch = DirWatcher::new(&heads_dir, DEBOUNCE, DEBOUNCE_MAX, |_| true)?;
+        let mut watch = DirWatcher::new(&heads_dir, DEBOUNCE, DEBOUNCE_MAX)?;
         let mut heads = sorted_heads(&repo).await?;
         let mut last_change = None;
         let mut last_sync = None;
@@ -511,7 +317,7 @@ impl RepoTask {
     /// Opens the repo's stores. Opening is heavy (gix opens the git repo,
     /// the self-check reads whole views), so it runs on a blocking
     /// thread: a hung disk must stall this repo, not the daemon.
-    async fn open(&self) -> Result<(JjRepo, Arc<MeshRepo>, crate::repo::StoreFingerprint)> {
+    async fn open(&self) -> Result<(JjRepo, Arc<MeshRepo>, StoreFingerprint)> {
         use pollster::FutureExt as _;
 
         let path = self.path.clone();
@@ -536,7 +342,7 @@ impl RepoTask {
     /// Builds the working-copy watcher, degrading to `None` instead of
     /// failing the repo: op sync must survive a tree too large or busted
     /// to watch. `None` means no snapshots for this repo, nothing else.
-    async fn watch_tree(&self, root: &std::path::Path) -> Option<TreeWatcher> {
+    async fn watch_tree(&self, root: &Path) -> Option<TreeWatcher> {
         match TreeWatcher::new(root).await {
             Ok(tree) => Some(tree),
             Err(err) => {
@@ -550,7 +356,7 @@ impl RepoTask {
     }
 
     /// The effective settings for this repo.
-    fn settings(&self) -> crate::config::RepoSettings {
+    fn settings(&self) -> RepoSettings {
         self.settings.for_repo(&self.name)
     }
 
@@ -648,7 +454,7 @@ impl RepoTask {
             &self.name,
             &self.id,
             wants,
-            crate::net::sync::GitTransferFormat::Loose,
+            GitTransferFormat::Loose,
             &mut send,
             &mut recv,
             transfer::ProgressSink::default(),
@@ -687,7 +493,7 @@ impl RepoTask {
     /// see them would schedule a snapshot of the daemon's own work, on
     /// and on. Failures only warn, the repo is fine either way.
     async fn run_jj(&self, args: &[&str], tree: &mut Option<TreeWatcher>) {
-        if let Err(err) = crate::repo::run_jj(&self.path, args, JJ_TIMEOUT).await {
+        if let Err(err) = run_jj(&self.path, args, JJ_TIMEOUT).await {
             warn!(repo = %self.name, "jj {} failed: {err:#}", args.join(" "));
         }
         if let Some(watcher) = tree
@@ -794,7 +600,7 @@ async fn tree_changed(tree: &mut Option<TreeWatcher>) -> Result<()> {
 
 /// Re-captures the store fingerprint: a handful of tiny reads, but on a
 /// blocking thread since a hung mount is one of the probed conditions.
-async fn store_fingerprint(jj: &JjRepo) -> Result<crate::repo::StoreFingerprint> {
+async fn store_fingerprint(jj: &JjRepo) -> Result<StoreFingerprint> {
     let jj = jj.clone();
     tokio::task::spawn_blocking(move || jj.fingerprint())
         .await
@@ -821,326 +627,4 @@ fn truncated_error(err: &color_eyre::Report) -> String {
         msg.push('…');
     }
     msg
-}
-
-#[cfg(test)]
-mod tests {
-    use std::time::Duration;
-
-    use super::*;
-    use crate::{config::Repo, testing::Fixture};
-
-    /// A repo set with the given `config.toml` contents.
-    fn repo_set(config: &str) -> RepoSet {
-        let settings = Arc::new(toml::from_str(config).unwrap());
-        RepoSet::new(Arc::new(SyncHub::new()), settings)
-    }
-
-    /// A repo set with auto-snapshot and update-stale disabled: hermetic
-    /// (the daemon spawns no jj, which would read the user's real config).
-    fn quiet_repo_set() -> RepoSet {
-        repo_set("snapshot-interval = 0\nupdate-stale = false")
-    }
-
-    /// Polls until `pred` holds on the statuses, panicking after 10s.
-    async fn wait_for(set: &RepoSet, pred: impl Fn(&[control::RepoStatus]) -> bool) {
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            if pred(&set.statuses()) {
-                return;
-            }
-            assert!(Instant::now() < deadline, "condition not reached in time");
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-    }
-
-    fn state_with(name: &str, path: &std::path::Path) -> MeshState {
-        let mut state = MeshState::default();
-        state.repos.insert(
-            name.to_owned(),
-            Repo {
-                id: RepoId::generate(),
-                path: path.to_owned(),
-            },
-        );
-        state
-    }
-
-    #[tokio::test]
-    async fn watches_and_detects_head_changes() {
-        let fx = Fixture::new();
-        let dir = fx.init_repo("a");
-
-        let set = quiet_repo_set();
-        set.sync(&state_with("a", &dir));
-
-        wait_for(&set, |s| {
-            matches!(
-                s,
-                [control::RepoStatus {
-                    watch: control::WatchStatus::Watching {
-                        op_heads: 1,
-                        last_change_secs: None,
-                        ..
-                    },
-                    ..
-                }]
-            )
-        })
-        .await;
-
-        fx.jj(&dir, &["new", "-m", "change"]);
-
-        wait_for(&set, |s| {
-            matches!(
-                s,
-                [control::RepoStatus {
-                    watch: control::WatchStatus::Watching {
-                        last_change_secs: Some(_),
-                        ..
-                    },
-                    ..
-                }]
-            )
-        })
-        .await;
-
-        set.sync(&MeshState::default());
-        assert!(set.statuses().is_empty());
-    }
-
-    /// Removing and recreating a watched repo must not leave a dead watch:
-    /// the task reopens and keeps detecting changes at the same path.
-    #[tokio::test]
-    async fn recovers_after_repo_recreation() {
-        let fx = Fixture::new();
-        let dir = fx.init_repo("a");
-
-        let set = quiet_repo_set();
-        set.sync(&state_with("a", &dir));
-        wait_for(&set, |s| {
-            matches!(
-                s,
-                [control::RepoStatus {
-                    watch: control::WatchStatus::Watching { .. },
-                    ..
-                }]
-            )
-        })
-        .await;
-
-        std::fs::remove_dir_all(&dir).unwrap();
-        fx.init_repo("a");
-
-        // The dead watch must be noticed (Failed, or Missing when the
-        // failure lands in the removed-not-yet-recreated window), then
-        // rebuilt (Watching); both states persist long enough for the 50ms
-        // polling to see them.
-        wait_for(&set, |s| {
-            matches!(
-                s,
-                [control::RepoStatus {
-                    watch: control::WatchStatus::Failed { .. }
-                        | control::WatchStatus::Missing { .. },
-                    ..
-                }]
-            )
-        })
-        .await;
-        wait_for(&set, |s| {
-            matches!(
-                s,
-                [control::RepoStatus {
-                    watch: control::WatchStatus::Watching { .. },
-                    ..
-                }]
-            )
-        })
-        .await;
-
-        fx.jj(&dir, &["new", "-m", "after-recreation"]);
-        wait_for(&set, |s| {
-            matches!(
-                s,
-                [control::RepoStatus {
-                    watch: control::WatchStatus::Watching {
-                        last_change_secs: Some(_),
-                        ..
-                    },
-                    ..
-                }]
-            )
-        })
-        .await;
-    }
-
-    /// A path with no repo directory at all is `Missing` (the state that
-    /// suggests `jj-mesh repo forget`), not a generic failure.
-    #[tokio::test]
-    async fn reports_missing_for_absent_repo_dir() {
-        let fx = Fixture::new();
-        let set = quiet_repo_set();
-        set.sync(&state_with("ghost", &fx.path().join("missing")));
-
-        wait_for(&set, |s| {
-            matches!(
-                s,
-                [control::RepoStatus {
-                    watch: control::WatchStatus::Missing { .. },
-                    ..
-                }]
-            )
-        })
-        .await;
-    }
-
-    /// A directory that exists but is not a usable repo is a `Failed`
-    /// watch, with the open error preserved.
-    #[tokio::test]
-    async fn reports_failure_for_invalid_repo() {
-        let fx = Fixture::new();
-        let dir = fx.path().join("broken");
-        std::fs::create_dir_all(dir.join(".jj")).unwrap();
-
-        let set = quiet_repo_set();
-        set.sync(&state_with("broken", &dir));
-
-        wait_for(&set, |s| {
-            matches!(
-                s,
-                [control::RepoStatus {
-                    watch: control::WatchStatus::Failed { .. },
-                    ..
-                }]
-            )
-        })
-        .await;
-    }
-
-    /// An edit to a working-copy file must produce a snapshot operation
-    /// one interval later, visible as an op-heads change.
-    #[tokio::test]
-    async fn auto_snapshots_working_copy_edits() {
-        let fx = Fixture::new();
-        let dir = fx.init_repo("a");
-
-        let set = repo_set("snapshot-interval = 1\nupdate-stale = false");
-        set.sync(&state_with("a", &dir));
-        wait_for(&set, |s| {
-            matches!(
-                s,
-                [control::RepoStatus {
-                    watch: control::WatchStatus::Watching {
-                        last_change_secs: None,
-                        ..
-                    },
-                    ..
-                }]
-            )
-        })
-        .await;
-
-        std::fs::write(dir.join("edited.txt"), "content").unwrap();
-
-        wait_for(&set, |s| {
-            matches!(
-                s,
-                [control::RepoStatus {
-                    watch: control::WatchStatus::Watching {
-                        last_change_secs: Some(_),
-                        ..
-                    },
-                    ..
-                }]
-            )
-        })
-        .await;
-    }
-
-    /// A stale working copy (op head advanced without updating it, which
-    /// is what applying synced operations does) is healed on watch start.
-    #[tokio::test]
-    async fn updates_stale_working_copy() {
-        let fx = Fixture::new();
-        let dir = fx.init_repo("a");
-        // Change the working-copy commit's tree without updating the
-        // working copy: jj only considers it stale when the trees differ.
-        std::fs::write(dir.join("f.txt"), "content").unwrap();
-        fx.jj(&dir, &["status"]);
-        fx.jj(&dir, &["--ignore-working-copy", "abandon", "@"]);
-        assert!(
-            !fx.jj_ok(&dir, &["status"]),
-            "the working copy must start stale for this test to mean anything",
-        );
-
-        let set = repo_set("snapshot-interval = 0\nupdate-stale = true");
-        set.sync(&state_with("a", &dir));
-
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while !fx.jj_ok(&dir, &["status"]) {
-            assert!(Instant::now() < deadline, "working copy still stale");
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-    }
-
-    /// Changing a watched repo's store configuration must be detected on
-    /// the next wake and reopen the repo against the new configuration
-    /// instead of continuing on stale stores.
-    #[tokio::test]
-    async fn reopens_when_store_configuration_changes() {
-        let fx = Fixture::new();
-        let dir = fx.init_repo("a");
-        let repo = JjRepo::discover(&dir).unwrap();
-        let before = repo.fingerprint().unwrap();
-
-        let set = quiet_repo_set();
-        set.sync(&state_with("a", &dir));
-        wait_for(&set, |s| {
-            matches!(
-                s,
-                [control::RepoStatus {
-                    watch: control::WatchStatus::Watching { .. },
-                    ..
-                }]
-            )
-        })
-        .await;
-
-        // Point git_target somewhere unusable, then wake the watch with a
-        // transient file in the watched op-heads directory (jj itself can
-        // no longer run against the broken configuration): the fingerprint
-        // change must force a reopen, which fails against the broken
-        // configuration. Watching on stale stores would sail right past
-        // this.
-        let target = dir.join(".jj/repo/store/git_target");
-        let original = std::fs::read_to_string(&target).unwrap();
-        std::fs::write(&target, "does-not-exist").unwrap();
-        assert_ne!(repo.fingerprint().unwrap(), before);
-        let wake = dir.join(".jj/repo/op_heads/heads/.wake");
-        std::fs::write(&wake, "").unwrap();
-        std::fs::remove_file(&wake).unwrap();
-        wait_for(&set, |s| {
-            matches!(
-                s,
-                [control::RepoStatus {
-                    watch: control::WatchStatus::Failed { .. },
-                    ..
-                }]
-            )
-        })
-        .await;
-
-        // Restoring the configuration heals the repo on the next retry.
-        std::fs::write(&target, original).unwrap();
-        wait_for(&set, |s| {
-            matches!(
-                s,
-                [control::RepoStatus {
-                    watch: control::WatchStatus::Watching { .. },
-                    ..
-                }]
-            )
-        })
-        .await;
-    }
 }

@@ -55,6 +55,12 @@ enum Command {
     RunDaemon(run_daemon::RunDaemonArgs),
 }
 
+/// This machine's hostname: the default identity it presents to the mesh,
+/// both as a peer name and as its workspace name in synced repos.
+fn hostname() -> String {
+    gethostname::gethostname().to_string_lossy().into_owned()
+}
+
 /// Entry point of the `jj-mesh` CLI
 pub fn run() -> Result<()> {
     // Answers shell completion requests (`COMPLETE=<shell> jj-mesh ...`)

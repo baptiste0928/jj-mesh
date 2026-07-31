@@ -1,13 +1,20 @@
 //! In-process multi-daemon harness for end-to-end tests.
 //!
-//! Each [`Machine`] runs a real daemon on its own tempdir configuration, peers
-//! are resolved in-memory without any relay.
+//! A [`TestMesh`] hosts any number of [`Machine`]s, each running a real
+//! daemon on its own tempdir configuration; peers resolve each other
+//! in-memory without any relay. Machines drive their daemon through the
+//! control socket exactly as the CLI would, and the free functions cover
+//! the recurring flows: pairing, sharing a repo across two machines, and
+//! waiting for op logs to converge.
 
 // Each test binary compiles this module separately and uses its own
 // subset of the helpers.
 #![allow(dead_code)]
 
-use std::{path::Path, time::Duration};
+use std::{
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use iroh::address_lookup::MemoryLookup;
 use jj_mesh::{
@@ -54,6 +61,27 @@ impl TestMesh {
         };
         machine.start().await;
         machine
+    }
+
+    /// Starts "machine-a" and "machine-b", paired and connected.
+    pub async fn connected_pair(&self) -> (Machine, Machine) {
+        let a = self.machine("machine-a").await;
+        let b = self.machine("machine-b").await;
+        connect(&a, &b).await;
+        (a, b)
+    }
+}
+
+/// Polls `step` every 100ms until it succeeds, panicking with the last
+/// error once [`WAIT_TIMEOUT`] has elapsed.
+async fn poll<T>(mut step: impl AsyncFnMut() -> Result<T, String>) -> T {
+    let deadline = tokio::time::Instant::now() + WAIT_TIMEOUT;
+    loop {
+        match step().await {
+            Ok(value) => return value,
+            Err(why) => assert!(tokio::time::Instant::now() < deadline, "{why}"),
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
 
@@ -146,18 +174,14 @@ impl Machine {
     /// Polls the daemon status until `pred` holds, panicking after
     /// [`WAIT_TIMEOUT`].
     pub async fn wait(&self, what: &str, pred: impl Fn(&Status) -> bool) {
-        let deadline = tokio::time::Instant::now() + WAIT_TIMEOUT;
-        loop {
+        poll(async || {
             if pred(&self.status().await) {
-                return;
+                Ok(())
+            } else {
+                Err(format!("{}: timed out waiting for {what}", self.name))
             }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "{}: timed out waiting for {what}",
-                self.name,
-            );
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
+        })
+        .await;
     }
 
     /// Issues a pairing ticket on this machine, as `jj-mesh peer add` would.
@@ -173,21 +197,34 @@ impl Machine {
         }
     }
 
+    /// Attempts to join a pairing with `ticket`, announcing `name`, and
+    /// returns the daemon's verdict.
+    pub async fn try_join_pairing(&self, ticket: String, name: &str) -> Response {
+        self.try_request(&Request::PairJoin {
+            ticket,
+            name: name.to_owned(),
+        })
+        .await
+    }
+
+    /// Joins a pairing with `ticket` under this machine's name. The host
+    /// persists the peer before confirming, so the `Paired` answer asserted
+    /// here means both sides are registered.
+    pub async fn join_pairing(&self, ticket: String) {
+        let joined = self.try_join_pairing(ticket, &self.name).await;
+        assert!(
+            matches!(joined, Response::Paired { .. }),
+            "{}: {joined:?}",
+            self.name,
+        );
+    }
+
     /// Pairs this machine (hosting) with `other` (joining), through both
     /// control sockets, as `jj-mesh peer add` would. Each side announces its
     /// own name and stores the peer under the peer's announced one.
     pub async fn pair_with(&self, other: &Machine) {
         let ticket = self.host_pairing().await;
-
-        // The host persists the peer before confirming, so a `Paired`
-        // answer to the joiner means both sides are registered.
-        let joined = other
-            .request(&Request::PairJoin {
-                ticket,
-                name: other.name.clone(),
-            })
-            .await;
-        assert!(matches!(joined, Response::Paired { .. }), "{joined:?}");
+        other.join_pairing(ticket).await;
     }
 
     /// Registers the repo at `path` under `name`, as `jj-mesh repo add` would.
@@ -220,28 +257,22 @@ impl Machine {
     }
 
     /// Clones the mesh repo `name` into `path` (which must be a freshly
-    /// initialized repo, see [`init_clone_repo`]), retrying while the
+    /// initialized repo, see [`Fixture::init_clone_repo`]), retrying while the
     /// daemon still lacks a usable source announcement.
     pub async fn clone_repo(&self, name: &str, path: &Path) {
         let request = Request::CloneRepo {
             name: name.to_owned(),
             path: std::fs::canonicalize(path).unwrap(),
         };
-        let deadline = tokio::time::Instant::now() + WAIT_TIMEOUT;
-        loop {
-            match self.try_streaming_request(&request).await {
-                Response::Cloned { .. } => return,
-                Response::Error(message) => {
-                    assert!(
-                        tokio::time::Instant::now() < deadline,
-                        "{}: clone of `{name}` kept failing: {message}",
-                        self.name,
-                    );
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                }
-                other => panic!("{}: unexpected response {other:?}", self.name),
-            }
-        }
+        poll(async || match self.try_streaming_request(&request).await {
+            Response::Cloned { .. } => Ok(()),
+            Response::Error(message) => Err(format!(
+                "{}: clone of `{name}` kept failing: {message}",
+                self.name,
+            )),
+            other => panic!("{}: unexpected response {other:?}", self.name),
+        })
+        .await;
     }
 }
 
@@ -253,36 +284,28 @@ pub async fn connect(a: &Machine, b: &Machine) {
     b.wait_peer_connected(&a.name).await;
 }
 
-/// Initializes a fresh repo for [`Machine::clone_repo`] as `jj-mesh repo clone`
-/// would: non-colocated, with a machine-unique workspace name.
-pub fn init_clone_repo(mesh: &TestMesh, dir_name: &str, workspace: &str) -> std::path::PathBuf {
-    let path = mesh.jj.path().join(dir_name);
-    mesh.jj
-        .jj(mesh.jj.path(), &["git", "init", "--no-colocate", dir_name]);
-    mesh.jj.jj(&path, &["workspace", "rename", workspace]);
-    path
-}
-
-/// Registers the repo at `dir` under `name` on `on`, clones it from `from`
-/// into a fresh repo, and waits until both are in sync. Returns the cloned
-/// repo's path.
+/// Creates a repo named `name`, registers it on `on`, clones it from `from`
+/// into a fresh repo, and waits until both are in sync. Returns the original
+/// and the cloned repo's paths.
 pub async fn add_and_clone(
     mesh: &TestMesh,
     on: &Machine,
     from: &Machine,
-    dir: &Path,
     name: &str,
-) -> std::path::PathBuf {
-    on.add_repo(name, dir).await;
+) -> (PathBuf, PathBuf) {
+    let dir = mesh.jj.init_repo(name);
+    on.add_repo(name, &dir).await;
     from.wait_available(name).await;
 
-    let cloned = init_clone_repo(mesh, &format!("{name}-on-{}", from.name), &from.name);
+    let cloned = mesh
+        .jj
+        .init_clone_repo(&format!("{name}-on-{}", from.name), &from.name);
     from.clone_repo(name, &cloned).await;
     // Any jj command merges the fresh workspace into the pulled history;
     // its operations then flow back until both sides agree.
     mesh.jj.jj(&cloned, &["status"]);
-    wait_converged(dir, &cloned).await;
-    cloned
+    wait_converged(&dir, &cloned).await;
+    (dir, cloned)
 }
 
 /// The descriptions of every commit in the repo at `dir`, one per line.
@@ -296,20 +319,19 @@ pub fn descriptions(mesh: &TestMesh, dir: &Path) -> String {
 /// Waits until both repos report the same jj op heads, i.e. their
 /// operation logs converged.
 pub async fn wait_converged(a: &Path, b: &Path) {
-    let deadline = tokio::time::Instant::now() + WAIT_TIMEOUT;
-    loop {
+    poll(async || {
         let (heads_a, heads_b) = (op_heads(a).await, op_heads(b).await);
         if heads_a == heads_b {
-            return;
+            Ok(())
+        } else {
+            Err(format!(
+                "repos did not converge: {} has {heads_a:?}, {} has {heads_b:?}",
+                a.display(),
+                b.display(),
+            ))
         }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "repos did not converge: {} has {heads_a:?}, {} has {heads_b:?}",
-            a.display(),
-            b.display(),
-        );
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
+    })
+    .await;
 }
 
 /// Reads a repo's sorted op heads (as their debug form, which is enough

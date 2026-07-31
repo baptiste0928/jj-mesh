@@ -9,82 +9,29 @@
 //! through the control socket and only reads it directly as a fallback
 //! when no daemon is running.
 
+mod membership;
+mod repo;
+
 use std::{
-    borrow::Borrow,
-    cmp,
     collections::BTreeMap,
-    fmt, fs, io,
+    fs, io,
     io::Write as _,
     path::{Path, PathBuf},
 };
 
 use color_eyre::eyre::{Result, WrapErr as _, bail, ensure};
-use data_encoding::HEXLOWER;
 use iroh::EndpointId;
 use serde::{Deserialize, Serialize};
 use tracing::debug;
 
-use super::ConfigDir;
-
-/// Maximum length of a peer or repo name, in bytes.
-///
-/// Names can be announced by remote machines and end up as terminal output,
-/// so they are kept short and free of control characters.
-pub const MAX_NAME_LEN: usize = 64;
-
-/// Cap on machines tracked in the mesh state, tombstones included. A
-/// personal mesh is a handful of machines; the cap keeps a peer from
-/// growing the state file (and the membership we must be able to gossip)
-/// without bound.
-pub const MAX_MESH_PEERS: usize = 256;
-
-/// Cap on repos tracked in the mesh-wide repo list, same reasoning.
-pub const MAX_MESH_REPOS: usize = 1024;
-
-/// Cap on a peer record's version. Versions only ever advance by one per
-/// local change, so a record beyond this is corrupted or hostile: without
-/// the cap, a record parked at `u64::MAX` could never be superseded again,
-/// permanently freezing a machine out of the mesh.
-const MAX_RECORD_VERSION: u64 = 1 << 32;
-
-/// Checks that a peer or repo name is usable; `kind` names it in errors.
-/// Also applied to names arriving from remote machines (announcements),
-/// which must never carry unbounded length or confusable characters.
-pub(crate) fn validate_name(kind: &str, name: &str) -> Result<()> {
-    ensure!(!name.is_empty(), "{kind} name cannot be empty");
-    ensure!(
-        name.len() <= MAX_NAME_LEN,
-        "{kind} name is longer than {MAX_NAME_LEN} bytes",
-    );
-    ensure!(
-        !name.chars().any(is_confusable),
-        "{kind} name contains control or invisible characters",
-    );
-
-    Ok(())
-}
-
-/// Makes a peer-supplied string safe to surface to the user: drops the
-/// characters that could hide or reorder terminal output, and bounds the
-/// length (a peer's string is not ours to trust for size).
-pub(crate) fn sanitize(text: &str) -> String {
-    const MAX_SANITIZED_LEN: usize = 200;
-    text.chars()
-        .filter(|c| !is_confusable(*c))
-        .take(MAX_SANITIZED_LEN)
-        .collect()
-}
-
-/// Whether a character can hide or reorder text in terminal output: controls
-/// (`is_control` covers only `Cc`), zero-width and bidi formatting. Names and
-/// other peer-supplied strings must never reach the terminal carrying one.
-pub(crate) fn is_confusable(c: char) -> bool {
-    c.is_control()
-        || matches!(
-            c,
-            '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' | '\u{FEFF}'
-        )
-}
+use self::membership::{MAX_RECORD_VERSION, bumped_version, should_adopt};
+pub use self::{
+    membership::{
+        MAX_MESH_PEERS, MAX_MESH_REPOS, Membership, MeshRepo, MeshRepoStatus, Peer, PeerStatus,
+    },
+    repo::{Repo, RepoId},
+};
+use super::{ConfigDir, validate_name};
 
 /// This machine's copy of the mesh state.
 ///
@@ -367,12 +314,11 @@ impl MeshState {
     /// Merges a peer's membership into ours. `local` is this machine's own
     /// endpoint: records about ourselves are not ours to store.
     ///
-    /// Peer and mesh repo records are versioned registers: the higher
-    /// version wins, and ties resolve to the retired state (removed),
-    /// then to the smaller name or id, so every machine converges on the
-    /// same record without clocks. Adopting a removed repo also
-    /// unregisters it here: that is how the removal reaches the machines
-    /// that hold it.
+    /// Records merge as versioned registers (see the `membership`
+    /// submodule), so every
+    /// machine converges on the same state without clocks. Adopting a
+    /// removed repo also unregisters it here: that is how the removal
+    /// reaches the machines that hold it.
     ///
     /// The merged maps are capped: a peer is authenticated but not trusted
     /// to grow our state file (which we must keep gossipable) without
@@ -427,213 +373,6 @@ fn canonical_path(path: &Path) -> PathBuf {
     fs::canonicalize(path).unwrap_or_else(|_| path.to_owned())
 }
 
-/// A gossip-replicated versioned register (peer or mesh repo record). The
-/// higher version wins; ties go to the retired state (tombstone), then to
-/// the smaller payload, so every machine converges on the same record
-/// without clocks. [`Peer`] and [`MeshRepo`] are the two implementors.
-trait Register: Clone {
-    /// Bumped on every local change, so the change outranks other machines.
-    fn version(&self) -> u64;
-    /// Whether this record outranks `other` and should replace it on merge.
-    fn outranks(&self, other: &Self) -> bool;
-}
-
-/// The version a local change to the record under `key` must carry to
-/// outrank the stored one. Refuses to pass [`MAX_RECORD_VERSION`]: a
-/// saturating bump would make the record unchangeable, so one parked at the
-/// ceiling is reported instead of silently freezing its subject out.
-fn bumped_version<K, Q, V>(map: &BTreeMap<K, V>, key: &Q) -> Result<u64>
-where
-    K: Ord + Borrow<Q>,
-    Q: Ord + fmt::Display + ?Sized,
-    V: Register,
-{
-    let version = map.get(key).map_or(0, V::version);
-    ensure!(
-        version < MAX_RECORD_VERSION,
-        "the mesh record of `{key}` is corrupted (version {version}); \
-         remove it from mesh.json on every machine",
-    );
-
-    Ok(version + 1)
-}
-
-/// Whether a gossiped `record` should be adopted into `map` under `key`: it
-/// must outrank what we hold, and a key we do not know is only added while
-/// the map is below `cap`, so a peer cannot grow our state without bound.
-fn should_adopt<K: Ord, V: Register>(
-    map: &BTreeMap<K, V>,
-    key: &K,
-    record: &V,
-    cap: usize,
-) -> bool {
-    match map.get(key) {
-        Some(ours) => record.outranks(ours),
-        None => map.len() < cap,
-    }
-}
-
-/// A machine's record in the mesh, replicated by the membership gossip as
-/// a versioned register (see [`MeshState::merge_membership`]).
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Peer {
-    /// Bumped on every local change to the record, so the change outranks
-    /// the state every other machine holds.
-    pub version: u64,
-    pub status: PeerStatus,
-}
-
-impl Peer {
-    /// The machine's name while it is part of the mesh; `None` for a
-    /// tombstone.
-    pub fn name(&self) -> Option<&str> {
-        match &self.status {
-            PeerStatus::Alive { name } => Some(name),
-            PeerStatus::Removed => None,
-        }
-    }
-}
-
-impl Register for Peer {
-    fn version(&self) -> u64 {
-        self.version
-    }
-
-    /// Higher version first, removal beating alive on ties, then the smaller
-    /// name (so equal-version renames converge instead of ping-ponging).
-    fn outranks(&self, other: &Self) -> bool {
-        fn rank(peer: &Peer) -> (u64, bool, cmp::Reverse<&str>) {
-            (
-                peer.version,
-                peer.name().is_none(),
-                cmp::Reverse(peer.name().unwrap_or("")),
-            )
-        }
-        rank(self) > rank(other)
-    }
-}
-
-/// Whether a machine is part of the mesh. `Removed` is a tombstone: it
-/// must be remembered (and gossiped) so a machine that missed the removal
-/// cannot resurrect the peer.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PeerStatus {
-    Alive { name: String },
-    Removed,
-}
-
-/// A repo's record in the mesh-wide list, replicated by the membership
-/// gossip as a versioned register like [`Peer`].
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct MeshRepo {
-    /// Bumped on every local change to the record.
-    pub version: u64,
-    pub status: MeshRepoStatus,
-}
-
-/// Whether a repo name is in use on the mesh. `Removed` is a tombstone:
-/// remembering it is what keeps a machine that missed the removal from
-/// resurrecting the name.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum MeshRepoStatus {
-    Present { id: RepoId },
-    Removed,
-}
-
-impl MeshRepo {
-    /// The repo's mesh id while the name is in use; `None` for a tombstone.
-    pub fn id(&self) -> Option<&RepoId> {
-        match &self.status {
-            MeshRepoStatus::Present { id } => Some(id),
-            MeshRepoStatus::Removed => None,
-        }
-    }
-}
-
-impl Register for MeshRepo {
-    fn version(&self) -> u64 {
-        self.version
-    }
-
-    /// Higher version first, removal beating presence on ties, then the
-    /// smaller id.
-    fn outranks(&self, other: &Self) -> bool {
-        fn rank(repo: &MeshRepo) -> (u64, bool, cmp::Reverse<Option<&RepoId>>) {
-            (repo.version, repo.id().is_none(), cmp::Reverse(repo.id()))
-        }
-        rank(self) > rank(other)
-    }
-}
-
-/// The membership one machine gossips: its whole view of the mesh. Sent as
-/// idempotent latest-wins snapshots (on connect, on every change, and
-/// periodically), so a lost message is healed by a later one.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Membership {
-    pub peers: BTreeMap<EndpointId, Peer>,
-    /// The mesh-wide repo list, tombstones included.
-    pub repos: BTreeMap<String, MeshRepo>,
-}
-
-/// A repo registered on this machine.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Repo {
-    /// Mesh-wide identifier of the repo.
-    pub id: RepoId,
-    /// Local repository root (the directory containing `.jj`), stored
-    /// canonicalized by [`MeshState::add_repo`].
-    pub path: PathBuf,
-}
-
-/// Mesh-wide identifier of a repo, shared by all machines syncing it. Randomly
-/// generated.
-///
-/// Ids also arrive from remote machines (sync announcements), so
-/// deserialization enforces the generated form: names and ids crossing that
-/// boundary must never carry control characters or unbounded length.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(try_from = "String")]
-pub struct RepoId(String);
-
-/// Length of a repo id in hex characters (16 random bytes).
-const REPO_ID_LEN: usize = 32;
-
-impl RepoId {
-    /// Generates a random id repo id.
-    pub fn generate() -> Self {
-        RepoId(HEXLOWER.encode(&rand::random::<[u8; 16]>()))
-    }
-}
-
-impl TryFrom<String> for RepoId {
-    type Error = String;
-
-    fn try_from(value: String) -> Result<Self, Self::Error> {
-        let valid = value.len() == REPO_ID_LEN
-            && value
-                .bytes()
-                .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
-        if valid {
-            Ok(RepoId(value))
-        } else {
-            Err(format!(
-                "repo ids are {REPO_ID_LEN} lowercase hex characters"
-            ))
-        }
-    }
-}
-
-impl fmt::Display for RepoId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use iroh::SecretKey;
@@ -645,20 +384,6 @@ mod tests {
         MeshRepo {
             version,
             status: MeshRepoStatus::Present { id: id.clone() },
-        }
-    }
-
-    #[test]
-    fn repo_id_rejects_non_generated_forms() {
-        let ok = postcard::to_stdvec(&RepoId::generate()).unwrap();
-        assert!(postcard::from_bytes::<RepoId>(&ok).is_ok());
-
-        for bad in ["", "short", &"a".repeat(33), &"Z".repeat(32), "e\x1b[2K\n"] {
-            let bytes = postcard::to_stdvec(&bad).unwrap();
-            assert!(
-                postcard::from_bytes::<RepoId>(&bytes).is_err(),
-                "{bad:?} must be rejected",
-            );
         }
     }
 

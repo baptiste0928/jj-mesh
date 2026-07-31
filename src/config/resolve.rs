@@ -1,8 +1,7 @@
-//! Configuration files resolution.
+//! Configuration directory resolution.
 //!
-//! The folder containing the configuration follows the XDG convention and is
-//! resolved with `etcetera` (it will be `~/.config/jj-mesh` in most cases). It
-//! will be created if not existing.
+//! The directory follows the XDG convention, resolved with `etcetera`
+//! (usually `~/.config/jj-mesh`), and is created on first use.
 
 use std::{
     fs,
@@ -12,7 +11,8 @@ use std::{
 use color_eyre::eyre::{Result, WrapErr, eyre};
 use etcetera::BaseStrategy;
 
-/// Resolved configuration directory.
+/// Resolved configuration directory. Constructing it guarantees the
+/// directory exists, so config files are safe to create inside.
 #[derive(Clone, Debug)]
 pub struct ConfigDir {
     path: PathBuf,
@@ -22,14 +22,11 @@ pub struct ConfigDir {
 }
 
 impl ConfigDir {
-    /// Resolves the configuration directory if no `dir` is provided.
-    ///
-    /// The directory will be created if it doesn't exist. This types guarantees
-    /// that the configuration directory exists, so config files are safe to
-    /// create inside.
+    /// Resolves the configuration directory, or uses `override_dir` when
+    /// given. An overridden directory is never created implicitly: it must
+    /// already exist.
     pub fn new(override_dir: Option<PathBuf>) -> Result<Self> {
         if let Some(config_dir) = override_dir {
-            // When a custom directory is provided, we don't create it implicitely.
             let metadata =
                 fs::metadata(&config_dir).wrap_err("cannot open custom config directory")?;
 
@@ -66,7 +63,7 @@ impl ConfigDir {
         })
     }
 
-    /// Get the resolved path of the config directory.
+    /// The resolved config directory path.
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -76,28 +73,22 @@ impl ConfigDir {
         self.custom
     }
 
-    /// Get the path to the machine key file.
-    ///
-    /// There is no guarantee that the file exists.
+    /// Path of the machine identity key file (`machine.key`).
     pub fn machine_key(&self) -> PathBuf {
         self.path.join("machine.key")
     }
 
-    /// Get the path to the mesh state file.
-    ///
-    /// There is no guarantee that the file exists.
+    /// Path of the mesh state file (`mesh.json`).
     pub fn mesh_file(&self) -> PathBuf {
         self.path.join("mesh.json")
     }
 
-    /// Get the path to the daemon settings file (`config.toml`).
-    ///
-    /// There is no guarantee that the file exists.
+    /// Path of the daemon settings file (`config.toml`).
     pub fn settings_file(&self) -> PathBuf {
         self.path.join("config.toml")
     }
 
-    /// Get the path to the daemon control socket.
+    /// Path of the daemon control socket.
     ///
     /// Usually `$XDG_RUNTIME_DIR/jj-mesh.sock`; kept inside custom config
     /// directories so several daemons can coexist on one machine (tests).

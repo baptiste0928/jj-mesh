@@ -2,9 +2,7 @@
 
 mod harness;
 
-use std::fs;
-
-use harness::{TestMesh, add_and_clone, connect, descriptions, init_clone_repo, wait_converged};
+use harness::{TestMesh, add_and_clone, connect, descriptions, wait_converged};
 use jj_mesh::daemon::control::{Request, Response};
 
 /// Machines that never paired directly learn about each other through
@@ -14,10 +12,8 @@ use jj_mesh::daemon::control::{Request, Response};
 async fn membership_gossips_transitively() {
     // Only A-B and B-C are paired.
     let mesh = TestMesh::new();
-    let a = mesh.machine("machine-a").await;
-    let b = mesh.machine("machine-b").await;
+    let (a, b) = mesh.connected_pair().await;
     let c = mesh.machine("machine-c").await;
-    connect(&a, &b).await;
     connect(&b, &c).await;
 
     // A and C discover each other through B and connect directly.
@@ -25,10 +21,8 @@ async fn membership_gossips_transitively() {
     a.wait_peer_connected("machine-c").await;
 
     // C clones a repo added on A and receives its commits.
-    let dir_a = mesh.jj.init_repo("proj");
-    let dir_c = add_and_clone(&mesh, &a, &c, &dir_a, "proj").await;
-    fs::write(dir_a.join("file.txt"), "hello\n").unwrap();
-    mesh.jj.jj(&dir_a, &["commit", "-m", "from a"]);
+    let (dir_a, dir_c) = add_and_clone(&mesh, &a, &c, "proj").await;
+    mesh.jj.commit_file(&dir_a, "file.txt", "from a");
     wait_converged(&dir_a, &dir_c).await;
     assert!(descriptions(&mesh, &dir_c).contains("from a"));
 
@@ -57,17 +51,12 @@ async fn membership_gossips_transitively() {
 #[tokio::test(flavor = "multi_thread")]
 async fn forgetting_locally_keeps_the_repo_clonable() {
     let mesh = TestMesh::new();
-    let a = mesh.machine("machine-a").await;
-    let b = mesh.machine("machine-b").await;
-    connect(&a, &b).await;
-
-    let dir_a = mesh.jj.init_repo("proj");
-    let dir_b = add_and_clone(&mesh, &a, &b, &dir_a, "proj").await;
+    let (a, b) = mesh.connected_pair().await;
+    let (dir_a, dir_b) = add_and_clone(&mesh, &a, &b, "proj").await;
 
     // Sync some traffic first, so B's announcement sequence has advanced
     // by the time it forgets the repo.
-    fs::write(dir_b.join("file.txt"), "hello\n").unwrap();
-    mesh.jj.jj(&dir_b, &["commit", "-m", "before forget"]);
+    mesh.jj.commit_file(&dir_b, "file.txt", "before forget");
     wait_converged(&dir_a, &dir_b).await;
 
     let forgotten = b
@@ -94,14 +83,13 @@ async fn forgetting_locally_keeps_the_repo_clonable() {
     assert!(matches!(again, Response::Error(_)), "{again:?}");
 
     // ...but the repo clones again into a fresh directory and catches up...
-    let dir_b2 = init_clone_repo(&mesh, "proj-again", "machine-b-again");
+    let dir_b2 = mesh.jj.init_clone_repo("proj-again", "machine-b-again");
     b.clone_repo("proj", &dir_b2).await;
     wait_converged(&dir_a, &dir_b2).await;
     assert!(descriptions(&mesh, &dir_b2).contains("before forget"));
 
     // ...and changes flow in both directions afterwards.
-    fs::write(dir_b2.join("after.txt"), "hello\n").unwrap();
-    mesh.jj.jj(&dir_b2, &["commit", "-m", "after forget"]);
+    mesh.jj.commit_file(&dir_b2, "after.txt", "after forget");
     wait_converged(&dir_a, &dir_b2).await;
     assert!(descriptions(&mesh, &dir_a).contains("after forget"));
 }
@@ -118,23 +106,14 @@ async fn pairing_requires_the_ticket_secret() {
 
     // A join with a tampered secret is rejected; nobody is paired.
     let rejected = b
-        .try_request(&Request::PairJoin {
-            ticket: tamper_secret(&ticket),
-            name: "machine-b".to_owned(),
-        })
+        .try_join_pairing(tamper_secret(&ticket), "machine-b")
         .await;
     assert!(matches!(rejected, Response::Error(_)), "{rejected:?}");
     assert!(a.status().await.peers.is_empty());
     assert!(b.status().await.peers.is_empty());
 
     // The ticket survives the bad attempt: the original one works.
-    let joined = b
-        .request(&Request::PairJoin {
-            ticket,
-            name: "machine-b".to_owned(),
-        })
-        .await;
-    assert!(matches!(joined, Response::Paired { .. }), "{joined:?}");
+    b.join_pairing(ticket).await;
     a.wait_peer_connected("machine-b").await;
     b.wait_peer_connected("machine-a").await;
 }
@@ -150,22 +129,11 @@ async fn pairing_ticket_is_single_use() {
     let ticket = a.host_pairing().await;
 
     // B pairs with the ticket, which redeems it.
-    let joined = b
-        .request(&Request::PairJoin {
-            ticket: ticket.clone(),
-            name: "machine-b".to_owned(),
-        })
-        .await;
-    assert!(matches!(joined, Response::Paired { .. }), "{joined:?}");
+    b.join_pairing(ticket.clone()).await;
     a.wait_peer_connected("machine-b").await;
 
     // Reusing the ticket is refused; the third machine is not paired.
-    let reused = c
-        .try_request(&Request::PairJoin {
-            ticket,
-            name: "machine-c".to_owned(),
-        })
-        .await;
+    let reused = c.try_join_pairing(ticket, "machine-c").await;
     assert!(matches!(reused, Response::Error(_)), "{reused:?}");
     assert!(c.status().await.peers.is_empty());
     assert_eq!(a.status().await.peers.len(), 1);
@@ -182,22 +150,11 @@ async fn failed_attempt_keeps_the_ticket_valid() {
 
     let ticket = a.host_pairing().await;
 
-    let rejected = b
-        .try_request(&Request::PairJoin {
-            ticket: ticket.clone(),
-            name: String::new(),
-        })
-        .await;
+    let rejected = b.try_join_pairing(ticket.clone(), "").await;
     assert!(matches!(rejected, Response::Error(_)), "{rejected:?}");
     assert!(a.status().await.peers.is_empty());
 
-    let joined = b
-        .request(&Request::PairJoin {
-            ticket,
-            name: "machine-b".to_owned(),
-        })
-        .await;
-    assert!(matches!(joined, Response::Paired { .. }), "{joined:?}");
+    b.join_pairing(ticket).await;
     a.wait_peer_connected("machine-b").await;
 }
 
@@ -214,23 +171,12 @@ async fn rehosting_replaces_the_ticket() {
 
     // The replaced ticket is dead, and rejecting it does not burn the
     // fresh one...
-    let rejected = b
-        .try_request(&Request::PairJoin {
-            ticket: stale,
-            name: "machine-b".to_owned(),
-        })
-        .await;
+    let rejected = b.try_join_pairing(stale, "machine-b").await;
     assert!(matches!(rejected, Response::Error(_)), "{rejected:?}");
     assert!(a.status().await.peers.is_empty());
 
     // ...while the fresh one pairs.
-    let joined = b
-        .request(&Request::PairJoin {
-            ticket: fresh,
-            name: "machine-b".to_owned(),
-        })
-        .await;
-    assert!(matches!(joined, Response::Paired { .. }), "{joined:?}");
+    b.join_pairing(fresh).await;
     a.wait_peer_connected("machine-b").await;
 }
 

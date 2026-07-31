@@ -55,7 +55,7 @@ impl Fixture {
             .is_ok_and(|out| out.status.success())
     }
 
-    /// The hermetic jj invocation shared by the runners above.
+    /// The hermetic jj invocation shared by all runners.
     fn jj_command(&self, dir: &Path, args: &[&str]) -> Command {
         let mut cmd = Command::new(crate::repo::jj_bin());
         cmd.current_dir(dir)
@@ -74,6 +74,22 @@ impl Fixture {
         self.jj(self.tmp.path(), &["git", "init", name]);
         self.jj(&dir, &["describe", "-m", "base"]);
         dir
+    }
+
+    /// Initializes a fresh repo named `name` as `jj-mesh repo clone` does:
+    /// non-colocated, with a machine-unique workspace name.
+    pub fn init_clone_repo(&self, name: &str, workspace: &str) -> PathBuf {
+        let dir = self.tmp.path().join(name);
+        self.jj(self.tmp.path(), &["git", "init", "--no-colocate", name]);
+        self.jj(&dir, &["workspace", "rename", workspace]);
+        dir
+    }
+
+    /// Writes `message` into `file` and commits it under the same message
+    /// in the repo at `dir`.
+    pub fn commit_file(&self, dir: &Path, file: &str, message: &str) {
+        fs::write(dir.join(file), format!("{message}\n")).unwrap();
+        self.jj(dir, &["commit", "-m", message]);
     }
 }
 

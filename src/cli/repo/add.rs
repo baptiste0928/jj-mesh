@@ -6,7 +6,7 @@ use clap::{Args, ValueHint};
 use color_eyre::eyre::{Result, bail, eyre};
 
 use crate::{
-    cli::ui,
+    cli::{hostname, ui},
     config::ConfigDir,
     daemon::control::{self, Request, Response},
     repo::JjRepo,
@@ -49,11 +49,12 @@ pub fn run(args: AddArgs, dir: &ConfigDir) -> Result<()> {
             .into_owned(),
     };
 
-    // Rename the machine workspace with its hostname if it's `default`
+    // A repo still on jj's `default` workspace name gets the hostname, so
+    // workspace names stay unique across the mesh; a deliberately named
+    // workspace is kept as-is.
     let workspace = match args.workspace {
         Some(name) => Some(name),
-        None if repo.workspace_name()? == "default" => Some(super::machine_workspace_name()),
-
+        None if repo.workspace_name()? == "default" => Some(hostname()),
         None => None,
     };
     if let Some(workspace) = &workspace {

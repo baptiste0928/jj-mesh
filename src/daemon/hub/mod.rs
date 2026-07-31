@@ -4,12 +4,17 @@
 //! them and makes announcements genuinely latest-wins in both directions:
 //!
 //! - Outbound, each connected peer has one sender task draining a per-repo
-//!   coalescing outbox: publishes overwrite the pending entry for their
+//!   coalescing [`Outbox`]: publishes overwrite the pending entry for their
 //!   repo, sends are sequential per peer, and a (re)connecting peer's
 //!   outbox is seeded with every published repo (anti-entropy replay).
-//! - Inbound, announcements land in a per-peer slot on the repo's inbox,
-//!   newer sequence numbers overwriting older ones, so reordered streams
-//!   and slow repo tasks can never make stale state win.
+//! - Inbound, announcements land in a per-peer slot on the repo's
+//!   [`Inbox`], newer sequence numbers overwriting older ones, so reordered
+//!   streams and slow repo tasks can never make stale state win.
+//!
+//! ```text
+//! peer task --route()---> Inbox (per repo) ---drain()--> repo task
+//! peer task <--sender---- Outbox (per peer) <-publish()- repo task
+//! ```
 //!
 //! Repos are identified by name. An announcement whose name matches a
 //! registered repo but whose id differs means two unrelated repos contest
@@ -23,6 +28,11 @@
 //! outboxes: the mesh store publishes it here on every change, and it is
 //! replayed (before any announcement) to every connecting peer.
 
+mod inbox;
+mod outbox;
+#[cfg(test)]
+mod tests;
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::{Arc, Mutex},
@@ -34,35 +44,18 @@ use iroh::{
     EndpointId,
     endpoint::{Connection, RecvStream, SendStream},
 };
-use tokio::sync::Notify;
 use tracing::{debug, warn};
 
+pub use self::inbox::{Inbox, PeerAnnounce};
+use self::outbox::{Outbox, run_sender};
 use crate::{
     config::{Membership, RepoId, sanitize, validate_name},
     net::{
-        sync::{
-            self, Announce, FetchRequest, MAX_OP_FRAME_SIZE, OpFrame, StatusReport, UniMessage,
-        },
+        sync::{Announce, FetchRequest, MAX_OP_FRAME_SIZE, OpFrame, StatusReport},
         wire,
     },
     repo::{MeshRepo, transfer},
 };
-
-/// Budget for sending one announcement; a stalled peer connection kills
-/// its sender task (the reconnect replay recovers the state).
-const ANNOUNCE_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// An announcement received from a peer, drained by a repo task.
-#[derive(Debug)]
-pub struct PeerAnnounce {
-    pub peer: EndpointId,
-    /// Sequence it was drained at, so a failed fetch can [requeue] the
-    /// heads without clobbering a newer announcement.
-    ///
-    /// [requeue]: Inbox::requeue
-    pub seq: u64,
-    pub heads: Vec<Vec<u8>>,
-}
 
 /// Fetches served concurrently per repo (read-only on the repo).
 const MAX_SERVES: usize = 2;
@@ -70,6 +63,15 @@ const MAX_SERVES: usize = 2;
 /// Hard budget on serving one fetch; QUIC flow control means a stalled
 /// fetcher could otherwise pin a serve task and its permit forever.
 const SERVE_TIMEOUT: Duration = Duration::from_mins(30);
+
+/// Cap on unregistered repo names tracked *per peer*, so one peer (hostile
+/// or simply repo-rich) cannot evict the names other peers announce. A
+/// peer's entries are pruned when it disconnects.
+const MAX_ORPHAN_REPOS_PER_PEER: usize = 64;
+
+/// A peer that can serve a `clone` of an unregistered repo, with the op
+/// heads it claims.
+pub type CloneSource = (EndpointId, Vec<Vec<u8>>);
 
 /// The router between peer connections and repo tasks.
 #[derive(Debug, Default)]
@@ -102,10 +104,23 @@ struct HubState {
     reports: BTreeMap<EndpointId, StatusReport>,
 }
 
-/// Cap on unregistered repo names tracked *per peer*, so one peer (hostile
-/// or simply repo-rich) cannot evict the names other peers announce. A
-/// peer's entries are pruned when it disconnects.
-const MAX_ORPHAN_REPOS_PER_PEER: usize = 64;
+impl HubState {
+    /// How many orphan names hold an entry for `peer`, against
+    /// [`MAX_ORPHAN_REPOS_PER_PEER`].
+    fn orphans_held_by(&self, peer: &EndpointId) -> usize {
+        self.orphans
+            .values()
+            .filter(|peers| peers.contains_key(peer))
+            .count()
+    }
+
+    /// Queues a message to every connected peer's outbox.
+    fn broadcast(&self, push: impl Fn(&Outbox)) {
+        for sender in self.peers.values() {
+            push(&sender.outbox);
+        }
+    }
+}
 
 /// The latest announcement one peer made for an unregistered repo name.
 #[derive(Debug, Clone)]
@@ -114,10 +129,6 @@ struct OrphanAnnounce {
     heads: Vec<Vec<u8>>,
     colocated: bool,
 }
-
-/// A peer that can serve a `clone` of an unregistered repo, with the op
-/// heads it claims.
-pub type CloneSource = (EndpointId, Vec<Vec<u8>>);
 
 /// Hub-side state of one registered repo.
 #[derive(Debug)]
@@ -155,7 +166,7 @@ impl RepoEntry {
     /// one peer's are both colocated. Two colocated instances exchanging
     /// ops pollute history (each side re-imports its machine-local git
     /// HEAD after every sync, resurrecting rewritten commits as divergent
-    /// changes), so while paused this repo fetches from nobody — with both
+    /// changes), so while paused this repo fetches from nobody; with both
     /// conflicted sides refusing to fetch, the poisonous ops cannot land
     /// even through a relaying third machine. Announcing and serving
     /// non-conflicted peers stays enabled: read-only serving cannot hurt
@@ -354,12 +365,7 @@ impl SyncHub {
         };
 
         for (peer, heads) in entry.inbox.snapshot() {
-            let held = state
-                .orphans
-                .values()
-                .filter(|peers| peers.contains_key(&peer))
-                .count();
-            if held >= MAX_ORPHAN_REPOS_PER_PEER {
+            if state.orphans_held_by(&peer) >= MAX_ORPHAN_REPOS_PER_PEER {
                 continue;
             }
             state.orphans.entry(name.to_owned()).or_default().insert(
@@ -374,16 +380,14 @@ impl SyncHub {
 
         if entry.published.is_some() {
             state.announce_seq += 1;
-            let retraction = Announce {
+            let announce = Announce {
                 name: name.to_owned(),
                 id: entry.id,
                 seq: state.announce_seq,
                 heads: Vec::new(),
                 colocated: false,
             };
-            for sender in state.peers.values() {
-                sender.outbox.push_announce(retraction.clone());
-            }
+            state.broadcast(|outbox| outbox.push_announce(announce.clone()));
         }
     }
 
@@ -408,9 +412,7 @@ impl SyncHub {
             heads,
             colocated: entry.local_colocated,
         };
-        for sender in state.peers.values() {
-            sender.outbox.push_announce(announce.clone());
-        }
+        state.broadcast(|outbox| outbox.push_announce(announce.clone()));
     }
 
     /// Publishes this machine's status report: cached for peers that
@@ -418,9 +420,7 @@ impl SyncHub {
     /// any report still pending there.
     pub fn publish_status(&self, report: StatusReport) {
         let mut state = self.state.lock().unwrap();
-        for sender in state.peers.values() {
-            sender.outbox.push_status(report.clone());
-        }
+        state.broadcast(|outbox| outbox.push_status(report.clone()));
         state.status = Some(report);
     }
 
@@ -432,9 +432,7 @@ impl SyncHub {
     pub fn publish_membership(&self, membership: Membership) {
         let mut state = self.state.lock().unwrap();
         state.membership = membership;
-        for sender in state.peers.values() {
-            sender.outbox.push_membership(state.membership.clone());
-        }
+        state.broadcast(|outbox| outbox.push_membership(state.membership.clone()));
     }
 
     /// Marks a peer connected: spawns its sender task and seeds the outbox
@@ -537,16 +535,9 @@ impl SyncHub {
                 .orphans
                 .get(&announce.name)
                 .is_some_and(|peers| peers.contains_key(&peer));
-            if !known {
-                let held = state
-                    .orphans
-                    .values()
-                    .filter(|peers| peers.contains_key(&peer))
-                    .count();
-                if held >= MAX_ORPHAN_REPOS_PER_PEER {
-                    debug!(peer = %peer, "dropping announcement: too many unregistered repos");
-                    return;
-                }
+            if !known && state.orphans_held_by(&peer) >= MAX_ORPHAN_REPOS_PER_PEER {
+                debug!(peer = %peer, "dropping announcement: too many unregistered repos");
+                return;
             }
             state.orphans.entry(announce.name).or_default().insert(
                 peer,
@@ -712,533 +703,4 @@ fn refuse_fetch(mut send: SendStream, message: &'static str) {
         let _ = wire::write_message(&mut send, &frame, MAX_OP_FRAME_SIZE).await;
         let _ = send.finish();
     });
-}
-
-/// Inbound announcements for one repo: the latest per peer, drained by
-/// the repo task.
-#[derive(Debug, Default)]
-pub struct Inbox {
-    slots: Mutex<BTreeMap<EndpointId, Slot>>,
-    notify: Notify,
-}
-
-/// One peer's slot: the highest announcement sequence seen and its heads.
-/// The heads survive draining (marked `drained`), so the peer's last known
-/// state can be demoted to an orphan announcement when the repo is
-/// unregistered, and the watermark fends off reordered stale
-/// announcements arriving after a drain.
-#[derive(Debug)]
-struct Slot {
-    seq: u64,
-    heads: Vec<Vec<u8>>,
-    drained: bool,
-}
-
-impl Inbox {
-    /// Stores an announcement unless a newer one was already seen.
-    fn offer(&self, peer: EndpointId, seq: u64, heads: Vec<Vec<u8>>) {
-        {
-            let mut slots = self.slots.lock().unwrap();
-            if slots.get(&peer).is_some_and(|slot| slot.seq >= seq) {
-                return;
-            }
-            slots.insert(
-                peer,
-                Slot {
-                    seq,
-                    heads,
-                    drained: false,
-                },
-            );
-        }
-        self.notify.notify_one();
-    }
-
-    /// Drops a peer's slot (its connection is gone).
-    fn forget(&self, peer: &EndpointId) {
-        self.slots.lock().unwrap().remove(peer);
-    }
-
-    /// Records a retraction: the watermark advances and the heads clear,
-    /// so a reordered pre-retraction announcement stays rejected while a
-    /// later re-registration's announcements come through.
-    fn retract(&self, peer: EndpointId, seq: u64) {
-        let mut slots = self.slots.lock().unwrap();
-        if slots.get(&peer).is_some_and(|slot| slot.seq >= seq) {
-            return;
-        }
-        slots.insert(
-            peer,
-            Slot {
-                seq,
-                heads: Vec::new(),
-                drained: true,
-            },
-        );
-    }
-
-    /// The last announced heads of every peer, drained or not, for
-    /// demotion to orphan announcements on unregistration. Peers that
-    /// retracted the repo (no heads) are not included.
-    fn snapshot(&self) -> Vec<(EndpointId, Vec<Vec<u8>>)> {
-        let slots = self.slots.lock().unwrap();
-        slots
-            .iter()
-            .filter(|(_, slot)| !slot.heads.is_empty())
-            .map(|(peer, slot)| (*peer, slot.heads.clone()))
-            .collect()
-    }
-
-    /// Resolves when an announcement may be waiting. Consumers should
-    /// still [`Self::drain`] on every wake from any source, so a missed
-    /// notification is healed by the next one.
-    pub async fn changed(&self) {
-        self.notify.notified().await;
-    }
-
-    /// Takes all undrained announcements, keeping the per-peer sequence
-    /// watermarks.
-    pub fn drain(&self) -> Vec<PeerAnnounce> {
-        let mut slots = self.slots.lock().unwrap();
-        slots
-            .iter_mut()
-            .filter(|(_, slot)| !slot.drained)
-            .map(|(peer, slot)| {
-                slot.drained = true;
-                PeerAnnounce {
-                    peer: *peer,
-                    seq: slot.seq,
-                    heads: slot.heads.clone(),
-                }
-            })
-            .collect()
-    }
-
-    /// Restores heads a fetch failed to apply, so the next drain retries
-    /// them. A newer announcement arriving meanwhile supersedes them (it
-    /// bumps the slot past `seq`), and a fresh connection drops the slot
-    /// entirely, so the retry never resurrects stale or revoked state. Does
-    /// not notify: the retry is driven by the repo task's own timer, which
-    /// avoids hot-looping against a peer that keeps failing.
-    pub fn requeue(&self, peer: EndpointId, seq: u64, heads: Vec<Vec<u8>>) {
-        let mut slots = self.slots.lock().unwrap();
-        if let Some(slot) = slots.get_mut(&peer)
-            && slot.seq == seq
-            && slot.drained
-        {
-            slot.heads = heads;
-            slot.drained = false;
-        }
-    }
-}
-
-/// Pending messages for one peer, coalesced latest-wins: one slot for the
-/// membership and one per repo for announcements, each kept until the
-/// sender task takes it.
-#[derive(Debug, Default)]
-struct Outbox {
-    pending: Mutex<OutboxState>,
-    notify: Notify,
-}
-
-#[derive(Debug, Default)]
-struct OutboxState {
-    membership: Option<Membership>,
-    status: Option<StatusReport>,
-    announces: BTreeMap<String, Announce>,
-}
-
-impl Outbox {
-    fn push_announce(&self, announce: Announce) {
-        self.pending
-            .lock()
-            .unwrap()
-            .announces
-            .insert(announce.name.clone(), announce);
-        self.notify.notify_one();
-    }
-
-    fn push_membership(&self, membership: Membership) {
-        self.pending.lock().unwrap().membership = Some(membership);
-        self.notify.notify_one();
-    }
-
-    fn push_status(&self, report: StatusReport) {
-        self.pending.lock().unwrap().status = Some(report);
-        self.notify.notify_one();
-    }
-
-    /// Takes the next message, membership first (a new peer should learn
-    /// the mesh before anything else), then the status report, then the
-    /// repo announcements.
-    fn pop(&self) -> Option<UniMessage> {
-        let mut pending = self.pending.lock().unwrap();
-        if let Some(membership) = pending.membership.take() {
-            return Some(UniMessage::Membership(membership));
-        }
-        if let Some(report) = pending.status.take() {
-            return Some(UniMessage::Status(report));
-        }
-        pending
-            .announces
-            .pop_first()
-            .map(|(_, announce)| UniMessage::Announce(announce))
-    }
-}
-
-/// Sends a peer's outbox until its connection fails; messages lost with
-/// the connection are recovered by the reconnect replay.
-async fn run_sender(conn: Connection, outbox: Arc<Outbox>) {
-    loop {
-        let Some(message) = outbox.pop() else {
-            outbox.notify.notified().await;
-            continue;
-        };
-        match tokio::time::timeout(ANNOUNCE_TIMEOUT, sync::send_uni(&conn, &message)).await {
-            Ok(Ok(())) => {}
-            Ok(Err(err)) => return debug!("send failed: {err:#}"),
-            Err(_) => return debug!("send timed out"),
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn announce(name: &str, id: &RepoId, seq: u64, heads: Vec<Vec<u8>>) -> Announce {
-        Announce {
-            name: name.to_owned(),
-            id: id.clone(),
-            seq,
-            heads,
-            colocated: false,
-        }
-    }
-
-    #[tokio::test]
-    async fn routes_to_registered_repo() {
-        let hub = SyncHub::new();
-        let id = RepoId::generate();
-        let inbox = hub.register_repo("a".to_owned(), id.clone());
-
-        let peer = iroh::SecretKey::generate().public();
-        hub.route(peer, announce("a", &id, 1, vec![vec![1; 64]]));
-
-        let drained = inbox.drain();
-        assert_eq!(drained.len(), 1);
-        assert_eq!(drained[0].peer, peer);
-        assert_eq!(drained[0].heads, vec![vec![1; 64]]);
-        assert!(inbox.drain().is_empty());
-    }
-
-    #[tokio::test]
-    async fn discards_reordered_announcements() {
-        let hub = SyncHub::new();
-        let id = RepoId::generate();
-        let inbox = hub.register_repo("a".to_owned(), id.clone());
-        let peer = iroh::SecretKey::generate().public();
-
-        hub.route(peer, announce("a", &id, 2, vec![vec![2; 64]]));
-        hub.route(peer, announce("a", &id, 1, vec![vec![1; 64]]));
-
-        let drained = inbox.drain();
-        assert_eq!(drained.len(), 1);
-        assert_eq!(drained[0].heads, vec![vec![2; 64]]);
-
-        // The watermark survives draining: the stale announcement stays
-        // rejected even when it arrives afterwards.
-        hub.route(peer, announce("a", &id, 1, vec![vec![1; 64]]));
-        assert!(inbox.drain().is_empty());
-    }
-
-    #[tokio::test]
-    async fn requeue_retries_failed_heads_until_superseded() {
-        let hub = SyncHub::new();
-        let id = RepoId::generate();
-        let inbox = hub.register_repo("a".to_owned(), id.clone());
-        let peer = iroh::SecretKey::generate().public();
-
-        hub.route(peer, announce("a", &id, 1, vec![vec![1; 64]]));
-        let drained = inbox.drain();
-        assert_eq!(drained.len(), 1);
-
-        // A failed fetch requeues the drained heads; the next drain retries.
-        inbox.requeue(peer, drained[0].seq, drained[0].heads.clone());
-        let retried = inbox.drain();
-        assert_eq!(retried.len(), 1);
-        assert_eq!(retried[0].heads, vec![vec![1; 64]]);
-
-        // A newer announcement supersedes a stale requeue.
-        hub.route(peer, announce("a", &id, 2, vec![vec![2; 64]]));
-        inbox.requeue(peer, 1, vec![vec![1; 64]]);
-        let latest = inbox.drain();
-        assert_eq!(latest.len(), 1);
-        assert_eq!(latest[0].heads, vec![vec![2; 64]]);
-    }
-
-    #[tokio::test]
-    async fn ignores_unregistered_repo() {
-        let hub = SyncHub::new();
-        let id = RepoId::generate();
-        let inbox = hub.register_repo("a".to_owned(), id.clone());
-        hub.unregister_repo("a");
-
-        let peer = iroh::SecretKey::generate().public();
-        hub.route(peer, announce("a", &id, 1, vec![vec![1; 64]]));
-        assert!(inbox.drain().is_empty());
-    }
-
-    #[tokio::test]
-    async fn remembers_unregistered_announcements_for_clone() {
-        let hub = SyncHub::new();
-        let id = RepoId::generate();
-        let peer = iroh::SecretKey::generate().public();
-
-        // Not offered as a clone source while the peer is not connected.
-        hub.route(peer, announce("a", &id, 1, vec![vec![1; 64]]));
-        assert!(hub.clone_sources("a").is_err());
-
-        // Registering the repo claims the orphan entry.
-        let inbox = hub.register_repo("a".to_owned(), id.clone());
-        assert!(hub.clone_sources("a").is_err());
-        hub.route(peer, announce("a", &id, 2, vec![vec![2; 64]]));
-        assert_eq!(inbox.drain().len(), 1);
-    }
-
-    #[tokio::test]
-    async fn conflicting_id_is_surfaced_and_never_synced() {
-        let hub = SyncHub::new();
-        let id = RepoId::generate();
-        let inbox = hub.register_repo("a".to_owned(), id.clone());
-        let peer = iroh::SecretKey::generate().public();
-
-        let foreign = RepoId::generate();
-        hub.route(peer, announce("a", &foreign, 1, vec![vec![1; 64]]));
-
-        assert!(inbox.drain().is_empty(), "conflicts must not be synced");
-        assert_eq!(hub.conflicts(), vec![("a".to_owned(), peer)]);
-
-        // A matching announcement resumes sync and resolves the conflict.
-        hub.route(peer, announce("a", &id, 2, vec![vec![2; 64]]));
-        assert_eq!(inbox.drain().len(), 1);
-        assert!(hub.conflicts().is_empty());
-    }
-
-    #[tokio::test]
-    async fn tracks_conflicts_per_peer() {
-        let hub = SyncHub::new();
-        let id = RepoId::generate();
-        hub.register_repo("a".to_owned(), id.clone());
-        let (b, c) = (
-            iroh::SecretKey::generate().public(),
-            iroh::SecretKey::generate().public(),
-        );
-
-        hub.route(b, announce("a", &RepoId::generate(), 1, vec![vec![1; 64]]));
-        hub.route(c, announce("a", &RepoId::generate(), 1, vec![vec![2; 64]]));
-        assert_eq!(hub.conflicts().len(), 2);
-
-        // One peer leaving must not hide the other's live conflict.
-        hub.peer_disconnected(&c);
-        assert_eq!(hub.conflicts(), vec![("a".to_owned(), b)]);
-    }
-
-    #[tokio::test]
-    async fn register_seeds_conflicts_from_orphans() {
-        let hub = SyncHub::new();
-        let peer = iroh::SecretKey::generate().public();
-
-        // The peer announced first; adding a different local repo under
-        // the same name must surface the conflict without waiting for the
-        // (idle) peer to announce again.
-        hub.route(
-            peer,
-            announce("a", &RepoId::generate(), 1, vec![vec![1; 64]]),
-        );
-        hub.register_repo("a".to_owned(), RepoId::generate());
-        assert_eq!(hub.conflicts(), vec![("a".to_owned(), peer)]);
-    }
-
-    #[tokio::test]
-    async fn orphans_are_bounded_per_peer() {
-        let hub = SyncHub::new();
-        let flooder = iroh::SecretKey::generate().public();
-        let honest = iroh::SecretKey::generate().public();
-
-        for n in 0..MAX_ORPHAN_REPOS_PER_PEER {
-            hub.route(
-                flooder,
-                announce(
-                    &format!("junk{n}"),
-                    &RepoId::generate(),
-                    1,
-                    vec![vec![1; 64]],
-                ),
-            );
-        }
-        hub.route(
-            honest,
-            announce("work", &RepoId::generate(), 1, vec![vec![2; 64]]),
-        );
-
-        // The honest orphan survived the flood: registering `work` with a
-        // different id seeds its conflict, proving the entry was kept.
-        hub.register_repo("work".to_owned(), RepoId::generate());
-        assert_eq!(hub.conflicts(), vec![("work".to_owned(), honest)]);
-
-        // Disconnecting the flooder frees its slots for new names.
-        hub.peer_disconnected(&flooder);
-        hub.route(
-            flooder,
-            announce("fresh", &RepoId::generate(), 1, vec![vec![3; 64]]),
-        );
-        hub.register_repo("fresh".to_owned(), RepoId::generate());
-        assert!(hub.conflicts().iter().any(|(name, _)| name == "fresh"));
-    }
-
-    /// A peer announcing a colocated instance while ours is colocated too
-    /// pauses the repo, and the pause lifts when either side stops being
-    /// colocated.
-    #[tokio::test]
-    async fn colocation_conflict_pauses_and_resumes() {
-        use crate::{repo::JjRepo, testing::Fixture};
-
-        // `jj git init` colocates by default, so the opened repo reports
-        // `is_colocated`.
-        let fx = Fixture::new();
-        let dir = fx.init_repo("a");
-        let repo = Arc::new(JjRepo::discover(&dir).unwrap().open().unwrap());
-        assert!(repo.is_colocated());
-
-        let hub = SyncHub::new();
-        let id = RepoId::generate();
-        let inbox = hub.register_repo("a".to_owned(), id.clone());
-        hub.repo_opened("a", &id, repo);
-        let peer = iroh::SecretKey::generate().public();
-
-        let colocated = |seq| Announce {
-            colocated: true,
-            ..announce("a", &id, seq, vec![vec![1; 64]])
-        };
-        hub.route(peer, colocated(1));
-        assert!(hub.is_paused("a"));
-        assert_eq!(hub.paused_repos().get("a"), Some(&vec![peer]));
-        // The heads still land in the inbox: the repo task requeues them
-        // while paused, so they are fetched once the pause lifts instead
-        // of being lost.
-        assert_eq!(inbox.drain().len(), 1);
-
-        // The peer de-colocating resumes sync with its own announcement.
-        hub.route(peer, announce("a", &id, 2, vec![vec![2; 64]]));
-        assert!(!hub.is_paused("a"));
-        assert_eq!(inbox.drain().len(), 1);
-
-        // So does the peer disconnecting.
-        hub.route(peer, colocated(3));
-        assert!(hub.is_paused("a"));
-        hub.peer_disconnected(&peer);
-        assert!(!hub.is_paused("a"));
-
-        // And so does a retraction (the peer forgot its instance).
-        hub.route(peer, colocated(1));
-        assert!(hub.is_paused("a"));
-        hub.route(peer, announce("a", &id, 2, vec![]));
-        assert!(!hub.is_paused("a"));
-    }
-
-    /// A repo unregistered locally keeps its peers' last announcements as
-    /// orphans, so the name stays clonable without waiting for the (idle)
-    /// peers to announce again.
-    #[tokio::test]
-    async fn unregister_demotes_announcements_to_orphans() {
-        let hub = SyncHub::new();
-        let id = RepoId::generate();
-        let inbox = hub.register_repo("a".to_owned(), id.clone());
-        let peer = iroh::SecretKey::generate().public();
-
-        hub.route(peer, announce("a", &id, 1, vec![vec![1; 64]]));
-        // Draining (a completed fetch) must not lose the heads.
-        assert_eq!(inbox.drain().len(), 1);
-        hub.unregister_repo("a");
-
-        // Re-registering under a different id seeds a conflict from the
-        // demoted entry, proving the announcement survived.
-        hub.register_repo("a".to_owned(), RepoId::generate());
-        assert_eq!(hub.conflicts(), vec![("a".to_owned(), peer)]);
-    }
-
-    /// A retraction releases everything attributed to the peer for the
-    /// name, while reordered pre-retraction announcements stay rejected.
-    #[tokio::test]
-    async fn retraction_releases_peer_state() {
-        let hub = SyncHub::new();
-        let id = RepoId::generate();
-        let inbox = hub.register_repo("a".to_owned(), id.clone());
-        let peer = iroh::SecretKey::generate().public();
-
-        // A retraction clears even a conflicting peer's entry.
-        hub.route(
-            peer,
-            announce("a", &RepoId::generate(), 1, vec![vec![1; 64]]),
-        );
-        assert_eq!(hub.conflicts().len(), 1);
-        hub.route(peer, announce("a", &RepoId::generate(), 2, vec![]));
-        assert!(hub.conflicts().is_empty());
-
-        // A stale pre-retraction announcement stays rejected...
-        hub.route(peer, announce("a", &id, 1, vec![vec![1; 64]]));
-        assert!(inbox.drain().is_empty());
-        // ...while a later one (a re-clone on the peer) comes through.
-        hub.route(peer, announce("a", &id, 3, vec![vec![2; 64]]));
-        assert_eq!(inbox.drain().len(), 1);
-
-        // A retraction of an unregistered name clears the orphan entry:
-        // registering the name no longer seeds a conflict from it.
-        hub.route(
-            peer,
-            announce("b", &RepoId::generate(), 4, vec![vec![1; 64]]),
-        );
-        hub.route(peer, announce("b", &RepoId::generate(), 5, vec![]));
-        hub.register_repo("b".to_owned(), RepoId::generate());
-        assert!(hub.conflicts().is_empty());
-    }
-
-    #[tokio::test]
-    async fn rejects_invalid_announced_names() {
-        let hub = SyncHub::new();
-        let id = RepoId::generate();
-        let inbox = hub.register_repo("a\u{202E}b".to_owned(), id.clone());
-        let peer = iroh::SecretKey::generate().public();
-
-        hub.route(peer, announce("a\u{202E}b", &id, 1, vec![vec![1; 64]]));
-        assert!(inbox.drain().is_empty());
-        hub.route(peer, announce("", &id, 1, vec![vec![1; 64]]));
-        assert!(hub.clone_sources("").is_err());
-    }
-
-    #[test]
-    fn outbox_coalesces_per_repo_with_membership_first() {
-        let outbox = Outbox::default();
-        let id = RepoId::generate();
-        let other = RepoId::generate();
-
-        outbox.push_announce(announce("a", &id, 1, vec![vec![1; 64]]));
-        outbox.push_membership(Membership::default());
-        outbox.push_announce(announce("b", &other, 1, vec![vec![3; 64]]));
-        outbox.push_announce(announce("a", &id, 2, vec![vec![2; 64]]));
-        outbox.push_membership(Membership::default());
-
-        let sent: Vec<UniMessage> = std::iter::from_fn(|| outbox.pop()).collect();
-        assert_eq!(sent.len(), 3);
-        assert!(matches!(sent[0], UniMessage::Membership(_)));
-        let seqs: Vec<(&str, u64)> = sent
-            .iter()
-            .filter_map(|message| match message {
-                UniMessage::Announce(a) => Some((a.name.as_str(), a.seq)),
-                UniMessage::Membership(_) | UniMessage::Status(_) => None,
-            })
-            .collect();
-        assert!(seqs.contains(&("a", 2)) && seqs.contains(&("b", 1)));
-    }
 }

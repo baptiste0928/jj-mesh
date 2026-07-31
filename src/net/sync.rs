@@ -163,8 +163,10 @@ pub const MAX_OP_FRAME_SIZE: u32 = 4 << 20;
 /// proportionality.
 pub const MAX_GIT_FRAME_SIZE: u32 = u32::MAX;
 
-/// Cap on ids in want/have lists.
+/// Cap on op ids in a fetch's want list.
 pub const MAX_WANTS: usize = 64;
+
+/// Cap on op ids in a fetch's have sample.
 pub const MAX_HAVES: usize = 256;
 
 /// Cap on commit haves sent in the git phase (current view heads).
@@ -225,7 +227,7 @@ pub struct FetchRequest {
 /// of objects written by older jj versions do not survive a decode +
 /// re-encode round trip; replicating the stored bytes verbatim is the only
 /// way to keep ids identical across the mesh. The receiver validates the
-/// bytes structurally (see `crate::repo::codec`) before storing them.
+/// bytes structurally (`repo`'s codec) before storing them.
 ///
 /// The proto bytes travel zstd-compressed; compression is a wire concern
 /// and the stored bytes stay verbatim.
@@ -266,6 +268,35 @@ pub struct GitRequest {
 pub enum GitTransferFormat {
     Loose,
     Pack,
+}
+
+/// Server-to-fetcher frame of the git phase.
+#[derive(Debug, Serialize, Deserialize)]
+pub enum GitFrame {
+    /// One raw git object, zstd-compressed; `id` is verified against the
+    /// decompressed data on receipt. Only sent in the loose format.
+    Object {
+        id: Vec<u8>,
+        kind: WireObjectKind,
+        data: Vec<u8>,
+    },
+    /// One chunk of the packfile stream. Only sent in the pack format; the
+    /// pack's own trailer checksum and the per-object hashing done while
+    /// indexing verify the content.
+    Pack { chunk: Vec<u8> },
+    /// End of the git phase.
+    Done,
+    /// The server cannot serve the git phase.
+    Error { message: String },
+}
+
+/// Git object kinds on the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WireObjectKind {
+    Commit,
+    Tree,
+    Blob,
+    Tag,
 }
 
 #[cfg(test)]
@@ -359,33 +390,4 @@ mod tests {
             super::MAX_UNI_SIZE,
         );
     }
-}
-
-/// Server-to-fetcher frame of the git phase.
-#[derive(Debug, Serialize, Deserialize)]
-pub enum GitFrame {
-    /// One raw git object, zstd-compressed; `id` is verified against the
-    /// decompressed data on receipt. Only sent in the loose format.
-    Object {
-        id: Vec<u8>,
-        kind: WireObjectKind,
-        data: Vec<u8>,
-    },
-    /// One chunk of the packfile stream. Only sent in the pack format; the
-    /// pack's own trailer checksum and the per-object hashing done while
-    /// indexing verify the content.
-    Pack { chunk: Vec<u8> },
-    /// End of the git phase.
-    Done,
-    /// The server cannot serve the git phase.
-    Error { message: String },
-}
-
-/// Git object kinds on the wire.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum WireObjectKind {
-    Commit,
-    Tree,
-    Blob,
-    Tag,
 }

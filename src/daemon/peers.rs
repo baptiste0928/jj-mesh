@@ -312,22 +312,14 @@ impl PeerTask {
         self.set_state(PeerState::Connecting);
 
         if self.local_id < self.peer_id {
-            match self.endpoint.connect(self.peer_id, sync::ALPN).await {
-                Ok(conn) => Some((conn, true)),
-                Err(err) => {
-                    debug!(peer = %self.name, "dial failed: {err:#}");
-                    None
-                }
-            }
+            dial(&self.endpoint, self.peer_id, &self.name)
+                .await
+                .map(|conn| (conn, true))
         } else {
             tokio::select! {
-                res = self.endpoint.connect(self.peer_id, sync::ALPN) => match res {
-                    Ok(conn) => Some((conn, true)),
-                    Err(err) => {
-                        debug!(peer = %self.name, "dial failed: {err:#}");
-                        None
-                    }
-                },
+                dialed = dial(&self.endpoint, self.peer_id, &self.name) => {
+                    dialed.map(|conn| (conn, true))
+                }
                 Some(conn) = self.inbound.recv() => Some((conn, false)),
             }
         }
@@ -454,5 +446,16 @@ impl PeerTask {
 
     fn set_state(&self, state: PeerState) {
         *self.state.lock().unwrap() = state;
+    }
+}
+
+/// Dials the peer on the sync ALPN, `None` on failure.
+async fn dial(endpoint: &Endpoint, peer: EndpointId, name: &str) -> Option<Connection> {
+    match endpoint.connect(peer, sync::ALPN).await {
+        Ok(conn) => Some(conn),
+        Err(err) => {
+            debug!(peer = %name, "dial failed: {err:#}");
+            None
+        }
     }
 }

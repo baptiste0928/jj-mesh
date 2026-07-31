@@ -127,7 +127,6 @@ impl MeshRepo {
         Ok(matches!(resolution, PrefixResolution::SingleMatch(_)))
     }
 
-    /// Reads an operation.
     pub async fn read_operation(&self, id: &OperationId) -> Result<Operation> {
         Ok(self.loader.op_store().read_operation(id).await?)
     }
@@ -159,12 +158,10 @@ impl MeshRepo {
         Ok(())
     }
 
-    /// Reads a view.
     pub async fn read_view(&self, id: &ViewId) -> Result<View> {
         Ok(self.loader.op_store().read_view(id).await?)
     }
 
-    /// Whether the op store contains the given view.
     pub async fn has_view(&self, id: &ViewId) -> Result<bool> {
         use jj_lib::op_store::OpStoreError;
         match self.loader.op_store().read_view(id).await {
@@ -356,7 +353,6 @@ impl MeshRepo {
         Ok(())
     }
 
-    /// The git backend of the repo.
     pub fn git_backend(&self) -> &GitBackend {
         self.loader
             .store()

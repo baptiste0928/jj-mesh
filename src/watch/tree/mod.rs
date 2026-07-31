@@ -19,10 +19,11 @@
 //!   rule files are read defensively, the event queue is bounded, and the
 //!   walks rebuilding the watched set are coalesced and run off-thread.
 
+mod rules;
+
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::BTreeSet,
     fs,
-    io::Read as _,
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
@@ -31,25 +32,19 @@ use std::{
 };
 
 use color_eyre::eyre::{Result, WrapErr as _, bail, ensure, eyre};
-use ignore::{
-    Match,
-    gitignore::{Gitignore, GitignoreBuilder},
-};
 use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher as _};
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
+use self::rules::{GITIGNORE, Rules};
+use super::backend;
+
 /// Cap on watched directories. Each kernel watch pins an inode and costs
 /// around a kilobyte of unswappable kernel memory, so this bounds what
-/// one pathological tree takes from the machine (and from the other repos
-/// sharing that budget). Changes under directories past the cap go
-/// unnoticed until something else triggers a snapshot.
+/// one pathological tree takes from the machine. Changes under
+/// directories past the cap go unnoticed until something else triggers a
+/// snapshot.
 const MAX_WATCHED_DIRS: usize = 10_000;
-
-/// Cap on a rule file's size. Rule files come from synced working copies,
-/// so their size is not ours to trust; a megabyte is orders of magnitude
-/// above any real one.
-const MAX_RULES_BYTES: u64 = 1024 * 1024;
 
 /// Bound on queued filesystem events. A build writing into watched
 /// directories emits thousands per second while the consumer can be busy
@@ -58,16 +53,8 @@ const MAX_RULES_BYTES: u64 = 1024 * 1024;
 /// re-derivation and one change signal.
 const SIGNAL_QUEUE: usize = 4096;
 
-/// Name of the per-directory ignore file. jj reads gitignore files
-/// whether or not the repo is colocated.
-const GITIGNORE: &str = ".gitignore";
-
-/// What the notify callback reports to the async side.
-#[derive(Debug)]
-enum Signal {
-    Event(Event),
-    Failed(String),
-}
+/// Signals carry the full event: paths decide relevance downstream.
+type Signal = backend::Signal<Event>;
 
 /// An ignore-aware watch on one working copy.
 ///
@@ -109,28 +96,21 @@ impl TreeWatcher {
         let overflowed = Arc::new(AtomicBool::new(false));
         let full = overflowed.clone();
 
-        let backend = notify::recommended_watcher(move |event: notify::Result<Event>| {
-            let signal = match event {
-                Err(err) => Some(Signal::Failed(format!("watch backend error: {err}"))),
-                // Access events never count: reads (the consumer's own
-                // snapshots included) must not feed back into the watch.
-                Ok(event) if event.kind.is_access() => None,
-                Ok(mut event) => {
-                    event.paths.retain(|path| !is_internal(path));
-                    (!event.paths.is_empty() || event.need_rescan()).then_some(Signal::Event(event))
+        let watcher = backend::spawn(
+            |mut event| {
+                event.paths.retain(|path| !is_internal(path));
+                (!event.paths.is_empty() || event.need_rescan()).then_some(Signal::Event(event))
+            },
+            move |signal| {
+                if tx.try_send(signal).is_err() {
+                    full.store(true, Ordering::Relaxed);
                 }
-            };
-            if let Some(signal) = signal
-                && tx.try_send(signal).is_err()
-            {
-                full.store(true, Ordering::Relaxed);
-            }
-        })
-        .wrap_err("cannot create filesystem watcher")?;
+            },
+        )?;
 
         let mut watch = TreeWatcher {
             root: root.to_owned(),
-            watcher: backend,
+            watcher,
             signals,
             overflowed,
             watched: BTreeSet::new(),
@@ -153,13 +133,7 @@ impl TreeWatcher {
                 .await
                 .ok_or_else(|| eyre!("filesystem watcher stopped"))?;
             let mut relevant = self.handle(signal)?;
-
-            // Whatever is already queued is handled in the same batch, so
-            // an event burst costs at most one walk.
-            while let Ok(signal) = self.signals.try_recv() {
-                relevant |= self.handle(signal)?;
-            }
-            relevant |= self.take_overflow();
+            relevant |= self.drain_queued()?;
             self.settle().await?;
 
             if relevant {
@@ -173,11 +147,20 @@ impl TreeWatcher {
     /// events its own working-copy writes caused, which would otherwise
     /// schedule a snapshot of that very work.
     pub async fn discard_queued(&mut self) -> Result<()> {
-        while let Ok(signal) = self.signals.try_recv() {
-            self.handle(signal)?;
-        }
-        self.take_overflow();
+        self.drain_queued()?;
         self.settle().await
+    }
+
+    /// Handles everything already queued, in one batch: an event burst
+    /// costs at most one walk. Returns whether any of it was a real
+    /// change.
+    fn drain_queued(&mut self) -> Result<bool> {
+        let mut relevant = false;
+        while let Ok(signal) = self.signals.try_recv() {
+            relevant |= self.handle(signal)?;
+        }
+        relevant |= self.take_overflow();
+        Ok(relevant)
     }
 
     /// Re-derives the watched set if anything in this batch invalidated
@@ -235,8 +218,8 @@ impl TreeWatcher {
     fn handle_path(&mut self, path: &Path) -> Result<bool> {
         if path == self.root {
             // The root's own disappearance is the one event its children
-            // cannot report; anything else about it (its mtime moving as
-            // children come and go) is their business, not its own.
+            // cannot report; any other event on it concerns its children,
+            // which report themselves.
             ensure!(
                 path.exists(),
                 "the watched working copy root was removed or moved",
@@ -361,120 +344,6 @@ fn walk_dirs(root: &Path, rules: &Arc<Mutex<Rules>>) -> Result<BTreeSet<PathBuf>
         bail!("the working copy root is gone or unreadable");
     }
     Ok(dirs)
-}
-
-/// Gitignore evaluation for one working copy: per-directory matchers,
-/// built lazily from rule files and cached until those files change.
-struct Rules {
-    root: PathBuf,
-    /// The user's global gitignore, lowest precedence.
-    global: Gitignore,
-    per_dir: HashMap<PathBuf, Option<Gitignore>>,
-}
-
-impl Rules {
-    fn new(root: &Path) -> Self {
-        Rules {
-            root: root.to_owned(),
-            global: Gitignore::global().0,
-            per_dir: HashMap::new(),
-        }
-    }
-
-    /// Whether `path` is ignored, evaluated deepest-first: the closest
-    /// rule file with an opinion decides, and the global gitignore only
-    /// speaks when none of them does.
-    fn is_ignored(&mut self, path: &Path, is_dir: bool) -> bool {
-        // The root is the working copy itself: never ignorable, and with
-        // no in-tree ancestor to consult.
-        if path == self.root {
-            return false;
-        }
-        // Outside the root: not this working copy's business.
-        if !path.starts_with(&self.root) {
-            return true;
-        }
-
-        for dir in path.ancestors().skip(1) {
-            if let Some(matcher) = self.matcher(dir) {
-                match matcher.matched(path, is_dir) {
-                    Match::Ignore(_) => return true,
-                    Match::Whitelist(_) => return false,
-                    Match::None => {}
-                }
-            }
-            if dir == self.root {
-                break;
-            }
-        }
-        self.global.matched(path, is_dir).is_ignore()
-    }
-
-    /// The matcher for one directory's own rule files.
-    fn matcher(&mut self, dir: &Path) -> Option<&Gitignore> {
-        let is_root = dir == self.root;
-        self.per_dir
-            .entry(dir.to_owned())
-            .or_insert_with(|| build_matcher(dir, is_root))
-            .as_ref()
-    }
-
-    /// Drops one directory's cached matcher, after its rules changed.
-    fn forget(&mut self, dir: Option<&Path>) {
-        if let Some(dir) = dir {
-            self.per_dir.remove(dir);
-        }
-    }
-}
-
-/// Builds the matcher for one directory: its `.gitignore`, plus
-/// `.git/info/exclude` at the root of colocated repos. `None` when the
-/// directory has no rules at all, which keeps the cache cheap.
-fn build_matcher(dir: &Path, is_root: bool) -> Option<Gitignore> {
-    let mut builder = GitignoreBuilder::new(dir);
-    let mut any = false;
-    // Lowest precedence first: within one matcher the last matching rule
-    // wins, and git ranks a directory's own `.gitignore` above
-    // `.git/info/exclude`.
-    let files = [
-        is_root.then(|| dir.join(".git").join("info").join("exclude")),
-        Some(dir.join(GITIGNORE)),
-    ];
-    for rules in files.into_iter().flatten() {
-        let Some(text) = read_rules(&rules) else {
-            continue;
-        };
-        for line in text.lines() {
-            // A malformed line is skipped and the valid remainder still
-            // applies, like git.
-            let _ = builder.add_line(None, line);
-        }
-        any = true;
-    }
-    any.then(|| builder.build().ok()).flatten()
-}
-
-/// Reads a rule file, refusing anything that is not a plain regular file
-/// of sane size. Rule files arrive with synced working copies: a
-/// `.gitignore` symlinked to `/dev/zero` would otherwise be read until
-/// the daemon is killed for its memory use, and an oversized one would
-/// compile into a matcher just as large. Symlinked rule files are skipped
-/// outright, as git does.
-fn read_rules(path: &Path) -> Option<String> {
-    if !fs::symlink_metadata(path).is_ok_and(|meta| meta.is_file()) {
-        return None;
-    }
-    let file = fs::File::open(path).ok()?;
-    // Re-checked on the open handle: the path may have been swapped
-    // between the two calls.
-    let meta = file.metadata().ok()?;
-    if !meta.is_file() || meta.len() > MAX_RULES_BYTES {
-        return None;
-    }
-
-    let mut text = String::new();
-    file.take(MAX_RULES_BYTES).read_to_string(&mut text).ok()?;
-    Some(text)
 }
 
 /// Whether a path is inside jj's or git's own state: never a working-copy
@@ -670,9 +539,9 @@ mod tests {
         assert_quiet(&mut watch).await;
     }
 
-    /// A rule file that is a symlink, a device or oversized must not be
-    /// read: a `.gitignore` pointing at `/dev/zero` in a synced working
-    /// copy would otherwise be read until the daemon dies of it.
+    /// A rule file symlinked to a device must not be read: a `.gitignore`
+    /// pointing at `/dev/zero` in a synced working copy would otherwise
+    /// be read until the daemon dies of it.
     #[tokio::test]
     async fn refuses_unreasonable_rule_files() {
         let tmp = tempfile::tempdir().unwrap();
@@ -686,15 +555,6 @@ mod tests {
             .unwrap();
         fs::write(root.join("file.rs"), "x").unwrap();
         assert_changed(&mut watch).await;
-
-        // Oversized rules are skipped rather than compiled.
-        let big = tmp.path().join("big");
-        fs::write(
-            &big,
-            vec![b'a'; usize::try_from(MAX_RULES_BYTES).unwrap() + 1],
-        )
-        .unwrap();
-        assert_eq!(read_rules(&big), None);
     }
 
     /// Symlinks are content, not directories to descend: treating one as

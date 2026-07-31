@@ -8,12 +8,10 @@ use notify::{
 };
 use tokio::sync::mpsc;
 
-/// What the notify callback reports to the async side.
-#[derive(Debug)]
-enum Signal {
-    Changed,
-    Failed(String),
-}
+use super::backend;
+
+/// A change carries no payload here; only its arrival matters.
+type Signal = backend::Signal<()>;
 
 /// A debounced watch on one directory.
 ///
@@ -27,43 +25,37 @@ pub struct DirWatcher {
 }
 
 impl DirWatcher {
-    /// Starts watching `dir` (non-recursively). Only events passing
-    /// `filter` count as changes; access events never do (the watcher's own
-    /// reads must not feed back into it).
+    /// Starts watching `dir` (non-recursively). Any event except access
+    /// counts as a change.
     ///
     /// `debounce` is the quiet window required before reporting a change,
     /// capped at `debounce_max` total so a busy writer cannot starve the
     /// caller.
-    pub fn new(
-        dir: &Path,
-        debounce: Duration,
-        debounce_max: Duration,
-        filter: impl Fn(&Event) -> bool + Send + 'static,
-    ) -> Result<Self> {
+    pub fn new(dir: &Path, debounce: Duration, debounce_max: Duration) -> Result<Self> {
         let (tx, signals) = mpsc::unbounded_channel();
-        let watched = dir.to_owned();
+        let target = dir.to_owned();
 
-        let mut backend = notify::recommended_watcher(move |event: notify::Result<Event>| {
-            let signal = match &event {
-                Err(err) => Some(Signal::Failed(format!("watch backend error: {err}"))),
-                Ok(event) if is_watch_death(event, &watched) => Some(Signal::Failed(
-                    "the watched directory was removed or moved".to_owned(),
-                )),
-                Ok(event) if !event.kind.is_access() && filter(event) => Some(Signal::Changed),
-                Ok(_) => None,
-            };
-            if let Some(signal) = signal {
+        let mut watcher = backend::spawn(
+            move |event| {
+                if is_watch_death(&event, &target) {
+                    Some(Signal::Failed(
+                        "the watched directory was removed or moved".to_owned(),
+                    ))
+                } else {
+                    Some(Signal::Event(()))
+                }
+            },
+            move |signal| {
                 let _ = tx.send(signal);
-            }
-        })
-        .wrap_err("cannot create filesystem watcher")?;
+            },
+        )?;
 
-        backend
+        watcher
             .watch(dir, RecursiveMode::NonRecursive)
             .wrap_err_with(|| format!("cannot watch {}", dir.display()))?;
 
         Ok(DirWatcher {
-            _watcher: backend,
+            _watcher: watcher,
             signals,
             debounce,
             debounce_max,
@@ -78,18 +70,13 @@ impl DirWatcher {
         let Ok(signal) = tokio::time::timeout(idle, self.signals.recv()).await else {
             return Ok(false);
         };
-        Self::consume(signal)?;
-        self.debounce().await?;
-        Ok(true)
-    }
-
-    /// Interprets one received signal.
-    fn consume(signal: Option<Signal>) -> Result<()> {
         match signal {
-            Some(Signal::Changed) => Ok(()),
+            Some(Signal::Event(())) => {}
             Some(Signal::Failed(msg)) => bail!(msg),
             None => bail!("filesystem watcher stopped"),
         }
+        self.debounce().await?;
+        Ok(true)
     }
 
     /// Waits out an event burst, bounded by the debounce cap.
@@ -97,7 +84,7 @@ impl DirWatcher {
         let deadline = tokio::time::Instant::now() + self.debounce_max;
         loop {
             match tokio::time::timeout(self.debounce, self.signals.recv()).await {
-                Ok(Some(Signal::Changed)) if tokio::time::Instant::now() < deadline => {}
+                Ok(Some(Signal::Event(()))) if tokio::time::Instant::now() < deadline => {}
                 Ok(Some(Signal::Failed(msg))) => bail!(msg),
                 _ => return Ok(()),
             }
@@ -127,7 +114,7 @@ mod tests {
     #[tokio::test]
     async fn reports_changes() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut watch = DirWatcher::new(tmp.path(), DEBOUNCE, DEBOUNCE_MAX, |_| true).unwrap();
+        let mut watch = DirWatcher::new(tmp.path(), DEBOUNCE, DEBOUNCE_MAX).unwrap();
 
         fs::write(tmp.path().join("file"), "x").unwrap();
 
@@ -140,7 +127,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("watched");
         fs::create_dir(&dir).unwrap();
-        let mut watch = DirWatcher::new(&dir, DEBOUNCE, DEBOUNCE_MAX, |_| true).unwrap();
+        let mut watch = DirWatcher::new(&dir, DEBOUNCE, DEBOUNCE_MAX).unwrap();
 
         fs::remove_dir(&dir).unwrap();
 
@@ -151,7 +138,7 @@ mod tests {
     #[tokio::test]
     async fn idle_elapses_without_events() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut watch = DirWatcher::new(tmp.path(), DEBOUNCE, DEBOUNCE_MAX, |_| true).unwrap();
+        let mut watch = DirWatcher::new(tmp.path(), DEBOUNCE, DEBOUNCE_MAX).unwrap();
 
         let changed = watch
             .changed_or_idle(Duration::from_millis(50))

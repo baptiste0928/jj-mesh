@@ -11,7 +11,7 @@ use clap::Args;
 use color_eyre::eyre::{Result, bail};
 
 use crate::{
-    cli::ui,
+    cli::{hostname, ui},
     config::ConfigDir,
     daemon::control::{ControlClient, Request, Response},
     net::pair::PairTicket,
@@ -43,9 +43,7 @@ pub struct AddArgs {
 
 /// Runs the `peer add` command.
 pub fn run(args: AddArgs, dir: &ConfigDir) -> Result<()> {
-    let name = args
-        .name
-        .unwrap_or_else(|| gethostname::gethostname().to_string_lossy().into_owned());
+    let name = args.name.unwrap_or_else(hostname);
 
     tokio::runtime::Builder::new_current_thread()
         .enable_all()

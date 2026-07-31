@@ -4,17 +4,13 @@ mod harness;
 
 use std::fs;
 
-use harness::{
-    TestMesh, add_and_clone, connect, descriptions, init_clone_repo, op_heads, wait_converged,
-};
+use harness::{TestMesh, add_and_clone, descriptions, op_heads, wait_converged};
 
 /// Cloning a repo added on another machine pulls its full history.
 #[tokio::test(flavor = "multi_thread")]
 async fn clone_pulls_full_history() {
     let mesh = TestMesh::new();
-    let a = mesh.machine("machine-a").await;
-    let b = mesh.machine("machine-b").await;
-    connect(&a, &b).await;
+    let (a, b) = mesh.connected_pair().await;
 
     // A registers a repo with a committed file and a bookmark.
     let dir_a = mesh.jj.init_repo("proj");
@@ -27,7 +23,7 @@ async fn clone_pulls_full_history() {
     // B clones it by name, as `jj-mesh repo clone` does: fresh repo with a
     // machine-unique workspace, merged by the next jj command.
     b.wait_available("proj").await;
-    let dir_b = init_clone_repo(&mesh, "proj-b", "machine-b");
+    let dir_b = mesh.jj.init_clone_repo("proj-b", "machine-b");
     b.clone_repo("proj", &dir_b).await;
     mesh.jj.jj(&dir_b, &["status"]);
     wait_converged(&dir_a, &dir_b).await;
@@ -44,21 +40,16 @@ async fn clone_pulls_full_history() {
 #[tokio::test(flavor = "multi_thread")]
 async fn commits_replicate_both_ways() {
     let mesh = TestMesh::new();
-    let a = mesh.machine("machine-a").await;
-    let b = mesh.machine("machine-b").await;
-    connect(&a, &b).await;
-    let dir_a = mesh.jj.init_repo("proj");
-    let dir_b = add_and_clone(&mesh, &a, &b, &dir_a, "proj").await;
+    let (a, b) = mesh.connected_pair().await;
+    let (dir_a, dir_b) = add_and_clone(&mesh, &a, &b, "proj").await;
 
     // A commit on A arrives on B.
-    fs::write(dir_a.join("a.txt"), "a\n").unwrap();
-    mesh.jj.jj(&dir_a, &["commit", "-m", "from a"]);
+    mesh.jj.commit_file(&dir_a, "a.txt", "from a");
     wait_converged(&dir_a, &dir_b).await;
     assert!(descriptions(&mesh, &dir_b).contains("from a"));
 
     // And a commit on B arrives on A.
-    fs::write(dir_b.join("b.txt"), "b\n").unwrap();
-    mesh.jj.jj(&dir_b, &["commit", "-m", "from b"]);
+    mesh.jj.commit_file(&dir_b, "b.txt", "from b");
     wait_converged(&dir_a, &dir_b).await;
     assert!(descriptions(&mesh, &dir_a).contains("from b"));
 }
@@ -67,19 +58,14 @@ async fn commits_replicate_both_ways() {
 #[tokio::test(flavor = "multi_thread")]
 async fn concurrent_commits_reconcile() {
     let mesh = TestMesh::new();
-    let a = mesh.machine("machine-a").await;
-    let b = mesh.machine("machine-b").await;
-    connect(&a, &b).await;
-    let dir_a = mesh.jj.init_repo("proj");
-    let dir_b = add_and_clone(&mesh, &a, &b, &dir_a, "proj").await;
+    let (a, b) = mesh.connected_pair().await;
+    let (dir_a, dir_b) = add_and_clone(&mesh, &a, &b, "proj").await;
 
     // Both sides commit within the watch debounce, so the op logs
     // typically diverge before the daemons exchange the heads; both
     // machines must settle on the same op head set either way.
-    fs::write(dir_a.join("a.txt"), "a\n").unwrap();
-    mesh.jj.jj(&dir_a, &["commit", "-m", "concurrent a"]);
-    fs::write(dir_b.join("b.txt"), "b\n").unwrap();
-    mesh.jj.jj(&dir_b, &["commit", "-m", "concurrent b"]);
+    mesh.jj.commit_file(&dir_a, "a.txt", "concurrent a");
+    mesh.jj.commit_file(&dir_b, "b.txt", "concurrent b");
     wait_converged(&dir_a, &dir_b).await;
 
     // Any jj command merges the divergence; the merged history holding

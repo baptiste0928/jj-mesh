@@ -17,12 +17,12 @@ fn state() -> MeshState {
 }
 
 /// The repos registered on this machine (`repo forget`).
-pub fn registered_repos() -> Vec<CompletionCandidate> {
+pub(super) fn registered_repos() -> Vec<CompletionCandidate> {
     state().repos.keys().map(CompletionCandidate::new).collect()
 }
 
 /// The repo names in use on the mesh (`repo remove`).
-pub fn mesh_repos() -> Vec<CompletionCandidate> {
+pub(super) fn mesh_repos() -> Vec<CompletionCandidate> {
     state()
         .mesh_repo_names()
         .map(CompletionCandidate::new)
@@ -31,7 +31,7 @@ pub fn mesh_repos() -> Vec<CompletionCandidate> {
 
 /// The mesh repos not registered on this machine, i.e. the clonable ones
 /// (`repo clone`).
-pub fn clonable_repos() -> Vec<CompletionCandidate> {
+pub(super) fn clonable_repos() -> Vec<CompletionCandidate> {
     let state = state();
     state
         .mesh_repo_names()
@@ -42,7 +42,7 @@ pub fn clonable_repos() -> Vec<CompletionCandidate> {
 
 /// The alive peers (`peer remove`), with their endpoint id as help text
 /// since names can be ambiguous.
-pub fn peers() -> Vec<CompletionCandidate> {
+pub(super) fn peers() -> Vec<CompletionCandidate> {
     state()
         .alive_peers()
         .map(|(endpoint, name)| {

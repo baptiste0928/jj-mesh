@@ -4,9 +4,9 @@
 //! we verify its store `type` files match the backends this build supports
 //! (git commit backend, simple op store and op heads store).
 
-pub mod codec;
+mod codec;
 mod mesh;
-pub mod transfer;
+pub(crate) mod transfer;
 
 use std::{
     fs,
@@ -20,7 +20,7 @@ pub use self::mesh::MeshRepo;
 /// The jj release series whose on-disk formats this build was written
 /// against. Must match the exact `jj-lib` pin in `Cargo.toml`: repos
 /// written by another jj series may use formats this build mis-reads.
-pub const SUPPORTED_JJ_SERIES: &str = "0.43";
+const SUPPORTED_JJ_SERIES: &str = "0.43";
 
 /// Store backends supported by jj-mesh, as `(<store dir>, <expected type>)`
 /// pairs relative to `.jj/repo`.
@@ -260,7 +260,7 @@ fn parse_jj_version(output: &str) -> Option<String> {
 }
 
 /// Whether a jj version belongs to the [`SUPPORTED_JJ_SERIES`].
-pub fn jj_version_supported(version: &str) -> bool {
+fn jj_version_supported(version: &str) -> bool {
     version
         .strip_prefix(SUPPORTED_JJ_SERIES)
         .is_some_and(|rest| rest.starts_with('.'))

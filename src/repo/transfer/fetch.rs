@@ -15,15 +15,15 @@ use tokio::io::{AsyncRead, AsyncWrite};
 
 use super::{
     FetchOutcome, OpBatch, ProgressSink, StoredOp, StoredView, TransferPhase, TransferProgress,
-    apply::apply, pack, to_gix_id, to_gix_kind,
+    apply::apply, pack, to_gix_id,
 };
 use crate::{
     config::{RepoId, sanitize},
     net::{
         sync::{
             FetchRequest, GitFrame, GitRequest, GitTransferFormat, MAX_GIT_FRAME_SIZE,
-            MAX_GIT_HAVES, MAX_GIT_OBJECT_SIZE, MAX_OP_FRAME_SIZE, MAX_WANTS, OpFrame,
-            decompress_payload,
+            MAX_GIT_HAVES, MAX_GIT_OBJECT_SIZE, MAX_HAVES, MAX_OP_FRAME_SIZE, MAX_WANTS, OpFrame,
+            WireObjectKind, decompress_payload,
         },
         wire::{read_message, write_message},
     },
@@ -537,6 +537,16 @@ async fn sample_haves(repo: &MeshRepo, heads: &[OperationId]) -> Result<Vec<Oper
 
     haves.sort_unstable();
     haves.dedup();
-    haves.truncate(crate::net::sync::MAX_HAVES);
+    haves.truncate(MAX_HAVES);
     Ok(haves)
+}
+
+/// Maps a wire object kind to its gix equivalent.
+fn to_gix_kind(kind: WireObjectKind) -> gix::object::Kind {
+    match kind {
+        WireObjectKind::Commit => gix::object::Kind::Commit,
+        WireObjectKind::Tree => gix::object::Kind::Tree,
+        WireObjectKind::Blob => gix::object::Kind::Blob,
+        WireObjectKind::Tag => gix::object::Kind::Tag,
+    }
 }

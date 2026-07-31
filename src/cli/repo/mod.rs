@@ -41,13 +41,6 @@ pub fn run(args: RepoArgs, dir: &ConfigDir) -> Result<()> {
     }
 }
 
-/// The machine-unique workspace name used when the user gives none: the
-/// hostname. Every copy of a repo across the mesh gets its own workspace,
-/// so the current head of each machine is displayed in `jj log`.
-fn machine_workspace_name() -> String {
-    gethostname::gethostname().to_string_lossy().into_owned()
-}
-
 /// Runs a jj command, surfacing its stderr on failure.
 fn jj(dir: Option<&Path>, args: &[&str]) -> Result<()> {
     let mut command = std::process::Command::new(crate::repo::jj_bin());

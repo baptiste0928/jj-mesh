@@ -18,7 +18,7 @@ use indicatif::{HumanBytes, ProgressBar, ProgressStyle};
 
 use super::jj;
 use crate::{
-    cli::{complete, ui},
+    cli::{complete, hostname, ui},
     config::{ConfigDir, MeshState},
     daemon::control::{self, CloneProgress, Request, Response},
 };
@@ -70,7 +70,7 @@ pub fn run(args: CloneArgs, dir: &ConfigDir) -> Result<()> {
         path.display(),
     );
 
-    let workspace = args.workspace.unwrap_or_else(super::machine_workspace_name);
+    let workspace = args.workspace.unwrap_or_else(hostname);
 
     // Fresh repo with a machine-unique workspace name, using the user's
     // own jj (their config applies to the repo from the start). Never
@@ -157,7 +157,7 @@ fn counted_style() -> ProgressStyle {
 /// Applies a progress frame to the bar, switching templates as phases and
 /// totals come and go; `counted` remembers which template is active.
 fn show_progress(bar: &ProgressBar, progress: &CloneProgress, counted: &mut bool) {
-    use crate::repo::transfer::TransferPhase;
+    use crate::daemon::control::TransferPhase;
 
     let CloneProgress { peer, transfer } = progress;
     let mut spin = |message: String| {

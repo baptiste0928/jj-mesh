@@ -6,8 +6,7 @@ use color_eyre::eyre::Result;
 use super::ui::{self, display_path, format_duration, name_width, sanitize};
 use crate::{
     config::ConfigDir,
-    daemon::control::{self, ConnectionStatus, PeerReport, Route},
-    net::sync::RepoHealthState,
+    daemon::control::{self, ConnectionStatus, PeerReport, RepoHealthState, Route},
 };
 
 /// Show the daemon state and the live mesh status

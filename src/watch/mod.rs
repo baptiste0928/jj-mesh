@@ -9,6 +9,7 @@
 //! all; [`DirWatcher::changed_or_idle`] lets callers run their own
 //! periodic liveness checks for that case.
 
+mod backend;
 mod dir;
 mod tree;
 

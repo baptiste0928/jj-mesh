@@ -210,18 +210,7 @@ pub async fn pair_with(
     };
 
     let endpoint = conn.remote_id();
-    // Re-pairing an already-registered machine is idempotent, keeping its
-    // stored name: accepting a peer we already trust gives an attacker
-    // nothing, and lets a half-paired joiner recover by retrying.
-    let name = if let Some(existing) = state.peer_name(&endpoint) {
-        existing.to_owned()
-    } else {
-        if let Err(err) = state.validate_new_peer(&hello, &endpoint) {
-            send_reject(conn, &mut send, &err.to_string(), REJECT_LINGER).await;
-            return Err(err.wrap_err("cannot pair"));
-        }
-        hello
-    };
+    let name = resolve_peer_name(conn, &mut send, hello, &endpoint, state).await?;
 
     let welcome = Message::Welcome {
         name: local_name.to_owned(),
@@ -306,17 +295,7 @@ pub async fn join(
         msg => bail!("unexpected message from host: {msg:?}"),
     };
 
-    // Mirror of the host's idempotent re-pairing: a host we already have
-    // registered keeps its stored name.
-    let name = if let Some(existing) = state.peer_name(&host_endpoint) {
-        existing.to_owned()
-    } else {
-        if let Err(err) = state.validate_new_peer(&name, &host_endpoint) {
-            send_reject(&conn, &mut send, &err.to_string(), REJECT_LINGER).await;
-            return Err(err.wrap_err("cannot pair"));
-        }
-        name
-    };
+    let name = resolve_peer_name(&conn, &mut send, name, &host_endpoint, state).await?;
 
     write_message(&mut send, &Message::Done, MAX_MESSAGE_SIZE).await?;
     let _ = send.finish();
@@ -338,6 +317,29 @@ pub async fn join(
         name,
         endpoint: host_endpoint,
     })
+}
+
+/// Resolves the name to register for the authenticated `endpoint`, which
+/// announced itself as `announced`. An already-registered peer keeps its
+/// stored name, making re-pairing idempotent: accepting a peer we already
+/// trust gives an attacker nothing, and lets a half-paired machine recover
+/// by retrying. A new peer is validated against the mesh state, and told
+/// the reason when refused.
+async fn resolve_peer_name(
+    conn: &Connection,
+    send: &mut SendStream,
+    announced: String,
+    endpoint: &EndpointId,
+    state: &MeshState,
+) -> Result<String> {
+    if let Some(existing) = state.peer_name(endpoint) {
+        return Ok(existing.to_owned());
+    }
+    if let Err(err) = state.validate_new_peer(&announced, endpoint) {
+        send_reject(conn, send, &err.to_string(), REJECT_LINGER).await;
+        return Err(err.wrap_err("cannot pair"));
+    }
+    Ok(announced)
 }
 
 /// Sends a rejection, waiting up to `linger` for the peer to see it before
