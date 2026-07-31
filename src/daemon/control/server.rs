@@ -5,7 +5,7 @@ use std::{
     fs::{self, File, TryLockError},
     path::PathBuf,
     sync::Arc,
-    time::{Duration, Instant},
+    time::{Duration, SystemTime},
 };
 
 use color_eyre::eyre::{Result, WrapErr as _, bail, eyre};
@@ -48,7 +48,7 @@ const ACCEPT_ERROR_BACKOFF_MAX: Duration = Duration::from_secs(5);
 #[derive(Debug)]
 pub struct ControlContext {
     pub endpoint: Endpoint,
-    pub started: Instant,
+    pub started: SystemTime,
     pub peers: Arc<PeerSet>,
     pub repos: Arc<RepoSet>,
     pub hub: Arc<SyncHub>,
@@ -113,7 +113,7 @@ impl ControlContext {
 
         Status {
             endpoint: self.endpoint.secret_key().public(),
-            uptime_secs: self.started.elapsed().as_secs(),
+            uptime_secs: self.started.elapsed().unwrap_or_default().as_secs(),
             jj_version: self.jj_version.clone(),
             peers,
             repos: self.repos.statuses(),

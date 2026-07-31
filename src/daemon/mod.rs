@@ -14,7 +14,7 @@ mod peers;
 mod repos;
 mod store;
 
-use std::{sync::Arc, time::Instant};
+use std::{sync::Arc, time::SystemTime};
 
 use color_eyre::eyre::{Result, eyre};
 use iroh::{Endpoint, EndpointId};
@@ -134,7 +134,7 @@ impl Daemon {
 
         let ctx = Arc::new(ControlContext {
             endpoint: endpoint.clone(),
-            started: Instant::now(),
+            started: SystemTime::now(),
             peers: peers.clone(),
             repos: repos.clone(),
             hub: hub.clone(),

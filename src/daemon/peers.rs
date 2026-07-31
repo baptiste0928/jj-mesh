@@ -9,7 +9,7 @@
 use std::{
     collections::BTreeMap,
     sync::{Arc, Mutex},
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
 use iroh::{Endpoint, EndpointId, TransportAddr, endpoint::Connection};
@@ -72,7 +72,7 @@ struct PeerHandle {
 #[derive(Debug)]
 enum PeerState {
     Connecting,
-    Connected { conn: Connection, since: Instant },
+    Connected { conn: Connection, since: SystemTime },
     Backoff { until: Instant },
 }
 
@@ -177,7 +177,7 @@ impl PeerSet {
                     },
                     PeerState::Connected { conn, since } => control::ConnectionStatus::Connected {
                         path: selected_path(conn),
-                        since_secs: since.elapsed().as_secs(),
+                        since_secs: since.elapsed().unwrap_or_default().as_secs(),
                     },
                 };
 
@@ -337,7 +337,7 @@ impl PeerTask {
     /// connections, serving inbound announcement streams, and keeping the
     /// hub's registration current.
     async fn connected(&mut self, mut conn: Connection, mut outbound: bool) {
-        let mut since = Instant::now();
+        let mut since = SystemTime::now();
         // The peer is authenticated but must not spawn unbounded work.
         let announce_permits = Arc::new(Semaphore::new(MAX_ANNOUNCE_STREAMS));
         let fetch_permits = Arc::new(Semaphore::new(MAX_FETCH_STREAMS));
@@ -364,7 +364,7 @@ impl PeerTask {
                         conn.close(0u32.into(), b"duplicate");
                         conn = new;
                         outbound = false;
-                        since = Instant::now();
+                        since = SystemTime::now();
                         self.hub.peer_connected(self.peer_id, &conn);
                     }
                 }

@@ -34,7 +34,7 @@ use std::{
     collections::BTreeMap,
     path::PathBuf,
     sync::{Arc, Mutex},
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
 use color_eyre::eyre::{Result, WrapErr as _, ensure, eyre};
@@ -128,8 +128,8 @@ enum RepoState {
     Opening,
     Watching {
         op_heads: usize,
-        last_change: Option<Instant>,
-        last_sync: Option<Instant>,
+        last_change: Option<SystemTime>,
+        last_sync: Option<SystemTime>,
     },
     Backoff {
         until: Instant,
@@ -242,8 +242,10 @@ impl RepoSet {
                         last_sync,
                     } => control::WatchStatus::Watching {
                         op_heads: *op_heads as u64,
-                        last_change_secs: last_change.map(|at| at.elapsed().as_secs()),
-                        last_sync_secs: last_sync.map(|at| at.elapsed().as_secs()),
+                        last_change_secs: last_change
+                            .map(|at| at.elapsed().unwrap_or_default().as_secs()),
+                        last_sync_secs: last_sync
+                            .map(|at| at.elapsed().unwrap_or_default().as_secs()),
                     },
                     RepoState::Backoff { until, error } => control::WatchStatus::Failed {
                         error: error.clone(),
@@ -473,7 +475,7 @@ impl RepoTask {
             // suppresses the watcher events our own writes caused.
             let drained = self.drain_announcements(&repo).await?;
             if drained.synced {
-                last_sync = Some(Instant::now());
+                last_sync = Some(SystemTime::now());
             }
             retry_at = drained.retry.then(|| Instant::now() + FETCH_RETRY);
 
@@ -484,7 +486,7 @@ impl RepoTask {
             let new = sorted_heads(&repo).await?;
             if new != heads {
                 heads = new;
-                last_change = Some(Instant::now());
+                last_change = Some(SystemTime::now());
                 info!(repo = %self.name, op_heads = heads.len(), "op heads changed");
                 self.hub.publish(&self.name, &self.id, wire_heads(&heads));
             }
