@@ -1,13 +1,24 @@
 # Overview
 
-This documentation describes the internal architecture of `jj-mesh`, as well as
-the main design decisions and trade-offs. If you wish to contribute or
-understand how it works, you're in the right place!
+This documentation describes the internal architecture of `jj-mesh`, its main
+design decisions and their trade-offs, for developers who want to understand
+or contribute to it.
 
 ## Bird's-eye view
 
 `jj-mesh` synchronizes [jj](https://docs.jj-vcs.dev/) repositories across
-machines. Here are the key parts, each described in its own chapter:
+machines:
+
+```text
+┌─────┐ control  ┌────────┐    iroh (QUIC)    ┌──────────────┐
+│ CLI │──socket─►│ daemon │◄─────────────────►│ peer daemons │
+└─────┘          └───┬────┘                   └──────────────┘
+              watch  │  sync
+                     ▼
+              jj repositories
+```
+
+Here are the key parts:
 
 - **[The mesh](mesh.md)** is the set of machines on which the repos are
   synced. They are connected peer-to-peer using
@@ -28,42 +39,16 @@ machines. Here are the key parts, each described in its own chapter:
 
 ## Security model
 
-`jj-mesh` is meant to be used **with a mesh of personal machines**. Every peer
-has full read/write access to every shared repo, and can add or remove other
-peers. It is not meant for multi-user collaboration, or adding untrusted peers
-to the mesh.
-
-The daemon syncs changes as soon as they are snapshotted by `jj`, and does
-not propagate deletions such as `jj op abandon` (see *Consistency* below).
-The daemon also snapshots the working copy by default. Per `jj`'s design,
-content of snapshots may live indefinitely as long as it is referenced by
-the op log. This means **secrets can be replicated across every machine of
-the mesh** (and future ones, if still referenceable by the op log) if they
-are ever snapshotted.
-
-Connections between peers are made with `iroh` and are **fully end-to-end
-encrypted**, and peers are authenticated using their cryptographically secure
-Ed25519 key. Adding a machine to the mesh requires a one-time secret generated
-by one of the existing peers.
-
-While peers are authenticated, **their data is not trusted**: every message
-has a bounded size, and everything a peer sends is validated or hash-verified
-before touching disk. A compromised peer can write to shared repos, which is
-inherent to the model, but it should not be able to corrupt local storage,
-silently rewrite history, or exhaust the daemon's resources.
-
-We rely on public `iroh` relays to perform the initial handshake (needed for
-NAT traversal), and in case a direct connection cannot be established, to
-forward the traffic. These relays cannot read any of the data transiting, but
-they will see peers' IP addresses. See [iroh's Security and
-Privacy](https://docs.iroh.computer/concepts/security-privacy).
+The [README](https://github.com/baptiste0928/jj-mesh#security-and-privacy)
+describes the security model: every peer has full read/write access to every
+shared repo and connections are end-to-end encrypted and authenticated with
+per-machine Ed25519 keys.
 
 ## Consistency
 
-As `jj-mesh` synchronizes the full history of repositories, it makes its
-best effort to ensure no data ever gets corrupted or lost in the process,
-and that users can always restore to a good state. This is thankfully made
-easy by `jj`'s design.
+As `jj-mesh` synchronizes the full history of repositories, it is designed
+so no data gets corrupted or lost in the process, and users can always
+restore a good state. `jj`'s design makes this easy.
 
 - **The sync protocol is append-only.** No data ever gets deleted during a
   sync to avoid any corruption. The op log is append-only by design, and `jj`

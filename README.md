@@ -57,6 +57,7 @@ Add the flake as an input:
 ```nix
 inputs.jj-mesh.url = "github:baptiste0928/jj-mesh";
 ```
+
 Then enable the service in your Home Manager configuration:
 
 ```nix
@@ -90,12 +91,11 @@ more machines by running `jj-mesh peer add` again.
 
 > [!IMPORTANT]
 > `jj-mesh` is meant to be used **across personal machines you control** only. Once a machine gets
-> added to the mesh, it gets full read/write access to all added repos (there are no additional
-> permissions) and can add other machines.
+> added to the mesh, it gets full read/write access to all added repos and can add other machines.
 >
-> Also, since the daemon snapshots the working copy by default and syncs instantly, **any secret
-> written in a non-ignored file is synced almost instantly**. Once synced, it lives in the
-> operation log of every machine and can be recovered.
+> Also, since the daemon regularly snapshots the working copy by default, **any secret written in
+> a non-ignored file is synced almost instantly**. Once synced, it lives in the operation log of
+> every machine and can be recovered.
 
 After you've added the machines, you can add a repo to the mesh and clone it on another machine to
 start syncing:
@@ -138,10 +138,10 @@ Check out [`docs/`](./docs/src) for more information about the internals.
 
 ## Security and privacy
 
-`jj-mesh` uses [iroh](https://www.iroh.computer/) to connect directly between machines, including
-NAT and firewall bypass methods to establish a direct connection in various network conditions.
-Connections are mutually authenticated with a per-machine private key, so only paired machines
-can connect to each other.
+`jj-mesh` uses [iroh](https://www.iroh.computer/) to connect directly between machines, which
+uses [hole punching](https://en.wikipedia.org/wiki/Hole_punching_(networking)) to get a direct
+connection in various network conditions. Connections are mutually authenticated with a
+per-machine private key, so only paired machines can connect to each other.
 
 We use iroh's public relays to perform the initial handshake, and sometimes as a proxy when a
 direct connection fails. All data is always fully end-to-end encrypted in transit. See

@@ -2,15 +2,30 @@
 
 All sync traffic runs over one persistent QUIC connection per peer. Messages
 are length-prefixed [postcard](https://docs.rs/postcard) encodings, and every
-read is bounded by the receiver: the length prefix is peer-controlled, so no
-message may allocate more than its context allows.
+read is bounded by a cap the receiver enforces per message type.
 
 The protocol is pull-based, in two halves: cheap _announcements_ advertise
-state, and an explicit _fetch_ transfers it. Pushing data would make the
-sender responsible for knowing what the receiver needs and for retrying; with
-tiny idempotent announcements and receiver-driven fetches, the receiver
-controls exactly what enters its repo (validation lives on one side), and
-delivery needs no guarantees: the latest announcement always suffices.
+state, and an explicit _fetch_ transfers it.
+
+```text
+announcer                                  fetcher
+    │                                         │
+    │── announce: op head ids ───────────────►│ (missing heads?)
+    │                                         │
+    │◄─ fetch: wanted heads + has-sample ─────│
+    │── op log delta: views + ops ───────────►│ 1. op phase
+    │                                         │
+    │◄─ missing commit ids ───────────────────│
+    │── git object closure ──────────────────►│ 2. git phase
+    │                                         │
+    │                                         │ validate, apply, publish
+```
+
+Pushing data would make the sender responsible for knowing what the receiver
+needs and for retrying; with tiny idempotent announcements and
+receiver-driven fetches, the receiver controls exactly what enters its repo
+(validation lives on one side), and delivery needs no guarantees: the latest
+announcement always suffices.
 
 ## Announcements
 
@@ -54,8 +69,8 @@ repo.
 
 ## Validation and apply
 
-The fetcher authenticates the peer but trusts nothing it sends. Before any
-write:
+The fetcher authenticates the peer but trusts nothing it sends. Before
+anything becomes part of the repo:
 
 - Every op and view must decode against jj's own schema: a
   stored-but-unreadable object would break every jj command in the repo.
@@ -63,35 +78,50 @@ write:
   every op must be reachable from a wanted head. This blocks a poisoned
   batch from tricking the fetcher into unlisting a local head and silently
   rolling back history.
-- Every git object is hashed and must match its claimed id.
+- Every git object must match its claimed id: loose objects are re-hashed
+  one by one, packfiles (used by clones) are hash-verified while indexing.
 
-Only then does the apply run, in an order chosen so that a crash at any point
-leaves the repo consistent: first anti-GC keep refs for the new heads, then
-views and ops (parents-first), and only at the very end the op head
-publication that makes anything visible to jj. Which local heads a new head
-supersedes is established by walking ancestry through validated data only;
-when in doubt the old head stays listed and jj reconciles the divergence.
+The apply then writes in an order chosen so that a crash at any point leaves
+the repo consistent. Git objects already landed during the fetch (they are
+content-addressed and invisible until published), then come:
+
+1. anti-GC keep refs for the new views' head commits;
+2. views and ops, parents-first;
+3. change-id extras, imported from the new commits;
+4. on colocated repos, the git ref mirror (see below);
+5. only at the very end, the op head publication that makes everything
+   visible to jj.
+
+Which local heads a new head supersedes is established by walking ancestry
+through validated data only; when in doubt the old head stays listed and jj
+reconciles the divergence.
 
 ## Colocated repos
 
 In colocated repos (where `.git` sits next to `.jj`), git tools read the git
-refs directly, so after applying synced state the daemon mirrors the new
-view's git refs into `.git`. The mirror is deliberately conservative and
-follows jj's own exporter semantics: each ref is compare-and-swapped from the
-value the previous view knew, refs the user moved directly in git are left
-alone, and HEAD is never touched. It only happens when the sync is a clean
-fast-forward; under divergence there is no single previous view to reconcile
-against, so the mirror is skipped and jj's next import sorts it out.
+refs directly, so the apply mirrors the new view's git refs into `.git`
+(step 4 above, before anything is published). The mirror is deliberately
+conservative and follows jj's own exporter semantics:
+
+- each ref is compare-and-swapped from the value the previous view knew,
+  refs new to the view are created only if absent, and refs the view
+  dropped are deleted under the same compare-and-swap;
+- refs whose previous value was conflicted, and refs the user moved
+  directly in git, are left alone;
+- HEAD is never touched.
+
+The mirror only happens when the sync is a clean fast-forward; under
+divergence there is no single previous view to reconcile against, so it is
+skipped and jj's next import sorts it out.
 
 A mesh repo supports at most one colocated checkout. jj records the
 colocated `.git`'s HEAD in the view (`git_head`), which the mesh replicates,
 while the HEAD file itself is machine-local state jj pins to the local
-working copy's parent. With a second colocated checkout the two machines
-permanently disagree on that single field: every synced operation makes jj
-re-import the local HEAD as a working-copy move, which resurrects rewritten
-commits as divergent changes and ping-pongs `import git head` operations
-across the mesh. This is why clones never colocate; only the machine that
-originally added the repo gets git interop.
+working copy's parent. Two colocated checkouts therefore permanently
+disagree on that field, and every sync makes jj re-import the local HEAD,
+ping-ponging `import git head` operations across the mesh. This is why
+clones never colocate; only the machine that originally added the repo gets
+git interop.
 
 ## Cloning a repo
 
@@ -101,21 +131,19 @@ non-colocated jj repo (see above), gives its workspace a machine-unique name
 peer that advertises it. The fresh repo's init operations are unrelated to
 the mesh history, so the pull is divergent by construction; the next jj
 command merges the fresh workspace into the replicated history. The working
-copy then starts on trunk (`trunk()`, falling back to a local
-`main`/`master`/`trunk` bookmark) rather than on the init commit off the
-root.
+copy is then moved onto trunk (`trunk()`, falling back to a local
+`main`/`master`/`trunk` bookmark) on a best-effort basis, rather than left
+on the init commit off the root.
 
 ## Safety properties
 
 The properties the protocol is designed around, useful as a review checklist:
 
-- Nothing is written to disk before it is validated or hash-verified.
+- Nothing synced becomes visible before it is validated or hash-verified.
 - Replicated bytes never overwrite an existing object: for content-addressed
   stores, first write wins.
 - No op head is published before the ops and views it exposes are readable.
 - A peer cannot cause a local head to be unlisted without supplying a valid
   operation history that supersedes it.
-- Every peer-controlled quantity is bounded: message sizes, list lengths,
-  object sizes, walk budgets, concurrent handshakes and serves.
-- Interrupted syncs are safe to retry, and announcements make the retry
-  automatic.
+- Interrupted syncs are safe to retry, and the retry is automatic: a timer
+  after a failed fetch, the next announcement otherwise.

@@ -2,17 +2,29 @@
 
 Each machine runs a single long-lived daemon, the only holder of the identity
 key: concurrent processes sharing one endpoint identity would race discovery
-and connections. The CLI does everything through the daemon's local control
-socket (pairing, joins, status, mesh mutations), and binding the socket
-doubles as the single-instance guard.
+and connections. A lock file next to the control socket guards the single
+instance, and the CLI performs every mesh mutation (pairing, joins, repo
+changes) through that socket.
 
 ## Connections
 
-The daemon maintains a persistent connection to every peer. Both sides dial
-and duplicate connections are resolved deterministically, so the mesh heals no
+The daemon maintains a persistent connection to every peer. Both sides dial,
+and duplicate connections are resolved deterministically (the connection
+whose dialer has the lower endpoint id survives), so the mesh heals no
 matter which machine comes back online last. Every (re)connect replays the
 latest mesh state and announcements, which is what makes the fire-and-forget
 parts of the [sync protocol](sync.md) safe.
+
+## Routing
+
+Peer connections and repo sync tasks do not know each other: the *hub* sits
+between them and implements the latest-wins semantics of the sync protocol
+in both directions.
+
+```text
+peer task ──route()──► Inbox (per repo) ──drain()──► repo task
+peer task ◄──sender─── Outbox (per peer) ◄─publish()─ repo task
+```
 
 ## Watching repositories
 
@@ -26,21 +38,12 @@ sync.
 
 Beyond replicating history, the daemon keeps working copies fresh:
 
-- **Auto-snapshot** watches the working copy and snapshots changes as they
-  are saved, so edits propagate without waiting for a jj command to run.
+- **Auto-snapshot** watches the working copy and, once something changed,
+  snapshots it on a configurable interval, so edits propagate without
+  waiting for a jj command to run.
 - **Auto-update-stale** refreshes a workspace that a synced operation left
   stale, sparing the user a manual `jj workspace update-stale`.
 
-Both are configurable in the user configuration, globally and per repo, since
-the right behavior differs per machine: a VM running a coding agent wants
-both, a laptop may not. The daemon never competes with the user for the
-working copy: if the working copy lock is held, it backs off and retries
-later.
-
-## Failure model
-
-The daemon is fail-fast: any unexpected subsystem exit takes the whole daemon
-down, so the service manager restarts it into a known-good state instead of
-leaving a zombie that still looks healthy. This is safe because the design is
-restart-tolerant end to end: connections re-establish, mesh state and
-announcements replay, and interrupted syncs retry.
+Both are configurable, globally and per repo, and run through the user's jj
+binary, so they take the working-copy lock like any jj command and respect the
+user's jj configuration.
