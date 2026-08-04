@@ -52,7 +52,7 @@ use crate::{
         backoff::Backoff,
         hub::{Inbox, PeerAnnounce, SyncHub},
     },
-    net::sync::GitTransferFormat,
+    net::fetch::GitTransferFormat,
     repo::{JjRepo, OpenRepo, StoreFingerprint, repo_present, run_jj, transfer},
     watch::{DirWatcher, TreeWatcher},
 };

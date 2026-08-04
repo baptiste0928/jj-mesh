@@ -8,7 +8,7 @@ use jj_lib::object_id::ObjectId as _;
 use super::*;
 use crate::{
     net::{
-        sync::{FetchRequest, GitTransferFormat, MAX_OP_FRAME_SIZE, OpFrame},
+        fetch::{FetchRequest, GitTransferFormat, MAX_OP_FRAME_SIZE, OpFrame},
         wire::{read_message, write_message},
     },
     repo::{JjRepo, OpenRepo},
@@ -266,7 +266,7 @@ async fn rejects_ops_unreachable_from_wants() {
     let server = tokio::spawn(async move {
         use prost::Message as _;
 
-        use crate::net::sync::compress_payload;
+        use crate::net::fetch::compress_payload;
         let _request: FetchRequest = read_message(&mut server_rx, MAX_OP_FRAME_SIZE)
             .await
             .unwrap();

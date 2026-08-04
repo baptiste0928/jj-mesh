@@ -20,7 +20,7 @@ use super::{
 use crate::{
     config::sanitize,
     net::{
-        sync::{
+        fetch::{
             FetchRequest, GitFrame, GitRequest, GitTransferFormat, MAX_GIT_FRAME_SIZE,
             MAX_GIT_HAVES, MAX_GIT_OBJECT_SIZE, MAX_HAVES, MAX_OP_FRAME_SIZE, MAX_WANTS, OpFrame,
             WireObjectKind, decompress_payload,

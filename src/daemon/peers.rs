@@ -22,7 +22,7 @@ use tracing::{debug, info};
 use super::{backoff::Backoff, control, hub::SyncHub};
 use crate::{
     config::{Membership, MeshState},
-    net::{sync, wire},
+    net::{fetch, sync, wire},
 };
 
 /// Maximum uni streams (announcements, status, membership) handled
@@ -400,10 +400,10 @@ impl PeerTask {
             let _permit = permit;
             let request = tokio::time::timeout(
                 STREAM_READ_TIMEOUT,
-                wire::read_message(&mut recv, sync::MAX_OP_FRAME_SIZE),
+                wire::read_message(&mut recv, fetch::MAX_OP_FRAME_SIZE),
             )
             .await;
-            let request: sync::FetchRequest = match request {
+            let request: fetch::FetchRequest = match request {
                 Ok(Ok(request)) => request,
                 Ok(Err(err)) => return debug!(peer = %name, "bad fetch request: {err:#}"),
                 Err(_) => return debug!(peer = %name, "fetch request timed out"),

@@ -27,7 +27,7 @@ use tracing::debug;
 use super::pack;
 use crate::{
     net::{
-        sync::{
+        fetch::{
             FetchRequest, GitFrame, GitRequest, GitTransferFormat, MAX_GIT_FRAME_SIZE,
             MAX_GIT_HAVES, MAX_HAVES, MAX_OP_FRAME_SIZE, MAX_WANTS, OpFrame, WireObjectKind,
             compress_payload,

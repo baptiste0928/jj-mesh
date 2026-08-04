@@ -4,6 +4,7 @@
 //! and sync protocols.
 
 mod endpoint;
+pub(crate) mod fetch;
 pub(crate) mod pair;
 pub(crate) mod sync;
 pub(crate) mod wire;

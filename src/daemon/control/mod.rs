@@ -10,11 +10,13 @@
 //! user-driven mesh mutation go through here. Gossip-driven mutations
 //! reach the same store from the daemon's membership loop.
 //!
-//! Split in three: [`protocol`] is the request/response vocabulary the CLI
-//! and daemon share, [`server`] serves it, and [`client`] is what the CLI
-//! dials. The CLI depends on `protocol` and `client`, never on `server`.
+//! Split along that line: [`protocol`] is the request/response vocabulary
+//! the CLI and daemon share, [`server`] serves it (with the streaming
+//! clone handler in [`clone`]), and [`client`] is what the CLI dials. The
+//! CLI depends on `protocol` and `client`, never on `server`.
 
 mod client;
+mod clone;
 mod protocol;
 mod server;
 

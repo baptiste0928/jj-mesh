@@ -2,7 +2,7 @@
 //!
 //! Both sides run over any `AsyncRead`/`AsyncWrite` pair (QUIC streams in
 //! production, in-memory duplexes in tests) and exchange the frame types
-//! defined in [`crate::net::sync`]:
+//! defined in [`crate::net::fetch`]:
 //!
 //! ```text
 //! fetcher                                     server
@@ -29,13 +29,13 @@
 //! The engine splits along its two sides and the apply step:
 //! - [`serve`] answers a fetch (read-only): the op-log delta, then the git
 //!   object closure the fetcher lacks, loose or as one packfile (see
-//!   [`crate::net::sync::GitTransferFormat`]).
+//!   [`crate::net::fetch::GitTransferFormat`]).
 //! - [`fetch`] pulls and validates that delta, then hands it to [`apply`],
 //!   which writes it in the crash-safe order: git objects, anti-GC keep
 //!   refs, views and ops (parents first), change-id extras, the colocated
 //!   ref mirror, and only then the op head publication.
 //!
-//! Bulk store and git work runs on blocking threads (see the `mesh` module
+//! Bulk store and git work runs on blocking threads (see the `open` module
 //! docs).
 
 mod apply;
@@ -54,7 +54,7 @@ pub use serve::serve;
 
 use super::{
     codec::{OpMeta, ViewMeta},
-    mesh::{is_virtual_root, to_gix_id},
+    open::{is_virtual_root, to_gix_id},
 };
 use crate::config::RepoId;
 

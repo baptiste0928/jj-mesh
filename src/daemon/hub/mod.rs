@@ -20,63 +20,43 @@
 //! registered repo but whose id differs means two unrelated repos contest
 //! the name: it is never synced (that would merge unrelated histories) and
 //! the conflict is surfaced through the status. Announcements for names not
-//! registered here are remembered for `clone`. Disconnecting a peer closes
-//! its connection through the hub: revocation must sever announcements even
-//! when it races connection setup.
+//! registered here are remembered for `clone` (see [`orphans`]).
+//! Disconnecting a peer closes its connection through the hub: revocation
+//! must sever announcements even when it races connection setup.
 //!
 //! The hub also carries the machine's latest membership and status report,
 //! since it owns the outboxes: both are published here on every change and
 //! replayed (before any announcement) to every connecting peer. It holds
-//! the latest report of each connected peer as well.
+//! the latest report of each connected peer as well. And it serves inbound
+//! fetches for the repos it has open (see [`serve`]).
 
 mod inbox;
+mod orphans;
 mod outbox;
+mod serve;
 #[cfg(test)]
 mod tests;
 
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::{Arc, Mutex},
-    time::Duration,
 };
 
-use color_eyre::eyre::{Result, bail, ensure};
-use iroh::{
-    EndpointId,
-    endpoint::{Connection, RecvStream, SendStream},
-};
+use iroh::{EndpointId, endpoint::Connection};
 use tracing::{debug, warn};
 
 pub use self::inbox::{Inbox, PeerAnnounce};
-use self::outbox::{Outbox, run_sender};
+pub use self::orphans::CloneSource;
+use self::{
+    orphans::OrphanAnnounce,
+    outbox::{Outbox, run_sender},
+    serve::Serving,
+};
 use crate::{
     config::{Membership, RepoId, sanitize, validate_name},
-    net::{
-        sync::{Announce, FetchRequest, MAX_OP_FRAME_SIZE, OpFrame, StatusReport},
-        wire,
-    },
-    repo::{OpenRepo, transfer},
+    net::sync::{Announce, StatusReport},
+    repo::OpenRepo,
 };
-
-/// Fetches served concurrently per repo (read-only on the repo).
-const MAX_SERVES: usize = 2;
-
-/// Hard budget on serving one fetch; QUIC flow control means a stalled
-/// fetcher could otherwise pin a serve task and its permit forever.
-const SERVE_TIMEOUT: Duration = Duration::from_mins(30);
-
-/// Cap on unregistered repo names tracked *per peer*, so one peer (hostile
-/// or simply repo-rich) cannot evict the names other peers announce. A
-/// peer's entries are pruned when it disconnects.
-const MAX_ORPHAN_REPOS_PER_PEER: usize = 64;
-
-/// A peer that can serve a `clone` of an unregistered repo, with the op
-/// heads it claims.
-#[derive(Debug)]
-pub struct CloneSource {
-    pub peer: EndpointId,
-    pub heads: Vec<Vec<u8>>,
-}
 
 /// The router between peer connections and repo tasks.
 #[derive(Debug, Default)]
@@ -93,10 +73,7 @@ struct HubState {
     /// cloned again keeps outranking its old announcements: receivers only
     /// reset their per-repo watermark when the connection drops.
     announce_seq: u64,
-    /// Latest announcement per peer for repo names not registered here.
-    /// Peers replay all their repos on connect, so this is how `clone`
-    /// learns a repo's id and heads and who serves it. Bounded; stale
-    /// entries are healed like any announcement.
+    /// See [`orphans`].
     orphans: BTreeMap<String, BTreeMap<EndpointId, OrphanAnnounce>>,
     /// This machine's latest membership, replayed to connecting peers and
     /// broadcast on every change (see [`SyncHub::publish_membership`]).
@@ -110,29 +87,12 @@ struct HubState {
 }
 
 impl HubState {
-    /// How many orphan names hold an entry for `peer`, against
-    /// [`MAX_ORPHAN_REPOS_PER_PEER`].
-    fn orphans_held_by(&self, peer: &EndpointId) -> usize {
-        self.orphans
-            .values()
-            .filter(|peers| peers.contains_key(peer))
-            .count()
-    }
-
     /// Queues a message to every connected peer's outbox.
     fn broadcast(&self, push: impl Fn(&Outbox)) {
         for sender in self.peers.values() {
             push(&sender.outbox);
         }
     }
-}
-
-/// The latest announcement one peer made for an unregistered repo name.
-#[derive(Debug, Clone)]
-struct OrphanAnnounce {
-    id: RepoId,
-    heads: Vec<Vec<u8>>,
-    colocated: bool,
 }
 
 /// Hub-side state of one registered repo.
@@ -159,10 +119,8 @@ struct RepoEntry {
     /// Peers whose last announcement claimed a colocated instance. An
     /// entry clears when its peer announces non-colocated or disconnects.
     colocated_peers: BTreeSet<EndpointId>,
-    /// Serve handle, present while the repo task has the repo open.
-    /// Serving is read-only and dispatched straight from the hub: it must
-    /// never depend on the repo task's loop, which may itself be blocked
-    /// fetching from the very peer whose fetch we are serving.
+    /// Serve handle, present while the repo task has the repo open (see
+    /// [`serve`] for why the hub dispatches fetches itself).
     serving: Option<Serving>,
 }
 
@@ -176,13 +134,6 @@ impl RepoEntry {
     fn paused(&self) -> bool {
         self.local_colocated && !self.colocated_peers.is_empty()
     }
-}
-
-/// What the hub needs to serve fetches for an open repo.
-#[derive(Debug, Clone)]
-struct Serving {
-    repo: Arc<OpenRepo>,
-    permits: Arc<tokio::sync::Semaphore>,
 }
 
 /// Hub-side state of one connected peer.
@@ -209,7 +160,7 @@ impl SyncHub {
 
         let mut conflicts = BTreeMap::new();
         let mut colocated_peers = BTreeSet::new();
-        for (peer, announce) in state.orphans.remove(&name).unwrap_or_default() {
+        for (peer, announce) in state.take_orphans(&name) {
             if announce.id != id {
                 warn!(
                     repo = %name, peer = %peer,
@@ -252,10 +203,7 @@ impl SyncHub {
             .filter(|entry| &entry.id == id)
         {
             entry.local_colocated = repo.is_colocated();
-            entry.serving = Some(Serving {
-                repo,
-                permits: Arc::new(tokio::sync::Semaphore::new(MAX_SERVES)),
-            });
+            entry.serving = Some(Serving::new(repo));
             if entry.paused() {
                 warn!(
                     repo = %name,
@@ -285,69 +233,6 @@ impl SyncHub {
         state.peers.get(peer).map(|sender| sender.conn.clone())
     }
 
-    /// Serves an inbound fetch on a detached task, or refuses it when the
-    /// repo is not open here or too busy.
-    pub fn serve_fetch(
-        &self,
-        peer: EndpointId,
-        request: FetchRequest,
-        mut send: SendStream,
-        mut recv: RecvStream,
-    ) {
-        let Some(serving) = self.lookup_serving(&peer, &request) else {
-            return refuse_fetch(send, "repo not available");
-        };
-        let Ok(permit) = serving.permits.clone().try_acquire_owned() else {
-            debug!(repo = %request.name, "refusing fetch: too many being served");
-            return refuse_fetch(send, "busy, retry later");
-        };
-
-        tokio::spawn(async move {
-            let _permit = permit;
-            let serve = transfer::serve(&serving.repo, request, &mut send, &mut recv);
-            match tokio::time::timeout(SERVE_TIMEOUT, serve).await {
-                Ok(Ok(())) => {
-                    let _ = send.finish();
-                    debug!(peer = %peer, "served fetch");
-                }
-                Ok(Err(err)) => debug!(peer = %peer, "serve failed: {err:#}"),
-                Err(_) => debug!(peer = %peer, "serve timed out"),
-            }
-        });
-    }
-
-    /// Resolves the serve handle for a fetch request, logging every kind of
-    /// refusal distinctly. The name needs no validation here: only names that
-    /// passed it at registration are ever in the map, so an invalid one
-    /// simply fails to match.
-    fn lookup_serving(&self, peer: &EndpointId, request: &FetchRequest) -> Option<Serving> {
-        let state = self.state.lock().unwrap();
-        let Some(entry) = state.repos.get(&request.name) else {
-            debug!(repo = %request.name, "refusing fetch: repo not registered here");
-            return None;
-        };
-        // An id mismatch means the fetcher's repo is not ours, whatever the
-        // name says: refuse rather than mix unrelated histories.
-        if entry.id != request.id {
-            debug!(repo = %request.name, "refusing fetch: repo id mismatch");
-            return None;
-        }
-        // Refused only for the conflicting peer, not repo-wide: it should
-        // not be fetching while paused itself, but an older or hostile
-        // build must still be denied the ops that feed the colocation
-        // ping-pong. Everyone else is served normally.
-        if entry.local_colocated && entry.colocated_peers.contains(peer) {
-            debug!(repo = %request.name, "refusing fetch: colocation conflict with this peer");
-            return None;
-        }
-
-        let serving = entry.serving.clone();
-        if serving.is_none() {
-            debug!(repo = %request.name, "refusing fetch: repo not open");
-        }
-        serving
-    }
-
     /// Removes a repo registration (a local forget, a mesh-wide removal,
     /// or a same-name replacement).
     ///
@@ -365,11 +250,9 @@ impl SyncHub {
         };
 
         for (peer, heads) in entry.inbox.snapshot() {
-            if state.orphans_held_by(&peer) >= MAX_ORPHAN_REPOS_PER_PEER {
-                continue;
-            }
-            state.orphans.entry(name.to_owned()).or_default().insert(
+            state.remember_orphan(
                 peer,
+                name.to_owned(),
                 OrphanAnnounce {
                     id: entry.id.clone(),
                     heads,
@@ -420,8 +303,8 @@ impl SyncHub {
     /// any report still pending there.
     pub fn publish_status(&self, report: StatusReport) {
         let mut state = self.state.lock().unwrap();
-        state.status = Some(report.clone());
-        state.broadcast(move |outbox| outbox.push_status(report.clone()));
+        state.broadcast(|outbox| outbox.push_status(report.clone()));
+        state.status = Some(report);
     }
 
     /// Publishes this machine's membership: cached for peers that connect
@@ -431,8 +314,8 @@ impl SyncHub {
     /// propagation transitive.
     pub fn publish_membership(&self, membership: Membership) {
         let mut state = self.state.lock().unwrap();
+        state.broadcast(|outbox| outbox.push_membership(membership.clone()));
         state.membership = membership;
-        state.broadcast(|outbox| outbox.push_membership(state.membership.clone()));
     }
 
     /// Marks a peer connected: spawns its sender task and seeds the outbox
@@ -488,10 +371,7 @@ impl SyncHub {
                 entry.conflicts.remove(peer);
                 entry.colocated_peers.remove(peer);
             }
-            state.orphans.retain(|_, peers| {
-                peers.remove(peer);
-                !peers.is_empty()
-            });
+            state.forget_orphan_peer(peer);
             state.reports.remove(peer);
             state.peers.remove(peer)
         };
@@ -523,30 +403,21 @@ impl SyncHub {
         let mut state = self.state.lock().unwrap();
         let Some(entry) = state.repos.get_mut(&announce.name) else {
             if retraction {
-                if let Some(peers) = state.orphans.get_mut(&announce.name) {
-                    peers.remove(&peer);
-                    if peers.is_empty() {
-                        state.orphans.remove(&announce.name);
-                    }
-                }
+                state.forget_orphan(&announce.name, &peer);
                 return;
             }
-            let known = state
-                .orphans
-                .get(&announce.name)
-                .is_some_and(|peers| peers.contains_key(&peer));
-            if !known && state.orphans_held_by(&peer) >= MAX_ORPHAN_REPOS_PER_PEER {
-                debug!(peer = %peer, "dropping announcement: too many unregistered repos");
-                return;
-            }
-            state.orphans.entry(announce.name).or_default().insert(
+            let remembered = state.remember_orphan(
                 peer,
+                announce.name,
                 OrphanAnnounce {
                     id: announce.id,
                     heads: announce.heads,
                     colocated: announce.colocated,
                 },
             );
+            if !remembered {
+                debug!(peer = %peer, "dropping announcement: too many unregistered repos");
+            }
             return;
         };
 
@@ -586,50 +457,6 @@ impl SyncHub {
         // fetching, so the heads are fetched once the pause lifts rather
         // than lost until the peer's next change.
         entry.inbox.offer(peer, announce.seq, announce.heads);
-    }
-
-    /// Resolves a `clone` of the repo named `name`: the id every connected
-    /// announcing peer agrees on, and each peer's claimed heads. Errors
-    /// when nobody announces the name, or when peers disagree on the id
-    /// (unrelated repos contesting one name, which only the user can
-    /// resolve).
-    pub fn clone_sources(&self, name: &str) -> Result<(RepoId, Vec<CloneSource>)> {
-        let state = self.state.lock().unwrap();
-        let sources: Vec<(EndpointId, OrphanAnnounce)> = state
-            .orphans
-            .get(name)
-            .map(|peers| {
-                peers
-                    .iter()
-                    .filter(|(peer, _)| state.peers.contains_key(*peer))
-                    .map(|(peer, announce)| (*peer, announce.clone()))
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        let Some(id) = sources.first().map(|(_, announce)| announce.id.clone()) else {
-            bail!(
-                "no connected peer announces a repo named `{name}`; check \
-                 that the other machine's daemon is running and the name is \
-                 correct"
-            );
-        };
-        ensure!(
-            sources.iter().all(|(_, announce)| announce.id == id),
-            "peers announce different repos under the name `{name}`; \
-             resolve the conflict before cloning",
-        );
-
-        Ok((
-            id,
-            sources
-                .into_iter()
-                .map(|(peer, announce)| CloneSource {
-                    peer,
-                    heads: announce.heads,
-                })
-                .collect(),
-        ))
     }
 
     /// The current name conflicts, one entry per contesting peer.
@@ -695,15 +522,4 @@ impl SyncHub {
             .map(|(peer, report)| (*peer, report.clone()))
             .collect()
     }
-}
-
-/// Refuses a fetch on a detached task, telling the peer why before closing.
-fn refuse_fetch(mut send: SendStream, message: &'static str) {
-    tokio::spawn(async move {
-        let frame = OpFrame::Error {
-            message: message.to_owned(),
-        };
-        let _ = wire::write_message(&mut send, &frame, MAX_OP_FRAME_SIZE).await;
-        let _ = send.finish();
-    });
 }
