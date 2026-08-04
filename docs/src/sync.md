@@ -72,9 +72,9 @@ publication that makes anything visible to jj. Which local heads a new head
 supersedes is established by walking ancestry through validated data only;
 when in doubt the old head stays listed and jj reconciles the divergence.
 
-## Collocated repos
+## Colocated repos
 
-In collocated repos (where `.git` sits next to `.jj`), git tools read the git
+In colocated repos (where `.git` sits next to `.jj`), git tools read the git
 refs directly, so after applying synced state the daemon mirrors the new
 view's git refs into `.git`. The mirror is deliberately conservative and
 follows jj's own exporter semantics: each ref is compare-and-swapped from the
@@ -83,27 +83,27 @@ alone, and HEAD is never touched. It only happens when the sync is a clean
 fast-forward; under divergence there is no single previous view to reconcile
 against, so the mirror is skipped and jj's next import sorts it out.
 
-A mesh repo supports at most one collocated checkout. jj records the
-collocated `.git`'s HEAD in the view (`git_head`), which the mesh replicates,
+A mesh repo supports at most one colocated checkout. jj records the
+colocated `.git`'s HEAD in the view (`git_head`), which the mesh replicates,
 while the HEAD file itself is machine-local state jj pins to the local
-working copy's parent. With a second collocated checkout the two machines
+working copy's parent. With a second colocated checkout the two machines
 permanently disagree on that single field: every synced operation makes jj
 re-import the local HEAD as a working-copy move, which resurrects rewritten
 commits as divergent changes and ping-pongs `import git head` operations
-across the mesh. This is why clones never collocate; only the machine that
+across the mesh. This is why clones never colocate; only the machine that
 originally added the repo gets git interop.
 
 ## Cloning a repo
 
 `jj-mesh repo clone` bootstraps a repo onto a new machine: it creates a fresh
-non-collocated jj repo (see above), gives its workspace a machine-unique
-name (mesh machines must never share one), and pulls the repo's full state
-from a peer that advertises it.
-The fresh repo's init operations are unrelated to the mesh history, so the
-pull is divergent by construction; the next jj command merges the fresh
-workspace into the replicated history. The working copy then starts on
-trunk (`trunk()`, falling back to a local `main`/`master`/`trunk` bookmark)
-rather than on the init commit off the root.
+non-colocated jj repo (see above), gives its workspace a machine-unique name
+(mesh machines must never share one), and pulls the repo's full state from a
+peer that advertises it. The fresh repo's init operations are unrelated to
+the mesh history, so the pull is divergent by construction; the next jj
+command merges the fresh workspace into the replicated history. The working
+copy then starts on trunk (`trunk()`, falling back to a local
+`main`/`master`/`trunk` bookmark) rather than on the init commit off the
+root.
 
 ## Safety properties
 

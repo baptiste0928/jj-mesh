@@ -414,8 +414,8 @@ impl PeerTask {
         });
     }
 
-    /// Reads one uni stream (announcement or membership) in its own task
-    /// and routes it.
+    /// Reads one uni stream (a [`sync::UniMessage`]) in its own task and
+    /// routes it.
     fn serve_uni(&self, mut stream: iroh::endpoint::RecvStream, permits: &Arc<Semaphore>) {
         let Ok(permit) = permits.clone().try_acquire_owned() else {
             debug!(peer = %self.name, "dropping message: too many open streams");

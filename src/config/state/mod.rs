@@ -5,9 +5,9 @@
 //! records, tombstones included, and the mesh-wide repo list) and what is
 //! strictly local (the repos registered here, with their paths).
 //!
-//! It is owned and written exclusively by the daemon; the CLI mutates it
-//! through the control socket and only reads it directly as a fallback
-//! when no daemon is running.
+//! The daemon is the only writer; the CLI mutates it through the control
+//! socket, and may read the file directly (for pre-checks and completion),
+//! treating what it sees as advisory.
 
 mod membership;
 mod repo;
@@ -315,18 +315,12 @@ impl MeshState {
     /// endpoint: records about ourselves are not ours to store.
     ///
     /// Records merge as versioned registers (see the `membership`
-    /// submodule), so every
-    /// machine converges on the same state without clocks. Adopting a
-    /// removed repo also unregisters it here: that is how the removal
-    /// reaches the machines that hold it.
+    /// submodule), so every machine converges on the same state without
+    /// clocks. Adopting a removed repo also unregisters it here: that is
+    /// how the removal reaches the machines that hold it.
     ///
-    /// The merged maps are capped: a peer is authenticated but not trusted
-    /// to grow our state file (which we must keep gossipable) without
-    /// bound, so *new* entries stop being accepted at the cap while updates
-    /// to known ones keep flowing. At the cap machines can disagree on
-    /// which entries they hold, which is the accepted trade: the caps sit
-    /// far above a personal mesh, and an unbounded state file breaks
-    /// gossip outright.
+    /// New entries stop being adopted at the caps ([`MAX_MESH_PEERS`],
+    /// [`MAX_MESH_REPOS`]) while updates to known ones keep flowing.
     pub fn merge_membership(&mut self, remote: &Membership, local: &EndpointId) {
         for (endpoint, record) in &remote.peers {
             // Strictly below the ceiling: a record *at* it could never be

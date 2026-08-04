@@ -101,10 +101,8 @@ pub fn run(args: ServiceArgs, dir: &ConfigDir) -> Result<()> {
     }
 }
 
-/// Stops and starts the service, verifying both transitions: `stop` can
-/// fail or land asynchronously (launchd), and `start` reports success as
-/// soon as the process forks, so trusting the exit codes could print
-/// "restarted" while no daemon runs (or the old one still does).
+/// Stops and starts the service, verifying both transitions by polling
+/// (see [`RESTART_WAIT`]).
 fn restart(manager: &dyn ServiceManager, label: &ServiceLabel) -> Result<()> {
     stop_quietly(manager, label);
     wait_status(manager, label, "stop", |status| {
@@ -119,8 +117,6 @@ fn restart(manager: &dyn ServiceManager, label: &ServiceLabel) -> Result<()> {
     wait_status(manager, label, "start", |status| {
         status == &ServiceStatus::Running
     })?;
-    // A daemon that dies right after starting still reports running for an
-    // instant; re-check once it had time to fail.
     std::thread::sleep(RESTART_SETTLE);
     let status = manager
         .status(ServiceStatusCtx {

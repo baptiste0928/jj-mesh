@@ -42,10 +42,9 @@ pub struct Announce {
     pub name: String,
     /// The sender's id for the repo, for conflict detection.
     pub id: RepoId,
-    /// Publish sequence for this repo, monotonically increasing within the
+    /// Publish sequence, sender-wide: monotonic across all repos for the
     /// sender's daemon run. Streams have no cross-stream ordering, so the
-    /// receiver uses it to discard reordered announcements; it forgets the
-    /// watermark when the connection goes away.
+    /// receiver uses it to discard reordered announcements.
     pub seq: u64,
     /// Current op head ids, as raw id bytes; the receiver validates them.
     pub heads: Vec<Vec<u8>>,
@@ -222,12 +221,9 @@ pub struct FetchRequest {
 /// Server-to-fetcher frame of the op phase.
 ///
 /// Views and ops travel as the raw proto bytes stored in the server's op
-/// store, under their stored ids. jj computes op and view ids by hashing
-/// its in-memory structs at write time and never re-verifies them, so ids
-/// of objects written by older jj versions do not survive a decode +
-/// re-encode round trip; replicating the stored bytes verbatim is the only
-/// way to keep ids identical across the mesh. The receiver validates the
-/// bytes structurally (`repo`'s codec) before storing them.
+/// store, under their stored ids (see the sync docs for why re-encoding
+/// them is impossible). The receiver validates the bytes structurally
+/// (`repo`'s codec) before storing them.
 ///
 /// The proto bytes travel zstd-compressed; compression is a wire concern
 /// and the stored bytes stay verbatim.

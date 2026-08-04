@@ -16,7 +16,6 @@ type Signal = backend::Signal<()>;
 /// A debounced watch on one directory.
 ///
 /// Dropping it stops notify's background threads.
-#[derive(Debug)]
 pub struct DirWatcher {
     _watcher: RecommendedWatcher,
     signals: mpsc::UnboundedReceiver<Signal>,

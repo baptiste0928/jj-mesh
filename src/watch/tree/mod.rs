@@ -287,17 +287,8 @@ impl TreeWatcher {
     }
 }
 
-impl std::fmt::Debug for TreeWatcher {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("TreeWatcher")
-            .field("root", &self.root)
-            .field("watched", &self.watched.len())
-            .finish_non_exhaustive()
-    }
-}
-
 /// Walks the tree and returns the directories deserving a watch. The
-/// crate's own ignore handling is off: [`Rules`] is the single source of
+/// `ignore` crate's own handling is off: [`Rules`] is the single source of
 /// truth, and the only one reading rule files defensively.
 fn walk_dirs(root: &Path, rules: &Arc<Mutex<Rules>>) -> Result<BTreeSet<PathBuf>> {
     let filter = rules.clone();

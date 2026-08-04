@@ -6,15 +6,13 @@
 //! post-sync build (see [`MeshRepo::build_commit_index`]).
 //!
 //! Invariants:
-//! - Ops and views replicate as raw stored bytes under the sender's ids.
-//!   jj computes these ids from its in-memory structs at write time and
-//!   never re-verifies them, so ids written by older jj versions do not
-//!   survive a decode + re-encode round trip; only byte-verbatim copies
-//!   keep them identical across the mesh. Raw writes are atomic and never
-//!   overwrite an existing object: for a content-addressed store the first
-//!   write wins. They are staged and persisted in batches (see
-//!   [`RawWriteBatch`]): one parallel sync pass, then the renames into
-//!   place, preserving jj's sync-before-rename durability order.
+//! - Ops and views replicate as raw stored bytes under the sender's ids
+//!   (see the sync docs for why re-encoding them is impossible). Raw
+//!   writes are atomic and never overwrite an existing object: for a
+//!   content-addressed store the first write wins. They are staged and
+//!   persisted in batches (see [`RawWriteBatch`]): one parallel sync pass,
+//!   then the renames into place, preserving jj's sync-before-rename
+//!   durability order.
 //! - The root operation is never transferred; it is identical in every repo.
 //!
 //! jj's store traits are async in signature only: every call does blocking
@@ -93,11 +91,6 @@ impl MeshRepo {
             mesh.repo.root().display(),
         );
         Ok(mesh)
-    }
-
-    /// The validated repo this was opened from.
-    pub fn repo(&self) -> &JjRepo {
-        &self.repo
     }
 
     /// The id of the root operation, common to all repos.
@@ -361,8 +354,8 @@ impl MeshRepo {
     }
 
     /// Path to the git repository holding the commit data (the `.git`
-    /// directory when colocated), for direct object access via gitoxide.
-    pub fn git_repo_path(&self) -> &Path {
+    /// directory when colocated).
+    fn git_repo_path(&self) -> &Path {
         self.git_backend().git_repo_path()
     }
 
@@ -462,25 +455,11 @@ impl RawWriteBatch<'_> {
         })?;
 
         for (temp, path) in self.staged {
-            if cfg!(windows) {
-                // Overwriting can fail on Windows if the file is open
-                // elsewhere; an existing file holds equivalent content
-                // (content-addressed), so keep it.
-                match temp.persist_noclobber(&path) {
-                    Ok(()) => {}
-                    Err(_) if path.exists() => {}
-                    Err(err) => {
-                        return Err(err.error)
-                            .wrap_err_with(|| format!("cannot persist {}", path.display()));
-                    }
-                }
-            } else {
-                // On Unix the rename atomically replaces any raced
-                // duplicate with equivalent content.
-                temp.persist(&path)
-                    .map_err(|err| err.error)
-                    .wrap_err_with(|| format!("cannot persist {}", path.display()))?;
-            }
+            // The rename atomically replaces any raced duplicate with
+            // equivalent content.
+            temp.persist(&path)
+                .map_err(|err| err.error)
+                .wrap_err_with(|| format!("cannot persist {}", path.display()))?;
         }
         Ok(())
     }

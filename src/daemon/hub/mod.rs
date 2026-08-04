@@ -24,9 +24,10 @@
 //! its connection through the hub: revocation must sever announcements even
 //! when it races connection setup.
 //!
-//! The hub also carries the machine's latest membership, since it owns the
-//! outboxes: the mesh store publishes it here on every change, and it is
-//! replayed (before any announcement) to every connecting peer.
+//! The hub also carries the machine's latest membership and status report,
+//! since it owns the outboxes: both are published here on every change and
+//! replayed (before any announcement) to every connecting peer. It holds
+//! the latest report of each connected peer as well.
 
 mod inbox;
 mod outbox;
@@ -162,17 +163,12 @@ struct RepoEntry {
 }
 
 impl RepoEntry {
-    /// Whether sync is suspended for this repo: our instance and at least
-    /// one peer's are both colocated. Two colocated instances exchanging
-    /// ops pollute history (each side re-imports its machine-local git
-    /// HEAD after every sync, resurrecting rewritten commits as divergent
-    /// changes), so while paused this repo fetches from nobody; with both
-    /// conflicted sides refusing to fetch, the poisonous ops cannot land
-    /// even through a relaying third machine. Announcing and serving
-    /// non-conflicted peers stays enabled: read-only serving cannot hurt
-    /// us, and the rest of the mesh keeps syncing. Detection needs the two
-    /// colocated instances directly connected; in a relay-only topology
-    /// the conflict goes undetected.
+    /// Whether sync is suspended for this repo: the local instance and at
+    /// least one peer's are both colocated (see the sync docs for why two
+    /// colocated instances must not exchange ops). While paused the repo
+    /// fetches from nobody; announcing and serving stay on. Detection
+    /// needs the colocated instances directly connected; in a relay-only
+    /// topology the conflict goes undetected.
     fn paused(&self) -> bool {
         self.local_colocated && !self.colocated_peers.is_empty()
     }

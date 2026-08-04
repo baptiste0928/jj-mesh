@@ -128,11 +128,9 @@ impl Pairing {
             }
         };
 
-        // Persist before confirming: the `paired` close is the joiner's
-        // commit signal, so the host must never send it for a peer it did
-        // not save. Consuming the ticket and saving happen under the lock,
-        // so a ticket revoked or replaced mid-exchange can never register
-        // a peer, and a ticket is redeemed at most once.
+        // Consuming the ticket and saving the peer happen under the same
+        // lock, so a ticket revoked or replaced mid-exchange can never
+        // register a peer, and a ticket is redeemed at most once.
         let saved = {
             let mut issued = self.issued.lock().unwrap();
             let live = issued

@@ -106,9 +106,9 @@ async fn fast_forward_sync_transfers_ops_and_git_objects() {
     let wants = ra.op_heads().await.unwrap();
     let outcome = sync_once(&rb, &ra, &wants).await;
 
-    assert_eq!(outcome.published, wants);
     assert!(outcome.ops > 0);
     assert!(outcome.git_objects > 0);
+    // The wanted heads were published: they superseded b's old head.
     assert_eq!(rb.op_heads().await.unwrap(), wants);
 
     // jj itself must accept the synced repo: log walks commits, which
@@ -121,7 +121,8 @@ async fn fast_forward_sync_transfers_ops_and_git_objects() {
 
     // Re-fetching the same heads is a no-op.
     let again = sync_once(&rb, &ra, &wants).await;
-    assert!(again.published.is_empty());
+    assert_eq!(again.ops, 0);
+    assert_eq!(rb.op_heads().await.unwrap(), wants);
 }
 
 /// An incremental sync must carry only the objects the change touched,
@@ -369,15 +370,21 @@ async fn clone_pull_into_fresh_repo() {
 
     let (ra, rb) = (open(&a), open(&b));
     let wants = ra.op_heads().await.unwrap();
+    let init_heads = rb.op_heads().await.unwrap();
     let outcome = sync_once_as(&rb, &ra, &wants, GitTransferFormat::Pack).await;
-    assert_eq!(outcome.published, wants);
     assert!(outcome.git_objects > 0);
+
+    // The wanted head was published next to the fresh repo's init head.
+    let mut expected: Vec<OperationId> = wants.clone();
+    expected.extend(init_heads);
+    expected.sort_unstable();
+    let mut heads = rb.op_heads().await.unwrap();
+    heads.sort_unstable();
+    assert_eq!(heads, expected);
 
     // The commit index was built for the published head: the fetch, not
     // the user's next jj command, paid for indexing the pulled history.
-    let op_link = b
-        .join(".jj/repo/index/op_links")
-        .join(outcome.published[0].hex());
+    let op_link = b.join(".jj/repo/index/op_links").join(wants[0].hex());
     assert!(op_link.is_file(), "missing index op link {op_link:?}");
 
     // The objects landed as one pack, not loose, and the `.keep` file
@@ -613,8 +620,9 @@ async fn syncs_trees_with_gitlink_entries() {
 
     let (ra, rb) = (open(&dir_a), open(&dir_b));
     let wants = ra.op_heads().await.unwrap();
-    let outcome = sync_once(&rb, &ra, &wants).await;
-    assert!(!outcome.published.is_empty());
+    sync_once(&rb, &ra, &wants).await;
+    // The wanted heads were published: they superseded b's old head.
+    assert_eq!(rb.op_heads().await.unwrap(), wants);
 
     // The gitlink commit's own objects arrived; the submodule target
     // was correctly skipped.

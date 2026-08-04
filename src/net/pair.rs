@@ -252,10 +252,8 @@ pub async fn reject_attempt(conn: &Connection, reason: &str) {
     }
 }
 
-/// Confirms a successful pairing to the joiner.
-///
-/// This close is the joiner's commit signal: the caller must have persisted
-/// the peer already, so the host never confirms a peer it did not save.
+/// Confirms a successful pairing to the joiner. The peer must already be
+/// persisted.
 pub fn confirm_paired(conn: &Connection) {
     conn.close(0u32.into(), PAIRED_REASON);
 }
@@ -300,9 +298,8 @@ pub async fn join(
     write_message(&mut send, &Message::Done, MAX_MESSAGE_SIZE).await?;
     let _ = send.finish();
 
-    // The host closes with "paired" once it has persisted the peer; any
-    // other close (including the code-0 close of a dropped connection, e.g.
-    // the host revoking the ticket) means the host did not register us.
+    // Any close but the `paired` confirmation (see the module docs) means
+    // the host did not register us.
     match conn.closed().await {
         ConnectionError::ApplicationClosed(close)
             if close.error_code == VarInt::from_u32(0)
@@ -321,9 +318,7 @@ pub async fn join(
 
 /// Resolves the name to register for the authenticated `endpoint`, which
 /// announced itself as `announced`. An already-registered peer keeps its
-/// stored name, making re-pairing idempotent: accepting a peer we already
-/// trust gives an attacker nothing, and lets a half-paired machine recover
-/// by retrying. A new peer is validated against the mesh state, and told
+/// stored name. A new peer is validated against the mesh state, and told
 /// the reason when refused.
 async fn resolve_peer_name(
     conn: &Connection,

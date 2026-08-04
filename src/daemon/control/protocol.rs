@@ -161,10 +161,9 @@ pub struct Status {
     pub peer_reports: Vec<PeerReport>,
 }
 
-/// A repo paused by a colocation conflict: this machine's instance and the
-/// named peers' all have a user-visible `.git`, which a mesh repo supports
-/// on at most one machine (see `jj-mesh repo clone`'s docs). The repo fetches
-/// from nobody until only one colocated instance remains visible.
+/// A repo whose sync is paused by a colocation conflict: this machine's
+/// instance and the named peers' are all colocated, which a mesh repo
+/// supports on at most one machine (see the sync docs).
 #[derive(Debug, Serialize, Deserialize)]
 pub struct PausedStatus {
     pub repo: String,

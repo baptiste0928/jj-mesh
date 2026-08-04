@@ -1,7 +1,37 @@
 //! The per-repo watch task: open, watch op heads, announce local changes,
 //! fetch announced changes from peers, and drive the optional auto-snapshot
-//! and update-stale jj runs. See the module docs in [`super`] for the
-//! overall behavior and its invariants.
+//! and update-stale jj runs.
+//!
+//! The task watches the repo's op-heads directory: every mutating jj
+//! command atomically swaps head marker files there, so a change event
+//! means new operations to announce. The task publishes its head set
+//! through the sync hub (on change and on watch start) and fetches
+//! operations peers announce; serving peer fetches is dispatched by the
+//! hub directly (never through this task's loop, which may itself be
+//! fetching).
+//!
+//! Change detection compares the head set against the last one seen, which
+//! also absorbs event bursts and spurious wakeups; the task's own head
+//! writes (applying fetched operations) fold into that baseline before the
+//! comparison, so self-triggered events are suppressed the same way.
+//!
+//! When auto-snapshotting is enabled, the task also watches the working
+//! copy files: the first edit arms a snapshot one interval later (never
+//! immediately), and edits during the wait do not postpone it, so
+//! continuous editing snapshots at the configured cadence. The snapshot
+//! runs through the jj binary and produces a regular operation, which the
+//! op-heads watch then picks up and announces like any local change.
+//!
+//! Syncing operations from peers can leave the local working copy stale
+//! (updated by an operation the working copy never saw). When enabled,
+//! `jj workspace update-stale` runs after every sync that applied
+//! operations, and once on watch start for staleness accrued while the
+//! daemon was down, but only while the op head is single. Any jj
+//! command reconciles divergent op heads by writing a merge operation,
+//! so daemons doing this on both ends of a divergence would ping-pong
+//! fresh merge operations at each other. Divergence is left to the next
+//! actual jj activity (a user command, an auto-snapshot), whose merge
+//! then arrives here as a single head.
 
 use std::{
     path::{Path, PathBuf},

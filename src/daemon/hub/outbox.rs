@@ -20,8 +20,8 @@ use crate::{
 const ANNOUNCE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Pending messages for one peer, coalesced latest-wins: one slot for the
-/// membership and one per repo for announcements, each kept until the
-/// sender task takes it.
+/// membership, one for the status report and one per repo for
+/// announcements, each kept until the sender task takes it.
 #[derive(Debug, Default)]
 pub(super) struct Outbox {
     pending: Mutex<OutboxState>,

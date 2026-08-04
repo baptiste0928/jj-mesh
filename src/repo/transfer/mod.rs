@@ -18,7 +18,7 @@
 //! ```
 //!
 //! Ops and views travel as raw stored bytes and keep their sender-side ids
-//! (see the `mesh` module docs for why re-hashing them is impossible).
+//! (see the sync docs for why re-hashing them is impossible).
 //! Peer-supplied data is authenticated but untrusted: op and view bytes are
 //! validated structurally before anything is written, git objects are
 //! hash-verified before writing (loose frames against their claimed id,
@@ -62,10 +62,6 @@ use super::codec::{OpMeta, ViewMeta};
 /// What a completed fetch did, for logging and status.
 #[derive(Debug)]
 pub struct FetchOutcome {
-    /// Op heads published locally (empty when already up to date). The
-    /// daemon only logs the counts; the tests assert on it.
-    #[cfg_attr(not(test), expect(dead_code))]
-    pub published: Vec<OperationId>,
     pub ops: usize,
     pub git_objects: usize,
 }

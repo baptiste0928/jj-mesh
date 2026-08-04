@@ -1,18 +1,8 @@
 //! Embeds the commit sha the binary was built from as `JJ_MESH_COMMIT`.
-//!
-//! Resolution order: an externally provided `JJ_MESH_COMMIT` (the Nix build
-//! sets it, since `.git` is stripped from the flake source), then the
-//! colocated git repository, then `"unknown"` for plain source archives.
 
 use std::{env, path::Path, process::Command};
 
 fn main() {
-    // We embed the commit sha the binary was built from as `JJ_MESH_COMMIT`.
-    //
-    // The value can also be provided at build time, for example when building
-    // in an environment without the .git folder available (for example, in
-    // the Nix flake).
-
     let manifest_dir = env::var("CARGO_MANIFEST_DIR").unwrap();
 
     println!("cargo::rerun-if-env-changed=JJ_MESH_COMMIT");

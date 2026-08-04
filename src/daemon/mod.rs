@@ -236,11 +236,9 @@ async fn accept_loop(endpoint: Endpoint, peers: Arc<PeerSet>, pairing: Arc<Pairi
     }
 }
 
-/// Broadcasts this machine's health to the peers: rebuilt on every repo
-/// state change (debounced) and periodically (the staleness bound for
-/// state the repo set does not signal, i.e. colocation pauses), but only
-/// published when it actually changed: an idle mesh stays silent. A
-/// report lost with its connection is replayed on reconnect.
+/// Broadcasts this machine's health to the peers, on repo state changes
+/// and periodically, publishing only when it changed: an idle mesh stays
+/// silent. A report lost with its connection is replayed on reconnect.
 async fn status_loop(repos: Arc<RepoSet>, hub: Arc<SyncHub>, jj_version: Option<String>) {
     let mut published: Option<sync::StatusReport> = None;
     loop {

@@ -156,9 +156,8 @@ pub async fn fetch(
     // so a failure here must not fail an otherwise complete fetch.
     if !published.is_empty() {
         let repo = repo.clone();
-        let heads = published.clone();
         let build = tokio::task::spawn_blocking(move || {
-            for head in &heads {
+            for head in &published {
                 if let Err(err) = repo.build_commit_index(head) {
                     tracing::warn!("cannot index synced operation: {err:#}");
                 }
@@ -170,7 +169,6 @@ pub async fn fetch(
     }
 
     Ok(FetchOutcome {
-        published,
         ops: ops_received,
         git_objects,
     })
