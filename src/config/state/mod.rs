@@ -311,6 +311,12 @@ impl MeshState {
         }
     }
 
+    /// Whether the gossiped part of the state (see [`Self::membership`])
+    /// differs, without building it.
+    pub fn membership_differs(&self, other: &Self) -> bool {
+        self.peers != other.peers || self.mesh_repos != other.mesh_repos
+    }
+
     /// Merges a peer's membership into ours. `local` is this machine's own
     /// endpoint: records about ourselves are not ours to store.
     ///

@@ -48,11 +48,18 @@ fn jj(dir: Option<&Path>, args: &[&str]) -> Result<()> {
         command.current_dir(dir);
     }
     let out = command.args(args).output().wrap_err("cannot run jj")?;
+    // Diagnostics embed bytes read from repo files; mask them line by
+    // line so escape sequences never reach the terminal.
+    let stderr: Vec<String> = String::from_utf8_lossy(&out.stderr)
+        .trim()
+        .lines()
+        .map(crate::config::sanitize)
+        .collect();
     ensure!(
         out.status.success(),
         "jj {} failed:\n{}",
         args.join(" "),
-        String::from_utf8_lossy(&out.stderr),
+        stderr.join("\n"),
     );
     Ok(())
 }

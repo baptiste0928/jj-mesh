@@ -73,9 +73,10 @@ pub(super) fn format_duration(secs: u64) -> String {
     }
 }
 
-/// Width of the longest name, for column alignment.
+/// Width of the longest name, for column alignment. Counts chars to match
+/// the `{:width$}` padding, which is not byte-based.
 pub(super) fn name_width<'a>(names: impl Iterator<Item = &'a str>) -> usize {
-    names.map(str::len).max().unwrap_or(0)
+    names.map(|name| name.chars().count()).max().unwrap_or(0)
 }
 
 #[cfg(test)]

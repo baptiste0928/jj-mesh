@@ -13,7 +13,7 @@ use color_eyre::eyre::{Result, bail};
 use crate::{
     cli::{hostname, ui},
     config::ConfigDir,
-    daemon::control::{ControlClient, Request, Response},
+    daemon::control::{ControlClient, PAIR_TICKET_TTL, Request, Response},
     net::pair::PairTicket,
 };
 
@@ -33,7 +33,7 @@ pub struct AddArgs {
     /// Pairing ticket printed by `jj-mesh peer add` on the other machine
     ///
     /// If omitted, a ticket will be generated. The ticket can be used once,
-    /// and expires after 3 minutes.
+    /// and expires after a few minutes.
     ticket: Option<String>,
 
     /// Name announced to the other machine (defaults to the hostname)
@@ -75,9 +75,10 @@ async fn host(client: &mut ControlClient, name: String) -> Result<()> {
             );
             println!(
                 "{}",
-                ui::dim(
-                    "The paired machine will have access to all repos from the mesh. The ticket is valid for 3 minutes.",
-                ),
+                ui::dim(format_args!(
+                    "The paired machine will have access to all repos from the mesh. The ticket is valid for {} minutes.",
+                    PAIR_TICKET_TTL.as_secs() / 60,
+                )),
             );
             Ok(())
         }

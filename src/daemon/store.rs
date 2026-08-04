@@ -94,7 +94,7 @@ impl MeshStore {
         }
 
         next.save(&self.dir)?;
-        let membership_changed = next.peers != state.peers || next.mesh_repos != state.mesh_repos;
+        let membership_changed = next.membership_differs(&state);
         *state = next;
 
         self.peers.sync(&state);

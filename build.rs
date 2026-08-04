@@ -30,7 +30,7 @@ fn git_commit(dir: &str) -> String {
         Some(output) if output.status.success() => {
             String::from_utf8_lossy(&output.stdout).trim().to_owned()
         }
-        _ => "unknown".to_owned(),
+        _ => return "unknown".to_owned(),
     };
 
     let dirty = Command::new("git")
