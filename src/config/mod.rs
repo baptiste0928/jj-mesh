@@ -18,7 +18,7 @@ mod state;
 pub use key::MachineKey;
 #[cfg(test)]
 pub(crate) use name::MAX_NAME_LEN;
-pub(crate) use name::{is_confusable, sanitize, validate_name};
+pub(crate) use name::{sanitize, sanitize_bounded, validate_name};
 pub use resolve::ConfigDir;
 pub use settings::{RepoSettings, Settings};
 pub use state::{

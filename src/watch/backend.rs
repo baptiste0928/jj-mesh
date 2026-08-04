@@ -17,7 +17,7 @@ pub(super) enum Signal<T> {
 /// `deliver` hands the signal to the async side; backend errors become
 /// [`Signal::Failed`]. Access events never signal: the consumer's own
 /// reads (snapshots, syncs) must not feed back into the watch.
-pub(super) fn spawn<T>(
+pub(super) fn watcher<T>(
     mut map: impl FnMut(Event) -> Option<Signal<T>> + Send + 'static,
     mut deliver: impl FnMut(Signal<T>) + Send + 'static,
 ) -> Result<RecommendedWatcher> {

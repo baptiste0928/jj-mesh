@@ -3,9 +3,9 @@
 use clap::Args;
 use color_eyre::eyre::Result;
 
-use super::ui::{self, display_path, format_duration, name_width, sanitize};
+use super::ui;
 use crate::{
-    config::ConfigDir,
+    config::{ConfigDir, sanitize},
     daemon::control::{self, ConnectionStatus, PeerReport, RepoHealthState, Route},
 };
 
@@ -29,7 +29,7 @@ pub fn run(_args: StatusArgs, dir: &ConfigDir) -> Result<()> {
     println!(
         "daemon: {} (uptime {})",
         ui::good("running"),
-        format_duration(status.uptime_secs)
+        ui::format_duration(status.uptime_secs)
     );
     if let Some(warning) = crate::repo::jj_version_warning(status.jj_version.as_deref()) {
         println!("{} {warning}", ui::warn("warning:"));
@@ -40,7 +40,7 @@ pub fn run(_args: StatusArgs, dir: &ConfigDir) -> Result<()> {
         println!("no paired peers");
     } else {
         println!("{}", ui::heading("peers:"));
-        let width = name_width(status.peers.iter().map(|p| p.name.as_str()));
+        let width = ui::name_width(status.peers.iter().map(|p| p.name.as_str()));
         for peer in &status.peers {
             println!(
                 "  {:width$}  {}",
@@ -55,9 +55,13 @@ pub fn run(_args: StatusArgs, dir: &ConfigDir) -> Result<()> {
         println!("no repos added");
     } else {
         println!("{}", ui::heading("repos:"));
-        let width = name_width(status.repos.iter().map(|r| r.name.as_str()));
-        let paths: Vec<String> = status.repos.iter().map(|r| display_path(&r.path)).collect();
-        let path_width = name_width(paths.iter().map(String::as_str));
+        let width = ui::name_width(status.repos.iter().map(|r| r.name.as_str()));
+        let paths: Vec<String> = status
+            .repos
+            .iter()
+            .map(|r| ui::display_path(&r.path))
+            .collect();
+        let path_width = ui::name_width(paths.iter().map(String::as_str));
         for (repo, path) in status.repos.iter().zip(&paths) {
             println!(
                 "  {:width$}  {}  {}",
@@ -117,7 +121,7 @@ fn collect_issues(status: &control::Status) -> Vec<String> {
                 RepoHealthState::Missing => "directory missing on that machine",
                 RepoHealthState::Paused => "paused there (colocation conflict)",
             };
-            issues.push(format!("`{}` on {peer}: {problem}", sanitize(&repo.name)));
+            issues.push(format!("`{}` on {peer}: {problem}", repo.name));
         }
     }
 
@@ -132,7 +136,7 @@ fn watch_summary(watch: &control::WatchStatus) -> String {
             last_change_secs, ..
         } => {
             let synced = match last_change_secs {
-                Some(secs) => format!(" (synced {} ago)", format_duration(*secs)),
+                Some(secs) => format!(" (synced {} ago)", ui::format_duration(*secs)),
                 None => String::new(),
             };
             format!("{}{synced}", ui::good("watching"))
@@ -144,12 +148,12 @@ fn watch_summary(watch: &control::WatchStatus) -> String {
             "{} {} (retry in {})",
             ui::bad("error:"),
             sanitize(error),
-            format_duration(*retry_in_secs)
+            ui::format_duration(*retry_in_secs)
         ),
         control::WatchStatus::Missing { retry_in_secs } => format!(
             "{} (retry in {})",
             ui::warn("directory missing"),
-            format_duration(*retry_in_secs)
+            ui::format_duration(*retry_in_secs)
         ),
     }
 }
@@ -161,7 +165,7 @@ fn connection_summary(connection: &ConnectionStatus) -> String {
         ConnectionStatus::Backoff { retry_in_secs } => format!(
             "{} (retry in {})",
             ui::bad("unreachable"),
-            format_duration(*retry_in_secs)
+            ui::format_duration(*retry_in_secs)
         ),
         ConnectionStatus::Connected { path, since_secs } => {
             let route = match path {
@@ -178,7 +182,7 @@ fn connection_summary(connection: &ConnectionStatus) -> String {
             format!(
                 "{} {route}, up {}",
                 ui::good("connected"),
-                format_duration(*since_secs)
+                ui::format_duration(*since_secs)
             )
         }
     }

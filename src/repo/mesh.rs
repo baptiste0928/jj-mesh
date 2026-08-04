@@ -320,16 +320,13 @@ impl MeshRepo {
     /// Ensures a jj-written commit carries the `change-id` git header (see
     /// [`Self::self_check`]).
     fn check_change_id_header(&self, id: &CommitId) -> Result<()> {
-        // jj's virtual root commit is never a real git object.
-        if id.as_bytes().iter().all(|byte| *byte == 0) {
+        if is_virtual_root(id) {
             return Ok(());
         }
 
         let git = self.git_backend().git_repo();
-        let oid = gix::ObjectId::try_from(id.as_bytes())
-            .map_err(|err| eyre!("bad working-copy commit id: {err}"))?;
         let object = git
-            .find_object(oid)
+            .find_object(to_gix_id(id)?)
             .map_err(|err| eyre!("cannot read working-copy commit {}: {err}", id.hex()))?;
         let commit = object
             .try_to_commit_ref()
@@ -364,6 +361,16 @@ impl MeshRepo {
     pub fn is_colocated(&self) -> bool {
         self.git_repo_path() == self.repo.root().join(".git")
     }
+}
+
+/// jj's virtual root commit is never a real git object.
+pub(super) fn is_virtual_root(id: &CommitId) -> bool {
+    id.as_bytes().iter().all(|byte| *byte == 0)
+}
+
+/// Converts a jj commit id into a gix object id.
+pub(super) fn to_gix_id(id: &CommitId) -> Result<gix::ObjectId> {
+    gix::ObjectId::try_from(id.as_bytes()).map_err(|err| eyre!("bad commit id: {err}"))
 }
 
 /// Reads a raw object file from a simple op store directory.

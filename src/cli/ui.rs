@@ -2,8 +2,10 @@
 //!
 //! Styling goes through the semantic wrappers below so every command
 //! renders the same palette; `console` disables the colors on its own
-//! when stdout is not a terminal or `NO_COLOR` is set. Peer-provided
-//! text must pass through [`sanitize`] before it is printed or styled.
+//! when stdout is not a terminal or `NO_COLOR` is set. Peer and repo
+//! names are validated at the daemon boundary and print as-is; free-form
+//! peer- or daemon-provided strings (error messages) must pass through
+//! [`crate::config::sanitize`] before they are printed or styled.
 
 use std::{fmt::Display, path::Path};
 
@@ -34,21 +36,6 @@ pub(super) fn dim<D: Display>(text: D) -> StyledObject<D> {
     style(text).dim()
 }
 
-/// Replaces control and invisible characters with `?` in daemon-provided
-/// text before it reaches the terminal: error messages embed bytes read from
-/// repo files, which could otherwise smuggle escape sequences.
-pub(super) fn sanitize(text: &str) -> String {
-    text.chars()
-        .map(|c| {
-            if crate::config::is_confusable(c) {
-                '?'
-            } else {
-                c
-            }
-        })
-        .collect()
-}
-
 /// Displays a path with the home directory shortened to `~`.
 pub(super) fn display_path(path: &Path) -> String {
     if let Ok(home) = etcetera::home_dir()
@@ -77,15 +64,4 @@ pub(super) fn format_duration(secs: u64) -> String {
 /// the `{:width$}` padding, which is not byte-based.
 pub(super) fn name_width<'a>(names: impl Iterator<Item = &'a str>) -> usize {
     names.map(|name| name.chars().count()).max().unwrap_or(0)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn sanitize_replaces_escape_sequences() {
-        assert_eq!(sanitize("plain text"), "plain text");
-        assert_eq!(sanitize("a\x1b[2Kb\r\nc"), "a?[2Kb??c");
-    }
 }

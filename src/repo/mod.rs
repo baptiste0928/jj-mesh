@@ -120,16 +120,16 @@ impl JjRepo {
 
     /// Reads the (trimmed) contents of the store `type` files, in
     /// [`SUPPORTED_STORES`] order.
-    fn store_types(&self) -> Result<Vec<String>> {
-        SUPPORTED_STORES
-            .iter()
-            .map(|(store, _)| {
-                let path = self.repo_dir().join(store).join("type");
-                let actual = fs::read_to_string(&path)
-                    .wrap_err_with(|| format!("cannot read {}", path.display()))?;
-                Ok(actual.trim().to_owned())
-            })
-            .collect()
+    fn store_types(&self) -> Result<[String; SUPPORTED_STORES.len()]> {
+        let mut types: [String; SUPPORTED_STORES.len()] = Default::default();
+        for (actual, (store, _)) in types.iter_mut().zip(SUPPORTED_STORES) {
+            let path = self.repo_dir().join(store).join("type");
+            fs::read_to_string(&path)
+                .wrap_err_with(|| format!("cannot read {}", path.display()))?
+                .trim()
+                .clone_into(actual);
+        }
+        Ok(types)
     }
 
     /// Checks that the repo owns its storage and uses supported backends.
@@ -174,14 +174,14 @@ pub fn jj_bin() -> std::ffi::OsString {
 /// locks, which jj-mesh must not reimplement. The child is killed when
 /// `timeout` fires.
 pub async fn run_jj(root: &Path, args: &[&str], timeout: std::time::Duration) -> Result<()> {
-    tokio::time::timeout(timeout, jj_status(root, args))
+    tokio::time::timeout(timeout, spawn_jj(root, args))
         .await
         .map_err(|_| eyre!("jj {} timed out", args.join(" ")))?
 }
 
 /// Spawns one jj command and waits for it, failing with its (bounded,
 /// sanitized) diagnostics.
-async fn jj_status(root: &Path, args: &[&str]) -> Result<()> {
+async fn spawn_jj(root: &Path, args: &[&str]) -> Result<()> {
     use tokio::io::AsyncReadExt as _;
 
     let mut child = tokio::process::Command::new(jj_bin())
@@ -284,7 +284,7 @@ pub fn jj_version_warning(version: Option<&str>) -> Option<String> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoreFingerprint {
     /// Contents of the store `type` files, in [`SUPPORTED_STORES`] order.
-    store_types: Vec<String>,
+    store_types: [String; SUPPORTED_STORES.len()],
     /// Contents of `store/git_target`: where the git data lives, and
     /// thereby whether the repo is colocated.
     git_target: String,

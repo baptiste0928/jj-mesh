@@ -20,7 +20,7 @@ use super::jj;
 use crate::{
     cli::{complete, hostname, ui},
     config::{ConfigDir, MeshState},
-    daemon::control::{self, CloneProgress, Request, Response},
+    daemon::control::{self, CloneProgress, Request, Response, TransferPhase},
 };
 
 /// Clone a repo from another machine
@@ -84,16 +84,16 @@ pub fn run(args: CloneArgs, dir: &ConfigDir) -> Result<()> {
     println!("Pulling repo `{name}` from the mesh...");
     let request = Request::CloneRepo {
         name: name.clone(),
-        path: std::fs::canonicalize(&path)?,
+        path: std::fs::canonicalize(&path)
+            .wrap_err_with(|| format!("cannot resolve {}", path.display()))?,
     };
 
     let bar = ProgressBar::new_spinner().with_style(spinner_style());
     bar.set_message("Contacting peers...");
     bar.enable_steady_tick(Duration::from_millis(100));
-    let mut counted = false;
     let pulled =
         control::request_streaming_blocking(dir, &request, control::CLONE_IDLE_WAIT, |progress| {
-            show_progress(&bar, &progress, &mut counted);
+            show_progress(&bar, &progress);
         });
 
     bar.finish_and_clear();
@@ -155,49 +155,46 @@ fn counted_style() -> ProgressStyle {
 }
 
 /// Applies a progress frame to the bar, switching templates as phases and
-/// totals come and go; `counted` remembers which template is active.
-fn show_progress(bar: &ProgressBar, progress: &CloneProgress, counted: &mut bool) {
-    use crate::daemon::control::TransferPhase;
-
+/// totals come and go.
+fn show_progress(bar: &ProgressBar, progress: &CloneProgress) {
     let CloneProgress { peer, transfer } = progress;
-    let mut spin = |message: String| {
-        if std::mem::take(counted) {
-            bar.set_style(spinner_style());
-        }
+    let spin = |message: String| {
+        bar.set_style(spinner_style());
         bar.set_message(message);
+    };
+    let counted = |total: u64| {
+        bar.set_style(counted_style());
+        bar.set_length(total);
+        bar.set_position(transfer.current);
     };
 
     if peer.is_empty() {
         // Seeded state before the daemon picked a source peer.
         return spin("Contacting peers...".to_owned());
     }
-    match (transfer.phase, transfer.total) {
-        (TransferPhase::Apply, _) => spin("Writing the repo...".to_owned()),
-        (TransferPhase::Ops, None) => spin(format!(
-            "Pulling history from `{peer}`: {} operations",
-            transfer.current,
-        )),
-        (TransferPhase::Git, None) => spin(format!(
-            "Pulling files from `{peer}`: {}",
-            HumanBytes(transfer.bytes),
-        )),
-        (phase, Some(total)) => {
-            if !std::mem::replace(counted, true) {
-                bar.set_style(counted_style());
+    match transfer.phase {
+        TransferPhase::Ops => match transfer.total {
+            None => spin(format!(
+                "Pulling history from `{peer}`: {} operations",
+                transfer.current,
+            )),
+            Some(total) => {
+                counted(total);
+                bar.set_prefix(format!("Pulling history from `{peer}`"));
+                bar.set_message("operations");
             }
-            bar.set_length(total);
-            bar.set_position(transfer.current);
-            match phase {
-                TransferPhase::Ops => {
-                    bar.set_prefix(format!("Pulling history from `{peer}`"));
-                    bar.set_message("operations");
-                }
-                TransferPhase::Git => {
-                    bar.set_prefix(format!("Pulling files from `{peer}`"));
-                    bar.set_message(format!("objects ({})", HumanBytes(transfer.bytes)));
-                }
-                TransferPhase::Apply => unreachable!("handled above"),
+        },
+        TransferPhase::Git => match transfer.total {
+            None => spin(format!(
+                "Pulling files from `{peer}`: {}",
+                HumanBytes(transfer.bytes),
+            )),
+            Some(total) => {
+                counted(total);
+                bar.set_prefix(format!("Pulling files from `{peer}`"));
+                bar.set_message(format!("objects ({})", HumanBytes(transfer.bytes)));
             }
-        }
+        },
+        TransferPhase::Apply => spin("Writing the repo...".to_owned()),
     }
 }

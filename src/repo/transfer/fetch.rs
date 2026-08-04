@@ -14,11 +14,11 @@ use pollster::FutureExt as _;
 use tokio::io::{AsyncRead, AsyncWrite};
 
 use super::{
-    FetchOutcome, OpBatch, ProgressSink, StoredOp, StoredView, TransferPhase, TransferProgress,
-    apply::apply, pack, to_gix_id,
+    FetchOutcome, OpBatch, ProgressSink, RepoIdent, StoredOp, StoredView, TransferPhase,
+    TransferProgress, apply::apply, is_virtual_root, pack, to_gix_id,
 };
 use crate::{
-    config::{RepoId, sanitize},
+    config::sanitize,
     net::{
         sync::{
             FetchRequest, GitFrame, GitRequest, GitTransferFormat, MAX_GIT_FRAME_SIZE,
@@ -53,14 +53,9 @@ const INGEST_SAMPLE_INTERVAL: std::time::Duration = std::time::Duration::from_mi
 /// (clones request a pack, incremental syncs stay loose, see
 /// [`GitTransferFormat`]); `progress` receives live counters as the phases
 /// advance.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "half are the repo/stream plumbing"
-)]
 pub async fn fetch(
     repo: &Arc<MeshRepo>,
-    name: &str,
-    repo_id: &RepoId,
+    target: RepoIdent<'_>,
     wants: &[OperationId],
     format: GitTransferFormat,
     send: &mut (impl AsyncWrite + Unpin),
@@ -72,8 +67,8 @@ pub async fn fetch(
     let haves = sample_haves(repo, &local_heads).await?;
 
     let request = FetchRequest {
-        name: name.to_owned(),
-        id: repo_id.clone(),
+        name: target.name.to_owned(),
+        id: target.id.clone(),
         wants: wants.iter().map(|id| id.as_bytes().to_vec()).collect(),
         haves: haves.iter().map(|id| id.as_bytes().to_vec()).collect(),
     };
@@ -92,8 +87,7 @@ pub async fn fetch(
             let git = repo.git_backend().git_repo();
             let mut missing: Vec<CommitId> = Vec::new();
             for id in referenced {
-                // jj's virtual root commit is never a real git object.
-                if id.as_bytes().iter().all(|byte| *byte == 0) {
+                if is_virtual_root(&id) {
                     continue;
                 }
                 if !git.has_object(to_gix_id(&id)?) {
@@ -131,7 +125,7 @@ pub async fn fetch(
     // writes the keep refs that take over; it is released below, and on any
     // early return or abandoned fetch by its own drop.
     let (git_objects, pack_keep) = match format {
-        GitTransferFormat::Loose => (receive_git_objects(repo, recv, progress).await?, None),
+        GitTransferFormat::Loose => (receive_git_loose(repo, recv, progress).await?, None),
         GitTransferFormat::Pack => {
             let (objects, keep) = receive_git_pack(repo, recv, progress).await?;
             (objects, Some(keep))
@@ -192,18 +186,24 @@ async fn receive_ops(
     let mut counters = TransferProgress::start(TransferPhase::Ops);
     progress.report(counters);
 
+    // Protocol position, kept apart from the display counters above.
+    let mut begun = false;
+    let mut data_seen = false;
+
     for _ in 0..MAX_OP_FRAMES {
         match read_message(recv, MAX_OP_FRAME_SIZE).await? {
             OpFrame::Begin {
                 ops: total_ops,
                 views: total_views,
             } => {
-                ensure!(counters.total.is_none(), "peer sent Begin twice");
-                ensure!(counters.current == 0, "peer sent Begin after data");
+                ensure!(!begun, "peer sent Begin twice");
+                ensure!(!data_seen, "peer sent Begin after data");
+                begun = true;
                 counters.total = Some(total_ops.saturating_add(total_views));
                 progress.report(counters);
             }
             OpFrame::View { id, view } => {
+                data_seen = true;
                 counters.current += 1;
                 counters.bytes += view.len() as u64;
                 progress.report(counters);
@@ -222,6 +222,7 @@ async fn receive_ops(
                 }
             }
             OpFrame::Op { id, op } => {
+                data_seen = true;
                 counters.current += 1;
                 counters.bytes += op.len() as u64;
                 progress.report(counters);
@@ -327,7 +328,7 @@ fn referenced_commits(batch: &OpBatch) -> Vec<CommitId> {
 /// Receives the git phase, decompressing and hash-verifying every object
 /// and writing them loose in chunks. Returns how many objects the peer
 /// sent.
-async fn receive_git_objects(
+async fn receive_git_loose(
     repo: &Arc<MeshRepo>,
     recv: &mut (impl AsyncRead + Unpin),
     progress: ProgressSink<'_>,

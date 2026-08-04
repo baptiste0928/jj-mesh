@@ -40,6 +40,7 @@ use std::{
 };
 
 use color_eyre::eyre::{Result, WrapErr as _, ensure, eyre};
+use iroh::EndpointId;
 use jj_lib::{object_id::ObjectId as _, op_store::OperationId};
 use tokio::sync::Notify;
 use tracing::{debug, info, warn};
@@ -471,7 +472,7 @@ impl RepoTask {
     async fn fetch_missing(
         &self,
         repo: &Arc<MeshRepo>,
-        peer: iroh::EndpointId,
+        peer: EndpointId,
         wants: &[OperationId],
     ) -> Result<transfer::FetchOutcome> {
         let conn = self
@@ -481,8 +482,10 @@ impl RepoTask {
         let (mut send, mut recv) = conn.open_bi().await?;
         let fetch = transfer::fetch(
             repo,
-            &self.name,
-            &self.id,
+            transfer::RepoIdent {
+                name: &self.name,
+                id: &self.id,
+            },
             wants,
             GitTransferFormat::Loose,
             &mut send,

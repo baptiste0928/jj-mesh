@@ -3,6 +3,8 @@
 
 use std::{fs, path::Path, process::Command, sync::Arc};
 
+use jj_lib::object_id::ObjectId as _;
+
 use super::*;
 use crate::{
     net::{
@@ -60,8 +62,10 @@ async fn sync_once_as(
 
     let outcome = fetch(
         fetcher,
-        "test",
-        &crate::config::RepoId::generate(),
+        RepoIdent {
+            name: "test",
+            id: &crate::config::RepoId::generate(),
+        },
         wants,
         format,
         &mut client_tx,
@@ -294,8 +298,10 @@ async fn rejects_ops_unreachable_from_wants() {
 
     let err = fetch(
         &repo,
-        "test",
-        &crate::config::RepoId::generate(),
+        RepoIdent {
+            name: "test",
+            id: &crate::config::RepoId::generate(),
+        },
         &[want],
         GitTransferFormat::Loose,
         &mut client_tx,
@@ -541,8 +547,10 @@ async fn progress_reports_phases_and_exact_totals() {
     let sink = |progress: TransferProgress| samples.lock().unwrap().push(progress);
     let outcome = fetch(
         &rb,
-        "test",
-        &crate::config::RepoId::generate(),
+        RepoIdent {
+            name: "test",
+            id: &crate::config::RepoId::generate(),
+        },
         &wants,
         GitTransferFormat::Pack,
         &mut client_tx,

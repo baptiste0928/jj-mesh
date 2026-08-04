@@ -82,10 +82,8 @@ impl Rules {
     }
 
     /// Drops one directory's cached matcher, after its rules changed.
-    pub(super) fn forget(&mut self, dir: Option<&Path>) {
-        if let Some(dir) = dir {
-            self.per_dir.remove(dir);
-        }
+    pub(super) fn forget(&mut self, dir: &Path) {
+        self.per_dir.remove(dir);
     }
 }
 

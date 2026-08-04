@@ -1,11 +1,11 @@
 //! Server side of a fetch: streaming the op-log delta, then the git object
 //! closure the fetcher lacks. Read-only on the repo throughout.
 //!
-//! Every phase runs the same pipeline: a blocking producer task walks the
-//! repo and streams frames through a bounded channel ([`spawn_producer`]),
-//! while the async side relays them to the wire ([`relay_frames`]) and
-//! closes the phase with `Done`, or with an `Error` frame carrying the
-//! producer's failure.
+//! Every phase runs the same pipeline ([`serve_phase`]): a blocking
+//! producer task walks the repo and streams frames through a bounded
+//! channel, while the async side relays them to the wire and closes the
+//! phase with `Done`, or with an `Error` frame carrying the producer's
+//! failure.
 
 use std::{
     collections::{HashSet, VecDeque},
@@ -77,61 +77,59 @@ pub async fn serve(
     // never sits in memory at once: a clone pulls the entire log. Each view
     // is sent before the first op referencing it, and ops stay
     // parents-first.
-    let (tx, mut rx) = mpsc::channel(OP_STREAM_BUFFER);
-    let walk = {
+    let mut op_count = 0usize;
+    let served = {
         let repo = repo.clone();
-        spawn_producer(tx, move |tx| {
-            let ops = repo.ancestors_until(&wants, &haves).block_on()?;
-            // The delta is fully collected, so the phase totals are exact:
-            // every unique view is sent exactly once.
-            let views: HashSet<&ViewId> = ops.iter().map(|(_, op)| &op.view_id).collect();
-            produce(
-                tx,
-                OpFrame::Begin {
-                    ops: ops.len() as u64,
-                    views: views.len() as u64,
-                },
-            )?;
-            let mut sent_views: HashSet<ViewId> = HashSet::with_capacity(views.len());
-            for (id, op) in ops {
-                if sent_views.insert(op.view_id.clone()) {
-                    let view = repo.read_view_bytes(&op.view_id)?;
+        serve_phase(
+            send,
+            OP_STREAM_BUFFER,
+            "cannot collect operations",
+            move |tx| {
+                let ops = repo.ancestors_until(&wants, &haves).block_on()?;
+                // The delta is fully collected, so the phase totals are
+                // exact: every unique view is sent exactly once.
+                let views: HashSet<&ViewId> = ops.iter().map(|(_, op)| &op.view_id).collect();
+                produce(
+                    tx,
+                    OpFrame::Begin {
+                        ops: ops.len() as u64,
+                        views: views.len() as u64,
+                    },
+                )?;
+                let mut sent_views: HashSet<ViewId> = HashSet::with_capacity(views.len());
+                for (id, op) in ops {
+                    if sent_views.insert(op.view_id.clone()) {
+                        let view = repo.read_view_bytes(&op.view_id)?;
+                        produce(
+                            tx,
+                            OpFrame::View {
+                                id: op.view_id.as_bytes().to_vec(),
+                                view: compress_payload(&view)?,
+                            },
+                        )?;
+                    }
+                    let bytes = repo.read_operation_bytes(&id)?;
                     produce(
                         tx,
-                        OpFrame::View {
-                            id: op.view_id.as_bytes().to_vec(),
-                            view: compress_payload(&view)?,
+                        OpFrame::Op {
+                            id: id.as_bytes().to_vec(),
+                            op: compress_payload(&bytes)?,
                         },
                     )?;
                 }
-                let bytes = repo.read_operation_bytes(&id)?;
-                produce(
-                    tx,
-                    OpFrame::Op {
-                        id: id.as_bytes().to_vec(),
-                        op: compress_payload(&bytes)?,
-                    },
-                )?;
-            }
-            Ok(())
-        })
+                Ok(())
+            },
+            |frame| {
+                if matches!(frame, OpFrame::Op { .. }) {
+                    op_count += 1;
+                }
+            },
+        )
+        .await?
     };
-
-    let mut op_count = 0usize;
-    let failed = relay_frames(send, &mut rx, MAX_OP_FRAME_SIZE, |frame| {
-        if matches!(frame, OpFrame::Op { .. }) {
-            op_count += 1;
-        }
-    })
-    .await?;
-    walk.await.wrap_err("fetch serve task failed")?;
-
-    if let Some(err) = failed {
-        let message = format!("cannot collect operations: {err:#}");
-        write_message(send, &OpFrame::Error { message }, MAX_OP_FRAME_SIZE).await?;
+    if !served {
         return Ok(());
     }
-    write_message(send, &OpFrame::Done, MAX_OP_FRAME_SIZE).await?;
     debug!(ops = op_count, "served op phase");
 
     serve_git_phase(repo, send, recv).await
@@ -193,10 +191,13 @@ async fn serve_git_loose(
     request: GitRequest,
     send: &mut (impl AsyncWrite + Unpin),
 ) -> Result<()> {
-    let (tx, mut rx) = mpsc::channel(GIT_STREAM_BUFFER);
-    let walk = {
-        let repo = repo.clone();
-        spawn_producer(tx, move |tx| {
+    let mut served = 0usize;
+    let repo = repo.clone();
+    let completed = serve_phase(
+        send,
+        GIT_STREAM_BUFFER,
+        "cannot walk git objects",
+        move |tx| {
             let git = repo.git_backend().git_repo();
             walk_git_closure(&repo, &request, |id, kind| {
                 let object = git
@@ -214,19 +215,13 @@ async fn serve_git_loose(
                     },
                 )
             })
-        })
-    };
-
-    let mut served = 0usize;
-    let failed = relay_frames(send, &mut rx, MAX_GIT_FRAME_SIZE, |_| served += 1).await?;
-    walk.await.wrap_err("git walk task failed")?;
-
-    finish_git_phase(
-        send,
-        failed.map(|err| format!("cannot walk git objects: {err:#}")),
+        },
+        |_| served += 1,
     )
     .await?;
-    debug!(objects = served, "served git phase");
+    if completed {
+        debug!(objects = served, "served git phase");
+    }
     Ok(())
 }
 
@@ -238,10 +233,13 @@ async fn serve_git_pack(
     request: GitRequest,
     send: &mut (impl AsyncWrite + Unpin),
 ) -> Result<()> {
-    let (tx, mut rx) = mpsc::channel(PACK_STREAM_BUFFER);
-    let walk = {
-        let repo = repo.clone();
-        spawn_producer(tx, move |tx| {
+    let mut served = 0usize;
+    let repo = repo.clone();
+    let completed = serve_phase(
+        send,
+        PACK_STREAM_BUFFER,
+        "cannot build pack",
+        move |tx| {
             let mut ids = Vec::new();
             walk_git_closure(&repo, &request, |id, _kind| {
                 ids.push(id);
@@ -249,79 +247,97 @@ async fn serve_git_pack(
             })?;
             let git = repo.git_backend().git_repo();
             pack::write_pack(&git, ids, |chunk| produce(tx, GitFrame::Pack { chunk }))
-        })
-    };
-
-    let mut served = 0usize;
-    let failed = relay_frames(send, &mut rx, MAX_GIT_FRAME_SIZE, |frame| {
-        if let GitFrame::Pack { chunk } = frame {
-            served += chunk.len();
-        }
-    })
-    .await?;
-    walk.await.wrap_err("pack build task failed")?;
-
-    finish_git_phase(
-        send,
-        failed.map(|err| format!("cannot build pack: {err:#}")),
+        },
+        |frame| {
+            if let GitFrame::Pack { chunk } = frame {
+                served += chunk.len();
+            }
+        },
     )
     .await?;
-    debug!(bytes = served, "served git phase (pack)");
+    if completed {
+        debug!(bytes = served, "served git phase (pack)");
+    }
     Ok(())
 }
 
-/// Spawns the blocking producer half of a streamed phase: `work` sends its
-/// frames through the channel (see [`produce`]) and its error, if any, is
-/// forwarded as the final channel item.
-fn spawn_producer<T: Send + 'static>(
-    tx: mpsc::Sender<Result<T>>,
+/// A phase's terminal frames: `Done`, or `Error` carrying a message.
+trait PhaseFrame: serde::Serialize {
+    const MAX_SIZE: u32;
+    fn done() -> Self;
+    fn error(message: String) -> Self;
+}
+
+impl PhaseFrame for OpFrame {
+    const MAX_SIZE: u32 = MAX_OP_FRAME_SIZE;
+    fn done() -> Self {
+        OpFrame::Done
+    }
+    fn error(message: String) -> Self {
+        OpFrame::Error { message }
+    }
+}
+
+impl PhaseFrame for GitFrame {
+    const MAX_SIZE: u32 = MAX_GIT_FRAME_SIZE;
+    fn done() -> Self {
+        GitFrame::Done
+    }
+    fn error(message: String) -> Self {
+        GitFrame::Error { message }
+    }
+}
+
+/// Runs one streamed phase: a blocking producer (`work`, sending frames
+/// with [`produce`]) feeds a bounded channel, the frames are relayed to
+/// the wire (`on_frame` sees each, for counting), and the phase closes
+/// with `Done` — or with an `Error` frame prefixed by `err_context` when
+/// the producer failed, in which case `false` is returned and the
+/// exchange must not continue.
+async fn serve_phase<T: PhaseFrame + Send + 'static>(
+    send: &mut (impl AsyncWrite + Unpin),
+    buffer: usize,
+    err_context: &str,
     work: impl FnOnce(&mpsc::Sender<Result<T>>) -> Result<()> + Send + 'static,
-) -> tokio::task::JoinHandle<()> {
-    tokio::task::spawn_blocking(move || {
+    mut on_frame: impl FnMut(&T),
+) -> Result<bool> {
+    let (tx, mut rx) = mpsc::channel(buffer);
+    let producer = tokio::task::spawn_blocking(move || {
+        // The error, if any, is forwarded as the final channel item.
         if let Err(err) = work(&tx) {
             let _ = tx.blocking_send(Err(err));
         }
-    })
+    });
+
+    // A producer error ends the relay; it is always the producer's last
+    // item, so not draining further cannot block it.
+    let mut failed = None;
+    while let Some(frame) = rx.recv().await {
+        match frame {
+            Ok(frame) => {
+                on_frame(&frame);
+                write_message(send, &frame, T::MAX_SIZE).await?;
+            }
+            Err(err) => {
+                failed = Some(err);
+                break;
+            }
+        }
+    }
+    producer.await.wrap_err("phase producer task failed")?;
+
+    let (last, ok) = match failed {
+        Some(err) => (T::error(format!("{err_context}: {err:#}")), false),
+        None => (T::done(), true),
+    };
+    write_message(send, &last, T::MAX_SIZE).await?;
+    Ok(ok)
 }
 
 /// Sends one frame from a producer, failing once the relay side is gone.
 fn produce<T>(tx: &mpsc::Sender<Result<T>>, frame: T) -> Result<()> {
     tx.blocking_send(Ok(frame))
         .map_err(|_| eyre!("fetcher went away"))
-}
-
-/// Relays producer frames to the wire until the channel closes. A producer
-/// error ends the relay and is returned for the caller to report to the
-/// peer; it is always the producer's last item, so not draining further
-/// cannot block it.
-async fn relay_frames<T: serde::Serialize>(
-    send: &mut (impl AsyncWrite + Unpin),
-    rx: &mut mpsc::Receiver<Result<T>>,
-    max_size: u32,
-    mut on_frame: impl FnMut(&T),
-) -> Result<Option<color_eyre::Report>> {
-    while let Some(frame) = rx.recv().await {
-        match frame {
-            Ok(frame) => {
-                on_frame(&frame);
-                write_message(send, &frame, max_size).await?;
-            }
-            Err(err) => return Ok(Some(err)),
-        }
-    }
-    Ok(None)
-}
-
-/// Closes the git phase with `Done`, or an `Error` frame carrying `failed`.
-async fn finish_git_phase(
-    send: &mut (impl AsyncWrite + Unpin),
-    failed: Option<String>,
-) -> Result<()> {
-    let last = match failed {
-        Some(message) => GitFrame::Error { message },
-        None => GitFrame::Done,
-    };
-    write_message(send, &last, MAX_GIT_FRAME_SIZE).await
 }
 
 /// Walks the object closure of the wanted commits, stopping at haves, and

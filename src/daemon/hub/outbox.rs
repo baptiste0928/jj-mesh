@@ -15,9 +15,9 @@ use crate::{
     net::sync::{self, Announce, StatusReport, UniMessage},
 };
 
-/// Budget for sending one announcement; a stalled peer connection kills
-/// its sender task (the reconnect replay recovers the state).
-const ANNOUNCE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Budget for sending one message; a stalled peer connection kills its
+/// sender task (the reconnect replay recovers the state).
+const SEND_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Pending messages for one peer, coalesced latest-wins: one slot for the
 /// membership, one for the status report and one per repo for
@@ -81,7 +81,7 @@ pub(super) async fn run_sender(conn: Connection, outbox: Arc<Outbox>) {
             outbox.notify.notified().await;
             continue;
         };
-        match tokio::time::timeout(ANNOUNCE_TIMEOUT, sync::send_uni(&conn, &message)).await {
+        match tokio::time::timeout(SEND_TIMEOUT, sync::send_uni(&conn, &message)).await {
             Ok(Ok(())) => {}
             Ok(Err(err)) => return debug!("send failed: {err:#}"),
             Err(_) => return debug!("send timed out"),

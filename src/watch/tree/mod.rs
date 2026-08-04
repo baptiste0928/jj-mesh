@@ -96,7 +96,7 @@ impl TreeWatcher {
         let overflowed = Arc::new(AtomicBool::new(false));
         let full = overflowed.clone();
 
-        let watcher = backend::spawn(
+        let watcher = backend::watcher(
             |mut event| {
                 event.paths.retain(|path| !is_internal(path));
                 (!event.paths.is_empty() || event.need_rescan()).then_some(Signal::Event(event))
@@ -117,7 +117,7 @@ impl TreeWatcher {
             rules: Arc::new(Mutex::new(Rules::new(root))),
             stale: false,
         };
-        let dirs = walk_dirs(&watch.root, &watch.rules)?;
+        let dirs = walk_dirs(&watch.root, watch.rules.clone())?;
         watch.apply(dirs);
         Ok(watch)
     }
@@ -171,7 +171,7 @@ impl TreeWatcher {
             let rules = self.rules.clone();
             // On a large tree the walk is hundreds of milliseconds of
             // syscalls: it must not sit on a runtime worker.
-            let dirs = tokio::task::spawn_blocking(move || walk_dirs(&root, &rules))
+            let dirs = tokio::task::spawn_blocking(move || walk_dirs(&root, rules))
                 .await
                 .wrap_err("working copy walk task failed")??;
             self.apply(dirs);
@@ -230,7 +230,9 @@ impl TreeWatcher {
         // An ignore-rule change moves the tracked/ignored boundary, and
         // is an edit in itself.
         if path.file_name().is_some_and(|name| name == GITIGNORE) {
-            self.rules.lock().unwrap().forget(path.parent());
+            if let Some(dir) = path.parent() {
+                self.rules.lock().unwrap().forget(dir);
+            }
             self.stale = true;
             return Ok(true);
         }
@@ -290,8 +292,7 @@ impl TreeWatcher {
 /// Walks the tree and returns the directories deserving a watch. The
 /// `ignore` crate's own handling is off: [`Rules`] is the single source of
 /// truth, and the only one reading rule files defensively.
-fn walk_dirs(root: &Path, rules: &Arc<Mutex<Rules>>) -> Result<BTreeSet<PathBuf>> {
-    let filter = rules.clone();
+fn walk_dirs(root: &Path, rules: Arc<Mutex<Rules>>) -> Result<BTreeSet<PathBuf>> {
     let walk = ignore::WalkBuilder::new(root)
         .hidden(false) // Dotfiles are regular files to jj.
         .ignore(false) // jj reads gitignore files, not .ignore.
@@ -308,7 +309,7 @@ fn walk_dirs(root: &Path, rules: &Arc<Mutex<Rules>>) -> Result<BTreeSet<PathBuf>
             // Only directories are collected, so files are pruned before
             // they cost an ignore evaluation.
             entry.file_type().is_some_and(|ty| ty.is_dir())
-                && !filter.lock().unwrap().is_ignored(entry.path(), true)
+                && !rules.lock().unwrap().is_ignored(entry.path(), true)
         })
         .build();
 

@@ -8,7 +8,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use color_eyre::eyre::{Result, WrapErr, eyre};
+use color_eyre::eyre::{Result, WrapErr, ensure};
 use etcetera::BaseStrategy;
 
 /// Resolved configuration directory. Constructing it guarantees the
@@ -29,10 +29,7 @@ impl ConfigDir {
         if let Some(config_dir) = override_dir {
             let metadata =
                 fs::metadata(&config_dir).wrap_err("cannot open custom config directory")?;
-
-            if !metadata.is_dir() {
-                return Err(eyre!("custom config path is not a directory"));
-            }
+            ensure!(metadata.is_dir(), "custom config path is not a directory");
 
             return Ok(ConfigDir {
                 path: config_dir,

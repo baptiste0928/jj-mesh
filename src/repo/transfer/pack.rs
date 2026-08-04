@@ -165,13 +165,13 @@ impl SharedObjectCount {
 /// signal is discarded. Progress is display-only, so an id drift in a gix
 /// upgrade would freeze the counter, never break the ingest.
 struct IndexCountProgress {
-    objects: SharedObjectCount,
+    objects: StepShared,
     /// Whether this node is the objects counter.
     active: bool,
 }
 
 impl IndexCountProgress {
-    fn root(objects: SharedObjectCount) -> Self {
+    fn root(objects: StepShared) -> Self {
         IndexCountProgress {
             objects,
             active: false,
@@ -182,13 +182,13 @@ impl IndexCountProgress {
 impl Count for IndexCountProgress {
     fn set(&self, step: Step) {
         if self.active {
-            self.objects.0.store(step, Ordering::Relaxed);
+            self.objects.store(step, Ordering::Relaxed);
         }
     }
 
     fn step(&self) -> Step {
         if self.active {
-            self.objects.0.load(Ordering::Relaxed)
+            self.objects.load(Ordering::Relaxed)
         } else {
             0
         }
@@ -196,13 +196,13 @@ impl Count for IndexCountProgress {
 
     fn inc_by(&self, step: Step) {
         if self.active {
-            self.objects.0.fetch_add(step, Ordering::Relaxed);
+            self.objects.fetch_add(step, Ordering::Relaxed);
         }
     }
 
     fn counter(&self) -> StepShared {
         if self.active {
-            self.objects.0.clone()
+            self.objects.clone()
         } else {
             StepShared::default()
         }
@@ -294,7 +294,7 @@ pub(super) fn ingest_pack(
 
     let pack_dir = git.objects.store_ref().path().join("pack");
     let no_interrupt = AtomicBool::new(false);
-    let mut progress = IndexCountProgress::root(indexed.clone());
+    let mut progress = IndexCountProgress::root(indexed.0.clone());
     let outcome = gix_pack::Bundle::write_to_directory(
         &mut io::BufReader::new(read),
         Some(&pack_dir),

@@ -40,21 +40,16 @@ struct Slot {
 impl Inbox {
     /// Stores an announcement unless a newer one was already seen.
     pub(super) fn offer(&self, peer: EndpointId, seq: u64, heads: Vec<Vec<u8>>) {
-        {
-            let mut slots = self.slots.lock().unwrap();
-            if slots.get(&peer).is_some_and(|slot| slot.seq >= seq) {
-                return;
-            }
-            slots.insert(
-                peer,
-                Slot {
-                    seq,
-                    heads,
-                    drained: false,
-                },
-            );
+        if self.advance(
+            peer,
+            Slot {
+                seq,
+                heads,
+                drained: false,
+            },
+        ) {
+            self.notify.notify_one();
         }
-        self.notify.notify_one();
     }
 
     /// Drops a peer's slot (its connection is gone).
@@ -66,11 +61,7 @@ impl Inbox {
     /// so a reordered pre-retraction announcement stays rejected while a
     /// later re-registration's announcements come through.
     pub(super) fn retract(&self, peer: EndpointId, seq: u64) {
-        let mut slots = self.slots.lock().unwrap();
-        if slots.get(&peer).is_some_and(|slot| slot.seq >= seq) {
-            return;
-        }
-        slots.insert(
+        self.advance(
             peer,
             Slot {
                 seq,
@@ -78,6 +69,17 @@ impl Inbox {
                 drained: true,
             },
         );
+    }
+
+    /// Installs a peer's slot unless one at or past its sequence is held;
+    /// returns whether the watermark advanced.
+    fn advance(&self, peer: EndpointId, slot: Slot) -> bool {
+        let mut slots = self.slots.lock().unwrap();
+        if slots.get(&peer).is_some_and(|held| held.seq >= slot.seq) {
+            return false;
+        }
+        slots.insert(peer, slot);
+        true
     }
 
     /// The last announced heads of every peer, drained or not, for

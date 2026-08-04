@@ -270,14 +270,13 @@ impl MeshState {
     /// every machine stops syncing the repo; none of them touch its files.
     /// Returns whether the repo was registered on this machine.
     pub fn remove_repo(&mut self, name: &str) -> Result<bool> {
-        ensure!(
-            self.mesh_repos.contains_key(name) || self.repos.contains_key(name),
-            "no repo named `{name}` in the mesh",
-        );
-        ensure!(
-            self.mesh_repo_id(name).is_some() || self.repos.contains_key(name),
-            "repo `{name}` is already removed",
-        );
+        match (self.mesh_repos.get(name), self.repos.contains_key(name)) {
+            (None, false) => bail!("no repo named `{name}` in the mesh"),
+            (Some(mesh), false) if mesh.id().is_none() => {
+                bail!("repo `{name}` is already removed")
+            }
+            _ => {}
+        }
 
         let version = bumped_version(&self.mesh_repos, name)?;
         self.mesh_repos.insert(

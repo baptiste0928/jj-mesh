@@ -16,8 +16,8 @@ use service_manager::{
 use super::ui;
 use crate::config::ConfigDir;
 
-/// Seconds before the service is restarted after a failure.
-const RESTART_DELAY_SECS: u32 = 5;
+/// Seconds the service manager waits before restarting a failed daemon.
+const FAILURE_RESTART_DELAY_SECS: u32 = 5;
 
 /// How long `restart` waits for the service to leave or reach the running
 /// state. Stopping is asynchronous on launchd, and starting reports
@@ -101,6 +101,90 @@ pub fn run(args: ServiceArgs, dir: &ConfigDir) -> Result<()> {
     }
 }
 
+/// Installs the service and starts it.
+fn install(
+    manager: &dyn ServiceManager,
+    label: ServiceLabel,
+    dir: &ConfigDir,
+    program: Option<PathBuf>,
+    jj_bin: Option<&Path>,
+) -> Result<()> {
+    let program = match program {
+        Some(program) => program,
+        None => std::env::current_exe().wrap_err("cannot resolve the jj-mesh binary path")?,
+    };
+    validate_service_path("the program path", &program)?;
+
+    let mut environment = vec![("RUST_LOG".to_owned(), "jj_mesh=info".to_owned())];
+    if let Some(jj_bin) = jj_bin {
+        // Environment values are written into the service definition just
+        // as unescaped as the paths, so they get the same restrictions.
+        validate_service_path("the jj binary path", jj_bin)?;
+        environment.push(("JJ_BIN".to_owned(), jj_bin.to_string_lossy().into_owned()));
+    }
+
+    // A custom config directory is baked into the service (useful for side
+    // setups); the default is resolved by the daemon at startup.
+    let mut args = Vec::new();
+    if dir.is_custom() {
+        validate_service_path("the config directory", dir.path())?;
+        args.push(OsString::from("--config-dir"));
+        args.push(dir.path().into());
+    }
+    args.push(OsString::from("run-daemon"));
+
+    manager
+        .install(ServiceInstallCtx {
+            label: label.clone(),
+            program,
+            args,
+            contents: None,
+            username: None,
+            working_directory: None,
+            environment: Some(environment),
+            autostart: true,
+            restart_policy: RestartPolicy::OnFailure {
+                delay_secs: Some(FAILURE_RESTART_DELAY_SECS),
+                max_retries: None,
+                reset_after_secs: None,
+            },
+        })
+        .wrap_err("cannot install the service")?;
+
+    // A reinstall rewrites the unit file, but systemd keeps serving the
+    // cached one (with a possibly stale ExecStart) until told to reload;
+    // `service-manager` never does. Best effort: a failure only means the
+    // cache heals on the next reboot or manual reload.
+    #[cfg(target_os = "linux")]
+    let _ = std::process::Command::new("systemctl")
+        .args(["--user", "daemon-reload"])
+        .status();
+
+    println!("Created {}", service_file(&label)?.display());
+
+    manager
+        .start(ServiceStartCtx { label })
+        .wrap_err("installed the service, but cannot start it")?;
+
+    println!("{}", ui::good("Service enabled and started"));
+
+    Ok(())
+}
+
+/// Stops the service if running, then removes it.
+fn uninstall(manager: &dyn ServiceManager, label: ServiceLabel) -> Result<()> {
+    stop_quietly(manager, &label);
+
+    let file = service_file(&label)?;
+    manager
+        .uninstall(ServiceUninstallCtx { label })
+        .wrap_err("cannot uninstall the service")?;
+
+    println!("{}", ui::good("Stopped the service"));
+    println!("{}", ui::good(format_args!("Removed {}", file.display())));
+    Ok(())
+}
+
 /// Stops and starts the service, verifying both transitions by polling
 /// (see [`RESTART_WAIT`]).
 fn restart(manager: &dyn ServiceManager, label: &ServiceLabel) -> Result<()> {
@@ -166,90 +250,6 @@ fn wait_status(
     }
 }
 
-/// Installs the service and starts it.
-fn install(
-    manager: &dyn ServiceManager,
-    label: ServiceLabel,
-    dir: &ConfigDir,
-    program: Option<PathBuf>,
-    jj_bin: Option<&Path>,
-) -> Result<()> {
-    let program = match program {
-        Some(program) => program,
-        None => std::env::current_exe().wrap_err("cannot resolve the jj-mesh binary path")?,
-    };
-    validate_service_path("the program path", &program)?;
-
-    let mut environment = vec![("RUST_LOG".to_owned(), "jj_mesh=info".to_owned())];
-    if let Some(jj_bin) = jj_bin {
-        // Environment values are written into the service definition just
-        // as unescaped as the paths, so they get the same restrictions.
-        validate_service_path("the jj binary path", jj_bin)?;
-        environment.push(("JJ_BIN".to_owned(), jj_bin.to_string_lossy().into_owned()));
-    }
-
-    // A custom config directory is baked into the service (useful for side
-    // setups); the default is resolved by the daemon at startup.
-    let mut args = Vec::new();
-    if dir.is_custom() {
-        validate_service_path("the config directory", dir.path())?;
-        args.push(OsString::from("--config-dir"));
-        args.push(dir.path().into());
-    }
-    args.push(OsString::from("run-daemon"));
-
-    manager
-        .install(ServiceInstallCtx {
-            label: label.clone(),
-            program,
-            args,
-            contents: None,
-            username: None,
-            working_directory: None,
-            environment: Some(environment),
-            autostart: true,
-            restart_policy: RestartPolicy::OnFailure {
-                delay_secs: Some(RESTART_DELAY_SECS),
-                max_retries: None,
-                reset_after_secs: None,
-            },
-        })
-        .wrap_err("cannot install the service")?;
-
-    // A reinstall rewrites the unit file, but systemd keeps serving the
-    // cached one (with a possibly stale ExecStart) until told to reload;
-    // `service-manager` never does. Best effort: a failure only means the
-    // cache heals on the next reboot or manual reload.
-    #[cfg(target_os = "linux")]
-    let _ = std::process::Command::new("systemctl")
-        .args(["--user", "daemon-reload"])
-        .status();
-
-    println!("Created {}", service_file(&label)?.display());
-
-    manager
-        .start(ServiceStartCtx { label })
-        .wrap_err("installed the service, but cannot start it")?;
-
-    println!("{}", ui::good("Service enabled and started"));
-
-    Ok(())
-}
-
-/// Stops the service if running, then removes it.
-fn uninstall(manager: &dyn ServiceManager, label: ServiceLabel) -> Result<()> {
-    stop_quietly(manager, &label);
-
-    let file = service_file(&label)?;
-    manager
-        .uninstall(ServiceUninstallCtx { label })
-        .wrap_err("cannot uninstall the service")?;
-
-    println!("{}", ui::good("Stopped the service"));
-    println!("{}", ui::good(format_args!("Removed {}", file.display())));
-    Ok(())
-}
-
 /// Checks that a path can be embedded in a service definition.
 ///
 /// `service-manager` writes systemd units without any quoting or escaping,
@@ -275,6 +275,10 @@ fn validate_service_path(what: &str, path: &Path) -> Result<()> {
 
 /// Path of the service definition file, where `service-manager` puts user
 /// services on each platform.
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "macos")),
+    allow(unused_variables, reason = "no service file on other platforms")
+)]
 fn service_file(label: &ServiceLabel) -> Result<PathBuf> {
     #[cfg(target_os = "linux")]
     {
@@ -291,7 +295,6 @@ fn service_file(label: &ServiceLabel) -> Result<PathBuf> {
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
-        let _ = label;
         bail!("unsupported platform for user services");
     }
 }

@@ -88,9 +88,7 @@ pub(super) fn apply(
     // a single old head to a single new one; under divergence the merged
     // view decides, and with several old heads there is no single previous
     // view to reconcile git refs against.
-    let fast_forward = to_publish.len() == 1
-        && local_heads.len() == 1
-        && all_superseded.len() == local_heads.len();
+    let fast_forward = to_publish.len() == 1 && local_heads.len() == 1 && all_superseded.len() == 1;
     if repo.is_colocated() && !to_publish.is_empty() {
         if fast_forward {
             let new_op = repo.read_operation(&to_publish[0].0).block_on()?;
@@ -207,7 +205,7 @@ fn mirror_git_refs(repo: &MeshRepo, view: &View, old_view: &View) -> Result<()> 
     use gix::refs::transaction::{Change, LogChange, PreviousValue, RefEdit};
 
     let git = repo.git_backend().git_repo();
-    let mut edits: Vec<(String, RefEdit)> = Vec::new();
+    let mut edits: Vec<RefEdit> = Vec::new();
 
     // Create or move refs to the new view's targets.
     for (name, target) in &view.git_refs {
@@ -227,21 +225,18 @@ fn mirror_git_refs(repo: &MeshRepo, view: &View, old_view: &View) -> Result<()> 
             // New ref: create, unless git already has one (user's).
             None => PreviousValue::MustNotExist,
         };
-        edits.push((
-            name.as_str().to_owned(),
-            RefEdit {
-                change: Change::Update {
-                    log: LogChange::default(),
-                    expected,
-                    new: gix::refs::Target::Object(to_gix_id(new_id)?),
-                },
-                name: name
-                    .as_str()
-                    .try_into()
-                    .map_err(|err| eyre!("bad ref name: {err}"))?,
-                deref: false,
+        edits.push(RefEdit {
+            change: Change::Update {
+                log: LogChange::default(),
+                expected,
+                new: gix::refs::Target::Object(to_gix_id(new_id)?),
             },
-        ));
+            name: name
+                .as_str()
+                .try_into()
+                .map_err(|err| eyre!("bad ref name: {err}"))?,
+            deref: false,
+        });
     }
 
     // Prune refs the new view no longer has, again only from their known
@@ -253,27 +248,25 @@ fn mirror_git_refs(repo: &MeshRepo, view: &View, old_view: &View) -> Result<()> 
         let Some(old_id) = old_target.as_normal() else {
             continue;
         };
-        edits.push((
-            name.as_str().to_owned(),
-            RefEdit {
-                change: Change::Delete {
-                    expected: PreviousValue::MustExistAndMatch(gix::refs::Target::Object(
-                        to_gix_id(old_id)?,
-                    )),
-                    log: gix::refs::transaction::RefLog::AndReference,
-                },
-                name: name
-                    .as_str()
-                    .try_into()
-                    .map_err(|err| eyre!("bad ref name: {err}"))?,
-                deref: false,
+        edits.push(RefEdit {
+            change: Change::Delete {
+                expected: PreviousValue::MustExistAndMatch(gix::refs::Target::Object(to_gix_id(
+                    old_id,
+                )?)),
+                log: gix::refs::transaction::RefLog::AndReference,
             },
-        ));
+            name: name
+                .as_str()
+                .try_into()
+                .map_err(|err| eyre!("bad ref name: {err}"))?,
+            deref: false,
+        });
     }
 
     // Edits apply individually: one ref the user raced must not abort the
     // rest of the mirror.
-    for (name, edit) in edits {
+    for edit in edits {
+        let name = edit.name.as_bstr().to_owned();
         if let Err(err) = git.edit_references(Some(edit)) {
             warn!("skipping git ref mirror of {name}: {err}");
         }

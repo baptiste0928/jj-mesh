@@ -19,7 +19,7 @@ mod protocol;
 mod server;
 
 pub use client::{
-    ControlClient, DaemonNotRunning, ensure_daemon_blocking, query_status_blocking,
+    ControlClient, DaemonNotRunning, block_on, ensure_daemon_blocking, query_status_blocking,
     request_blocking, request_streaming_blocking,
 };
 pub use protocol::*;

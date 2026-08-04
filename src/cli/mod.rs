@@ -55,12 +55,6 @@ enum Command {
     RunDaemon(run_daemon::RunDaemonArgs),
 }
 
-/// This machine's hostname: the default identity it presents to the mesh,
-/// both as a peer name and as its workspace name in synced repos.
-fn hostname() -> String {
-    gethostname::gethostname().to_string_lossy().into_owned()
-}
-
 /// Entry point of the `jj-mesh` CLI
 pub fn run() -> Result<()> {
     // Answers shell completion requests (`COMPLETE=<shell> jj-mesh ...`)
@@ -78,4 +72,22 @@ pub fn run() -> Result<()> {
         Command::Status(args) => status::run(args, &dir),
         Command::RunDaemon(args) => run_daemon::run(args, &dir),
     }
+}
+
+/// Prints a top-level CLI error to stderr in the shared palette. The
+/// expected "daemon not running" case prints as a plain message, without
+/// the error prefix.
+pub fn report_error(err: &color_eyre::Report) {
+    let message = if err.is::<crate::daemon::control::DaemonNotRunning>() {
+        format!("{err:#}")
+    } else {
+        format!("Error: {err:#}")
+    };
+    eprintln!("{}", ui::bad(message).for_stderr());
+}
+
+/// This machine's hostname: the default identity it presents to the mesh,
+/// both as a peer name and as its workspace name in synced repos.
+fn hostname() -> String {
+    gethostname::gethostname().to_string_lossy().into_owned()
 }

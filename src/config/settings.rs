@@ -31,7 +31,7 @@ const MAX_SNAPSHOT_INTERVAL: u64 = 24 * 60 * 60;
 const TEMPLATE: &str = r"# jj-mesh configuration
 #
 # The commented values below are the default options. Restart the background
-# service after updating this file. 
+# service after updating this file.
 
 # Interval between automatic snapshots of the working copy, in seconds.
 # Set 0 to disable auto-snapshotting.

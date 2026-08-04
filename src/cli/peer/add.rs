@@ -13,7 +13,7 @@ use color_eyre::eyre::{Result, bail};
 use crate::{
     cli::{hostname, ui},
     config::ConfigDir,
-    daemon::control::{ControlClient, PAIR_TICKET_TTL, Request, Response},
+    daemon::control::{self, ControlClient, PAIR_TICKET_TTL, Request, Response},
     net::pair::PairTicket,
 };
 
@@ -45,10 +45,7 @@ pub struct AddArgs {
 pub fn run(args: AddArgs, dir: &ConfigDir) -> Result<()> {
     let name = args.name.unwrap_or_else(hostname);
 
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?
-        .block_on(pair(args.ticket, name, dir))
+    control::block_on(pair(args.ticket, name, dir))
 }
 
 /// Dispatches to the hosting or joining side of the pairing.

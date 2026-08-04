@@ -91,8 +91,7 @@ pub fn parse_view(bytes: &[u8]) -> Result<ViewMeta> {
     let mut heads = IdSet::default();
     view.head_ids.iter().for_each(|id| heads.add(id));
 
-    let mut ids = IdSet::default();
-    view.head_ids.iter().for_each(|id| ids.add(id));
+    let mut ids = heads.clone();
     ids.add(&view.wc_commit_id); // Legacy single-workspace form.
     view.wc_commit_ids.values().for_each(|id| ids.add(id));
     for bookmark in &view.bookmarks {
@@ -136,10 +135,12 @@ pub fn parse_view(bytes: &[u8]) -> Result<ViewMeta> {
     // moving `refs/tags/*` there. A peer could otherwise craft a view that
     // panics jj's reader once stored.
     if !view.has_git_refs_migrated_to_remote_tags {
-        let has_tag_refs = view
-            .git_refs
-            .iter()
-            .any(|git_ref| matches!(git_ref.name.strip_prefix("refs/tags/"), Some(name) if !name.is_empty()));
+        let has_tag_refs = view.git_refs.iter().any(|git_ref| {
+            git_ref
+                .name
+                .strip_prefix("refs/tags/")
+                .is_some_and(|name| !name.is_empty())
+        });
         let git_remote_has_tags = view
             .remote_views
             .iter()
@@ -161,7 +162,7 @@ pub fn parse_view(bytes: &[u8]) -> Result<ViewMeta> {
 
 /// Deduplicating commit id collector. Empty ids are proto3 defaults of
 /// absent legacy fields, not references, and are dropped.
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct IdSet(HashSet<Vec<u8>>);
 
 impl IdSet {

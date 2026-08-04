@@ -112,12 +112,9 @@ impl Pairing {
         let snapshot = self.store.snapshot();
         let exchange = pair::pair_with(&conn, &ticket, &local_name, &snapshot);
         let peer = match tokio::time::timeout(EXCHANGE_TIMEOUT, exchange).await {
-            Ok(Ok(Some(peer))) => peer,
-            // Invalid or interrupted attempt; nothing to do.
-            Ok(Ok(None)) => return,
-            // The attempt failed after proving ticket possession (e.g. an
-            // unacceptable name): only the ticket holder can trigger this,
-            // and it was sent the reason, so let it retry.
+            Ok(Ok(pair::Outcome::Paired(peer))) => peer,
+            Ok(Ok(pair::Outcome::Dismissed)) => return,
+            // The joiner was sent the reason and can retry.
             Ok(Err(err)) => {
                 warn!("pairing attempt failed: {err:#}");
                 return;

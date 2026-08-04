@@ -47,23 +47,30 @@ mod tests;
 
 use std::collections::HashMap;
 
-use color_eyre::eyre::{Result, eyre};
-use jj_lib::{
-    backend::CommitId,
-    object_id::ObjectId as _,
-    op_store::{OperationId, ViewId},
-};
+use jj_lib::op_store::{OperationId, ViewId};
 
 pub use fetch::fetch;
 pub use serve::serve;
 
-use super::codec::{OpMeta, ViewMeta};
+use super::{
+    codec::{OpMeta, ViewMeta},
+    mesh::{is_virtual_root, to_gix_id},
+};
+use crate::config::RepoId;
 
 /// What a completed fetch did, for logging and status.
 #[derive(Debug)]
 pub struct FetchOutcome {
     pub ops: usize,
     pub git_objects: usize,
+}
+
+/// The mesh identity of the repo a fetch targets, sent in the request so
+/// the server can refuse name or id mismatches.
+#[derive(Clone, Copy)]
+pub struct RepoIdent<'a> {
+    pub name: &'a str,
+    pub id: &'a RepoId,
 }
 
 /// A snapshot of an in-flight fetch, for progress display. Serialized as
@@ -160,9 +167,4 @@ impl OpBatch {
     fn ops_by_id(&self) -> HashMap<&OperationId, &OpMeta> {
         self.ops.iter().map(|op| (&op.id, &op.meta)).collect()
     }
-}
-
-/// Converts a jj commit id into a gix object id.
-fn to_gix_id(id: &CommitId) -> Result<gix::ObjectId> {
-    gix::ObjectId::try_from(id.as_bytes()).map_err(|err| eyre!("bad commit id: {err}"))
 }

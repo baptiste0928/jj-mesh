@@ -2,7 +2,7 @@
 //! blocking helpers CLI commands use, which have no tokio runtime of their
 //! own.
 
-use std::{io, time::Duration};
+use std::{future::Future, io, time::Duration};
 
 use color_eyre::eyre::{Report, Result, WrapErr as _, bail, eyre};
 use tokio::net::UnixStream;
@@ -84,38 +84,35 @@ impl ControlClient {
     }
 }
 
-/// Queries the status of the daemon serving this configuration.
-///
-/// Errors when no daemon is running, or when one is listening but does not
-/// answer properly.
-pub async fn query_status(dir: &ConfigDir) -> Result<Status> {
-    let mut client = ControlClient::connect_required(dir).await?;
-
-    client.send(&Request::Status).await?;
-    match client.recv(Some(CLIENT_TIMEOUT)).await? {
-        Response::Status(status) => Ok(status),
-        other => bail!("unexpected response from the daemon: {other:?}"),
-    }
-}
-
-/// Blocking convenience over [`query_status`] for CLI commands that have no
-/// tokio runtime of their own.
-pub fn query_status_blocking(dir: &ConfigDir) -> Result<Status> {
+/// Runs a control-socket future on a fresh current-thread runtime, for CLI
+/// commands that have no tokio runtime of their own.
+pub fn block_on<T>(future: impl Future<Output = Result<T>>) -> Result<T> {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?
-        .block_on(query_status(dir))
+        .block_on(future)
+}
+
+/// Queries the status of the daemon serving this configuration. Errors when
+/// no daemon is running, or when one is listening but does not answer
+/// properly. Blocking.
+pub fn query_status_blocking(dir: &ConfigDir) -> Result<Status> {
+    block_on(async {
+        let mut client = ControlClient::connect_required(dir).await?;
+
+        client.send(&Request::Status).await?;
+        match client.recv(Some(CLIENT_TIMEOUT)).await? {
+            Response::Status(status) => Ok(status),
+            other => bail!("unexpected response from the daemon: {other:?}"),
+        }
+    })
 }
 
 /// Checks that a daemon is running, erroring with [`DaemonNotRunning`]
 /// otherwise: for commands that want to fail fast before doing local work
 /// they would otherwise have to undo.
 pub fn ensure_daemon_blocking(dir: &ConfigDir) -> Result<()> {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?
-        .block_on(ControlClient::connect_required(dir))
-        .map(drop)
+    block_on(ControlClient::connect_required(dir)).map(drop)
 }
 
 /// Sends one request and returns the daemon's answer, for CLI commands with
@@ -136,19 +133,16 @@ pub fn request_streaming_blocking(
     idle: Duration,
     mut on_progress: impl FnMut(CloneProgress),
 ) -> Result<Response> {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?
-        .block_on(async {
-            let mut client = ControlClient::connect_required(dir).await?;
+    block_on(async {
+        let mut client = ControlClient::connect_required(dir).await?;
 
-            client.send(request).await?;
-            loop {
-                match client.recv(Some(idle)).await? {
-                    Response::CloneProgress(progress) => on_progress(progress),
-                    Response::Error(message) => bail!("{message}"),
-                    response => return Ok(response),
-                }
+        client.send(request).await?;
+        loop {
+            match client.recv(Some(idle)).await? {
+                Response::CloneProgress(progress) => on_progress(progress),
+                Response::Error(message) => bail!("{message}"),
+                response => return Ok(response),
             }
-        })
+        }
+    })
 }

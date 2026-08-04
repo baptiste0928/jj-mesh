@@ -72,7 +72,11 @@ const MAX_ORPHAN_REPOS_PER_PEER: usize = 64;
 
 /// A peer that can serve a `clone` of an unregistered repo, with the op
 /// heads it claims.
-pub type CloneSource = (EndpointId, Vec<Vec<u8>>);
+#[derive(Debug)]
+pub struct CloneSource {
+    pub peer: EndpointId,
+    pub heads: Vec<Vec<u8>>,
+}
 
 /// The router between peer connections and repo tasks.
 #[derive(Debug, Default)]
@@ -392,13 +396,13 @@ impl SyncHub {
     /// any announcement still pending there. The id guards against a stale
     /// task of a replaced same-name repo announcing the wrong heads.
     pub fn publish(&self, name: &str, id: &RepoId, heads: Vec<Vec<u8>>) {
-        let mut state = self.state.lock().unwrap();
-        state.announce_seq += 1;
-        let seq = state.announce_seq;
+        let mut guard = self.state.lock().unwrap();
+        let state = &mut *guard;
         let Some(entry) = state.repos.get_mut(name).filter(|entry| &entry.id == id) else {
             return;
         };
-        entry.seq = seq;
+        state.announce_seq += 1;
+        entry.seq = state.announce_seq;
         entry.published = Some(heads.clone());
 
         let announce = Announce {
@@ -416,8 +420,8 @@ impl SyncHub {
     /// any report still pending there.
     pub fn publish_status(&self, report: StatusReport) {
         let mut state = self.state.lock().unwrap();
-        state.broadcast(|outbox| outbox.push_status(report.clone()));
-        state.status = Some(report);
+        state.status = Some(report.clone());
+        state.broadcast(move |outbox| outbox.push_status(report.clone()));
     }
 
     /// Publishes this machine's membership: cached for peers that connect
@@ -519,12 +523,12 @@ impl SyncHub {
         let mut state = self.state.lock().unwrap();
         let Some(entry) = state.repos.get_mut(&announce.name) else {
             if retraction {
-                state.orphans.retain(|name, peers| {
-                    if *name == announce.name {
-                        peers.remove(&peer);
+                if let Some(peers) = state.orphans.get_mut(&announce.name) {
+                    peers.remove(&peer);
+                    if peers.is_empty() {
+                        state.orphans.remove(&announce.name);
                     }
-                    !peers.is_empty()
-                });
+                }
                 return;
             }
             let known = state
@@ -620,7 +624,10 @@ impl SyncHub {
             id,
             sources
                 .into_iter()
-                .map(|(peer, announce)| (peer, announce.heads))
+                .map(|(peer, announce)| CloneSource {
+                    peer,
+                    heads: announce.heads,
+                })
                 .collect(),
         ))
     }

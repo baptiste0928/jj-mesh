@@ -14,7 +14,10 @@ mod peers;
 mod repos;
 mod store;
 
-use std::{sync::Arc, time::SystemTime};
+use std::{
+    sync::Arc,
+    time::{Duration, SystemTime},
+};
 
 use color_eyre::eyre::{Result, eyre};
 use iroh::{Endpoint, EndpointId};
@@ -44,20 +47,20 @@ const GOSSIP_QUEUE: usize = 16;
 
 /// How often the membership is re-gossiped even when nothing changed, so a
 /// snapshot dropped under load is not lost until the next change.
-const GOSSIP_INTERVAL: std::time::Duration = std::time::Duration::from_mins(5);
+const GOSSIP_INTERVAL: Duration = Duration::from_mins(5);
 
 /// Handshake budget, so stalled attempts release their permit quickly
 /// instead of waiting out the transport-level timeout.
-const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How often the status report is re-broadcast without a repo state
 /// change. Also the staleness bound for the parts the repo set does not
 /// signal (colocation pauses, which flip on peer announcements).
-const STATUS_REFRESH: std::time::Duration = std::time::Duration::from_mins(1);
+const STATUS_REFRESH: Duration = Duration::from_mins(1);
 
 /// Coalescing window for status changes: a failing repo can flip states
 /// quickly, and peers only care about the latest.
-const STATUS_DEBOUNCE: std::time::Duration = std::time::Duration::from_secs(1);
+const STATUS_DEBOUNCE: Duration = Duration::from_secs(1);
 
 /// The ALPNs the daemon serves. The pairing ALPN is always among them:
 /// pairing is gated by the one-time ticket, not by ALPN exposure, and
@@ -148,12 +151,7 @@ impl Daemon {
         tasks.spawn(accept_loop(endpoint.clone(), peers, pairing));
         tasks.spawn(membership_loop(gossip_rx, key.endpoint_id(), store.clone()));
         tasks.spawn(status_loop(repos, hub, jj_version));
-        tasks.spawn(async move {
-            loop {
-                tokio::time::sleep(GOSSIP_INTERVAL).await;
-                store.republish_membership();
-            }
-        });
+        tasks.spawn(gossip_loop(store));
 
         Ok(Daemon { tasks, endpoint })
     }
@@ -276,6 +274,16 @@ async fn membership_loop(
         if let Err(err) = merged {
             warn!("cannot apply membership from {peer}: {err:#}");
         }
+    }
+}
+
+/// Re-gossips the membership every [`GOSSIP_INTERVAL`], even when nothing
+/// changed, so a snapshot dropped under load is not lost until the next
+/// change.
+async fn gossip_loop(store: Arc<MeshStore>) {
+    loop {
+        tokio::time::sleep(GOSSIP_INTERVAL).await;
+        store.republish_membership();
     }
 }
 

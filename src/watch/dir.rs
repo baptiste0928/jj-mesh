@@ -34,7 +34,7 @@ impl DirWatcher {
         let (tx, signals) = mpsc::unbounded_channel();
         let target = dir.to_owned();
 
-        let mut watcher = backend::spawn(
+        let mut watcher = backend::watcher(
             move |event| {
                 if is_watch_death(&event, &target) {
                     Some(Signal::Failed(

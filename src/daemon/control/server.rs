@@ -3,7 +3,7 @@
 
 use std::{
     fs::{self, File, TryLockError},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, SystemTime},
 };
@@ -21,7 +21,7 @@ use super::protocol::{
     MAX_MESSAGE_SIZE, PausedStatus, PeerReport, Request, Response, Status,
 };
 use crate::{
-    config::{ConfigDir, MeshState, Repo, RepoId},
+    config::{ConfigDir, Repo, RepoId},
     daemon::{
         backoff::Backoff,
         hub::{CloneSource, SyncHub},
@@ -61,7 +61,7 @@ pub struct ControlContext {
 impl ControlContext {
     /// Snapshots the daemon state.
     fn status(&self) -> Status {
-        let state = self.state();
+        let state = self.store.snapshot();
         let peers = self.peers.statuses();
         // Peer-related entries are resolved to (and filtered by) the
         // paired name: hub state recorded for a since-unpaired peer can no
@@ -122,17 +122,6 @@ impl ControlContext {
             paused,
             peer_reports,
         }
-    }
-
-    /// Clones the current mesh state.
-    fn state(&self) -> MeshState {
-        self.store.snapshot()
-    }
-
-    /// Mutates the mesh state through the store: persisted, applied to the
-    /// live sets, and broadcast when the membership changed.
-    fn update_state<T>(&self, mutate: impl FnOnce(&mut MeshState) -> Result<T>) -> Result<T> {
-        self.store.update(mutate)
     }
 }
 
@@ -228,16 +217,16 @@ async fn handle_client(mut stream: UnixStream, ctx: Arc<ControlContext>) {
     // progress streaming for the clone); the rest return a single response
     // and share one error conversion.
     let served = match request {
+        Request::Status => reply(&mut stream, Ok(Response::Status(ctx.status()))).await,
         Request::PairHost { name } => reply(&mut stream, pair_host(&ctx, name).await).await,
         Request::PairJoin { ticket, name } => pair_join(&mut stream, &ctx, &ticket, &name).await,
-        Request::Status => reply(&mut stream, Ok(Response::Status(ctx.status()))).await,
         Request::CloneRepo { name, path } => clone_repo(&mut stream, &ctx, &name, &path).await,
         Request::AddRepo { name, path } => {
             reply(&mut stream, add_repo(&ctx, name, path).await).await
         }
         Request::RemoveRepo { name } => reply(&mut stream, remove_repo(&ctx, &name)).await,
-        Request::ForgetRepo { name } => reply(&mut stream, forget_repo(&ctx, &name)).await,
         Request::RemovePeer { peer } => reply(&mut stream, remove_peer(&ctx, &peer)).await,
+        Request::ForgetRepo { name } => reply(&mut stream, forget_repo(&ctx, &name)).await,
     };
 
     if let Err(err) = served {
@@ -287,7 +276,7 @@ async fn pair_join(
 
     let exchange = async {
         let ticket: pair::PairTicket = ticket.parse()?;
-        pair::join(&ctx.endpoint, &ticket, name, &ctx.state()).await
+        pair::join(&ctx.endpoint, &ticket, name, &ctx.store.snapshot()).await
     };
     let result = tokio::select! {
         result = tokio::time::timeout(PAIRING_TIMEOUT, exchange) => result.unwrap_or_else(|_| {
@@ -328,7 +317,7 @@ async fn clone_repo(
     stream: &mut UnixStream,
     ctx: &ControlContext,
     name: &str,
-    path: &std::path::Path,
+    path: &Path,
 ) -> Result<()> {
     let (mut read_half, mut write_half) = stream.split();
     // Seeded before the pull so the heartbeat covers the whole handler,
@@ -372,16 +361,16 @@ async fn clone_repo(
 async fn clone_pull_and_register(
     ctx: &ControlContext,
     name: &str,
-    path: &std::path::Path,
+    path: &Path,
     progress: &tokio::sync::watch::Sender<CloneProgress>,
 ) -> Result<Response> {
     let (repo_id, sources) = ctx.hub.clone_sources(name)?;
 
-    // Fail before the (long) pull when the registration cannot succeed. Only
-    // the re-validation inside `update_state` below is authoritative: the
-    // state may change during the pull.
+    // Fail before the (long) pull when the registration cannot succeed.
+    // Only the re-validation inside the `store.update` below is
+    // authoritative: the state may change during the pull.
     {
-        let state = ctx.state();
+        let state = ctx.store.snapshot();
         state.validate_new_repo(name, path)?;
         state.ensure_mesh_id(name, &repo_id)?;
         if let Some(existing) = state.repo_name(&repo_id) {
@@ -391,7 +380,7 @@ async fn clone_pull_and_register(
 
     let (ops, git_objects) = clone_pull(ctx, name, &repo_id, sources, path, progress).await?;
 
-    ctx.update_state(|state| {
+    ctx.store.update(|state| {
         state.add_repo(
             name.to_owned(),
             Repo {
@@ -408,7 +397,7 @@ async fn clone_pull(
     name: &str,
     repo_id: &RepoId,
     sources: Vec<CloneSource>,
-    path: &std::path::Path,
+    path: &Path,
     progress: &tokio::sync::watch::Sender<CloneProgress>,
 ) -> Result<(u64, u64)> {
     use jj_lib::op_store::OperationId;
@@ -421,7 +410,7 @@ async fn clone_pull(
     .wrap_err("repo open task failed")??;
 
     let mut last_error = eyre!("no usable source peer");
-    for (peer, heads) in sources {
+    for CloneSource { peer, heads } in sources {
         let wants: Vec<OperationId> = heads.into_iter().map(OperationId::new).collect();
         let Some(conn) = ctx.hub.connection(&peer) else {
             continue;
@@ -432,7 +421,8 @@ async fn clone_pull(
         // to zeroed counters before dialing, so a fallback to this source
         // is visible and a stalled dial still heartbeats fresh state.
         let peer_name = ctx
-            .state()
+            .store
+            .snapshot()
             .peer_name(&peer)
             .map_or_else(|| peer.to_string(), str::to_owned);
         let sink = |transfer: transfer::TransferProgress| {
@@ -452,8 +442,7 @@ async fn clone_pull(
             // instead of writing every object loose.
             let outcome = transfer::fetch(
                 &repo,
-                name,
-                repo_id,
+                transfer::RepoIdent { name, id: repo_id },
                 &wants,
                 crate::net::sync::GitTransferFormat::Pack,
                 &mut send,
@@ -487,7 +476,7 @@ async fn add_repo(ctx: &ControlContext, name: String, path: PathBuf) -> Result<R
     .await
     .wrap_err("repo validation task failed")??;
 
-    ctx.update_state(|state| {
+    ctx.store.update(|state| {
         state.add_repo(
             name,
             Repo {
@@ -502,7 +491,7 @@ async fn add_repo(ctx: &ControlContext, name: String, path: PathBuf) -> Result<R
 /// Retires a repo name from the mesh; the repo set stops watching it here
 /// and the gossip propagates the removal to the other machines.
 fn remove_repo(ctx: &ControlContext, name: &str) -> Result<Response> {
-    let was_local = ctx.update_state(|state| state.remove_repo(name))?;
+    let was_local = ctx.store.update(|state| state.remove_repo(name))?;
     info!(repo = %name, "repo removed from the mesh");
     Ok(Response::RepoRemoved { was_local })
 }
@@ -511,7 +500,7 @@ fn remove_repo(ctx: &ControlContext, name: &str) -> Result<Response> {
 /// it, announcements stop, and the mesh record stays untouched (no gossip
 /// change), so the repo remains clonable here.
 fn forget_repo(ctx: &ControlContext, name: &str) -> Result<Response> {
-    let repo = ctx.update_state(|state| state.forget_repo(name))?;
+    let repo = ctx.store.update(|state| state.forget_repo(name))?;
     info!(repo = %name, "repo forgotten locally");
     Ok(Response::RepoForgotten { path: repo.path })
 }
@@ -519,7 +508,7 @@ fn forget_repo(ctx: &ControlContext, name: &str) -> Result<Response> {
 /// Tombstones a paired peer; the peer set disconnects it immediately and
 /// the gossip propagates the removal.
 fn remove_peer(ctx: &ControlContext, peer: &str) -> Result<Response> {
-    let endpoint = ctx.update_state(|state| state.remove_peer(peer))?;
+    let endpoint = ctx.store.update(|state| state.remove_peer(peer))?;
     info!(peer = %peer, "peer removed");
     Ok(Response::PeerRemoved(endpoint))
 }

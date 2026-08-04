@@ -34,7 +34,7 @@ use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq as _;
 
 use super::wire::{read_message, write_message};
-use crate::config::MeshState;
+use crate::config::{MeshState, sanitize_bounded};
 
 /// ALPN of the pairing protocol.
 pub const ALPN: &[u8] = b"jj-mesh/pair/0";
@@ -144,6 +144,17 @@ pub struct PairedPeer {
     pub endpoint: EndpointId,
 }
 
+/// Outcome of hosting one pairing attempt (see [`pair_with`]).
+#[derive(Debug)]
+pub enum Outcome {
+    /// The exchange completed; the caller must persist the peer and then
+    /// call [`confirm_paired`].
+    Paired(PairedPeer),
+    /// The attempt failed without needing user action (invalid ticket,
+    /// connection trouble); the joiner may retry.
+    Dismissed,
+}
+
 /// A protocol message. Every message is sent by a single side, but they share
 /// one enum as the wire format.
 #[derive(Debug, Serialize, Deserialize)]
@@ -161,20 +172,18 @@ enum Message {
 /// Runs the host side of the exchange on one connection, accepted on the
 /// pairing ALPN with `ticket` outstanding.
 ///
-/// Returns `Ok(None)` when the attempt failed without needing user action
-/// (invalid ticket, connection trouble). Errors mean an attempt by the
-/// ticket holder itself failed (it was sent the reason); the caller
-/// decides whether the ticket stays redeemable.
+/// Errors mean an attempt by the ticket holder itself failed (it was sent
+/// the reason); the caller decides whether the ticket stays redeemable.
 ///
-/// On success the connection is left open: the caller must persist the peer
-/// and then call [`confirm_paired`]. Closing any other way (including by
-/// dropping the connection) makes the joiner treat the pairing as failed.
+/// On [`Outcome::Paired`] the connection is left open. Closing it any way
+/// but [`confirm_paired`] (including by dropping it) makes the joiner
+/// treat the pairing as failed.
 pub async fn pair_with(
     conn: &Connection,
     ticket: &PairTicket,
     local_name: &str,
     state: &MeshState,
-) -> Result<Option<PairedPeer>> {
+) -> Result<Outcome> {
     let opening = tokio::time::timeout(HELLO_TIMEOUT, async {
         let (send, mut recv) = conn.accept_bi().await.ok()?;
         let hello = read_message(&mut recv, MAX_MESSAGE_SIZE).await;
@@ -183,10 +192,10 @@ pub async fn pair_with(
     .await;
     let (mut send, mut recv, hello) = match opening {
         Ok(Some(opened)) => opened,
-        Ok(None) => return Ok(None),
+        Ok(None) => return Ok(Outcome::Dismissed),
         Err(_timeout) => {
             conn.close(0u32.into(), b"timeout");
-            return Ok(None);
+            return Ok(Outcome::Dismissed);
         }
     };
 
@@ -205,7 +214,7 @@ pub async fn pair_with(
                 REJECT_LINGER_BRIEF,
             )
             .await;
-            return Ok(None);
+            return Ok(Outcome::Dismissed);
         }
     };
 
@@ -219,22 +228,21 @@ pub async fn pair_with(
         .await
         .is_err()
     {
-        return Ok(None);
+        return Ok(Outcome::Dismissed);
     }
 
     match read_message(&mut recv, MAX_MESSAGE_SIZE).await {
         Ok(Message::Done) => {}
-        Ok(Message::Reject { reason }) => bail!(
-            "peer rejected pairing: {}",
-            crate::config::sanitize(&reason)
-        ),
+        Ok(Message::Reject { reason }) => {
+            bail!("peer rejected pairing: {}", sanitize_bounded(&reason))
+        }
         Ok(msg) => bail!("unexpected message from peer: {msg:?}"),
         // Connection lost mid-exchange: let the joiner retry with the same
         // ticket instead of failing the attempt for good.
-        Err(_) => return Ok(None),
+        Err(_) => return Ok(Outcome::Dismissed),
     }
 
-    Ok(Some(PairedPeer { name, endpoint }))
+    Ok(Outcome::Paired(PairedPeer { name, endpoint }))
 }
 
 /// Host side for connections arriving while no ticket is outstanding:
@@ -288,7 +296,7 @@ pub async fn join(
         Message::Welcome { name } => name,
         Message::Reject { reason } => {
             conn.close(0u32.into(), b"rejected");
-            bail!("pairing rejected: {}", crate::config::sanitize(&reason));
+            bail!("pairing rejected: {}", sanitize_bounded(&reason));
         }
         msg => bail!("unexpected message from host: {msg:?}"),
     };
