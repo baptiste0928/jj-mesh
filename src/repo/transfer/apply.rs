@@ -18,7 +18,7 @@ use pollster::FutureExt as _;
 use tracing::{info, warn};
 
 use super::{OpBatch, to_gix_id};
-use crate::repo::{MeshRepo, codec::OpMeta};
+use crate::repo::{OpenRepo, codec::OpMeta};
 
 /// Walk budget for [`superseded_by`]: stopping early is safe (unwalked
 /// local heads stay listed and jj reconciles the divergence), so deep
@@ -28,7 +28,7 @@ const SUPERSEDE_WALK_BUDGET: usize = 1 << 16;
 /// Applies a validated batch: keep refs, views, ops, extras, the colocated
 /// ref mirror, then head publication. Runs on a blocking thread.
 pub(super) fn apply(
-    repo: &Arc<MeshRepo>,
+    repo: &Arc<OpenRepo>,
     batch: &OpBatch,
     wants: &[OperationId],
     local_heads: &[OperationId],
@@ -122,7 +122,7 @@ pub(super) fn apply(
 /// The local heads that are ancestors of `want`, walking parent links of
 /// validated ops (batch first, local store as fallback).
 fn superseded_by(
-    repo: &MeshRepo,
+    repo: &OpenRepo,
     batch: &HashMap<&OperationId, &OpMeta>,
     want: &OperationId,
     local_heads: &[OperationId],
@@ -166,7 +166,7 @@ fn superseded_by(
 
 /// Writes `refs/jj/keep/*` refs so git GC cannot prune commits jj has not
 /// imported yet (mirrors the git backend's own convention).
-fn write_keep_refs(repo: &MeshRepo, commit_ids: &HashSet<CommitId>) -> Result<()> {
+fn write_keep_refs(repo: &OpenRepo, commit_ids: &HashSet<CommitId>) -> Result<()> {
     use gix::refs::transaction::{Change, LogChange, PreviousValue, RefEdit};
 
     let git = repo.git_backend().git_repo();
@@ -201,7 +201,7 @@ fn write_keep_refs(repo: &MeshRepo, commit_ids: &HashSet<CommitId>) -> Result<()
 /// Refs the user created or moved directly in git are left alone (a
 /// failed swap is logged and skipped; jj's importer reconciles it), and
 /// HEAD is never touched.
-fn mirror_git_refs(repo: &MeshRepo, view: &View, old_view: &View) -> Result<()> {
+fn mirror_git_refs(repo: &OpenRepo, view: &View, old_view: &View) -> Result<()> {
     use gix::refs::transaction::{Change, LogChange, PreviousValue, RefEdit};
 
     let git = repo.git_backend().git_repo();

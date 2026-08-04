@@ -11,11 +11,11 @@ use crate::{
         sync::{FetchRequest, GitTransferFormat, MAX_OP_FRAME_SIZE, OpFrame},
         wire::{read_message, write_message},
     },
-    repo::{JjRepo, MeshRepo},
+    repo::{JjRepo, OpenRepo},
     testing::Fixture,
 };
 
-fn open(dir: &Path) -> Arc<MeshRepo> {
+fn open(dir: &Path) -> Arc<OpenRepo> {
     Arc::new(JjRepo::discover(dir).unwrap().open().unwrap())
 }
 
@@ -32,8 +32,8 @@ fn fork(from: &Path, to: &Path) {
 /// Runs one fetch of `wants` from `server` into `fetcher` over an
 /// in-memory stream pair, as the daemon would over QUIC.
 async fn sync_once(
-    fetcher: &Arc<MeshRepo>,
-    server: &Arc<MeshRepo>,
+    fetcher: &Arc<OpenRepo>,
+    server: &Arc<OpenRepo>,
     wants: &[OperationId],
 ) -> FetchOutcome {
     sync_once_as(fetcher, server, wants, GitTransferFormat::Loose).await
@@ -41,8 +41,8 @@ async fn sync_once(
 
 /// [`sync_once`] with an explicit git transfer format.
 async fn sync_once_as(
-    fetcher: &Arc<MeshRepo>,
-    server: &Arc<MeshRepo>,
+    fetcher: &Arc<OpenRepo>,
+    server: &Arc<OpenRepo>,
     wants: &[OperationId],
     format: GitTransferFormat,
 ) -> FetchOutcome {
@@ -80,7 +80,7 @@ async fn sync_once_as(
 
 /// Fetches the heads `dst` lacks from `src`, as the daemon does on an
 /// announcement. Returns whether anything was fetched.
-async fn sync_missing(dst: &Arc<MeshRepo>, src: &Arc<MeshRepo>) -> bool {
+async fn sync_missing(dst: &Arc<OpenRepo>, src: &Arc<OpenRepo>) -> bool {
     let mut wants = Vec::new();
     for head in src.op_heads().await.unwrap() {
         if !dst.has_operation(&head).await.unwrap() {

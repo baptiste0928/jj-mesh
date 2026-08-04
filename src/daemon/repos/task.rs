@@ -53,7 +53,7 @@ use crate::{
         hub::{Inbox, PeerAnnounce, SyncHub},
     },
     net::sync::GitTransferFormat,
-    repo::{JjRepo, MeshRepo, StoreFingerprint, repo_present, run_jj, transfer},
+    repo::{JjRepo, OpenRepo, StoreFingerprint, repo_present, run_jj, transfer},
     watch::{DirWatcher, TreeWatcher},
 };
 
@@ -208,7 +208,7 @@ impl RepoTask {
     /// is dispatched by the hub.
     ///
     /// The head reads here are cheap single-shot store calls (one readdir),
-    /// safe from async context; see the [`crate::repo::MeshRepo`] docs.
+    /// safe from async context; see the [`crate::repo::OpenRepo`] docs.
     async fn watch(&self) -> Result<()> {
         let (jj, repo, fingerprint) = self.open().await?;
         // Fetch serving is dispatched by the hub, never by this loop: a
@@ -348,12 +348,12 @@ impl RepoTask {
     /// Opens the repo's stores. Opening is heavy (gix opens the git repo,
     /// the self-check reads whole views), so it runs on a blocking
     /// thread: a hung disk must stall this repo, not the daemon.
-    async fn open(&self) -> Result<(JjRepo, Arc<MeshRepo>, StoreFingerprint)> {
+    async fn open(&self) -> Result<(JjRepo, Arc<OpenRepo>, StoreFingerprint)> {
         use pollster::FutureExt as _;
 
         let path = self.path.clone();
         let (jj, repo, fingerprint) =
-            tokio::task::spawn_blocking(move || -> Result<(JjRepo, MeshRepo, _)> {
+            tokio::task::spawn_blocking(move || -> Result<(JjRepo, OpenRepo, _)> {
                 let jj = JjRepo::discover(&path)?;
                 // The fingerprint is captured before the open: taken after,
                 // a reconfiguration racing the open could leave stale
@@ -394,7 +394,7 @@ impl RepoTask {
     /// Drains the announcement inbox, handling every entry. Failed
     /// fetches are requeued (a newer announcement or a reconnect
     /// supersedes them) and reported for a retry wakeup.
-    async fn drain_announcements(&self, repo: &Arc<MeshRepo>) -> Result<Drained> {
+    async fn drain_announcements(&self, repo: &Arc<OpenRepo>) -> Result<Drained> {
         let mut drained = Drained {
             synced: false,
             retry: false,
@@ -417,7 +417,7 @@ impl RepoTask {
     /// missing locally.
     async fn handle_announce(
         &self,
-        repo: &Arc<MeshRepo>,
+        repo: &Arc<OpenRepo>,
         announce: &PeerAnnounce,
     ) -> Result<Handled> {
         let id_len = repo.root_operation_id().as_bytes().len();
@@ -471,7 +471,7 @@ impl RepoTask {
     /// bidirectional stream.
     async fn fetch_missing(
         &self,
-        repo: &Arc<MeshRepo>,
+        repo: &Arc<OpenRepo>,
         peer: EndpointId,
         wants: &[OperationId],
     ) -> Result<transfer::FetchOutcome> {
@@ -641,7 +641,7 @@ async fn store_fingerprint(jj: &JjRepo) -> Result<StoreFingerprint> {
 }
 
 /// Reads the current op heads as a sorted set, comparable across reads.
-async fn sorted_heads(repo: &MeshRepo) -> Result<Vec<OperationId>> {
+async fn sorted_heads(repo: &OpenRepo) -> Result<Vec<OperationId>> {
     let mut heads = repo.op_heads().await?;
     heads.sort_unstable();
     Ok(heads)

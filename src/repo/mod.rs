@@ -15,7 +15,7 @@ use std::{
 
 use color_eyre::eyre::{Result, WrapErr as _, ensure, eyre};
 
-pub use self::mesh::MeshRepo;
+pub use self::mesh::OpenRepo;
 
 /// The jj release series whose on-disk formats this build was written
 /// against. Must match the exact `jj-lib` pin in `Cargo.toml`: repos
@@ -73,8 +73,8 @@ impl JjRepo {
     }
 
     /// Opens the repo's stores through jj_lib for sync operations.
-    pub fn open(&self) -> Result<MeshRepo> {
-        MeshRepo::open(self.clone())
+    pub fn open(&self) -> Result<OpenRepo> {
+        OpenRepo::open(self.clone())
     }
 
     /// The name of the workspace at the repo root (`default` until it is

@@ -1,9 +1,9 @@
 //! jj_lib-backed access to a repo's stores, scoped to what sync needs.
 //!
-//! [`MeshRepo`] wraps a [`RepoLoader`] and exposes op-head enumeration, op
+//! [`OpenRepo`] wraps a [`RepoLoader`] and exposes op-head enumeration, op
 //! DAG walking, op/view transfer primitives and the git backend. It never
 //! loads a full repo; the commit index is only touched by the explicit
-//! post-sync build (see [`MeshRepo::build_commit_index`]).
+//! post-sync build (see [`OpenRepo::build_commit_index`]).
 //!
 //! Invariants:
 //! - Ops and views replicate as raw stored bytes under the sender's ids
@@ -46,14 +46,14 @@ use super::JjRepo;
 /// One long-lived instance per registered repo; all methods take `&self` and
 /// are safe under concurrent jj commands (jj's stores are designed for
 /// multiple writers, see its concurrency docs).
-pub struct MeshRepo {
+pub struct OpenRepo {
     repo: JjRepo,
     loader: RepoLoader,
 }
 
-impl std::fmt::Debug for MeshRepo {
+impl std::fmt::Debug for OpenRepo {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("MeshRepo")
+        f.debug_struct("OpenRepo")
             .field("root", &self.repo.root())
             .finish_non_exhaustive()
     }
@@ -73,7 +73,7 @@ pub(super) fn settings() -> Result<&'static UserSettings> {
         .map_err(|err| eyre!("cannot build jj settings: {err}"))
 }
 
-impl MeshRepo {
+impl OpenRepo {
     /// Opens the stores of a validated repo.
     pub(super) fn open(repo: JjRepo) -> Result<Self> {
         let settings = settings()?;
@@ -84,7 +84,7 @@ impl MeshRepo {
         )
         .wrap_err_with(|| format!("cannot open jj repo at {}", repo.root().display()))?;
 
-        let mesh = MeshRepo { repo, loader };
+        let mesh = OpenRepo { repo, loader };
         ensure!(
             mesh.loader.store().backend_impl::<GitBackend>().is_some(),
             "{} does not use the git commit backend",
@@ -391,7 +391,7 @@ fn read_raw(dir: &Path, id: &impl ObjectId) -> Result<Vec<u8>> {
 /// Nothing is readable under its final id until [`Self::persist`];
 /// dropping the batch instead discards the staged files.
 pub struct RawWriteBatch<'a> {
-    repo: &'a MeshRepo,
+    repo: &'a OpenRepo,
     staged: Vec<(tempfile::TempPath, PathBuf)>,
 }
 
@@ -479,7 +479,7 @@ mod tests {
     use super::*;
     use crate::testing::Fixture;
 
-    fn open(dir: &Path) -> MeshRepo {
+    fn open(dir: &Path) -> OpenRepo {
         JjRepo::discover(dir).unwrap().open().unwrap()
     }
 

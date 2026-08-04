@@ -34,7 +34,7 @@ use crate::{
         },
         wire::{read_message, write_message},
     },
-    repo::MeshRepo,
+    repo::OpenRepo,
 };
 
 /// Op/view frames buffered between the blocking walk and the stream writer.
@@ -53,7 +53,7 @@ const PACK_STREAM_BUFFER: usize = 8;
 /// repo; errors are reported to the peer as protocol frames where the
 /// exchange allows it.
 pub async fn serve(
-    repo: &Arc<MeshRepo>,
+    repo: &Arc<OpenRepo>,
     request: FetchRequest,
     send: &mut (impl AsyncWrite + Unpin),
     recv: &mut (impl AsyncRead + Unpin),
@@ -136,7 +136,7 @@ pub async fn serve(
 }
 
 /// Validates the shape of a fetch request.
-fn validate_request(repo: &MeshRepo, request: &FetchRequest) -> Result<(), String> {
+fn validate_request(repo: &OpenRepo, request: &FetchRequest) -> Result<(), String> {
     let id_len = repo.root_operation_id().as_bytes().len();
     let ok = !request.wants.is_empty()
         && request.wants.len() <= MAX_WANTS
@@ -156,7 +156,7 @@ fn validate_request(repo: &MeshRepo, request: &FetchRequest) -> Result<(), Strin
 /// Serves the git phase: answers the fetcher's commit wants with the raw
 /// object closure, stopping at its haves, in the requested format.
 async fn serve_git_phase(
-    repo: &Arc<MeshRepo>,
+    repo: &Arc<OpenRepo>,
     send: &mut (impl AsyncWrite + Unpin),
     recv: &mut (impl AsyncRead + Unpin),
 ) -> Result<()> {
@@ -187,7 +187,7 @@ async fn serve_git_phase(
 
 /// Serves the git phase in the loose format: one object per frame.
 async fn serve_git_loose(
-    repo: &Arc<MeshRepo>,
+    repo: &Arc<OpenRepo>,
     request: GitRequest,
     send: &mut (impl AsyncWrite + Unpin),
 ) -> Result<()> {
@@ -229,7 +229,7 @@ async fn serve_git_loose(
 /// ids without loading blob contents, then the pack pipeline streams one
 /// packfile in chunks.
 async fn serve_git_pack(
-    repo: &Arc<MeshRepo>,
+    repo: &Arc<OpenRepo>,
     request: GitRequest,
     send: &mut (impl AsyncWrite + Unpin),
 ) -> Result<()> {
@@ -350,7 +350,7 @@ fn produce<T>(tx: &mpsc::Sender<Result<T>>, frame: T) -> Result<()> {
 /// format reads what it needs (the loose server per object, the pack
 /// pipeline itself).
 fn walk_git_closure(
-    repo: &MeshRepo,
+    repo: &OpenRepo,
     request: &GitRequest,
     mut emit: impl FnMut(gix::ObjectId, WireObjectKind) -> Result<()>,
 ) -> Result<()> {

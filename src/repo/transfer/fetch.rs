@@ -27,7 +27,7 @@ use crate::{
         },
         wire::{read_message, write_message},
     },
-    repo::{MeshRepo, codec},
+    repo::{OpenRepo, codec},
 };
 
 /// Read budget when sampling have-ancestors for a fetch request.
@@ -54,7 +54,7 @@ const INGEST_SAMPLE_INTERVAL: std::time::Duration = std::time::Duration::from_mi
 /// [`GitTransferFormat`]); `progress` receives live counters as the phases
 /// advance.
 pub async fn fetch(
-    repo: &Arc<MeshRepo>,
+    repo: &Arc<OpenRepo>,
     target: RepoIdent<'_>,
     wants: &[OperationId],
     format: GitTransferFormat,
@@ -172,7 +172,7 @@ pub async fn fetch(
 /// proto schema, every op's parents and view must be part of the batch or
 /// already stored, and every want must be covered.
 async fn receive_ops(
-    repo: &Arc<MeshRepo>,
+    repo: &Arc<OpenRepo>,
     wants: &[OperationId],
     recv: &mut (impl AsyncRead + Unpin),
     progress: ProgressSink<'_>,
@@ -329,7 +329,7 @@ fn referenced_commits(batch: &OpBatch) -> Vec<CommitId> {
 /// and writing them loose in chunks. Returns how many objects the peer
 /// sent.
 async fn receive_git_loose(
-    repo: &Arc<MeshRepo>,
+    repo: &Arc<OpenRepo>,
     recv: &mut (impl AsyncRead + Unpin),
     progress: ProgressSink<'_>,
 ) -> Result<usize> {
@@ -393,7 +393,7 @@ async fn receive_git_loose(
 /// on every received chunk and, once the stream ends, on a timer while
 /// the ingest finishes resolving.
 async fn receive_git_pack(
-    repo: &Arc<MeshRepo>,
+    repo: &Arc<OpenRepo>,
     recv: &mut (impl AsyncRead + Unpin),
     progress: ProgressSink<'_>,
 ) -> Result<(usize, pack::PackKeep)> {
@@ -477,7 +477,7 @@ async fn receive_git_pack(
 /// (each was verified, and nothing references them until the apply
 /// publishes).
 fn write_git_chunk(
-    repo: &Arc<MeshRepo>,
+    repo: &Arc<OpenRepo>,
     chunk: Vec<(gix::ObjectId, gix::object::Kind, Vec<u8>)>,
 ) -> tokio::task::JoinHandle<Result<()>> {
     let repo = repo.clone();
@@ -508,7 +508,7 @@ fn write_git_chunk(
 /// Samples haves for a fetch: local heads plus ancestors at exponentially
 /// growing first-parent distances, bounding redundant transfer even when
 /// histories diverged long ago.
-async fn sample_haves(repo: &MeshRepo, heads: &[OperationId]) -> Result<Vec<OperationId>> {
+async fn sample_haves(repo: &OpenRepo, heads: &[OperationId]) -> Result<Vec<OperationId>> {
     let mut haves: Vec<OperationId> = heads.to_vec();
     let mut budget = SAMPLE_BUDGET;
 

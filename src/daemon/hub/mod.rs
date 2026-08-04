@@ -55,7 +55,7 @@ use crate::{
         sync::{Announce, FetchRequest, MAX_OP_FRAME_SIZE, OpFrame, StatusReport},
         wire,
     },
-    repo::{MeshRepo, transfer},
+    repo::{OpenRepo, transfer},
 };
 
 /// Fetches served concurrently per repo (read-only on the repo).
@@ -181,7 +181,7 @@ impl RepoEntry {
 /// What the hub needs to serve fetches for an open repo.
 #[derive(Debug, Clone)]
 struct Serving {
-    repo: Arc<MeshRepo>,
+    repo: Arc<OpenRepo>,
     permits: Arc<tokio::sync::Semaphore>,
 }
 
@@ -242,7 +242,7 @@ impl SyncHub {
     /// handle from a previous open. The id guards against a stale task of
     /// a replaced same-name repo installing the wrong stores (aborts only
     /// land at the task's next await point).
-    pub fn repo_opened(&self, name: &str, id: &RepoId, repo: Arc<MeshRepo>) {
+    pub fn repo_opened(&self, name: &str, id: &RepoId, repo: Arc<OpenRepo>) {
         if let Some(entry) = self
             .state
             .lock()
