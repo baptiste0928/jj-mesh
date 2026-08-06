@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- The Nix flake now uses `buildRustPackage` instead of [crane](https://crane.dev/). It no longer
+  leaves large build artifacts in the user nix store after compiling from source.
+
 ## [0.1.0] - 2026-08-04
 
 Initial version of `jj-mesh`.

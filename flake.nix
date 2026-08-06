@@ -3,21 +3,10 @@
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
-    crane.url = "github:ipetkov/crane";
-    rust-overlay = {
-      url = "github:oxalica/rust-overlay";
-      inputs.nixpkgs.follows = "nixpkgs";
-    };
   };
 
   outputs =
-    {
-      self,
-      nixpkgs,
-      crane,
-      rust-overlay,
-      ...
-    }:
+    { self, nixpkgs, ... }:
     let
       forEachSystem = nixpkgs.lib.genAttrs [
         "x86_64-linux"
@@ -36,43 +25,32 @@
       packages = forEachSystem (
         system:
         let
-          pkgs = import nixpkgs {
-            inherit system;
-            overlays = [ rust-overlay.overlays.default ];
-          };
+          pkgs = nixpkgs.legacyPackages.${system};
 
-          # Build with the toolchain pinned in rust-toolchain.toml
-          craneLib = (crane.mkLib pkgs).overrideToolchain (
-            p: p.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml
-          );
+          jj-mesh = pkgs.rustPlatform.buildRustPackage {
+            pname = "jj-mesh";
+            version = (nixpkgs.lib.importTOML ./Cargo.toml).package.version;
 
-          commonArgs = {
-            src = craneLib.cleanCargoSource ./.;
-            strictDeps = true;
+            src = self;
+            cargoHash = "sha256-jtQ4A41YIxa9e0axdqEAySfrcTd5j6bzJSvFxcBcabE=";
+
             doCheck = false; # Don't run tests on the flake
+            env.JJ_MESH_COMMIT = self.shortRev or self.dirtyShortRev or "unknown";
+
+            nativeBuildInputs = [ pkgs.installShellFiles ];
+            postInstall = ''
+              installShellCompletion --cmd jj-mesh \
+                --bash <(COMPLETE=bash $out/bin/jj-mesh) \
+                --fish <(COMPLETE=fish $out/bin/jj-mesh) \
+                --zsh <(COMPLETE=zsh $out/bin/jj-mesh)
+            '';
+
+            meta = {
+              description = "Peer-to-peer synchronization of jj repositories";
+              license = nixpkgs.lib.licenses.isc;
+              mainProgram = "jj-mesh";
+            };
           };
-
-          cargoArtifacts = craneLib.buildDepsOnly commonArgs;
-
-          jj-mesh = craneLib.buildPackage (
-            commonArgs
-            // {
-              inherit cargoArtifacts;
-              JJ_MESH_COMMIT = self.shortRev or self.dirtyShortRev or "unknown";
-              nativeBuildInputs = [ pkgs.installShellFiles ];
-              postInstall = ''
-                installShellCompletion --cmd jj-mesh \
-                  --bash <(COMPLETE=bash $out/bin/jj-mesh) \
-                  --fish <(COMPLETE=fish $out/bin/jj-mesh) \
-                  --zsh <(COMPLETE=zsh $out/bin/jj-mesh)
-              '';
-              meta = {
-                description = "Peer-to-peer synchronization of jj repositories";
-                license = nixpkgs.lib.licenses.isc;
-                mainProgram = "jj-mesh";
-              };
-            }
-          );
         in
         {
           default = jj-mesh;
