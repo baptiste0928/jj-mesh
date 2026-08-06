@@ -10,7 +10,7 @@
 //!
 //! Parsing must reject every shape jj's own readers reject (or panic on):
 //! once stored and reachable from a published op head, an unreadable
-//! object would break every jj command in the repo. jj 0.43 requires a
+//! object would break every jj command in the repo. jj 0.44 requires a
 //! ref target's value oneof to be set, native ref conflicts to have one
 //! more add than removes, remote ref merges to have odd arity, and remote
 //! ref states to be known enum values.

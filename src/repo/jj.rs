@@ -108,7 +108,7 @@ pub fn local_jj_version() -> Option<String> {
     parse_jj_version(&stdout)
 }
 
-/// Extracts the version from `jj --version` output (`jj 0.43.0[-hash]`).
+/// Extracts the version from `jj --version` output (`jj 0.44.0[-hash]`).
 fn parse_jj_version(output: &str) -> Option<String> {
     let version = output.trim().strip_prefix("jj ")?.split('-').next()?;
     let plausible = !version.is_empty() && version.chars().all(|c| c.is_ascii_digit() || c == '.');
@@ -140,20 +140,20 @@ mod tests {
 
     #[test]
     fn parses_and_matches_jj_versions() {
-        assert_eq!(parse_jj_version("jj 0.43.0\n"), Some("0.43.0".to_owned()));
+        assert_eq!(parse_jj_version("jj 0.44.0\n"), Some("0.44.0".to_owned()));
         assert_eq!(
-            parse_jj_version("jj 0.43.0-dev+abcdef\n"),
-            Some("0.43.0".to_owned()),
+            parse_jj_version("jj 0.44.0-dev+abcdef\n"),
+            Some("0.44.0".to_owned()),
         );
         assert_eq!(parse_jj_version("command not found: jj"), None);
         assert_eq!(parse_jj_version("jj whatever"), None);
         assert_eq!(parse_jj_version(""), None);
 
-        assert!(jj_version_supported("0.43.0"));
-        assert!(jj_version_supported("0.43.12"));
-        assert!(!jj_version_supported("0.44.0"));
-        assert!(!jj_version_supported("0.4.30"));
-        assert!(!jj_version_supported("0.430.0"));
-        assert!(!jj_version_supported("0.43"));
+        assert!(jj_version_supported("0.44.0"));
+        assert!(jj_version_supported("0.44.12"));
+        assert!(!jj_version_supported("0.43.0"));
+        assert!(!jj_version_supported("0.4.40"));
+        assert!(!jj_version_supported("0.440.0"));
+        assert!(!jj_version_supported("0.44"));
     }
 }

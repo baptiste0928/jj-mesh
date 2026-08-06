@@ -28,10 +28,11 @@ use color_eyre::eyre::{Result, WrapErr as _, ensure, eyre};
 use jj_lib::{
     backend::CommitId,
     config::StackedConfig,
+    default_backend_factories::default_backend_factories,
     git_backend::GitBackend,
     object_id::{HexPrefix, ObjectId, PrefixResolution},
     op_store::{Operation, OperationId, View, ViewId},
-    repo::{RepoLoader, StoreFactories},
+    repo::RepoLoader,
     settings::UserSettings,
 };
 use pollster::FutureExt as _;
@@ -77,7 +78,7 @@ impl OpenRepo {
         let loader = RepoLoader::init_from_file_system(
             settings,
             &repo.repo_dir(),
-            &StoreFactories::default(),
+            &default_backend_factories(),
         )
         .wrap_err_with(|| format!("cannot open jj repo at {}", repo.root().display()))?;
 

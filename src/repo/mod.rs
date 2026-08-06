@@ -31,7 +31,7 @@ pub use self::{
 /// The jj release series whose on-disk formats this build was written
 /// against. Must match the exact `jj-lib` pin in `Cargo.toml`: repos
 /// written by another jj series may use formats this build mis-reads.
-const SUPPORTED_JJ_SERIES: &str = "0.43";
+const SUPPORTED_JJ_SERIES: &str = "0.44";
 
 /// Store backends supported by jj-mesh, as `(<store dir>, <expected type>)`
 /// pairs relative to `.jj/repo`.
@@ -106,14 +106,14 @@ impl JjRepo {
     /// renamed).
     pub fn workspace_name(&self) -> Result<String> {
         use jj_lib::{
-            repo::StoreFactories,
-            workspace::{Workspace, default_working_copy_factories},
+            default_backend_factories::{default_backend_factories, default_working_copy_factories},
+            workspace::Workspace,
         };
 
         let workspace = Workspace::load(
             open::settings()?,
             &self.root,
-            &StoreFactories::default(),
+            &default_backend_factories(),
             &default_working_copy_factories(),
         )
         .wrap_err_with(|| format!("cannot load the workspace at {}", self.root.display()))?;

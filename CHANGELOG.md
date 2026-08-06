@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- ***BREAKING*** Updated supported `jj` version to 0.44.
 - The Nix flake now uses `buildRustPackage` instead of [crane](https://crane.dev/). It no longer
   leaves large build artifacts in the user nix store after compiling from source.
 
