@@ -1,7 +1,12 @@
-//! Applying a validated batch, in the crash-safe order: keep refs, views
-//! and ops (parents first, persisted with one batched durability sync),
-//! change-id extras, the colocated ref mirror, and only then the op head
-//! publication that makes anything visible to jj.
+//! Applying a validated batch, in the crash-safe order: anti-GC keep
+//! refs, views and ops (parents first, persisted with one batched
+//! durability sync), change-id extras, the commit index for the incoming
+//! heads, the colocated ref mirror, and only then the op head publication
+//! that makes anything visible to jj.
+//!
+//! The apply is split in two so [`super::fetch`] can run the index build
+//! in between: [`stage`] lands everything on disk and computes what to
+//! publish, [`publish`] makes it visible.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -25,14 +30,29 @@ use crate::repo::{OpenRepo, codec::OpMeta};
 /// histories need not be traversed exhaustively.
 const SUPERSEDE_WALK_BUDGET: usize = 1 << 16;
 
-/// Applies a validated batch: keep refs, views, ops, extras, the colocated
-/// ref mirror, then head publication. Runs on a blocking thread.
-pub(super) fn apply(
+/// A staged batch: everything is on disk and readable; the index build,
+/// the colocated ref mirror and the op head publication remain.
+pub(super) struct Staged {
+    /// Wants to publish, each with the local heads it supersedes.
+    to_publish: Vec<(OperationId, Vec<OperationId>)>,
+    /// Set when the batch fast-forwards the repo's single local head:
+    /// that head, whose view the colocated ref mirror reconciles
+    /// against. `None` under divergence, where no single previous view
+    /// exists.
+    fast_forward: Option<OperationId>,
+    /// Ops the batch carried, for the publication log line.
+    ops: usize,
+}
+
+/// Stages a validated batch: keep refs, views, ops, extras, and the
+/// supersession computation, leaving nothing visible to jj yet. Runs on a
+/// blocking thread.
+pub(super) fn stage(
     repo: &Arc<OpenRepo>,
     batch: &OpBatch,
     wants: &[OperationId],
     local_heads: &[OperationId],
-) -> Result<Vec<OperationId>> {
+) -> Result<Staged> {
     // Anti-GC keep refs for every new view head, before anything
     // references those commits.
     let new_commit_heads: HashSet<CommitId> = batch
@@ -88,12 +108,32 @@ pub(super) fn apply(
     // a single old head to a single new one; under divergence the merged
     // view decides, and with several old heads there is no single previous
     // view to reconcile git refs against.
-    let fast_forward = to_publish.len() == 1 && local_heads.len() == 1 && all_superseded.len() == 1;
+    let fast_forward =
+        (to_publish.len() == 1 && local_heads.len() == 1 && all_superseded.len() == 1)
+            .then(|| local_heads[0].clone());
+
+    Ok(Staged {
+        to_publish,
+        fast_forward,
+        ops: batch.ops.len(),
+    })
+}
+
+/// Publishes a staged batch: the colocated ref mirror, then the op head
+/// publication that makes everything visible to jj. Runs on a blocking
+/// thread.
+pub(super) fn publish(repo: &Arc<OpenRepo>, staged: &Staged) -> Result<()> {
+    let Staged {
+        to_publish,
+        fast_forward,
+        ops,
+    } = staged;
+
     if repo.is_colocated() && !to_publish.is_empty() {
-        if fast_forward {
+        if let Some(old_head) = fast_forward {
             let new_op = repo.read_operation(&to_publish[0].0).block_on()?;
             let new_view = repo.read_view(&new_op.view_id).block_on()?;
-            let old_op = repo.read_operation(&local_heads[0]).block_on()?;
+            let old_op = repo.read_operation(old_head).block_on()?;
             let old_view = repo.read_view(&old_op.view_id).block_on()?;
             mirror_git_refs(repo, &new_view, &old_view)?;
         } else {
@@ -104,19 +144,13 @@ pub(super) fn apply(
     // Each want removes exactly the heads its own ancestry covers, so a
     // crash between two to_publish cannot unlist a head whose replacement
     // was never published.
-    let mut published = Vec::new();
-    for (want, superseded) in &to_publish {
-        repo.update_op_heads(superseded, want).block_on()?;
-        published.push(want.clone());
+    for (want, covered) in to_publish {
+        repo.update_op_heads(covered, want).block_on()?;
     }
-    if !published.is_empty() {
-        info!(
-            heads = published.len(),
-            ops = batch.ops.len(),
-            "applied synced operations",
-        );
+    if !to_publish.is_empty() {
+        info!(heads = to_publish.len(), ops, "applied synced operations");
     }
-    Ok(published)
+    Ok(())
 }
 
 /// The local heads that are ancestors of `want`, walking parent links of

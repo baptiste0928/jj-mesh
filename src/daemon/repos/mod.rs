@@ -57,6 +57,9 @@ enum RepoState {
         last_change: Option<SystemTime>,
         last_sync: Option<SystemTime>,
     },
+    /// Rebuilding the commit index for op heads that lack one; jj commands
+    /// in the repo would otherwise pay for the rebuild themselves.
+    Indexing,
     Backoff {
         until: Instant,
         error: String,
@@ -137,8 +140,10 @@ impl RepoSet {
                     RepoHealthState::Paused
                 } else {
                     match &*handle.state.lock().unwrap() {
-                        // Opening is a moment, not a health state.
-                        RepoState::Opening | RepoState::Watching { .. } => RepoHealthState::Ok,
+                        // Opening and indexing are transitions, not faults.
+                        RepoState::Opening | RepoState::Watching { .. } | RepoState::Indexing => {
+                            RepoHealthState::Ok
+                        }
                         RepoState::Backoff { .. } => RepoHealthState::Failed,
                         RepoState::Missing { .. } => RepoHealthState::Missing,
                     }
@@ -160,6 +165,7 @@ impl RepoSet {
             .map(|(name, handle)| {
                 let watch = match &*handle.state.lock().unwrap() {
                     RepoState::Opening => control::WatchStatus::Opening,
+                    RepoState::Indexing => control::WatchStatus::Indexing,
                     RepoState::Watching {
                         op_heads,
                         last_change,

@@ -196,5 +196,8 @@ fn show_progress(bar: &ProgressBar, progress: &CloneProgress) {
             }
         },
         TransferPhase::Apply => spin("Writing the repo...".to_owned()),
+        TransferPhase::Index => {
+            spin("Indexing commits...".to_owned());
+        }
     }
 }

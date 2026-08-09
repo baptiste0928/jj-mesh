@@ -1,14 +1,14 @@
 //! The clone handler: pull a mesh repo from an announcing peer, register
 //! it, and stream progress frames to the client while the pull runs.
 
-use std::{path::Path, sync::Arc};
+use std::{path::Path, sync::Arc, time::Duration};
 
 use color_eyre::eyre::{Result, WrapErr as _, bail, eyre};
 use tokio::net::UnixStream;
 use tracing::{info, warn};
 
 use super::{
-    protocol::{CLONE_PROGRESS_INTERVAL, CLONE_PULL_TIMEOUT, CloneProgress, Response},
+    protocol::{CLONE_PROGRESS_INTERVAL, CLONE_PULL_NET_TIMEOUT, CloneProgress, Response},
     server::{ControlContext, client_gone, respond},
 };
 use crate::{
@@ -18,13 +18,19 @@ use crate::{
     repo::{JjRepo, transfer},
 };
 
+/// Budget for opening the pull stream on an established connection: a
+/// peer that never grants stream credit must not stall the clone (the
+/// progress heartbeat would mask the hang from the CLI).
+const OPEN_STREAM_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Pulls the mesh repo named `name` into the freshly initialized repo at
 /// `path`, streaming progress frames while the pull runs. Stops the pull
 /// when the client disconnects (or stops reading progress): the clone only
 /// exists for the CLI that asked, and it must not register a repo behind
 /// a gone user's back. Work already handed to a blocking thread (a pack
-/// ingest, the apply) still finishes, so the directory the CLI tells the
-/// user to remove may gain more objects; it is never registered.
+/// ingest, the apply with its index build — the longest such work on a
+/// large clone) still finishes, so the directory the CLI tells the user
+/// to remove may gain more objects; it is never registered.
 pub(super) async fn clone_repo(
     stream: &mut UnixStream,
     ctx: &ControlContext,
@@ -148,7 +154,9 @@ async fn clone_pull(
         ));
 
         let pull = async {
-            let (mut send, mut recv) = conn.open_bi().await?;
+            let (mut send, mut recv) = tokio::time::timeout(OPEN_STREAM_TIMEOUT, conn.open_bi())
+                .await
+                .map_err(|_| eyre!("timed out opening the pull stream"))??;
             // A clone pulls a whole history: the pack format reuses the
             // server's on-disk deltas and lands as one pack file here,
             // instead of writing every object loose.
@@ -156,7 +164,10 @@ async fn clone_pull(
                 &repo,
                 transfer::RepoIdent { name, id: repo_id },
                 &wants,
-                GitTransferFormat::Pack,
+                transfer::FetchOptions {
+                    format: GitTransferFormat::Pack,
+                    net_timeout: CLONE_PULL_NET_TIMEOUT,
+                },
                 &mut send,
                 &mut recv,
                 transfer::ProgressSink::new(&sink),
@@ -165,10 +176,9 @@ async fn clone_pull(
             let _ = send.finish();
             Ok::<_, color_eyre::Report>(outcome)
         };
-        match tokio::time::timeout(CLONE_PULL_TIMEOUT, pull).await {
-            Err(_) => last_error = eyre!("pull from {peer} timed out"),
-            Ok(Err(err)) => last_error = err.wrap_err(format!("pull from {peer} failed")),
-            Ok(Ok(outcome)) => return Ok((outcome.ops as u64, outcome.git_objects as u64)),
+        match pull.await {
+            Err(err) => last_error = err.wrap_err(format!("pull from {peer} failed")),
+            Ok(outcome) => return Ok((outcome.ops as u64, outcome.git_objects as u64)),
         }
         warn!("clone pull attempt failed: {last_error:#}");
     }

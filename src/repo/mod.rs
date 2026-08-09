@@ -106,7 +106,9 @@ impl JjRepo {
     /// renamed).
     pub fn workspace_name(&self) -> Result<String> {
         use jj_lib::{
-            default_backend_factories::{default_backend_factories, default_working_copy_factories},
+            default_backend_factories::{
+                default_backend_factories, default_working_copy_factories,
+            },
             workspace::Workspace,
         };
 

@@ -22,9 +22,10 @@ pub const MUTATE_WAIT: Duration = Duration::from_secs(10);
 /// CLI tells the user; the daemon enforces it.
 pub const PAIR_TICKET_TTL: Duration = Duration::from_mins(3);
 
-/// Time budget for a clone's initial repo pull; it may transfer an entire
-/// repository.
-pub(super) const CLONE_PULL_TIMEOUT: Duration = Duration::from_mins(30);
+/// Deadline for the network-facing work of a clone's initial repo pull
+/// (it may transfer an entire repository); the pull's local apply and
+/// index work runs unbounded.
+pub(super) const CLONE_PULL_NET_TIMEOUT: Duration = Duration::from_mins(30);
 
 /// Cadence at which the daemon re-sends the latest clone progress. Sent
 /// unconditionally, changed or not: the frames double as the liveness
@@ -33,8 +34,9 @@ pub(super) const CLONE_PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Time budget the CLI grants between clone frames, not the whole exchange:
 /// the daemon heartbeats progress every [`CLONE_PROGRESS_INTERVAL`] while
-/// the clone runs, so a silent daemon is a dead one. The exchange as a
-/// whole stays bounded by the daemon's own [`CLONE_PULL_TIMEOUT`].
+/// the clone runs, so a silent daemon is a dead one. The transfer's
+/// network phases stay bounded by the daemon's own
+/// [`CLONE_PULL_NET_TIMEOUT`].
 pub const CLONE_IDLE_WAIT: Duration = Duration::from_secs(30);
 
 /// A request from the CLI to the daemon.
@@ -261,4 +263,7 @@ pub enum WatchStatus {
     /// The repo directory is gone (unmounted disk, or deleted without
     /// `jj-mesh repo forget`); retried in the background.
     Missing { retry_in_secs: u64 },
+    /// The daemon is rebuilding the repo's commit index, so jj commands
+    /// there do not pay for it.
+    Indexing,
 }

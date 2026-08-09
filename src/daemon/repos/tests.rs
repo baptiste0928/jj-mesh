@@ -206,6 +206,33 @@ async fn updates_stale_working_copy() {
     }
 }
 
+/// An op head without a commit index (published by a fetch whose index
+/// build failed, or by an older jj-mesh) is reindexed on watch start,
+/// before any jj command pays for the rebuild itself.
+#[tokio::test]
+async fn heals_missing_commit_index_on_watch_start() {
+    use jj_lib::object_id::ObjectId as _;
+
+    let fx = Fixture::new();
+    let dir = fx.init_repo("a");
+    let repo = JjRepo::discover(&dir).unwrap().open().unwrap();
+    let head = repo.op_heads().await.unwrap().remove(0);
+    let op_link = dir.join(".jj/repo/index/op_links").join(head.hex());
+    assert!(op_link.is_file(), "jj indexes its own operations");
+    std::fs::remove_file(&op_link).unwrap();
+    assert!(!repo.has_commit_index(&head).await);
+
+    let set = quiet_repo_set();
+    set.sync(&state_with("a", &dir));
+    // The heal runs before the watch reports itself up.
+    wait_watching(&set).await;
+
+    assert!(
+        repo.has_commit_index(&head).await,
+        "op link must be rebuilt"
+    );
+}
+
 /// Changing a watched repo's store configuration must be detected on
 /// the next wake and reopen the repo against the new configuration
 /// instead of continuing on stale stores.

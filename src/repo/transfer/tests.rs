@@ -1,19 +1,25 @@
 //! End-to-end transfer tests: fetch/serve exchanges over in-memory stream
 //! pairs against real jj repos, as the daemon runs them over QUIC.
 
-use std::{fs, path::Path, process::Command, sync::Arc};
+use std::{fs, path::Path, process::Command, sync::Arc, time::Duration};
 
 use jj_lib::object_id::ObjectId as _;
 
 use super::*;
 use crate::{
     net::{
-        fetch::{FetchRequest, GitTransferFormat, MAX_OP_FRAME_SIZE, OpFrame},
+        fetch::{
+            FetchRequest, GitFrame, GitRequest, GitTransferFormat, MAX_GIT_FRAME_SIZE,
+            MAX_OP_FRAME_SIZE, OpFrame,
+        },
         wire::{read_message, write_message},
     },
     repo::{JjRepo, OpenRepo},
     testing::Fixture,
 };
+
+/// Network deadline passed to test fetches; generous, never meant to fire.
+const NET_TIMEOUT: Duration = Duration::from_mins(1);
 
 fn open(dir: &Path) -> Arc<OpenRepo> {
     Arc::new(JjRepo::discover(dir).unwrap().open().unwrap())
@@ -67,7 +73,10 @@ async fn sync_once_as(
             id: &crate::config::RepoId::generate(),
         },
         wants,
-        format,
+        FetchOptions {
+            format,
+            net_timeout: NET_TIMEOUT,
+        },
         &mut client_tx,
         &mut client_rx,
         ProgressSink::default(),
@@ -76,6 +85,18 @@ async fn sync_once_as(
     .unwrap();
     serve_task.await.unwrap();
     outcome
+}
+
+/// Asserts every op head of `repo` has its commit index, so no jj command
+/// pays for a rebuild after a sync.
+async fn assert_heads_indexed(repo: &Arc<OpenRepo>) {
+    for head in repo.op_heads().await.unwrap() {
+        assert!(
+            repo.has_commit_index(&head).await,
+            "op head {} published without a commit index",
+            head.hex(),
+        );
+    }
 }
 
 /// Fetches the heads `dst` lacks from `src`, as the daemon does on an
@@ -114,6 +135,8 @@ async fn fast_forward_sync_transfers_ops_and_git_objects() {
     assert!(outcome.git_objects > 0);
     // The wanted heads were published: they superseded b's old head.
     assert_eq!(rb.op_heads().await.unwrap(), wants);
+    // And they were indexed before publication.
+    assert_heads_indexed(&rb).await;
 
     // jj itself must accept the synced repo: log walks commits, which
     // requires the git objects and the change-id extras. The fork
@@ -185,6 +208,7 @@ async fn divergent_sync_keeps_both_heads() {
     let mut heads = rb.op_heads().await.unwrap();
     heads.sort_unstable();
     assert_eq!(heads, expected);
+    assert_heads_indexed(&rb).await;
     fx.jj(&b, &["op", "log"]);
 }
 
@@ -303,7 +327,10 @@ async fn rejects_ops_unreachable_from_wants() {
             id: &crate::config::RepoId::generate(),
         },
         &[want],
-        GitTransferFormat::Loose,
+        FetchOptions {
+            format: GitTransferFormat::Loose,
+            net_timeout: NET_TIMEOUT,
+        },
         &mut client_tx,
         &mut client_rx,
         ProgressSink::default(),
@@ -314,6 +341,98 @@ async fn rejects_ops_unreachable_from_wants() {
     server.await.unwrap();
 
     // Nothing was published: the local head is untouched.
+    assert_eq!(repo.op_heads().await.unwrap(), vec![local_head]);
+}
+
+/// A peer that omits git objects its views reference must fail the fetch
+/// before anything is staged: published, such a head could never be
+/// loaded or indexed.
+#[tokio::test]
+async fn rejects_fetch_when_referenced_git_objects_are_missing() {
+    let fx = Fixture::new();
+    let dir = fx.init_repo("a");
+    let repo = open(&dir);
+    let local_head = repo.op_heads().await.unwrap().remove(0);
+
+    let (client, remote) = tokio::io::duplex(1 << 20);
+    let (mut client_rx, mut client_tx) = tokio::io::split(client);
+    let (mut server_rx, mut server_tx) = tokio::io::split(remote);
+
+    let parent = local_head.clone();
+    let server = tokio::spawn(async move {
+        use prost::Message as _;
+
+        use crate::net::fetch::compress_payload;
+        let _request: FetchRequest = read_message(&mut server_rx, MAX_OP_FRAME_SIZE)
+            .await
+            .unwrap();
+        // A view whose head names a commit the git phase never delivers.
+        let view = jj_lib::protos::simple_op_store::View {
+            head_ids: vec![vec![0xAB; 20]],
+            ..Default::default()
+        }
+        .encode_to_vec();
+        let op = jj_lib::protos::simple_op_store::Operation {
+            view_id: vec![9; 64],
+            parents: vec![parent.as_bytes().to_vec()],
+            metadata: Some(jj_lib::protos::simple_op_store::OperationMetadata {
+                description: "crafted".to_owned(),
+                hostname: "evil".to_owned(),
+                username: "evil".to_owned(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+        .encode_to_vec();
+        let frames = [
+            OpFrame::View {
+                id: vec![9; 64],
+                view: compress_payload(&view).unwrap(),
+            },
+            OpFrame::Op {
+                id: vec![1; 64],
+                op: compress_payload(&op).unwrap(),
+            },
+            OpFrame::Done,
+        ];
+        for frame in frames {
+            write_message(&mut server_tx, &frame, MAX_OP_FRAME_SIZE)
+                .await
+                .unwrap();
+        }
+        // Answer the git request without sending the object it asks for.
+        let _git: GitRequest = read_message(&mut server_rx, MAX_GIT_FRAME_SIZE)
+            .await
+            .unwrap();
+        write_message(&mut server_tx, &GitFrame::Done, MAX_GIT_FRAME_SIZE)
+            .await
+            .unwrap();
+    });
+
+    let err = fetch(
+        &repo,
+        RepoIdent {
+            name: "test",
+            id: &crate::config::RepoId::generate(),
+        },
+        &[OperationId::new(vec![1; 64])],
+        FetchOptions {
+            format: GitTransferFormat::Loose,
+            net_timeout: NET_TIMEOUT,
+        },
+        &mut client_tx,
+        &mut client_rx,
+        ProgressSink::default(),
+    )
+    .await
+    .unwrap_err();
+    assert!(err.to_string().contains("did not send"), "{err:#}");
+    server.await.unwrap();
+
+    // Nothing was staged or published: the crafted op was never stored
+    // and the local head is untouched.
+    let want = OperationId::new(vec![1; 64]);
+    assert!(!repo.has_operation(&want).await.unwrap());
     assert_eq!(repo.op_heads().await.unwrap(), vec![local_head]);
 }
 
@@ -552,7 +671,10 @@ async fn progress_reports_phases_and_exact_totals() {
             id: &crate::config::RepoId::generate(),
         },
         &wants,
-        GitTransferFormat::Pack,
+        FetchOptions {
+            format: GitTransferFormat::Pack,
+            net_timeout: NET_TIMEOUT,
+        },
         &mut client_tx,
         &mut client_rx,
         ProgressSink::new(&sink),
@@ -562,12 +684,18 @@ async fn progress_reports_phases_and_exact_totals() {
     serve_task.await.unwrap();
     let samples = samples.into_inner().unwrap();
 
-    // The phases arrive strictly in order.
+    // The phases arrive strictly in order; the pulled head is new to the
+    // fresh repo, so the index phase must run before publication.
     let mut phases: Vec<TransferPhase> = samples.iter().map(|p| p.phase).collect();
     phases.dedup();
     assert_eq!(
         phases,
-        [TransferPhase::Ops, TransferPhase::Git, TransferPhase::Apply],
+        [
+            TransferPhase::Ops,
+            TransferPhase::Git,
+            TransferPhase::Apply,
+            TransferPhase::Index,
+        ],
     );
 
     // Counters are monotonic within each phase.

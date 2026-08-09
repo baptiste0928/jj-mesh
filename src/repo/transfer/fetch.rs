@@ -1,8 +1,9 @@
 //! Fetcher side of a fetch: requesting the op-log delta, validating it,
-//! pulling the git objects it references, then applying it (see [`super`]
-//! for the crash-safe apply order).
+//! pulling the git objects it references, then staging it, indexing the
+//! incoming heads and publishing them (see [`super`] for the crash-safe
+//! apply order).
 
-use std::{collections::HashSet, sync::Arc};
+use std::{collections::HashSet, sync::Arc, time::Duration};
 
 use color_eyre::eyre::{Result, WrapErr as _, bail, ensure, eyre};
 use jj_lib::{
@@ -14,8 +15,8 @@ use pollster::FutureExt as _;
 use tokio::io::{AsyncRead, AsyncWrite};
 
 use super::{
-    FetchOutcome, OpBatch, ProgressSink, RepoIdent, StoredOp, StoredView, TransferPhase,
-    TransferProgress, apply::apply, is_virtual_root, pack, to_gix_id,
+    FetchOptions, FetchOutcome, OpBatch, ProgressSink, RepoIdent, StoredOp, StoredView,
+    TransferPhase, TransferProgress, apply, is_virtual_root, pack, to_gix_id,
 };
 use crate::{
     config::sanitize,
@@ -46,35 +47,45 @@ const MAX_OP_FRAMES: usize = 1 << 20;
 
 /// How often the pack ingest's object count is sampled for progress once
 /// the stream ended and only local indexing remains.
-const INGEST_SAMPLE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
+const INGEST_SAMPLE_INTERVAL: Duration = Duration::from_millis(200);
 
 /// Fetches the given op heads from a peer over the stream pair and applies
-/// them locally in crash-safe order. `format` picks how git objects travel
-/// (clones request a pack, incremental syncs stay loose, see
-/// [`GitTransferFormat`]); `progress` receives live counters as the phases
-/// advance.
+/// them locally in crash-safe order. `options.format` picks how git
+/// objects travel (clones request a pack, incremental syncs stay loose,
+/// see [`GitTransferFormat`]); `progress` receives live counters as the
+/// phases advance.
+///
+/// `options.net_timeout` sets one deadline for all network-facing work
+/// (the request writes, the op frames, the git object or pack streaming)
+/// so a stalled or hostile peer cannot pin the caller past it. Local work
+/// — pack delta resolution, the apply, the index build — runs unbounded,
+/// since timing it out after the transfer would only waste the received
+/// data.
 pub async fn fetch(
     repo: &Arc<OpenRepo>,
     target: RepoIdent<'_>,
     wants: &[OperationId],
-    format: GitTransferFormat,
+    options: FetchOptions,
     send: &mut (impl AsyncWrite + Unpin),
     recv: &mut (impl AsyncRead + Unpin),
     progress: ProgressSink<'_>,
 ) -> Result<FetchOutcome> {
     ensure!(!wants.is_empty() && wants.len() <= MAX_WANTS, "bad wants");
+    let deadline = tokio::time::Instant::now() + options.net_timeout;
     let local_heads = repo.op_heads().await?;
     let haves = sample_haves(repo, &local_heads).await?;
 
-    let request = FetchRequest {
-        name: target.name.to_owned(),
-        id: target.id.clone(),
-        wants: wants.iter().map(|id| id.as_bytes().to_vec()).collect(),
-        haves: haves.iter().map(|id| id.as_bytes().to_vec()).collect(),
-    };
-    write_message(send, &request, MAX_OP_FRAME_SIZE).await?;
-
-    let batch = receive_ops(repo, wants, recv, progress).await?;
+    let batch = bounded(deadline, "op", async {
+        let request = FetchRequest {
+            name: target.name.to_owned(),
+            id: target.id.clone(),
+            wants: wants.iter().map(|id| id.as_bytes().to_vec()).collect(),
+            haves: haves.iter().map(|id| id.as_bytes().to_vec()).collect(),
+        };
+        write_message(send, &request, MAX_OP_FRAME_SIZE).await?;
+        receive_ops(repo, wants, recv, progress).await
+    })
+    .await?;
     let ops_received = batch.ops.len();
 
     // Everything the new views (and op predecessor records) reference and
@@ -113,59 +124,122 @@ pub async fn fetch(
     let format = if missing.is_empty() {
         GitTransferFormat::Loose
     } else {
-        format
+        options.format
     };
     let git_request = GitRequest {
         wants: missing.iter().map(|id| id.as_bytes().to_vec()).collect(),
         haves: git_haves.iter().map(|id| id.as_bytes().to_vec()).collect(),
         format,
     };
-    write_message(send, &git_request, MAX_GIT_FRAME_SIZE).await?;
-    // The keep guard holds a received pack against git GC until the apply
+    bounded(
+        deadline,
+        "git",
+        write_message(send, &git_request, MAX_GIT_FRAME_SIZE),
+    )
+    .await?;
+    // The keep guard holds a received pack against git GC until the stage
     // writes the keep refs that take over; it is released below, and on any
     // early return or abandoned fetch by its own drop.
     let (git_objects, pack_keep) = match format {
-        GitTransferFormat::Loose => (receive_git_loose(repo, recv, progress).await?, None),
+        GitTransferFormat::Loose => {
+            let objects = bounded(deadline, "git", receive_git_loose(repo, recv, progress)).await?;
+            (objects, None)
+        }
         GitTransferFormat::Pack => {
-            let (objects, keep) = receive_git_pack(repo, recv, progress).await?;
+            let (objects, keep) = receive_git_pack(repo, deadline, recv, progress).await?;
             (objects, Some(keep))
         }
     };
 
+    ensure_git_wants_arrived(repo, missing).await?;
+
     // Nothing threw: objects are on disk, batch is closed and verified.
     progress.report(TransferProgress::start(TransferPhase::Apply));
-    let published = {
+    // Heads to publish (wants new to this repo) whose commit index must
+    // be built first, so the user's next jj command finds the replicated
+    // history indexed instead of building the index itself — which after
+    // a clone covers the entire history, silently and for minutes.
+    // Stat'd here because progress cannot be reported from the blocking
+    // task below.
+    let new_heads: Vec<OperationId> = wants
+        .iter()
+        .filter(|want| !local_heads.contains(want))
+        .cloned()
+        .collect();
+    let to_index = repo.unindexed(&new_heads).await;
+    if !to_index.is_empty() {
+        progress.report(TransferProgress::start(TransferPhase::Index));
+    }
+
+    // One blocking task from staging to publication: a started blocking
+    // task always runs to completion, so an abandoned fetch (daemon
+    // shutdown, clone client gone) cannot persist ops without publishing
+    // their heads — a state no later sync would repair, since the stored
+    // ops would look like nothing is missing. The index build stays
+    // best-effort: op data is valid without it, and the watch-start heal
+    // retries.
+    {
         let repo = repo.clone();
         let wants = wants.to_vec();
-        tokio::task::spawn_blocking(move || apply(&repo, &batch, &wants, &local_heads))
-            .await
-            .wrap_err("apply task failed")??
-    };
-    // The apply's keep refs now protect the pack's commits.
-    drop(pack_keep);
-
-    // Index the published heads, so the next jj command loads the commit
-    // index instead of building it (which after a clone means indexing the
-    // entire replicated history). Best-effort: jj rebuilds lazily anyway,
-    // so a failure here must not fail an otherwise complete fetch.
-    if !published.is_empty() {
-        let repo = repo.clone();
-        let build = tokio::task::spawn_blocking(move || {
-            for head in &published {
-                if let Err(err) = repo.build_commit_index(head) {
-                    tracing::warn!("cannot index synced operation: {err:#}");
-                }
-            }
-        });
-        if let Err(err) = build.await {
-            tracing::warn!("index build task failed: {err}");
-        }
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let staged = apply::stage(&repo, &batch, &wants, &local_heads)?;
+            repo.build_commit_indexes(&to_index);
+            apply::publish(&repo, &staged)
+        })
+        .await
+        .wrap_err("apply task failed")??;
     }
+    // The stage's keep refs now protect the pack's commits.
+    drop(pack_keep);
 
     Ok(FetchOutcome {
         ops: ops_received,
         git_objects,
     })
+}
+
+/// Fails the fetch when any of the `requested` commits is still absent
+/// after the git phase: a hostile peer can serve views naming commits it
+/// never sends, and published, such a head could never be loaded or
+/// indexed. An honest server stores everything its op log references, so
+/// absence is a hard failure (the announcement retry machinery covers
+/// transients). One sweep on a blocking thread.
+async fn ensure_git_wants_arrived(repo: &Arc<OpenRepo>, requested: Vec<CommitId>) -> Result<()> {
+    if requested.is_empty() {
+        return Ok(());
+    }
+    let repo = repo.clone();
+    let absent = tokio::task::spawn_blocking(move || -> Result<Vec<CommitId>> {
+        let git = repo.git_backend().git_repo();
+        let mut absent = Vec::new();
+        for id in requested {
+            if !git.has_object(to_gix_id(&id)?) {
+                absent.push(id);
+            }
+        }
+        Ok(absent)
+    })
+    .await
+    .wrap_err("git verify task failed")??;
+    if let Some(first) = absent.first() {
+        bail!(
+            "peer did not send {} of the requested commits (e.g. {})",
+            absent.len(),
+            first.hex(),
+        );
+    }
+    Ok(())
+}
+
+/// Runs one network-facing section under the fetch's shared deadline.
+async fn bounded<T>(
+    deadline: tokio::time::Instant,
+    phase: &str,
+    section: impl Future<Output = Result<T>>,
+) -> Result<T> {
+    tokio::time::timeout_at(deadline, section)
+        .await
+        .map_err(|_| eyre!("{phase} phase timed out"))?
 }
 
 /// Receives and validates the op phase: every frame must decode as jj's
@@ -388,12 +462,17 @@ async fn receive_git_loose(
 /// [`pack::ingest_pack`] for the verification done there). Returns how many
 /// objects the pack carried and the `.keep` file protecting it.
 ///
+/// Only the frame streaming runs under the fetch's network `deadline`; the
+/// delta resolution left once the stream ends is local work, and timing it
+/// out would throw away a fully received pack.
+///
 /// Progress: the phase total is read off the pack header (its exact object
 /// count), `current` tracks the ingest's objects-indexed counter, sampled
 /// on every received chunk and, once the stream ends, on a timer while
 /// the ingest finishes resolving.
 async fn receive_git_pack(
     repo: &Arc<OpenRepo>,
+    deadline: tokio::time::Instant,
     recv: &mut (impl AsyncRead + Unpin),
     progress: ProgressSink<'_>,
 ) -> Result<(usize, pack::PackKeep)> {
@@ -411,46 +490,54 @@ async fn receive_git_pack(
         })
     };
 
-    let mut failed = None;
-    loop {
-        match read_message(recv, MAX_GIT_FRAME_SIZE).await? {
-            GitFrame::Pack { chunk } => {
-                // The first chunk starts with the pack header, whose object
-                // count is the exact phase total. Display only: the ingest
-                // decodes and enforces the header itself.
-                if counters.bytes == 0 && chunk.len() >= 12 {
-                    let mut header = [0u8; 12];
-                    header.copy_from_slice(&chunk[..12]);
-                    if let Ok((_version, objects)) = gix::odb::pack::data::header::decode(&header) {
-                        counters.total = Some(u64::from(objects));
+    let streamed = bounded(deadline, "git", async {
+        loop {
+            match read_message(recv, MAX_GIT_FRAME_SIZE).await? {
+                GitFrame::Pack { chunk } => {
+                    // The first chunk starts with the pack header, whose
+                    // object count is the exact phase total. Display only:
+                    // the ingest decodes and enforces the header itself.
+                    if counters.bytes == 0 && chunk.len() >= 12 {
+                        let mut header = [0u8; 12];
+                        header.copy_from_slice(&chunk[..12]);
+                        if let Ok((_version, objects)) =
+                            gix::odb::pack::data::header::decode(&header)
+                        {
+                            counters.total = Some(u64::from(objects));
+                        }
+                    }
+                    counters.bytes += chunk.len() as u64;
+                    counters.current = indexed.get();
+                    progress.report(counters);
+                    // A closed channel means the ingest died; its own error
+                    // is reported after the join below.
+                    if tx.send(chunk).await.is_err() {
+                        break Ok(None);
                     }
                 }
-                counters.bytes += chunk.len() as u64;
-                counters.current = indexed.get();
-                progress.report(counters);
-                // A closed channel means the ingest died; its own error is
-                // reported after the join below.
-                if tx.send(chunk).await.is_err() {
-                    break;
+                GitFrame::Done => break Ok(None),
+                GitFrame::Error { message } => {
+                    break Ok(Some(format!(
+                        "peer failed git phase: {}",
+                        sanitize(&message)
+                    )));
+                }
+                GitFrame::Object { .. } => {
+                    break Ok(Some(
+                        "peer sent a loose object in a pack transfer".to_owned(),
+                    ));
                 }
             }
-            GitFrame::Done => break,
-            GitFrame::Error { message } => {
-                failed = Some(format!("peer failed git phase: {}", sanitize(&message)));
-                break;
-            }
-            GitFrame::Object { .. } => {
-                failed = Some("peer sent a loose object in a pack transfer".to_owned());
-                break;
-            }
         }
-    }
+    })
+    .await;
 
     // Closing the channel ends the ingest's stream; on a clean `Done` it
     // finishes the pack, otherwise it fails on the truncation. Indexing
     // (delta resolution most of all) keeps running after the last byte
     // arrived, so keep sampling its object count while waiting.
     drop(tx);
+    let failed = streamed?;
     let outcome = loop {
         tokio::select! {
             outcome = &mut ingest => break outcome.wrap_err("pack ingest task failed")?,

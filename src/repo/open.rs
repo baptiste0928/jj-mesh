@@ -3,7 +3,8 @@
 //! [`OpenRepo`] wraps a [`RepoLoader`] and exposes op-head enumeration, op
 //! DAG walking, op/view transfer primitives and the git backend. It never
 //! loads a full repo; the commit index is only touched by the explicit
-//! post-sync build (see [`OpenRepo::build_commit_index`]).
+//! builds (see [`OpenRepo::build_commit_indexes`]): syncs run one before
+//! publishing an op head, and the repo watch heals heads that lack one.
 //!
 //! Invariants:
 //! - Ops and views replicate as raw stored bytes under the sender's ids
@@ -29,6 +30,7 @@ use jj_lib::{
     backend::CommitId,
     config::StackedConfig,
     default_backend_factories::default_backend_factories,
+    default_index::DefaultIndexStore,
     git_backend::GitBackend,
     object_id::{HexPrefix, ObjectId, PrefixResolution},
     op_store::{Operation, OperationId, View, ViewId},
@@ -36,6 +38,7 @@ use jj_lib::{
     settings::UserSettings,
 };
 use pollster::FutureExt as _;
+use tracing::warn;
 
 use super::{JjRepo, write::RawWriteBatch};
 
@@ -123,19 +126,13 @@ impl OpenRepo {
 
     /// Builds the commit index at the given operation, incrementally from
     /// the nearest indexed ancestor operation (the same build `jj debug
-    /// reindex` runs, minus the wipe). Syncs call it after publishing an
-    /// op head so the user's next jj command loads the index instead of
-    /// building it; after a clone that build would cover the entire
-    /// replicated history. Blocking.
+    /// reindex` runs, minus the wipe). Without it, the next jj command
+    /// loading the operation pays for the build itself; after a clone
+    /// that covers the entire replicated history. Not free even when the
+    /// op is already indexed (it loads the whole index into memory), so
+    /// callers should check [`Self::has_commit_index`] first. Blocking.
     pub fn build_commit_index(&self, id: &OperationId) -> Result<()> {
-        use jj_lib::default_index::DefaultIndexStore;
-
-        let Some(index_store) = self
-            .loader
-            .index_store()
-            .downcast_ref::<DefaultIndexStore>()
-        else {
-            // Another index backend indexes on its own terms.
+        let Some(index_store) = self.default_index_store() else {
             return Ok(());
         };
         let data = self.loader.op_store().read_operation(id).block_on()?;
@@ -146,6 +143,65 @@ impl OpenRepo {
             .block_on()
             .wrap_err_with(|| format!("cannot build commit index at {}", id.hex()))?;
         Ok(())
+    }
+
+    /// Builds the commit index for each operation in turn (see
+    /// [`Self::build_commit_index`]), serialized process-wide: a build
+    /// with no indexed ancestor materializes the entire history in
+    /// memory, and repos building concurrently would multiply that peak.
+    /// Failures only warn: a missing index costs the next jj command
+    /// time, not correctness. Blocking.
+    pub fn build_commit_indexes(&self, ids: &[OperationId]) {
+        static BUILD_SLOT: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+        let _slot = BUILD_SLOT
+            .acquire()
+            .block_on()
+            .expect("the build slot is never closed");
+        for id in ids {
+            if let Err(err) = self.build_commit_index(id) {
+                warn!("cannot index operation {}: {err:#}", id.hex());
+            }
+        }
+    }
+
+    /// Whether a commit index is already built for the operation, meaning
+    /// jj loads it there instead of building it. A single stat of the
+    /// default index store's op-link file; the layout is private to jj
+    /// but stable, and the exact `jj-lib` pin protects it (same spirit as
+    /// the raw op-store writes). Another index backend indexes on its own
+    /// terms and counts as built.
+    // Async to match the sibling store queries, though the stat needs no
+    // await.
+    #[expect(clippy::unused_async)]
+    pub async fn has_commit_index(&self, id: &OperationId) -> bool {
+        if self.default_index_store().is_none() {
+            return true;
+        }
+        self.repo
+            .repo_dir()
+            .join("index")
+            .join("op_links")
+            .join(id.hex())
+            .is_file()
+    }
+
+    /// The operations among `ids` with no commit index built yet.
+    pub async fn unindexed(&self, ids: &[OperationId]) -> Vec<OperationId> {
+        let mut missing = Vec::new();
+        for id in ids {
+            if !self.has_commit_index(id).await {
+                missing.push(id.clone());
+            }
+        }
+        missing
+    }
+
+    /// The default index store, `None` when another backend indexes on
+    /// its own terms.
+    fn default_index_store(&self) -> Option<&DefaultIndexStore> {
+        self.loader
+            .index_store()
+            .downcast_ref::<DefaultIndexStore>()
     }
 
     pub async fn read_view(&self, id: &ViewId) -> Result<View> {

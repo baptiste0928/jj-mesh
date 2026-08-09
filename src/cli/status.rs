@@ -155,6 +155,7 @@ fn watch_summary(watch: &control::WatchStatus) -> String {
             ui::warn("directory missing"),
             ui::format_duration(*retry_in_secs)
         ),
+        control::WatchStatus::Indexing => "indexing commits".to_owned(),
     }
 }
 

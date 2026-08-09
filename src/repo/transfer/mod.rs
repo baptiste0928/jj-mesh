@@ -14,7 +14,7 @@
 //!    |----------------------------------------->|
 //!    |  GitFrame: (Object* | Pack chunk*), Done |
 //!    |<-----------------------------------------|
-//!    |  apply + publish (local only)            |
+//!    |  stage + index + publish (local only)    |
 //! ```
 //!
 //! Ops and views travel as raw stored bytes and keep their sender-side ids
@@ -30,10 +30,12 @@
 //! - [`serve`] answers a fetch (read-only): the op-log delta, then the git
 //!   object closure the fetcher lacks, loose or as one packfile (see
 //!   [`crate::net::fetch::GitTransferFormat`]).
-//! - [`fetch`] pulls and validates that delta, then hands it to [`apply`],
-//!   which writes it in the crash-safe order: git objects, anti-GC keep
-//!   refs, views and ops (parents first), change-id extras, the colocated
-//!   ref mirror, and only then the op head publication.
+//! - [`fetch`] pulls and validates that delta, then orchestrates the
+//!   local write in the crash-safe order: git objects already landed
+//!   during the transfer, [`apply`]'s stage step persists keep refs,
+//!   views and ops (parents first) and change-id extras, the commit
+//!   index is built for the incoming heads, and [`apply`]'s publish step
+//!   runs the colocated ref mirror and the op head publication.
 //!
 //! Bulk store and git work runs on blocking threads (see the `open` module
 //! docs).
@@ -56,13 +58,21 @@ use super::{
     codec::{OpMeta, ViewMeta},
     open::{is_virtual_root, to_gix_id},
 };
-use crate::config::RepoId;
+use crate::{config::RepoId, net::fetch::GitTransferFormat};
 
 /// What a completed fetch did, for logging and status.
 #[derive(Debug)]
 pub struct FetchOutcome {
     pub ops: usize,
     pub git_objects: usize,
+}
+
+/// How a fetch runs: the git transfer format and the shared deadline for
+/// its network-facing work (local work runs unbounded, see [`fetch`]).
+#[derive(Clone, Copy)]
+pub struct FetchOptions {
+    pub format: GitTransferFormat,
+    pub net_timeout: std::time::Duration,
 }
 
 /// The mesh identity of the repo a fetch targets, sent in the request so
@@ -82,11 +92,12 @@ pub struct TransferProgress {
     pub phase: TransferPhase,
     /// Progress in the phase's unit: op and view frames in [`Ops`]; in
     /// [`Git`], objects indexed from the pack (pack format) or objects
-    /// received (loose format). Unused in [`Apply`].
+    /// received (loose format). Unused in [`Apply`] and [`Index`].
     ///
     /// [`Ops`]: TransferPhase::Ops
     /// [`Git`]: TransferPhase::Git
     /// [`Apply`]: TransferPhase::Apply
+    /// [`Index`]: TransferPhase::Index
     pub current: u64,
     /// Exact end of the phase, `None` until known: announced by the peer
     /// for the op phase, read from the pack header for the git phase
@@ -108,16 +119,24 @@ impl TransferProgress {
     }
 }
 
-/// The sequential stages of a fetch, in order.
+/// The sequential stages of a fetch, in order (`Index` is skipped when
+/// the incoming heads are already indexed).
+///
+/// Postcard encodes variants by position (this enum travels in the
+/// control protocol): existing ones must keep their position, new ones
+/// are only appended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum TransferPhase {
     /// Pulling the op-log delta.
     Ops,
     /// Pulling the git objects the new views reference.
     Git,
-    /// Writing everything into the local repo (and indexing it after a
-    /// clone, which can rival the transfer for large histories).
+    /// Writing everything into the local repo.
     Apply,
+    /// Building the commit index for the incoming heads, before they are
+    /// published. Indeterminate; after a clone it can rival the transfer
+    /// for large histories.
+    Index,
 }
 
 /// Sink for [`TransferProgress`] updates, called inline from the transfer

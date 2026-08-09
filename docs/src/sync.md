@@ -18,7 +18,7 @@ announcer                                  fetcher
     │◄─ missing commit ids ───────────────────│
     │── git object closure ──────────────────►│ 2. git phase
     │                                         │
-    │                                         │ validate, apply, publish
+    │                                         │ validate, apply, index, publish
 ```
 
 Pushing data would make the sender responsible for knowing what the receiver
@@ -88,8 +88,9 @@ content-addressed and invisible until published), then come:
 1. anti-GC keep refs for the new views' head commits;
 2. views and ops, parents-first;
 3. change-id extras, imported from the new commits;
-4. on colocated repos, the git ref mirror (see below);
-5. only at the very end, the op head publication that makes everything
+4. the commit index, built for the incoming heads;
+5. on colocated repos, the git ref mirror (see below);
+6. only at the very end, the op head publication that makes everything
    visible to jj.
 
 Which local heads a new head supersedes is established by walking ancestry
@@ -100,7 +101,7 @@ reconciles the divergence.
 
 In colocated repos (where `.git` sits next to `.jj`), git tools read the git
 refs directly, so the apply mirrors the new view's git refs into `.git`
-(step 4 above, before anything is published). The mirror is deliberately
+(step 5 above, before anything is published). The mirror is deliberately
 conservative and follows jj's own exporter semantics:
 
 - each ref is compare-and-swapped from the value the previous view knew,

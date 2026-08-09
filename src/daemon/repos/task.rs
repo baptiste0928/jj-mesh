@@ -32,6 +32,11 @@
 //! fresh merge operations at each other. Divergence is left to the next
 //! actual jj activity (a user command, an auto-snapshot), whose merge
 //! then arrives here as a single head.
+//!
+//! On watch start the task also rebuilds the commit index for op heads
+//! that lack one (a fetch whose build failed, a repo synced by an older
+//! jj-mesh), showing the repo as indexing meanwhile: without it the
+//! user's next jj command would pay for the rebuild.
 
 use std::{
     path::{Path, PathBuf},
@@ -88,10 +93,15 @@ const MAX_ERROR_LEN: usize = 256;
 /// a few heads, anything more is a hostile or broken peer.
 const MAX_ANNOUNCED_HEADS: usize = 64;
 
-/// Hard budget on one fetch from a peer: a stalled or hostile server must
-/// not pin the repo task forever (announcement handling and local change
-/// publication pause while a fetch runs).
-const FETCH_TIMEOUT: Duration = Duration::from_mins(30);
+/// Deadline for the network-facing work of one fetch from a peer: a
+/// stalled or hostile server must not pin the repo task forever
+/// (announcement handling and local change publication pause while a
+/// fetch runs). The fetch's local apply and index work runs unbounded.
+const FETCH_NET_TIMEOUT: Duration = Duration::from_mins(30);
+
+/// Budget for opening the fetch stream on an established connection: a
+/// peer that never grants stream credit must not hang the task.
+const OPEN_STREAM_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Delay before retrying a fetch that failed. The announcement was already
 /// consumed, so without this a transient failure (a peer momentarily busy,
@@ -228,6 +238,10 @@ impl RepoTask {
         // while the watch was down are absorbed into the baseline above and
         // would otherwise never be announced.
         self.hub.publish(&self.name, &self.id, wire_heads(&heads));
+        // Heal heads left without a commit index (a fetch whose index
+        // build failed, or a repo synced by an older jj-mesh) before any
+        // jj run below pays for the rebuild.
+        self.heal_index(&repo, &heads).await;
         self.set_state(RepoState::Watching {
             op_heads: heads.len(),
             last_change,
@@ -479,24 +493,49 @@ impl RepoTask {
             .hub
             .connection(&peer)
             .ok_or_else(|| eyre!("peer is no longer connected"))?;
-        let (mut send, mut recv) = conn.open_bi().await?;
-        let fetch = transfer::fetch(
+        let (mut send, mut recv) = tokio::time::timeout(OPEN_STREAM_TIMEOUT, conn.open_bi())
+            .await
+            .map_err(|_| eyre!("timed out opening the fetch stream"))??;
+        let outcome = transfer::fetch(
             repo,
             transfer::RepoIdent {
                 name: &self.name,
                 id: &self.id,
             },
             wants,
-            GitTransferFormat::Loose,
+            transfer::FetchOptions {
+                format: GitTransferFormat::Loose,
+                net_timeout: FETCH_NET_TIMEOUT,
+            },
             &mut send,
             &mut recv,
             transfer::ProgressSink::default(),
-        );
-        let outcome = tokio::time::timeout(FETCH_TIMEOUT, fetch)
-            .await
-            .map_err(|_| eyre!("fetch timed out"))??;
+        )
+        .await?;
         let _ = send.finish();
         Ok(outcome)
+    }
+
+    /// Builds the commit index for any op head missing one, on a blocking
+    /// thread, showing the repo as `Indexing` meanwhile. Normally a no-op
+    /// (fetches index before publishing): this heals heads published
+    /// without an index, which would otherwise silently stall the user's
+    /// next jj command on a rebuild. Failures only warn; the next watch
+    /// start retries.
+    async fn heal_index(&self, repo: &Arc<OpenRepo>, heads: &[OperationId]) {
+        let missing = repo.unindexed(heads).await;
+        if missing.is_empty() {
+            return;
+        }
+        info!(repo = %self.name, heads = missing.len(), "building the commit index");
+        self.set_state(RepoState::Indexing);
+        let build = {
+            let repo = repo.clone();
+            tokio::task::spawn_blocking(move || repo.build_commit_indexes(&missing))
+        };
+        if let Err(err) = build.await {
+            warn!(repo = %self.name, "index build task failed: {err}");
+        }
     }
 
     /// Runs `jj workspace update-stale` when enabled for this repo.
