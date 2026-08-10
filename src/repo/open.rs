@@ -352,9 +352,9 @@ impl OpenRepo {
             parse().wrap_err_with(|| {
                 format!(
                     "cannot decode op head {}; was the repo written by a jj \
-                     release other than the supported {} series?",
+                     release outside the supported {} series?",
                     head.hex(),
-                    super::SUPPORTED_JJ_SERIES,
+                    super::jj::supported_series(),
                 )
             })?;
 

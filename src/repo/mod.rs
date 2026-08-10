@@ -24,14 +24,13 @@ use std::{
 use color_eyre::eyre::{Result, WrapErr as _, ensure, eyre};
 
 pub use self::{
-    jj::{jj_bin, jj_version_warning, local_jj_version, repo_present, run_jj},
+    jj::{jj_bin, jj_peer_warning, jj_version_warning, local_jj_version, repo_present, run_jj},
     open::OpenRepo,
 };
 
-/// The jj release series whose on-disk formats this build was written
-/// against. Must match the exact `jj-lib` pin in `Cargo.toml`: repos
-/// written by another jj series may use formats this build mis-reads.
-const SUPPORTED_JJ_SERIES: &str = "0.44";
+/// The jj release series this build accepts, as minors of `0.<minor>.<patch>`
+/// versions.
+const SUPPORTED_JJ_MINORS: std::ops::RangeInclusive<u32> = 43..=44;
 
 /// Store backends supported by jj-mesh, as `(<store dir>, <expected type>)`
 /// pairs relative to `.jj/repo`.

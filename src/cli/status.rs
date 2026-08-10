@@ -111,8 +111,10 @@ fn collect_issues(status: &control::Status) -> Vec<String> {
         ));
     }
     for PeerReport { peer, report } in &status.peer_reports {
-        if report.jj_version.is_none() {
-            issues.push(format!("{peer}: jj not found on that machine"));
+        if let Some(warning) =
+            crate::repo::jj_peer_warning(status.jj_version.as_deref(), report.jj_version.as_deref())
+        {
+            issues.push(format!("{peer}: {warning}"));
         }
         for repo in &report.repos {
             let problem = match repo.state {

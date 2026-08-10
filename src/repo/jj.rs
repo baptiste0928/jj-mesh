@@ -1,14 +1,15 @@
 //! Invoking the user's jj binary.
 //!
 //! [`run_jj`] runs one command against a repo, [`local_jj_version`]
-//! detects the binary's version, and [`jj_version_warning`] words the
-//! warning when that version is not from the supported series.
+//! detects the binary's version, and [`jj_version_warning`] and
+//! [`jj_peer_warning`] word the warnings when the local or a peer's
+//! version falls outside the supported series.
 
 use std::path::Path;
 
 use color_eyre::eyre::{Result, WrapErr as _, ensure, eyre};
 
-use super::SUPPORTED_JJ_SERIES;
+use super::SUPPORTED_JJ_MINORS;
 
 /// Cap on the child's diagnostics kept in memory. jj reports one line
 /// per file it refuses to snapshot, so on a hostile or merely enormous
@@ -115,11 +116,27 @@ fn parse_jj_version(output: &str) -> Option<String> {
     plausible.then(|| version.to_owned())
 }
 
-/// Whether a jj version belongs to the [`SUPPORTED_JJ_SERIES`].
+/// The release series of a jj version: the minor of `0.<minor>.<patch>`.
+fn jj_series(version: &str) -> Option<u32> {
+    match version.split('.').collect::<Vec<_>>()[..] {
+        ["0", minor, _patch] => minor.parse().ok(),
+        _ => None,
+    }
+}
+
+/// Whether a jj version belongs to the [`SUPPORTED_JJ_MINORS`] series.
 fn jj_version_supported(version: &str) -> bool {
-    version
-        .strip_prefix(SUPPORTED_JJ_SERIES)
-        .is_some_and(|rest| rest.starts_with('.'))
+    jj_series(version).is_some_and(|minor| SUPPORTED_JJ_MINORS.contains(&minor))
+}
+
+/// Human form of the supported series range (`0.43-0.44`).
+pub(crate) fn supported_series() -> String {
+    let (start, end) = (SUPPORTED_JJ_MINORS.start(), SUPPORTED_JJ_MINORS.end());
+    if start == end {
+        format!("0.{start}")
+    } else {
+        format!("0.{start}-0.{end}")
+    }
 }
 
 /// The warning a detected jj version deserves, `None` when it is
@@ -128,9 +145,39 @@ pub fn jj_version_warning(version: Option<&str>) -> Option<String> {
     match version {
         Some(version) if jj_version_supported(version) => None,
         Some(version) => Some(format!(
-            "unsupported jj {version} found (supported: {SUPPORTED_JJ_SERIES})"
+            "unsupported jj {version} found (supported: {})",
+            supported_series(),
         )),
         None => Some("jj not found (on PATH or via JJ_BIN)".to_owned()),
+    }
+}
+
+/// The warning a peer's reported jj version deserves next to the local
+/// one, `None` when nothing is wrong. Mixed series across a mesh risk the
+/// older side failing to read ops the newer side writes, so a mismatch
+/// warns in both directions, worded for the machine showing it. The
+/// comparison only runs when the local version is supported: a missing or
+/// unsupported local jj is [`jj_version_warning`]'s problem, and repeating
+/// it against every peer would drown the one actionable line.
+pub fn jj_peer_warning(local: Option<&str>, peer: Option<&str>) -> Option<String> {
+    let Some(peer) = peer else {
+        return Some("jj not found on that machine".to_owned());
+    };
+    if !jj_version_supported(peer) {
+        return Some(format!(
+            "unsupported jj {peer} found (supported: {})",
+            supported_series(),
+        ));
+    }
+    let local = local.filter(|local| jj_version_supported(local))?;
+    match jj_series(peer)?.cmp(&jj_series(local)?) {
+        std::cmp::Ordering::Less => {
+            Some(format!("runs jj {peer}, older than the local jj {local}"))
+        }
+        std::cmp::Ordering::Greater => {
+            Some(format!("runs jj {peer}, newer than the local jj {local}"))
+        }
+        std::cmp::Ordering::Equal => None,
     }
 }
 
@@ -149,11 +196,35 @@ mod tests {
         assert_eq!(parse_jj_version("jj whatever"), None);
         assert_eq!(parse_jj_version(""), None);
 
+        assert!(jj_version_supported("0.43.0"));
         assert!(jj_version_supported("0.44.0"));
         assert!(jj_version_supported("0.44.12"));
-        assert!(!jj_version_supported("0.43.0"));
+        assert!(!jj_version_supported("0.42.0"));
+        assert!(!jj_version_supported("0.45.0"));
         assert!(!jj_version_supported("0.4.40"));
         assert!(!jj_version_supported("0.440.0"));
         assert!(!jj_version_supported("0.44"));
+        assert!(!jj_version_supported("1.44.0"));
+    }
+
+    #[test]
+    fn words_peer_version_warnings() {
+        // Same series, patch differences included: silent.
+        assert_eq!(jj_peer_warning(Some("0.44.0"), Some("0.44.2")), None);
+
+        let older = jj_peer_warning(Some("0.44.0"), Some("0.43.1")).unwrap();
+        assert!(older.contains("older"), "{older}");
+        let newer = jj_peer_warning(Some("0.43.1"), Some("0.44.0")).unwrap();
+        assert!(newer.contains("newer"), "{newer}");
+
+        let out_of_range = jj_peer_warning(Some("0.44.0"), Some("0.42.0")).unwrap();
+        assert!(out_of_range.contains("unsupported"), "{out_of_range}");
+        let missing = jj_peer_warning(Some("0.44.0"), None).unwrap();
+        assert!(missing.contains("not found"), "{missing}");
+
+        // A missing or unsupported local version is the local warning's
+        // problem: no mismatch line per peer on top of it.
+        assert_eq!(jj_peer_warning(None, Some("0.43.0")), None);
+        assert_eq!(jj_peer_warning(Some("0.42.0"), Some("0.44.0")), None);
     }
 }
