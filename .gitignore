@@ -1,3 +1,6 @@
 /target
 /result
 /docs/book
+
+.envrc
+.direnv

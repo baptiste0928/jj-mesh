@@ -3,16 +3,35 @@
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
+    rust-overlay = {
+      url = "github:oxalica/rust-overlay";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
   };
 
   outputs =
-    { self, nixpkgs, ... }:
+    {
+      self,
+      nixpkgs,
+      rust-overlay,
+      ...
+    }:
     let
       forEachSystem = nixpkgs.lib.genAttrs [
         "x86_64-linux"
         "aarch64-linux"
         "aarch64-darwin"
       ];
+
+      pkgsFor =
+        system:
+        import nixpkgs {
+          inherit system;
+          overlays = [ rust-overlay.overlays.default ];
+        };
+
+      # Toolchain pinned by rust-toolchain.toml
+      toolchainFor = pkgs: pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
     in
     {
       formatter = forEachSystem (system: nixpkgs.legacyPackages.${system}.nixfmt-tree);
@@ -25,9 +44,14 @@
       packages = forEachSystem (
         system:
         let
-          pkgs = nixpkgs.legacyPackages.${system};
+          pkgs = pkgsFor system;
+          toolchain = toolchainFor pkgs;
+          rustPlatform = pkgs.makeRustPlatform {
+            cargo = toolchain;
+            rustc = toolchain;
+          };
 
-          jj-mesh = pkgs.rustPlatform.buildRustPackage {
+          jj-mesh = rustPlatform.buildRustPackage {
             pname = "jj-mesh";
             version = (nixpkgs.lib.importTOML ./Cargo.toml).package.version;
 
@@ -58,22 +82,24 @@
         }
       );
 
-
       devShells = forEachSystem (
         system:
         let
-          pkgs = nixpkgs.legacyPackages.${system};
+          pkgs = pkgsFor system;
+          toolchain = (toolchainFor pkgs).override {
+            extensions = [
+              "rust-src"
+              "rust-analyzer"
+            ];
+          };
         in
         {
           default = pkgs.mkShell {
             packages = with pkgs; [
-              cargo
-              rustc
-              clippy
-              rustfmt
-              rust-analyzer
+              rustup
+              pinact # pin github actions versions
             ];
-            env.RUST_SRC_PATH = "${pkgs.rustPlatform.rustLibSrc}";
+            env.RUSTUP_TOOLCHAIN = "${toolchain}";
           };
         }
       );
