@@ -29,8 +29,8 @@ const OPEN_STREAM_TIMEOUT: Duration = Duration::from_secs(30);
 /// exists for the CLI that asked, and it must not register a repo behind
 /// a gone user's back. Work already handed to a blocking thread (a pack
 /// ingest, the apply with its index build — the longest such work on a
-/// large clone) still finishes, so the directory the CLI tells the user
-/// to remove may gain more objects; it is never registered.
+/// large clone) still finishes, so the abandoned directory may gain more
+/// objects; it is never registered.
 pub(super) async fn clone_repo(
     stream: &mut UnixStream,
     ctx: &ControlContext,

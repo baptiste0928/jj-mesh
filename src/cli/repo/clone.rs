@@ -4,7 +4,7 @@
 //! (mesh machines must never share one), asks the daemon to pull the mesh
 //! repo's full state from a peer and register it, lets jj merge the
 //! fresh workspace into the replicated history, and starts the working
-//! copy on trunk.
+//! copy on trunk. A failed clone removes the directory it created.
 
 use std::{
     path::{Path, PathBuf},
@@ -13,7 +13,7 @@ use std::{
 
 use clap::{Args, ValueHint};
 use clap_complete::ArgValueCandidates;
-use color_eyre::eyre::{Result, WrapErr as _, bail, ensure};
+use color_eyre::eyre::{Report, Result, WrapErr as _, bail, ensure};
 use indicatif::{HumanBytes, ProgressBar, ProgressStyle};
 
 use super::jj;
@@ -79,33 +79,12 @@ pub fn run(args: CloneArgs, dir: &ConfigDir) -> Result<()> {
         None,
         &["git", "init", "--no-colocate", &path.to_string_lossy()],
     )?;
-    jj(Some(&path), &["workspace", "rename", &workspace])?;
 
-    println!("Pulling repo `{name}` from the mesh...");
-    let request = Request::CloneRepo {
-        name: name.clone(),
-        path: std::fs::canonicalize(&path)
-            .wrap_err_with(|| format!("cannot resolve {}", path.display()))?,
-    };
-
-    let bar = ProgressBar::new_spinner().with_style(spinner_style());
-    bar.set_message("Contacting peers...");
-    bar.enable_steady_tick(Duration::from_millis(100));
-    let pulled =
-        control::request_streaming_blocking(dir, &request, control::CLONE_IDLE_WAIT, |progress| {
-            show_progress(&bar, &progress);
-        });
-
-    bar.finish_and_clear();
-    let response = pulled.wrap_err_with(|| {
-        format!(
-            "the repo directory {} was created but not registered, remove it before retrying",
-            path.display(),
-        )
-    })?;
-    let Response::Cloned { .. } = response else {
-        bail!("unexpected response from the daemon: {response:?}");
-    };
+    // The directory exists from here on: a failed pull removes it again so
+    // a retry starts clean.
+    if let Err(err) = pull(dir, &name, &path, &workspace) {
+        return Err(clean_failed_clone(dir, &name, &path, err));
+    }
 
     // Any jj command merges the fresh workspace into the pulled history;
     // doing it here leaves the repo ready to use. A re-clone after
@@ -127,6 +106,56 @@ pub fn run(args: CloneArgs, dir: &ConfigDir) -> Result<()> {
         ui::good(format_args!("Cloned `{name}` in {}", path.display())),
     );
     Ok(())
+}
+
+/// Names the workspace, then asks the daemon to pull and register the
+/// repo, streaming its progress. On failure the repo stays unregistered,
+/// except when the response of a successful pull was lost (see
+/// [`clean_failed_clone`]).
+fn pull(dir: &ConfigDir, name: &str, path: &Path, workspace: &str) -> Result<()> {
+    jj(Some(path), &["workspace", "rename", workspace])?;
+
+    println!("Pulling repo `{name}` from the mesh...");
+    let request = Request::CloneRepo {
+        name: name.to_owned(),
+        path: std::fs::canonicalize(path)
+            .wrap_err_with(|| format!("cannot resolve {}", path.display()))?,
+    };
+
+    let bar = ProgressBar::new_spinner().with_style(spinner_style());
+    bar.set_message("Contacting peers...");
+    bar.enable_steady_tick(Duration::from_millis(100));
+    let pulled =
+        control::request_streaming_blocking(dir, &request, control::CLONE_IDLE_WAIT, |progress| {
+            show_progress(&bar, &progress);
+        });
+
+    bar.finish_and_clear();
+    match pulled? {
+        Response::Cloned { .. } => Ok(()),
+        response => bail!("unexpected response from the daemon: {response:?}"),
+    }
+}
+
+/// Removes the directory a failed clone created. The daemon registers the
+/// repo only once the pull succeeded, so the directory is normally
+/// unregistered; when the state lists the repo anyway (the pull succeeded
+/// but its response was lost), the directory holds a valid clone and is
+/// kept.
+fn clean_failed_clone(dir: &ConfigDir, name: &str, path: &Path, err: Report) -> Report {
+    if MeshState::load(dir).is_ok_and(|state| state.repos.contains_key(name)) {
+        return err.wrap_err(format!(
+            "the pull succeeded and `{name}` is registered at {}, but its result was lost",
+            path.display(),
+        ));
+    }
+    match std::fs::remove_dir_all(path) {
+        Ok(()) => err,
+        Err(remove_err) => err.wrap_err(format!(
+            "cannot clean up the repo directory {} ({remove_err}), remove it before retrying",
+            path.display(),
+        )),
+    }
 }
 
 /// Moves the working copy from the init commit off the root (where `jj git

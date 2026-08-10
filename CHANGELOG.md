@@ -18,6 +18,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Synced op heads are now made visible *after* the index has been built. This prevents the user's
   `jj` commands from blocking while indexing is in progress.
+- The leftover destination directory is now removed when cloning a repo from the mesh fails.
 
 ## [0.1.0] - 2026-08-04
 
