@@ -14,7 +14,10 @@ use service_manager::{
 };
 
 use super::ui;
-use crate::config::ConfigDir;
+use crate::config::{ConfigDir, ServiceState};
+
+/// Label of the service installed by `service install`.
+const DEFAULT_LABEL: &str = "jj-mesh";
 
 /// Seconds the service manager waits before restarting a failed daemon.
 const FAILURE_RESTART_DELAY_SECS: u32 = 5;
@@ -71,18 +74,30 @@ enum ServiceCommand {
 
 /// Runs the `service` command.
 pub fn run(args: ServiceArgs, dir: &ConfigDir) -> Result<()> {
-    let label: ServiceLabel = "jj-mesh".parse()?;
     let mut manager =
         <dyn ServiceManager>::native().wrap_err("no supported service manager on this system")?;
     manager
         .set_level(ServiceLevel::User)
         .wrap_err("user services are not supported on this system")?;
 
+    // The recorded label lets start/stop/restart drive an externally
+    // installed service even when its label differs from ours (Home
+    // Manager prefixes launchd agents on macOS).
+    let state = ServiceState::load(dir)?;
+    let label: ServiceLabel = state
+        .as_ref()
+        .map_or(DEFAULT_LABEL, |state| state.label.as_str())
+        .parse()?;
+
     match args.command {
         ServiceCommand::Install { program, jj_bin } => {
+            ensure_ours(state.as_ref(), &label)?;
             install(&*manager, label, dir, program, jj_bin.as_deref())
         }
-        ServiceCommand::Uninstall => uninstall(&*manager, label),
+        ServiceCommand::Uninstall => {
+            ensure_ours(state.as_ref(), &label)?;
+            uninstall(&*manager, label, dir)
+        }
         ServiceCommand::Start => {
             manager
                 .start(ServiceStartCtx { label })
@@ -99,6 +114,29 @@ pub fn run(args: ServiceArgs, dir: &ConfigDir) -> Result<()> {
         }
         ServiceCommand::Restart => restart(&*manager, &label),
     }
+}
+
+/// Refuses to install or uninstall a service this command does not own:
+/// either the state file records another installer, or an unrecorded
+/// service definition is a symlink (how Home Manager and other nix-based
+/// managers install theirs).
+fn ensure_ours(state: Option<&ServiceState>, label: &ServiceLabel) -> Result<()> {
+    if let Some(state) = state {
+        ensure!(
+            state.installer == ServiceState::CLI,
+            "the service is managed by {}: update that configuration instead",
+            state.installer,
+        );
+    } else {
+        let file = service_file(label)?;
+        ensure!(
+            !file.is_symlink(),
+            "{} is a symlink, so an external program probably manages \
+             the service: refusing to replace it",
+            file.display(),
+        );
+    }
+    Ok(())
 }
 
 /// Installs the service and starts it.
@@ -161,6 +199,7 @@ fn install(
         .status();
 
     println!("Created {}", service_file(&label)?.display());
+    ServiceState::record_cli(dir, &label.to_string())?;
 
     manager
         .start(ServiceStartCtx { label })
@@ -172,13 +211,14 @@ fn install(
 }
 
 /// Stops the service if running, then removes it.
-fn uninstall(manager: &dyn ServiceManager, label: ServiceLabel) -> Result<()> {
+fn uninstall(manager: &dyn ServiceManager, label: ServiceLabel, dir: &ConfigDir) -> Result<()> {
     stop_quietly(manager, &label);
 
     let file = service_file(&label)?;
     manager
         .uninstall(ServiceUninstallCtx { label })
         .wrap_err("cannot uninstall the service")?;
+    ServiceState::clear(dir)?;
 
     println!("{}", ui::good("Stopped the service"));
     println!("{}", ui::good(format_args!("Removed {}", file.display())));
