@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-08-10
+
 ### Changed
 - **Added `jj` 0.44 to the supported versions.** `jj` 0.43 is still supported.
 - `jj-mesh status` now displays a warning when a peer is running a different `jj` version than the
@@ -25,5 +27,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Initial version of `jj-mesh`.
 
-[unreleased]: https://github.com/baptiste0928/jj-mesh/compare/v0.1.0...HEAD
+[unreleased]: https://github.com/baptiste0928/jj-mesh/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/baptiste0928/jj-mesh/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/baptiste0928/jj-mesh/releases/tag/v0.1.0
