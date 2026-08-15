@@ -1,3 +1,5 @@
+
+
 # jj-mesh
 
 `jj-mesh` is a peer-to-peer synchronization daemon for [`jj`](https://docs.jj-vcs.dev/) repositories.
@@ -27,7 +29,7 @@ between your desktop and laptop.
 need to compile it from source, as we don't provide pre-built binaries. You can watch this
 repository on GitHub to be notified of any updates.
 
-It is currently tested on Linux and supports macOS as well, and **supports `jj` 0.43 and above**.
+It is currently tested on Linux and supports macOS as well, and **supports `jj` 0.44**.
 Windows is unsupported.
 
 ### With `cargo`
