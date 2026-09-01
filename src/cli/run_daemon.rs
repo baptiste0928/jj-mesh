@@ -21,5 +21,8 @@ pub fn run(_args: RunDaemonArgs, dir: &ConfigDir) -> Result<()> {
         )
         .init();
 
-    tokio::runtime::Runtime::new()?.block_on(daemon::run(dir))
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?
+        .block_on(daemon::run(dir))
 }

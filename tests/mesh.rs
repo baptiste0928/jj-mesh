@@ -8,7 +8,7 @@ use jj_mesh::daemon::control::{Request, Response};
 /// Machines that never paired directly learn about each other through
 /// gossip: they connect on their own, repos added anywhere become
 /// clonable everywhere, and removing a repo retires it mesh-wide.
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test]
 async fn membership_gossips_transitively() {
     // Only A-B and B-C are paired.
     let mesh = TestMesh::new();
@@ -48,7 +48,7 @@ async fn membership_gossips_transitively() {
 /// mesh keeps the repo, it can be cloned again right away (the daemon
 /// keeps the peers' announcements), and sync resumes in both directions
 /// afterwards (announcement sequences survive the re-registration).
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test]
 async fn forgetting_locally_keeps_the_repo_clonable() {
     let mesh = TestMesh::new();
     let (a, b) = mesh.connected_pair().await;
@@ -96,7 +96,7 @@ async fn forgetting_locally_keeps_the_repo_clonable() {
 
 /// Pairing requires the ticket secret, and a failed attempt never
 /// persists a peer nor burns the host's ticket.
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test]
 async fn pairing_requires_the_ticket_secret() {
     let mesh = TestMesh::new();
     let a = mesh.machine("machine-a").await;
@@ -117,7 +117,7 @@ async fn pairing_requires_the_ticket_secret() {
 }
 
 /// A pairing ticket stops working once its pairing has concluded.
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test]
 async fn pairing_ticket_is_single_use() {
     let mesh = TestMesh::new();
     let a = mesh.machine("machine-a").await;
@@ -140,7 +140,7 @@ async fn pairing_ticket_is_single_use() {
 /// A failed attempt by the ticket holder (here: announcing an unacceptable
 /// name) does not burn the ticket: fixing the problem and retrying with
 /// the same ticket works.
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test]
 async fn failed_attempt_keeps_the_ticket_valid() {
     let mesh = TestMesh::new();
     let a = mesh.machine("machine-a").await;
@@ -165,7 +165,7 @@ async fn failed_attempt_keeps_the_ticket_valid() {
 
 /// A renamed machine keeps its connections, and its peers learn the new
 /// name through the gossip; the name survives a restart.
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test]
 async fn rename_reaches_the_peers() {
     let mesh = TestMesh::new();
     let (mut a, b) = mesh.connected_pair().await;
@@ -181,7 +181,7 @@ async fn rename_reaches_the_peers() {
 
 /// Hosting again replaces the outstanding ticket: only the newest one is
 /// valid.
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test]
 async fn rehosting_replaces_the_ticket() {
     let mesh = TestMesh::new();
     let a = mesh.machine("machine-a").await;

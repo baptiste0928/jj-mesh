@@ -11,7 +11,7 @@ use jj_mesh::daemon::control::RepoHealthState;
 /// Converting a second instance of a mesh repo to colocated pauses sync on
 /// both machines (instead of ping-ponging git HEAD imports), and reverting
 /// the conversion resumes it.
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test]
 async fn second_colocated_instance_pauses_sync() {
     let mesh = TestMesh::new();
     let (a, b) = mesh.connected_pair().await;
@@ -69,7 +69,7 @@ async fn second_colocated_instance_pauses_sync() {
 
 /// Peers report their health to each other, and a healthy mesh shows every
 /// repo `Ok` with the daemon and jj versions attached.
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test]
 async fn peers_report_their_health() {
     let mesh = TestMesh::new();
     let (a, b) = mesh.connected_pair().await;

@@ -7,7 +7,7 @@ use harness::{TestMesh, add_and_clone, descriptions, op_heads, wait_converged};
 /// Commits made while a machine's daemon was down are exchanged after
 /// restart: the histories diverged offline, converge on reconnect, and
 /// jj merges them.
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test]
 async fn offline_machine_catches_up() {
     let mesh = TestMesh::new();
     let (a, mut b) = mesh.connected_pair().await;

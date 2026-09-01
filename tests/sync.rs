@@ -7,7 +7,7 @@ use std::fs;
 use harness::{TestMesh, add_and_clone, descriptions, op_heads, wait_converged};
 
 /// Cloning a repo added on another machine pulls its full history.
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test]
 async fn clone_pulls_full_history() {
     let mesh = TestMesh::new();
     let (a, b) = mesh.connected_pair().await;
@@ -37,7 +37,7 @@ async fn clone_pulls_full_history() {
 }
 
 /// Commits made on either machine replicate to the other.
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test]
 async fn commits_replicate_both_ways() {
     let mesh = TestMesh::new();
     let (a, b) = mesh.connected_pair().await;
@@ -55,7 +55,7 @@ async fn commits_replicate_both_ways() {
 }
 
 /// Concurrent commits replicate as divergent op heads and jj merges them.
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test]
 async fn concurrent_commits_reconcile() {
     let mesh = TestMesh::new();
     let (a, b) = mesh.connected_pair().await;
