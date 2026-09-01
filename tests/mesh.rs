@@ -105,9 +105,7 @@ async fn pairing_requires_the_ticket_secret() {
     let ticket = a.host_pairing().await;
 
     // A join with a tampered secret is rejected; nobody is paired.
-    let rejected = b
-        .try_join_pairing(tamper_secret(&ticket), "machine-b")
-        .await;
+    let rejected = b.try_join_pairing(tamper_secret(&ticket)).await;
     assert!(matches!(rejected, Response::Error(_)), "{rejected:?}");
     assert!(a.status().await.peers.is_empty());
     assert!(b.status().await.peers.is_empty());
@@ -133,7 +131,7 @@ async fn pairing_ticket_is_single_use() {
     a.wait_peer_connected("machine-b").await;
 
     // Reusing the ticket is refused; the third machine is not paired.
-    let reused = c.try_join_pairing(ticket, "machine-c").await;
+    let reused = c.try_join_pairing(ticket).await;
     assert!(matches!(reused, Response::Error(_)), "{reused:?}");
     assert!(c.status().await.peers.is_empty());
     assert_eq!(a.status().await.peers.len(), 1);
@@ -146,16 +144,39 @@ async fn pairing_ticket_is_single_use() {
 async fn failed_attempt_keeps_the_ticket_valid() {
     let mesh = TestMesh::new();
     let a = mesh.machine("machine-a").await;
-    let b = mesh.machine("machine-b").await;
+    let mut b = mesh.machine("machine-b").await;
+
+    // B carries a name the host refuses (a control character); only a
+    // hand-edited state can hold one.
+    b.stop().await;
+    b.edit_state(|state| state.machine.name = "machine\u{7}b".to_owned());
+    b.start().await;
 
     let ticket = a.host_pairing().await;
 
-    let rejected = b.try_join_pairing(ticket.clone(), "").await;
+    let rejected = b.try_join_pairing(ticket.clone()).await;
     assert!(matches!(rejected, Response::Error(_)), "{rejected:?}");
     assert!(a.status().await.peers.is_empty());
 
+    b.rename("machine-b").await;
     b.join_pairing(ticket).await;
     a.wait_peer_connected("machine-b").await;
+}
+
+/// A renamed machine keeps its connections, and its peers learn the new
+/// name through the gossip; the name survives a restart.
+#[tokio::test(flavor = "multi_thread")]
+async fn rename_reaches_the_peers() {
+    let mesh = TestMesh::new();
+    let (mut a, b) = mesh.connected_pair().await;
+
+    a.rename("desk").await;
+    assert_eq!(a.status().await.name, "desk");
+    b.wait_peer_connected("desk").await;
+
+    a.stop().await;
+    a.start().await;
+    assert_eq!(a.status().await.name, "desk");
 }
 
 /// Hosting again replaces the outstanding ticket: only the newest one is
@@ -171,7 +192,7 @@ async fn rehosting_replaces_the_ticket() {
 
     // The replaced ticket is dead, and rejecting it does not burn the
     // fresh one...
-    let rejected = b.try_join_pairing(stale, "machine-b").await;
+    let rejected = b.try_join_pairing(stale).await;
     assert!(matches!(rejected, Response::Error(_)), "{rejected:?}");
     assert!(a.status().await.peers.is_empty());
 

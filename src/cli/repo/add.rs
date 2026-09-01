@@ -6,7 +6,7 @@ use clap::{Args, ValueHint};
 use color_eyre::eyre::{Result, bail, eyre};
 
 use crate::{
-    cli::{hostname, ui},
+    cli::{machine_name, ui},
     config::ConfigDir,
     daemon::control::{self, Request, Response},
     repo::JjRepo,
@@ -26,7 +26,7 @@ pub struct AddArgs {
     #[arg(long)]
     name: Option<String>,
 
-    /// This machine's workspace name in the repo (defaults to the hostname)
+    /// Override the workspace name (defaults to this machine name)
     ///
     /// We assign a workspace for each copy of the repo across the mesh, so
     /// the current head of each machine is displayed in `jj log`.
@@ -49,12 +49,12 @@ pub fn run(args: AddArgs, dir: &ConfigDir) -> Result<()> {
             .into_owned(),
     };
 
-    // A repo still on jj's `default` workspace name gets the hostname, so
-    // workspace names stay unique across the mesh; a deliberately named
+    // A repo still on jj's `default` workspace name gets the machine name,
+    // so workspace names stay unique across the mesh; a deliberately named
     // workspace is kept as-is.
     let workspace = match args.workspace {
         Some(name) => Some(name),
-        None if repo.workspace_name()? == "default" => Some(hostname()),
+        None if repo.workspace_name()? == "default" => Some(machine_name(dir)?),
         None => None,
     };
     if let Some(workspace) = &workspace {

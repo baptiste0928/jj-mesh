@@ -124,6 +124,7 @@ impl Daemon {
         let repos = Arc::new(RepoSet::new(hub.clone(), settings));
         let store = Arc::new(MeshStore::new(
             dir.clone(),
+            key.endpoint_id(),
             state,
             peers.clone(),
             repos.clone(),
@@ -149,7 +150,7 @@ impl Daemon {
         let mut tasks = tokio::task::JoinSet::new();
         tasks.spawn(async move { server.serve(ctx).await });
         tasks.spawn(accept_loop(endpoint.clone(), peers, pairing));
-        tasks.spawn(membership_loop(gossip_rx, key.endpoint_id(), store.clone()));
+        tasks.spawn(membership_loop(gossip_rx, store.clone()));
         tasks.spawn(status_loop(repos, hub, jj_version));
         tasks.spawn(gossip_loop(store));
 
@@ -256,22 +257,13 @@ async fn status_loop(repos: Arc<RepoSet>, hub: Arc<SyncHub>, jj_version: Option<
     }
 }
 
-/// Merges memberships received from peers into the mesh state. A merge
-/// that changes anything is persisted and re-broadcast by the store, which
-/// is what propagates membership across machines that are not directly
-/// exchanging right now; a merge that changes nothing is silent, which is
-/// what stops the echo.
+/// Merges memberships received from peers into the mesh state.
 async fn membership_loop(
     mut gossip: mpsc::Receiver<(EndpointId, Membership)>,
-    local: EndpointId,
     store: Arc<MeshStore>,
 ) {
     while let Some((peer, membership)) = gossip.recv().await {
-        let merged = store.update(|state| {
-            state.merge_membership(&membership, &local);
-            Ok(())
-        });
-        if let Err(err) = merged {
+        if let Err(err) = store.merge_membership(&membership) {
             warn!("cannot apply membership from {peer}: {err:#}");
         }
     }

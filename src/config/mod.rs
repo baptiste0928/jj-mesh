@@ -27,6 +27,6 @@ pub use resolve::ConfigDir;
 pub use service::ServiceState;
 pub use settings::{RepoSettings, Settings};
 pub use state::{
-    MAX_MESH_PEERS, MAX_MESH_REPOS, Membership, MeshRepo, MeshRepoStatus, MeshState, Peer,
+    MAX_MESH_PEERS, MAX_MESH_REPOS, Machine, Membership, MeshRepo, MeshRepoStatus, MeshState, Peer,
     PeerStatus, Repo, RepoId,
 };

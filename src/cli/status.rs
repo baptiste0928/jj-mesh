@@ -31,6 +31,7 @@ pub fn run(_args: StatusArgs, dir: &ConfigDir) -> Result<()> {
         ui::good("running"),
         ui::format_duration(status.uptime_secs)
     );
+    println!("machine: {}", sanitize(&status.name));
     if let Some(warning) = crate::repo::jj_version_warning(status.jj_version.as_deref()) {
         println!("{} {warning}", ui::warn("warning:"));
     }

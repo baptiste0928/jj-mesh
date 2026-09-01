@@ -11,7 +11,7 @@ use clap::Args;
 use color_eyre::eyre::{Result, bail};
 
 use crate::{
-    cli::{hostname, ui},
+    cli::ui,
     config::ConfigDir,
     daemon::control::{self, ControlClient, PAIR_TICKET_TTL, Request, Response},
     net::pair::PairTicket,
@@ -35,33 +35,27 @@ pub struct AddArgs {
     /// If omitted, a ticket will be generated. The ticket can be used once,
     /// and expires after a few minutes.
     ticket: Option<String>,
-
-    /// Name announced to the other machine (defaults to the hostname)
-    #[arg(long)]
-    name: Option<String>,
 }
 
 /// Runs the `peer add` command.
 pub fn run(args: AddArgs, dir: &ConfigDir) -> Result<()> {
-    let name = args.name.unwrap_or_else(hostname);
-
-    control::block_on(pair(args.ticket, name, dir))
+    control::block_on(pair(args.ticket, dir))
 }
 
 /// Dispatches to the hosting or joining side of the pairing.
-async fn pair(ticket: Option<String>, name: String, dir: &ConfigDir) -> Result<()> {
+async fn pair(ticket: Option<String>, dir: &ConfigDir) -> Result<()> {
     let mut client = ControlClient::connect_required(dir).await?;
 
     match ticket {
-        Some(ticket) => join(&mut client, ticket, name).await,
-        None => host(&mut client, name).await,
+        Some(ticket) => join(&mut client, ticket).await,
+        None => host(&mut client).await,
     }
 }
 
 /// Asks the daemon for a fresh pairing ticket and prints it. The daemon
 /// finishes the pairing on its own, so this returns right away.
-async fn host(client: &mut ControlClient, name: String) -> Result<()> {
-    client.send(&Request::PairHost { name }).await?;
+async fn host(client: &mut ControlClient) -> Result<()> {
+    client.send(&Request::PairHost).await?;
 
     match client.recv(Some(TICKET_TIMEOUT)).await? {
         Response::PairTicket(ticket) => {
@@ -85,12 +79,12 @@ async fn host(client: &mut ControlClient, name: String) -> Result<()> {
 }
 
 /// Joins a pairing hosted by another machine, waiting for the outcome.
-async fn join(client: &mut ControlClient, ticket: String, name: String) -> Result<()> {
+async fn join(client: &mut ControlClient, ticket: String) -> Result<()> {
     // Parse locally first, for fast feedback on a mangled paste.
     let _: PairTicket = ticket.parse()?;
 
     println!("Connecting to the pairing host...");
-    client.send(&Request::PairJoin { ticket, name }).await?;
+    client.send(&Request::PairJoin { ticket }).await?;
 
     match client.recv(None).await? {
         Response::Paired { name, .. } => {

@@ -1,14 +1,16 @@
 //! Mesh state file (`mesh.json`).
 //!
 //! This file holds the machine's copy of the mesh state, in two parts:
-//! what is replicated across the mesh by the membership gossip (the peer
-//! records, tombstones included, and the mesh-wide repo list) and what is
-//! strictly local (the repos registered here, with their paths).
+//! what is replicated across the mesh by the membership gossip (this
+//! machine's own record, the peer records, tombstones included, and the
+//! mesh-wide repo list) and what is strictly local (the repos registered
+//! here, with their paths).
 //!
 //! The daemon is the only writer; the CLI mutates it through the control
 //! socket, and may read the file directly (for pre-checks and completion),
 //! treating what it sees as advisory.
 
+mod machine;
 mod membership;
 mod repo;
 
@@ -24,8 +26,9 @@ use iroh::EndpointId;
 use serde::{Deserialize, Serialize};
 use tracing::debug;
 
-use self::membership::{MAX_RECORD_VERSION, bumped_version, should_adopt};
+use self::membership::{MAX_OTHER_PEERS, MAX_RECORD_VERSION, bumped_version, should_adopt};
 pub use self::{
+    machine::Machine,
     membership::{
         MAX_MESH_PEERS, MAX_MESH_REPOS, Membership, MeshRepo, MeshRepoStatus, Peer, PeerStatus,
     },
@@ -35,15 +38,17 @@ use super::{ConfigDir, validate_name};
 
 /// This machine's copy of the mesh state.
 ///
-/// `peers` and `mesh_repos` are replicated across the mesh by the
-/// membership gossip; `repos` (with its local paths) never leaves this
+/// `machine`, `peers` and `mesh_repos` are replicated across the mesh by
+/// the membership gossip; `repos` (with its local paths) never leaves this
 /// machine.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct MeshState {
-    /// Machines of the mesh, keyed by endpoint id. Includes tombstones
-    /// (removed peers), which gossip must remember so a removal cannot be
-    /// undone by a machine that missed it.
+    /// This machine's own record.
+    pub machine: Machine,
+    /// The other machines of the mesh, keyed by endpoint id. Includes
+    /// tombstones (removed peers), which gossip must remember so a removal
+    /// cannot be undone by a machine that missed it.
     pub peers: BTreeMap<EndpointId, Peer>,
     /// Repos registered on this machine, keyed by their mesh-wide name.
     pub repos: BTreeMap<String, Repo>,
@@ -176,7 +181,7 @@ impl MeshState {
         // would make our own membership undecodable by every peer, which
         // silently stops us from gossiping anything at all.
         ensure!(
-            self.peers.contains_key(&endpoint) || self.peers.len() < MAX_MESH_PEERS,
+            self.peers.contains_key(&endpoint) || self.peers.len() < MAX_OTHER_PEERS,
             "the mesh already has {MAX_MESH_PEERS} machines",
         );
 
@@ -190,6 +195,12 @@ impl MeshState {
         );
 
         Ok(())
+    }
+
+    /// Renames this machine; the bumped version propagates the rename
+    /// through the gossip.
+    pub fn rename_machine(&mut self, name: String) -> Result<()> {
+        self.machine.rename(name)
     }
 
     /// Tombstones an alive peer, resolved by name or full endpoint id.
@@ -301,11 +312,14 @@ impl MeshState {
         }
     }
 
-    /// The membership this machine gossips: every peer record (tombstones
-    /// included) and the mesh-wide repo list.
-    pub fn membership(&self) -> Membership {
+    /// The membership this machine gossips: its own record under `local`,
+    /// every peer record (tombstones included) and the mesh-wide repo
+    /// list.
+    pub fn membership(&self, local: EndpointId) -> Membership {
+        let mut peers = self.peers.clone();
+        peers.insert(local, self.machine.record());
         Membership {
-            peers: self.peers.clone(),
+            peers,
             repos: self.mesh_repos.clone(),
         }
     }
@@ -313,16 +327,21 @@ impl MeshState {
     /// Whether the gossiped part of the state (see [`Self::membership`])
     /// differs, without building it.
     pub fn membership_differs(&self, other: &Self) -> bool {
-        self.peers != other.peers || self.mesh_repos != other.mesh_repos
+        self.machine != other.machine
+            || self.peers != other.peers
+            || self.mesh_repos != other.mesh_repos
     }
 
     /// Merges a peer's membership into ours. `local` is this machine's own
-    /// endpoint: records about ourselves are not ours to store.
+    /// endpoint.
     ///
     /// Records merge as versioned registers (see the `membership`
     /// submodule), so every machine converges on the same state without
     /// clocks. Adopting a removed repo also unregisters it here: that is
     /// how the removal reaches the machines that hold it.
+    ///
+    /// Copies of our own record are absorbed by [`Machine::observe`] and
+    /// never stored as peers.
     ///
     /// New entries stop being adopted at the caps ([`MAX_MESH_PEERS`],
     /// [`MAX_MESH_REPOS`]) while updates to known ones keep flowing.
@@ -330,7 +349,11 @@ impl MeshState {
         for (endpoint, record) in &remote.peers {
             // Strictly below the ceiling: a record *at* it could never be
             // superseded by a local change, freezing the machine's status.
-            if endpoint == local || record.version >= MAX_RECORD_VERSION {
+            if record.version >= MAX_RECORD_VERSION {
+                continue;
+            }
+            if endpoint == local {
+                self.machine.observe(record);
                 continue;
             }
             if let PeerStatus::Alive { name } = &record.status
@@ -338,7 +361,7 @@ impl MeshState {
             {
                 continue;
             }
-            if should_adopt(&self.peers, endpoint, record, MAX_MESH_PEERS) {
+            if should_adopt(&self.peers, endpoint, record, MAX_OTHER_PEERS) {
                 self.peers.insert(*endpoint, record.clone());
             }
         }
@@ -376,7 +399,16 @@ fn canonical_path(path: &Path) -> PathBuf {
 mod tests {
     use iroh::SecretKey;
 
-    use super::*;
+    use super::{membership::Register as _, *};
+
+    impl Machine {
+        fn new(name: &str, version: u64) -> Self {
+            Machine {
+                name: name.to_owned(),
+                version,
+            }
+        }
+    }
 
     /// A mesh repo record in use.
     fn present(version: u64, id: &RepoId) -> MeshRepo {
@@ -500,16 +532,69 @@ mod tests {
         // ...and a higher version supersedes the tombstone (re-pairing).
         state.merge_membership(&membership(alive(3, "laptop")), &local);
         assert_eq!(state.peer_name(&peer), Some("laptop"));
+    }
 
-        // Records about ourselves are ignored.
-        state.merge_membership(
-            &Membership {
-                peers: BTreeMap::from([(local, removed(9))]),
-                repos: BTreeMap::new(),
+    #[test]
+    fn own_record_keeps_its_name_and_outranks_copies() {
+        let local = SecretKey::generate().public();
+        let alive = |version, name: &str| Peer {
+            version,
+            status: PeerStatus::Alive {
+                name: name.to_owned(),
             },
-            &local,
-        );
+        };
+        let about_us = |record: Peer| Membership {
+            peers: BTreeMap::from([(local, record)]),
+            repos: BTreeMap::new(),
+        };
+
+        let mut state = MeshState::default();
+        state.rename_machine("desk".to_owned()).unwrap();
+        assert_eq!(state.machine.version, 1);
+        assert_eq!(state.membership(local).peers[&local], alive(1, "desk"));
+
+        // A copy under our name is only matched...
+        state.merge_membership(&about_us(alive(3, "desk")), &local);
+        assert_eq!(state.machine, Machine::new("desk", 3));
+
+        // ...one under another name is outranked, so ours wins the merge
+        // everywhere...
+        state.merge_membership(&about_us(alive(5, "stale")), &local);
+        assert_eq!(state.machine, Machine::new("desk", 6));
+        assert!(alive(6, "desk").outranks(&alive(5, "stale")));
+
+        // ...and a tombstone is matched, not outranked: the removed machine
+        // cannot undo its removal.
+        let removed = Peer {
+            version: 8,
+            status: PeerStatus::Removed,
+        };
+        state.merge_membership(&about_us(removed.clone()), &local);
+        assert_eq!(state.machine, Machine::new("desk", 8));
+        assert!(!state.membership(local).peers[&local].outranks(&removed));
+
+        // Records about ourselves never land in the peer map.
         assert!(!state.peers.contains_key(&local));
+
+        // A copy parked next to the version ceiling is clamped: what we
+        // gossip stays below it (records at the ceiling are skipped by
+        // every merge), and the parked record is reported on rename
+        // instead of freezing us silently.
+        state.merge_membership(&about_us(alive(MAX_RECORD_VERSION - 1, "pwned")), &local);
+        assert_eq!(state.machine.version, MAX_RECORD_VERSION - 1);
+        assert!(state.membership(local).peers[&local].version < MAX_RECORD_VERSION);
+        assert!(state.rename_machine("frozen".to_owned()).is_err());
+    }
+
+    #[test]
+    fn rename_validates_and_bumps_once_per_change() {
+        let mut state = MeshState::default();
+        assert!(state.rename_machine(String::new()).is_err());
+        assert!(state.rename_machine("a\u{200B}b".to_owned()).is_err());
+
+        state.rename_machine("desk".to_owned()).unwrap();
+        state.rename_machine("desk".to_owned()).unwrap();
+        assert_eq!(state.machine, Machine::new("desk", 1));
     }
 
     #[test]
@@ -545,8 +630,11 @@ mod tests {
             state.merge_membership(&Membership { peers, repos }, &local);
         }
 
-        assert_eq!(state.peers.len(), MAX_MESH_PEERS);
+        assert_eq!(state.peers.len(), MAX_OTHER_PEERS);
         assert_eq!(state.mesh_repos.len(), MAX_MESH_REPOS);
+        // With our own record added, the membership stays within the wire
+        // cap.
+        assert_eq!(state.membership(local).peers.len(), MAX_MESH_PEERS);
     }
 
     #[test]

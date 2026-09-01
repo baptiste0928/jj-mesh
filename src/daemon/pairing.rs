@@ -48,8 +48,6 @@ pub struct Pairing {
 struct IssuedTicket {
     ticket: pair::PairTicket,
     expires: Instant,
-    /// Name this machine announces to the redeeming joiner.
-    local_name: String,
 }
 
 impl Pairing {
@@ -64,7 +62,7 @@ impl Pairing {
     }
 
     /// Issues a fresh one-time ticket, revoking any outstanding one.
-    pub async fn host(&self, local_name: String) -> Result<pair::PairTicket> {
+    pub async fn host(&self) -> Result<pair::PairTicket> {
         // Revoke before the relay wait below: a user re-hosting to kill a
         // leaked ticket must not depend on the relay being reachable, and
         // a failed reissue must fail closed.
@@ -85,7 +83,6 @@ impl Pairing {
         *self.issued.lock().unwrap() = Some(IssuedTicket {
             ticket: ticket.clone(),
             expires: Instant::now() + PAIR_TICKET_TTL,
-            local_name,
         });
 
         info!("pairing ticket issued");
@@ -103,14 +100,14 @@ impl Pairing {
             return;
         };
 
-        let Some((ticket, local_name)) = self.issued_ticket() else {
+        let Some(ticket) = self.issued_ticket() else {
             debug!("refusing pairing connection: no valid ticket");
             pair::reject_attempt(&conn, "no pairing in progress on this machine").await;
             return;
         };
 
         let snapshot = self.store.snapshot();
-        let exchange = pair::pair_with(&conn, &ticket, &local_name, &snapshot);
+        let exchange = pair::pair_with(&conn, &ticket, &snapshot);
         let peer = match tokio::time::timeout(EXCHANGE_TIMEOUT, exchange).await {
             Ok(Ok(pair::Outcome::Paired(peer))) => peer,
             Ok(Ok(pair::Outcome::Dismissed)) => return,
@@ -153,16 +150,13 @@ impl Pairing {
         }
     }
 
-    /// The outstanding ticket and announced name, dropping the ticket when
-    /// it turns out expired.
-    fn issued_ticket(&self) -> Option<(pair::PairTicket, String)> {
+    /// The outstanding ticket, dropped when it turns out expired.
+    fn issued_ticket(&self) -> Option<pair::PairTicket> {
         let mut issued = self.issued.lock().unwrap();
         if issued.as_ref().is_some_and(|i| i.expires <= Instant::now()) {
             *issued = None;
             info!("pairing ticket expired");
         }
-        issued
-            .as_ref()
-            .map(|i| (i.ticket.clone(), i.local_name.clone()))
+        issued.as_ref().map(|i| i.ticket.clone())
     }
 }

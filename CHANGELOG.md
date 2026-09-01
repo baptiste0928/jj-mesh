@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Current machine can now be renamed with `jj-mesh peer rename`.
+
 ## [0.1.1] - 2026-08-10
 
 ### Changed

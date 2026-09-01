@@ -181,7 +181,6 @@ enum Message {
 pub async fn pair_with(
     conn: &Connection,
     ticket: &PairTicket,
-    local_name: &str,
     state: &MeshState,
 ) -> Result<Outcome> {
     let opening = tokio::time::timeout(HELLO_TIMEOUT, async {
@@ -222,7 +221,7 @@ pub async fn pair_with(
     let name = resolve_peer_name(conn, &mut send, hello, &endpoint, state).await?;
 
     let welcome = Message::Welcome {
-        name: local_name.to_owned(),
+        name: state.machine.name.clone(),
     };
     if write_message(&mut send, &welcome, MAX_MESSAGE_SIZE)
         .await
@@ -271,7 +270,6 @@ pub fn confirm_paired(conn: &Connection) {
 pub async fn join(
     endpoint: &Endpoint,
     ticket: &PairTicket,
-    local_name: &str,
     state: &MeshState,
 ) -> Result<PairedPeer> {
     ensure!(
@@ -287,7 +285,7 @@ pub async fn join(
 
     let hello = Message::Hello {
         secret: ticket.secret.clone(),
-        name: local_name.to_owned(),
+        name: state.machine.name.clone(),
     };
     write_message(&mut send, &hello, MAX_MESSAGE_SIZE).await?;
 

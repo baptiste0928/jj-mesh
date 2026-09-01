@@ -30,6 +30,9 @@ without needing clocks:
 - on equal versions, removal (kept as a tombstone) wins over presence;
 - on a full tie, the smaller name wins.
 
+A machine's own record (its name, the hostname by default) is stored on the
+machine and gossiped with the rest.
+
 Repos are advertised like machines, and their mesh records are versioned
 registers too (tie-breaking on the smaller *id* instead of the name):
 registering a repo on one machine makes it visible everywhere, and clonable
@@ -70,9 +73,9 @@ Each machine stores everything mesh-related in its config directory
 
 - **The identity key**, in its own file, only ever read by the daemon.
 - **`mesh.json`**, this machine's copy of the mesh state, in two parts: what
-  is replicated by the gossip (peer records, tombstones included, and the
-  mesh-wide repo list) and what is strictly local (the repos registered
-  here, with their paths). Only the daemon writes it: the CLI mutates it
+  is replicated by the gossip (this machine's own record, the peer records,
+  tombstones included, and the mesh-wide repo list) and what is strictly
+  local (the repos registered here, with their paths). Only the daemon writes it: the CLI mutates it
   through the daemon's control socket, and reads it directly only for
   pre-checks and completion, treating what it sees as advisory.
 - **The user configuration**, the only hand-edited file, holding local

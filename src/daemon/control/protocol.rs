@@ -54,10 +54,10 @@ pub enum Request {
     /// [`Response::Error`]. The exchange itself runs in the daemon; the
     /// ticket is valid for [`PAIR_TICKET_TTL`] or until redeemed or
     /// replaced.
-    PairHost { name: String },
+    PairHost,
     /// Join a pairing hosted by another machine. Answered with
     /// [`Response::Paired`] or [`Response::Error`].
-    PairJoin { ticket: String, name: String },
+    PairJoin { ticket: String },
     /// Pull the full state of the mesh repo named `name` into a freshly
     /// initialized local repo at `path` and register it (see `jj-mesh repo
     /// clone`). Answered with a stream of [`Response::CloneProgress`] frames
@@ -79,6 +79,9 @@ pub enum Request {
     /// the mesh keeps the repo and it stays clonable here. Answered with
     /// [`Response::RepoForgotten`] or [`Response::Error`].
     ForgetRepo { name: String },
+    /// Rename this machine; peers learn the new name through the gossip.
+    /// Answered with [`Response::MachineRenamed`] or [`Response::Error`].
+    RenameMachine { name: String },
 }
 
 /// A daemon answer to a [`Request`].
@@ -121,6 +124,8 @@ pub enum Response {
     RepoForgotten {
         path: PathBuf,
     },
+    /// This machine's name is changed in the mesh state.
+    MachineRenamed,
 }
 
 /// A snapshot of a running clone pull, for progress display.
@@ -140,6 +145,8 @@ pub struct CloneProgress {
 /// the daemon: the CLI displays this structure as-is.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Status {
+    /// This machine's name in the mesh.
+    pub name: String,
     /// This machine's endpoint id.
     pub endpoint: EndpointId,
     /// Seconds since the daemon started.

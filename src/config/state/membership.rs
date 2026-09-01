@@ -20,6 +20,10 @@ use super::RepoId;
 /// without bound.
 pub const MAX_MESH_PEERS: usize = 256;
 
+/// Cap on the other machines' records, leaving room for our own in the
+/// gossiped membership.
+pub(super) const MAX_OTHER_PEERS: usize = MAX_MESH_PEERS - 1;
+
 /// Cap on repos tracked in the mesh-wide repo list, same reasoning.
 pub const MAX_MESH_REPOS: usize = 1024;
 
@@ -49,19 +53,24 @@ pub(super) trait Register: Clone {
 }
 
 /// The version a local change to the record under `key` must carry to
-/// outrank the stored one. Refuses to pass [`MAX_RECORD_VERSION`]: a
-/// saturating bump would make the record unchangeable, so one parked at the
-/// ceiling is reported instead of silently freezing its subject out.
+/// outrank the stored one.
 pub(super) fn bumped_version<K, Q, V>(map: &BTreeMap<K, V>, key: &Q) -> Result<u64>
 where
     K: Ord + Borrow<Q>,
     Q: Ord + fmt::Display + ?Sized,
     V: Register,
 {
-    let version = map.get(key).map_or(0, V::version);
+    next_version(map.get(key).map_or(0, V::version), key)
+}
+
+/// The version after `version` for the record of `subject`. Refuses to
+/// reach [`MAX_RECORD_VERSION`]: every merge skips records at the ceiling,
+/// so handing it out would freeze the subject; a record parked next to it
+/// is reported instead.
+pub(super) fn next_version(version: u64, subject: impl fmt::Display) -> Result<u64> {
     ensure!(
-        version < MAX_RECORD_VERSION,
-        "the mesh record of `{key}` is corrupted (version {version}); \
+        version + 1 < MAX_RECORD_VERSION,
+        "the mesh record of {subject} is corrupted (version {version}); \
          remove it from mesh.json on every machine",
     );
 

@@ -112,6 +112,7 @@ impl ControlContext {
             .collect();
 
         Status {
+            name: state.machine.name,
             endpoint: self.endpoint.secret_key().public(),
             uptime_secs: self.started.elapsed().unwrap_or_default().as_secs(),
             jj_version: self.jj_version.clone(),
@@ -218,8 +219,8 @@ async fn handle_client(mut stream: UnixStream, ctx: Arc<ControlContext>) {
     // and share one error conversion.
     let served = match request {
         Request::Status => reply(&mut stream, Ok(Response::Status(ctx.status()))).await,
-        Request::PairHost { name } => reply(&mut stream, pair_host(&ctx, name).await).await,
-        Request::PairJoin { ticket, name } => pair_join(&mut stream, &ctx, &ticket, &name).await,
+        Request::PairHost => reply(&mut stream, pair_host(&ctx).await).await,
+        Request::PairJoin { ticket } => pair_join(&mut stream, &ctx, &ticket).await,
         Request::CloneRepo { name, path } => {
             clone::clone_repo(&mut stream, &ctx, &name, &path).await
         }
@@ -229,6 +230,7 @@ async fn handle_client(mut stream: UnixStream, ctx: Arc<ControlContext>) {
         Request::RemoveRepo { name } => reply(&mut stream, remove_repo(&ctx, &name)).await,
         Request::RemovePeer { peer } => reply(&mut stream, remove_peer(&ctx, &peer)).await,
         Request::ForgetRepo { name } => reply(&mut stream, forget_repo(&ctx, &name)).await,
+        Request::RenameMachine { name } => reply(&mut stream, rename_machine(&ctx, &name)).await,
     };
 
     if let Err(err) = served {
@@ -260,25 +262,20 @@ pub(super) async fn respond(
 /// Hosts a pairing: issues a fresh one-time ticket, revoking any
 /// outstanding one. The exchange itself runs in the daemon once the other
 /// machine redeems the ticket.
-async fn pair_host(ctx: &ControlContext, name: String) -> Result<Response> {
-    let ticket = ctx.pairing.host(name).await?;
+async fn pair_host(ctx: &ControlContext) -> Result<Response> {
+    let ticket = ctx.pairing.host().await?;
     Ok(Response::PairTicket(ticket.to_string()))
 }
 
 /// Joins a pairing hosted by another machine. Aborts the exchange when the
 /// client disconnects, so a cancelled join cannot pair behind the user's
 /// back.
-async fn pair_join(
-    stream: &mut UnixStream,
-    ctx: &ControlContext,
-    ticket: &str,
-    name: &str,
-) -> Result<()> {
+async fn pair_join(stream: &mut UnixStream, ctx: &ControlContext, ticket: &str) -> Result<()> {
     let (mut read_half, mut write_half) = stream.split();
 
     let exchange = async {
         let ticket: pair::PairTicket = ticket.parse()?;
-        pair::join(&ctx.endpoint, &ticket, name, &ctx.store.snapshot()).await
+        pair::join(&ctx.endpoint, &ticket, &ctx.store.snapshot()).await
     };
     let result = tokio::select! {
         result = tokio::time::timeout(PAIRING_TIMEOUT, exchange) => result.unwrap_or_else(|_| {
@@ -356,6 +353,14 @@ fn remove_peer(ctx: &ControlContext, peer: &str) -> Result<Response> {
     let endpoint = ctx.store.update(|state| state.remove_peer(peer))?;
     info!(peer = %peer, "peer removed");
     Ok(Response::PeerRemoved(endpoint))
+}
+
+/// Renames this machine; the store gossips the change.
+fn rename_machine(ctx: &ControlContext, name: &str) -> Result<Response> {
+    ctx.store
+        .update(|state| state.rename_machine(name.to_owned()))?;
+    info!(name = %name, "machine renamed");
+    Ok(Response::MachineRenamed)
 }
 
 /// Resolves when the client closes its end of the connection.

@@ -18,7 +18,7 @@ use indicatif::{HumanBytes, ProgressBar, ProgressStyle};
 
 use super::jj;
 use crate::{
-    cli::{complete, hostname, ui},
+    cli::{complete, ui},
     config::{ConfigDir, MeshState},
     daemon::control::{self, CloneProgress, Request, Response, TransferPhase},
 };
@@ -43,8 +43,7 @@ pub struct CloneArgs {
     #[arg(value_hint = ValueHint::DirPath)]
     path: Option<PathBuf>,
 
-    /// This machine's workspace name in the repo (defaults to the
-    /// hostname)
+    /// Override the workspace name (defaults to this machine name)
     ///
     /// We assign a workspace for each copy of the repo across the mesh, so the
     /// current head of each machine is displayed in `jj log`.
@@ -63,14 +62,15 @@ pub fn run(args: CloneArgs, dir: &ConfigDir) -> Result<()> {
     // accept the repo (the daemon re-validates authoritatively before
     // registering).
     control::ensure_daemon_blocking(dir)?;
-    MeshState::load(dir)?.validate_new_repo(&name, &path)?;
+    let state = MeshState::load(dir)?;
+    state.validate_new_repo(&name, &path)?;
     ensure!(
         !path.exists(),
         "{} already exists (clone creates the directory)",
         path.display(),
     );
 
-    let workspace = args.workspace.unwrap_or_else(hostname);
+    let workspace = args.workspace.unwrap_or(state.machine.name);
 
     // Fresh repo with a machine-unique workspace name, using the user's
     // own jj (their config applies to the repo from the start). Never

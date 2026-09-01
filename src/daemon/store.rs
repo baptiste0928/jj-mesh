@@ -9,10 +9,11 @@
 use std::sync::{Arc, Mutex};
 
 use color_eyre::eyre::Result;
+use iroh::EndpointId;
 
 use super::{hub::SyncHub, peers::PeerSet, repos::RepoSet};
 use crate::{
-    config::{ConfigDir, MeshState},
+    config::{ConfigDir, Membership, MeshState},
     net::pair,
 };
 
@@ -20,6 +21,8 @@ use crate::{
 #[derive(Debug)]
 pub struct MeshStore {
     dir: ConfigDir,
+    /// This machine's endpoint, under which its own record is gossiped.
+    local: EndpointId,
     state: Mutex<MeshState>,
     peers: Arc<PeerSet>,
     repos: Arc<RepoSet>,
@@ -32,17 +35,19 @@ impl MeshStore {
     /// task cannot connect and replay an empty membership.
     pub fn new(
         dir: ConfigDir,
+        local: EndpointId,
         state: MeshState,
         peers: Arc<PeerSet>,
         repos: Arc<RepoSet>,
         hub: Arc<SyncHub>,
     ) -> Self {
-        hub.publish_membership(state.membership());
+        hub.publish_membership(state.membership(local));
         peers.sync(&state);
         repos.sync(&state);
 
         MeshStore {
             dir,
+            local,
             state: Mutex::new(state),
             peers,
             repos,
@@ -62,7 +67,18 @@ impl MeshStore {
     /// is the anti-entropy that heals it.
     pub fn republish_membership(&self) {
         let state = self.state.lock().unwrap();
-        self.hub.publish_membership(state.membership());
+        self.hub.publish_membership(state.membership(self.local));
+    }
+
+    /// Merges a peer's membership; a merge that changes anything is
+    /// persisted and re-broadcast, which carries membership across machines
+    /// that are not directly exchanging, while one that changes nothing is
+    /// silent, which stops the echo.
+    pub fn merge_membership(&self, remote: &Membership) -> Result<()> {
+        self.update(|state| {
+            state.merge_membership(remote, &self.local);
+            Ok(())
+        })
     }
 
     /// Registers a paired peer; a no-op when the endpoint is already alive
@@ -100,7 +116,7 @@ impl MeshStore {
         self.peers.sync(&state);
         self.repos.sync(&state);
         if membership_changed {
-            self.hub.publish_membership(state.membership());
+            self.hub.publish_membership(state.membership(self.local));
         }
 
         Ok(value)

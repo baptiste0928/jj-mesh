@@ -18,7 +18,7 @@ use std::{
 
 use iroh::address_lookup::MemoryLookup;
 use jj_mesh::{
-    config::ConfigDir,
+    config::{ConfigDir, MeshState},
     daemon::{
         Daemon,
         control::{ConnectionStatus, ControlClient, Request, Response, Status},
@@ -60,6 +60,7 @@ impl TestMesh {
             daemon: None,
         };
         machine.start().await;
+        machine.rename(name).await;
         machine
     }
 
@@ -113,6 +114,16 @@ impl Machine {
             .await
             .unwrap_or_else(|err| panic!("{}: daemon failed to start: {err:#}", self.name));
         self.daemon = Some(daemon);
+    }
+
+    /// Edits the stored mesh state directly, as a user (or a bug) could.
+    /// The daemon must be stopped: it owns the file while running.
+    pub fn edit_state(&self, edit: impl FnOnce(&mut MeshState)) {
+        assert!(self.daemon.is_none(), "{}: daemon running", self.name);
+        let dir = self.config_dir();
+        let mut state = MeshState::load(&dir).unwrap();
+        edit(&mut state);
+        state.save(&dir).unwrap();
     }
 
     /// Stops the daemon, releasing its control socket.
@@ -184,34 +195,35 @@ impl Machine {
         .await;
     }
 
+    /// Renames this machine, as `jj-mesh peer rename` would.
+    pub async fn rename(&self, name: &str) {
+        let response = self
+            .request(&Request::RenameMachine {
+                name: name.to_owned(),
+            })
+            .await;
+        assert!(matches!(response, Response::MachineRenamed), "{response:?}");
+    }
+
     /// Issues a pairing ticket on this machine, as `jj-mesh peer add` would.
     pub async fn host_pairing(&self) -> String {
-        match self
-            .request(&Request::PairHost {
-                name: self.name.clone(),
-            })
-            .await
-        {
+        match self.request(&Request::PairHost).await {
             Response::PairTicket(ticket) => ticket,
             other => panic!("{}: expected a pairing ticket, got {other:?}", self.name),
         }
     }
 
-    /// Attempts to join a pairing with `ticket`, announcing `name`, and
-    /// returns the daemon's verdict.
-    pub async fn try_join_pairing(&self, ticket: String, name: &str) -> Response {
-        self.try_request(&Request::PairJoin {
-            ticket,
-            name: name.to_owned(),
-        })
-        .await
+    /// Attempts to join a pairing with `ticket` and returns the daemon's
+    /// verdict.
+    pub async fn try_join_pairing(&self, ticket: String) -> Response {
+        self.try_request(&Request::PairJoin { ticket }).await
     }
 
-    /// Joins a pairing with `ticket` under this machine's name. The host
-    /// persists the peer before confirming, so the `Paired` answer asserted
-    /// here means both sides are registered.
+    /// Joins a pairing with `ticket`. The host persists the peer before
+    /// confirming, so the `Paired` answer asserted here means both sides
+    /// are registered.
     pub async fn join_pairing(&self, ticket: String) {
-        let joined = self.try_join_pairing(ticket, &self.name).await;
+        let joined = self.try_join_pairing(ticket).await;
         assert!(
             matches!(joined, Response::Paired { .. }),
             "{}: {joined:?}",
