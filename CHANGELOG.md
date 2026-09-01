@@ -10,6 +10,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - Current machine can now be renamed with `jj-mesh peer rename`.
 
+### Fixed
+- Improved memory usage when idle, including a case where memory could grow
+  multiple GB when you have a large `/etc/hosts`.
+
 ## [0.1.1] - 2026-08-10
 
 ### Changed
