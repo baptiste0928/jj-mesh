@@ -204,7 +204,10 @@ pub struct PeerStatus {
 #[derive(Debug, Serialize, Deserialize)]
 pub enum ConnectionStatus {
     /// Dialing, or waiting for the peer to dial us.
-    Connecting,
+    Connecting {
+        /// Consecutive failed attempts before this one.
+        failures: u32,
+    },
     /// Connection established.
     Connected {
         /// The selected network path, when already known.
@@ -216,6 +219,8 @@ pub enum ConnectionStatus {
     Backoff {
         /// Seconds until the next attempt.
         retry_in_secs: u64,
+        /// Why the last attempt failed.
+        error: String,
     },
 }
 

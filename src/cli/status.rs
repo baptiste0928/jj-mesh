@@ -164,10 +164,13 @@ fn watch_summary(watch: &control::WatchStatus) -> String {
 /// One-line description of a peer connection.
 fn connection_summary(connection: &ConnectionStatus) -> String {
     match connection {
-        ConnectionStatus::Connecting => ui::warn("connecting").to_string(),
-        ConnectionStatus::Backoff { retry_in_secs } => format!(
+        ConnectionStatus::Connecting { failures: 0 } => ui::warn("connecting").to_string(),
+        ConnectionStatus::Connecting { .. } => {
+            format!("{} (retrying)", ui::bad("offline"))
+        }
+        ConnectionStatus::Backoff { retry_in_secs, .. } => format!(
             "{} (retry in {})",
-            ui::bad("unreachable"),
+            ui::bad("offline"),
             ui::format_duration(*retry_in_secs)
         ),
         ConnectionStatus::Connected { path, since_secs } => {

@@ -37,6 +37,10 @@ const STREAM_READ_TIMEOUT: Duration = Duration::from_secs(10);
 /// pending their routing to repo tasks.
 const MAX_FETCH_STREAMS: usize = 4;
 
+/// Budget for one dial. iroh only gives up on its own after its handshake
+/// idle timeout, and a peer with a stale discovery record hangs until then.
+const DIAL_TIMEOUT: Duration = Duration::from_secs(15);
+
 /// Reconnect delay after a first failure; doubles up to [`BACKOFF_MAX`].
 const BACKOFF_MIN: Duration = Duration::from_secs(1);
 
@@ -75,9 +79,18 @@ struct PeerHandle {
 /// snapshots.
 #[derive(Debug)]
 enum PeerState {
-    Connecting,
-    Connected { conn: Connection, since: SystemTime },
-    Backoff { until: Instant },
+    /// Dialing, after `failures` consecutive failed attempts.
+    Connecting {
+        failures: u32,
+    },
+    Connected {
+        conn: Connection,
+        since: SystemTime,
+    },
+    Backoff {
+        until: Instant,
+        error: String,
+    },
 }
 
 impl PeerSet {
@@ -175,9 +188,12 @@ impl PeerSet {
             .iter()
             .map(|(id, handle)| {
                 let connection = match &*handle.state.lock().unwrap() {
-                    PeerState::Connecting => control::ConnectionStatus::Connecting,
-                    PeerState::Backoff { until } => control::ConnectionStatus::Backoff {
+                    PeerState::Connecting { failures } => control::ConnectionStatus::Connecting {
+                        failures: *failures,
+                    },
+                    PeerState::Backoff { until, error } => control::ConnectionStatus::Backoff {
                         retry_in_secs: until.saturating_duration_since(Instant::now()).as_secs(),
+                        error: error.clone(),
                     },
                     PeerState::Connected { conn, since } => control::ConnectionStatus::Connected {
                         path: selected_path(conn),
@@ -195,7 +211,7 @@ impl PeerSet {
     }
 
     fn spawn_peer(&self, peer_id: EndpointId, name: String) -> PeerHandle {
-        let state = Arc::new(Mutex::new(PeerState::Connecting));
+        let state = Arc::new(Mutex::new(PeerState::Connecting { failures: 0 }));
         let (tx, rx) = mpsc::channel(4);
 
         let task = tokio::spawn(run_peer(PeerTask {
@@ -265,16 +281,21 @@ struct PeerTask {
 /// Maintains the connection to one peer forever.
 async fn run_peer(mut task: PeerTask) {
     let mut backoff = Backoff::new(BACKOFF_MIN, BACKOFF_MAX);
-    // Delay to respect before the next attempt, from a previous failure.
-    let mut delay = None;
+    // Consecutive attempts that failed to yield a stable connection.
+    let mut failures = 0u32;
+    // Why the last attempt failed, to be waited out before the next one.
+    let mut failure: Option<String> = None;
 
     loop {
         // Wait out the backoff, adopting an inbound connection if one
         // arrives in the meantime.
         let mut adopted = None;
-        if let Some(delay) = delay.take() {
+        if let Some(error) = failure.take() {
+            failures += 1;
+            let delay = backoff.next_delay();
             task.set_state(PeerState::Backoff {
                 until: Instant::now() + delay,
+                error,
             });
             tokio::select! {
                 () = tokio::time::sleep(delay) => {}
@@ -283,12 +304,15 @@ async fn run_peer(mut task: PeerTask) {
         }
 
         let established = match adopted {
-            Some(adopted) => Some(adopted),
-            None => task.establish().await,
+            Some(adopted) => Ok(adopted),
+            None => task.establish(failures).await,
         };
-        let Some((conn, outbound)) = established else {
-            delay = Some(backoff.next_delay());
-            continue;
+        let (conn, outbound) = match established {
+            Ok(established) => established,
+            Err(error) => {
+                failure = Some(error);
+                continue;
+            }
         };
 
         let held = Instant::now();
@@ -298,22 +322,23 @@ async fn run_peer(mut task: PeerTask) {
 
         if held.elapsed() >= STABLE_UPTIME {
             backoff.reset();
+            failures = 0;
         } else {
-            delay = Some(backoff.next_delay());
+            failure = Some("connection dropped right after connecting".to_owned());
         }
     }
 }
 
 impl PeerTask {
-    /// Dials the peer, returning `None` on failure.
+    /// Dials the peer, returning why it failed otherwise.
     ///
     /// The lower endpoint id prefers completing its own dial, leaving
     /// inbound connections queued for the duplicate tie-break; the higher id
     /// adopts whichever lands first. First-wins on both sides could adopt
     /// mirrored connections that the other side just abandoned, redialing
     /// in a loop.
-    async fn establish(&mut self) -> Option<(Connection, bool)> {
-        self.set_state(PeerState::Connecting);
+    async fn establish(&mut self, failures: u32) -> Result<(Connection, bool), String> {
+        self.set_state(PeerState::Connecting { failures });
 
         if self.local_id < self.peer_id {
             dial(&self.endpoint, self.peer_id, &self.name)
@@ -324,7 +349,7 @@ impl PeerTask {
                 dialed = dial(&self.endpoint, self.peer_id, &self.name) => {
                     dialed.map(|conn| (conn, true))
                 }
-                Some(conn) = self.inbound.recv() => Some((conn, false)),
+                Some(conn) = self.inbound.recv() => Ok((conn, false)),
             }
         }
     }
@@ -448,13 +473,14 @@ impl PeerTask {
     }
 }
 
-/// Dials the peer on the sync ALPN, `None` on failure.
-async fn dial(endpoint: &Endpoint, peer: EndpointId, name: &str) -> Option<Connection> {
-    match endpoint.connect(peer, sync::ALPN).await {
-        Ok(conn) => Some(conn),
-        Err(err) => {
-            debug!(peer = %name, "dial failed: {err:#}");
-            None
-        }
-    }
+/// Dials the peer on the sync ALPN within [`DIAL_TIMEOUT`], returning why it
+/// failed otherwise.
+async fn dial(endpoint: &Endpoint, peer: EndpointId, name: &str) -> Result<Connection, String> {
+    let error = match tokio::time::timeout(DIAL_TIMEOUT, endpoint.connect(peer, sync::ALPN)).await {
+        Ok(Ok(conn)) => return Ok(conn),
+        Ok(Err(err)) => format!("{err:#}"),
+        Err(_) => format!("no answer within {}s", DIAL_TIMEOUT.as_secs()),
+    };
+    debug!(peer = %name, "dial failed: {error}");
+    Err(error)
 }
