@@ -57,5 +57,25 @@
           inherit jj-mesh;
         }
       );
+
+
+      devShells = forEachSystem (
+        system:
+        let
+          pkgs = nixpkgs.legacyPackages.${system};
+        in
+        {
+          default = pkgs.mkShell {
+            packages = with pkgs; [
+              cargo
+              rustc
+              clippy
+              rustfmt
+              rust-analyzer
+            ];
+            env.RUST_SRC_PATH = "${pkgs.rustPlatform.rustLibSrc}";
+          };
+        }
+      );
     };
 }
