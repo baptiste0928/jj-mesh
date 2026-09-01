@@ -74,6 +74,9 @@ pub struct TreeWatcher {
     /// events and acted on once per batch: one walk is expensive, and a
     /// checkout can touch thousands of paths that each ask for one.
     stale: bool,
+    /// A change was consumed but not yet reported: [`changed`](Self::changed)
+    /// dropped mid-way reports it on the next call instead of losing it.
+    pending: bool,
 }
 
 impl TreeWatcher {
@@ -116,6 +119,7 @@ impl TreeWatcher {
             watched: BTreeSet::new(),
             rules: Arc::new(Mutex::new(Rules::new(root))),
             stale: false,
+            pending: false,
         };
         let dirs = walk_dirs(&watch.root, watch.rules.clone())?;
         watch.apply(dirs);
@@ -125,18 +129,23 @@ impl TreeWatcher {
     /// Waits for the next change to a non-ignored file or directory.
     /// Errors when the watch is dead (root gone, backend failed) and the
     /// whole watcher must be rebuilt.
+    ///
+    /// Cancel-safe: a change consumed before the future was dropped is
+    /// reported by the next call.
     pub async fn changed(&mut self) -> Result<()> {
         loop {
-            let signal = self
-                .signals
-                .recv()
-                .await
-                .ok_or_else(|| eyre!("filesystem watcher stopped"))?;
-            let mut relevant = self.handle(signal)?;
-            relevant |= self.drain_queued()?;
+            if !self.pending {
+                let signal = self
+                    .signals
+                    .recv()
+                    .await
+                    .ok_or_else(|| eyre!("filesystem watcher stopped"))?;
+                self.pending = self.handle(signal)?;
+            }
+            self.pending |= self.drain_queued()?;
             self.settle().await?;
 
-            if relevant {
+            if std::mem::take(&mut self.pending) {
                 return Ok(());
             }
         }
@@ -147,6 +156,7 @@ impl TreeWatcher {
     /// events its own working-copy writes caused, which would otherwise
     /// schedule a snapshot of that very work.
     pub async fn discard_queued(&mut self) -> Result<()> {
+        self.pending = false;
         self.drain_queued()?;
         self.settle().await
     }
@@ -166,7 +176,7 @@ impl TreeWatcher {
     /// Re-derives the watched set if anything in this batch invalidated
     /// it.
     async fn settle(&mut self) -> Result<()> {
-        if std::mem::take(&mut self.stale) {
+        if self.stale {
             let root = self.root.clone();
             let rules = self.rules.clone();
             // On a large tree the walk is hundreds of milliseconds of
@@ -175,6 +185,7 @@ impl TreeWatcher {
                 .await
                 .wrap_err("working copy walk task failed")??;
             self.apply(dirs);
+            self.stale = false;
         }
         Ok(())
     }

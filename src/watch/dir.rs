@@ -6,7 +6,7 @@ use color_eyre::eyre::{Result, WrapErr as _, bail};
 use notify::{
     Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher as _, event::ModifyKind,
 };
-use tokio::sync::mpsc;
+use tokio::{sync::mpsc, time::Instant};
 
 use super::backend;
 
@@ -21,6 +21,10 @@ pub struct DirWatcher {
     signals: mpsc::UnboundedReceiver<Signal>,
     debounce: Duration,
     debounce_max: Duration,
+    /// Cap of the burst being debounced, if a change was received but not
+    /// yet reported: [`changed_or_idle`](Self::changed_or_idle) dropped
+    /// mid-debounce resumes here instead of losing the change.
+    burst: Option<Instant>,
 }
 
 impl DirWatcher {
@@ -58,6 +62,7 @@ impl DirWatcher {
             signals,
             debounce,
             debounce_max,
+            burst: None,
         })
     }
 
@@ -65,29 +70,38 @@ impl DirWatcher {
     /// after `idle` without an event and returns `Ok(false)`, letting the
     /// caller run a liveness check: some watch deaths (unmounts) produce no
     /// event at all. Errors when the watch is dead and must be rebuilt.
+    ///
+    /// Cancel-safe: a change received before the future was dropped is
+    /// reported by the next call.
     pub async fn changed_or_idle(&mut self, idle: Duration) -> Result<bool> {
-        let Ok(signal) = tokio::time::timeout(idle, self.signals.recv()).await else {
-            return Ok(false);
+        let deadline = if let Some(deadline) = self.burst {
+            deadline
+        } else {
+            let Ok(signal) = tokio::time::timeout(idle, self.signals.recv()).await else {
+                return Ok(false);
+            };
+            check(signal)?;
+            *self.burst.insert(Instant::now() + self.debounce_max)
         };
-        match signal {
-            Some(Signal::Event(())) => {}
-            Some(Signal::Failed(msg)) => bail!(msg),
-            None => bail!("filesystem watcher stopped"),
-        }
-        self.debounce().await?;
-        Ok(true)
-    }
-
-    /// Waits out an event burst, bounded by the debounce cap.
-    async fn debounce(&mut self) -> Result<()> {
-        let deadline = tokio::time::Instant::now() + self.debounce_max;
+        // Wait out the burst, bounded by the cap.
         loop {
             match tokio::time::timeout(self.debounce, self.signals.recv()).await {
-                Ok(Some(Signal::Event(()))) if tokio::time::Instant::now() < deadline => {}
+                Ok(Some(Signal::Event(()))) if Instant::now() < deadline => {}
                 Ok(Some(Signal::Failed(msg))) => bail!(msg),
-                _ => return Ok(()),
+                _ => break,
             }
         }
+        self.burst = None;
+        Ok(true)
+    }
+}
+
+/// Turns a received signal into the watch's fate.
+fn check(signal: Option<Signal>) -> Result<()> {
+    match signal {
+        Some(Signal::Event(())) => Ok(()),
+        Some(Signal::Failed(msg)) => bail!(msg),
+        None => bail!("filesystem watcher stopped"),
     }
 }
 
