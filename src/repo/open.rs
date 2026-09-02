@@ -2,9 +2,10 @@
 //!
 //! [`OpenRepo`] wraps a [`RepoLoader`] and exposes op-head enumeration, op
 //! DAG walking, op/view transfer primitives and the git backend. It never
-//! loads a full repo; the commit index is only touched by the explicit
+//! loads a full repo; the commit index is built only by the explicit
 //! builds (see [`OpenRepo::build_commit_indexes`]): syncs run one before
 //! publishing an op head, and the repo watch heals heads that lack one.
+//! The git ref mirror reads the built indexes to merge divergent views.
 //!
 //! Invariants:
 //! - Ops and views replicate as raw stored bytes under the sender's ids
@@ -32,6 +33,7 @@ use jj_lib::{
     default_backend_factories::default_backend_factories,
     default_index::DefaultIndexStore,
     git_backend::GitBackend,
+    index::ReadonlyIndex,
     object_id::{HexPrefix, ObjectId, PrefixResolution},
     op_store::{Operation, OperationId, View, ViewId},
     repo::RepoLoader,
@@ -122,6 +124,21 @@ impl OpenRepo {
 
     pub async fn read_operation(&self, id: &OperationId) -> Result<Operation> {
         Ok(self.loader.op_store().read_operation(id).await?)
+    }
+
+    /// Loads an operation as jj_lib's handle, for its walks and views.
+    pub async fn load_operation(&self, id: &OperationId) -> Result<jj_lib::operation::Operation> {
+        Ok(self.loader.load_operation(id).await?)
+    }
+
+    /// The commit index at an operation, built first when missing.
+    /// Blocking.
+    pub fn index_at(&self, op: &jj_lib::operation::Operation) -> Result<Box<dyn ReadonlyIndex>> {
+        Ok(self
+            .loader
+            .index_store()
+            .get_index_at_op(op, self.loader.store())
+            .block_on()?)
     }
 
     /// Builds the commit index at the given operation, incrementally from
@@ -406,10 +423,16 @@ impl OpenRepo {
         self.git_backend().git_repo_path()
     }
 
-    /// Whether the repo is colocated with a user-visible `.git`, which
-    /// then must be kept in sync when applying remote operations.
+    /// Whether the repo is colocated with a user-visible `.git`.
     pub fn is_colocated(&self) -> bool {
         self.git_repo_path() == self.repo.root().join(".git")
+    }
+
+    /// Whether the git repo lives inside `.jj`, where only jj writes refs.
+    /// False when colocated or backed by an external git repo (`jj git
+    /// init --git-repo`), whose refs the user may edit directly.
+    pub fn owns_git_refs(&self) -> bool {
+        self.git_repo_path() == self.repo.repo_dir().join("store").join("git")
     }
 }
 

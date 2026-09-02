@@ -79,8 +79,17 @@ impl Fixture {
     /// Initializes a fresh non-colocated repo named `name` with a
     /// machine-unique workspace name, ready to receive a pull.
     pub fn init_pull_target(&self, name: &str, workspace: &str) -> PathBuf {
+        self.init_target(name, workspace, "--no-colocate")
+    }
+
+    /// [`Self::init_pull_target`], colocated.
+    pub fn init_colocated_pull_target(&self, name: &str, workspace: &str) -> PathBuf {
+        self.init_target(name, workspace, "--colocate")
+    }
+
+    fn init_target(&self, name: &str, workspace: &str, colocate: &str) -> PathBuf {
         let dir = self.tmp.path().join(name);
-        self.jj(self.tmp.path(), &["git", "init", "--no-colocate", name]);
+        self.jj(self.tmp.path(), &["git", "init", colocate, name]);
         self.jj(&dir, &["workspace", "rename", workspace]);
         dir
     }

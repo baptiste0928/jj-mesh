@@ -1,7 +1,13 @@
 //! End-to-end transfer tests: fetch/serve exchanges over in-memory stream
 //! pairs against real jj repos, as the daemon runs them over QUIC.
 
-use std::{fs, path::Path, process::Command, sync::Arc, time::Duration};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    process::Command,
+    sync::Arc,
+    time::Duration,
+};
 
 use jj_lib::object_id::ObjectId as _;
 
@@ -241,9 +247,58 @@ async fn colocated_sync_mirrors_git_branches() {
     fx.jj(&dir_b, &["log", "-r", "all()"]);
 }
 
+/// A git HEAD symbolic to a branch the mirror moves must be detached at
+/// its current commit first, as jj's export does: otherwise git's index
+/// and worktree fall behind the branch, and jj's next import reads the
+/// jump as a checkout.
+#[tokio::test]
+async fn mirror_detaches_head_before_moving_its_branch() {
+    let fx = Fixture::new();
+    let dir_a = fx.path().join("a");
+    fx.jj(fx.path(), &["git", "init", "--colocate", "a"]);
+    fx.jj(&dir_a, &["describe", "-m", "base"]);
+    fx.jj(&dir_a, &["bookmark", "create", "main", "-r", "@"]);
+    fx.jj(&dir_a, &["new", "-m", "export"]);
+    fork(&dir_a, &fx.path().join("b"));
+    let dir_b = fx.path().join("b");
+
+    // The user checks the branch out in b's colocated git.
+    git(
+        &dir_b.join(".git"),
+        &["symbolic-ref", "HEAD", "refs/heads/main"],
+    );
+    let checked_out = git_rev(&dir_b, "refs/heads/main");
+
+    fs::write(dir_a.join("file.txt"), "moved\n").unwrap();
+    fx.jj(&dir_a, &["commit", "-m", "advance"]);
+    fx.jj(&dir_a, &["bookmark", "set", "main", "-r", "@-"]);
+    fx.jj(&dir_a, &["new", "-m", "trigger export"]);
+
+    let (ra, rb) = (open(&dir_a), open(&dir_b));
+    let wants = ra.op_heads().await.unwrap();
+    sync_once(&rb, &ra, &wants).await;
+
+    assert_eq!(
+        git_rev(&dir_b, "refs/heads/main"),
+        git_rev(&dir_a, "refs/heads/main")
+    );
+    assert_eq!(git_rev(&dir_b, "HEAD"), checked_out);
+    assert!(
+        !git_ok(&dir_b.join(".git"), &["symbolic-ref", "-q", "HEAD"]),
+        "HEAD must be detached"
+    );
+}
+
+/// Resolves `rev` in the colocated `.git` of `dir`.
 fn git_rev(dir: &Path, rev: &str) -> String {
+    git_rev_at(&dir.join(".git"), rev)
+}
+
+/// Resolves `rev` in the git repo at `git_dir`.
+fn git_rev_at(git_dir: &Path, rev: &str) -> String {
     let out = Command::new("git")
-        .current_dir(dir)
+        .arg("--git-dir")
+        .arg(git_dir)
         .args(["rev-parse", rev])
         .output()
         .unwrap();
@@ -764,4 +819,226 @@ async fn syncs_trees_with_gitlink_entries() {
         .status()
         .unwrap();
     assert!(present.success());
+}
+
+/// A colocated pull target with `main` and `feat` bookmarks pulled from
+/// `a`, settled on both sides (the first pull is divergent by
+/// construction, and a jj command on each side merges it).
+async fn settled_colocated_pair(fx: &Fixture) -> (PathBuf, PathBuf, Arc<OpenRepo>, Arc<OpenRepo>) {
+    let a = fx.init_repo("a");
+    fx.jj(&a, &["bookmark", "create", "main", "-r", "@"]);
+    fx.jj(&a, &["bookmark", "create", "feat", "-r", "@"]);
+    fx.jj(&a, &["new", "-m", "export"]);
+    let b = fx.init_colocated_pull_target("b", "machine-b");
+    let (ra, rb) = (open(&a), open(&b));
+    assert!(ra.is_colocated());
+    assert!(rb.is_colocated());
+    sync_missing(&rb, &ra).await;
+    fx.jj(&b, &["status"]);
+    sync_missing(&ra, &rb).await;
+    fx.jj(&a, &["status"]);
+    (a, b, ra, rb)
+}
+
+/// Moves `bookmark` in `dir` forward to a new commit and exports it to
+/// git, returning the git id.
+fn move_bookmark(fx: &Fixture, dir: &Path, bookmark: &str, file: &str) -> String {
+    fx.jj(dir, &["new", bookmark]);
+    fx.commit_file(dir, file, &format!("{bookmark} moved"));
+    fx.jj(dir, &["bookmark", "set", bookmark, "-r", "@-"]);
+    fx.jj(dir, &["new", "-m", "export"]);
+    git_rev(dir, &format!("refs/heads/{bookmark}"))
+}
+
+/// A colocated clone's first pull is divergent by construction (its init
+/// ops share only the root with the mesh history), so the mirror must
+/// still land the mesh's git refs in its `.git`: otherwise jj's next
+/// import reads the missing refs as deletions and wipes the bookmarks
+/// mesh-wide.
+#[tokio::test]
+async fn colocated_pull_target_keeps_mesh_bookmarks() {
+    let fx = Fixture::new();
+    let a = fx.init_repo("a");
+    fx.jj(&a, &["bookmark", "create", "main", "-r", "@"]);
+    fx.jj(&a, &["new", "-m", "export"]);
+    let b = fx.init_colocated_pull_target("b", "machine-b");
+    let (ra, rb) = (open(&a), open(&b));
+
+    sync_missing(&rb, &ra).await;
+    assert_eq!(
+        git_rev(&b, "refs/heads/main"),
+        git_rev(&a, "refs/heads/main")
+    );
+
+    // jj merges the divergent heads and imports git: nothing to import.
+    fx.jj(&b, &["status"]);
+    let bookmarks = fx.jj_output(&b, &["bookmark", "list"]);
+    assert!(bookmarks.contains("main"), "{bookmarks}");
+    sync_missing(&ra, &rb).await;
+    fx.jj(&a, &["status"]);
+    let bookmarks = fx.jj_output(&a, &["bookmark", "list"]);
+    assert!(bookmarks.contains("main"), "{bookmarks}");
+}
+
+/// Two colocated instances changing refs concurrently: the sync is
+/// divergent, and the mirror must still apply the refs only the peer
+/// changed, while leaving the ones changed locally to jj's merge.
+#[tokio::test]
+async fn divergent_sync_mirrors_refs_the_peer_changed() {
+    let fx = Fixture::new();
+    let (a, b, ra, rb) = settled_colocated_pair(&fx).await;
+
+    // a moves main and b moves feat, concurrently.
+    let a_main = move_bookmark(&fx, &a, "main", "a.txt");
+    let b_feat = move_bookmark(&fx, &b, "feat", "b.txt");
+
+    sync_missing(&rb, &ra).await;
+    assert_eq!(rb.op_heads().await.unwrap().len(), 2);
+    // The peer's move landed in b's .git; b's own move stayed.
+    assert_eq!(git_rev(&b, "refs/heads/main"), a_main);
+    assert_eq!(git_rev(&b, "refs/heads/feat"), b_feat);
+
+    // jj merges and imports: both moves hold, nothing reverts.
+    fx.jj(&b, &["status"]);
+    assert_eq!(git_rev(&b, "refs/heads/main"), a_main);
+    assert_eq!(git_rev(&b, "refs/heads/feat"), b_feat);
+    sync_missing(&ra, &rb).await;
+    fx.jj(&a, &["status"]);
+    assert_eq!(git_rev(&a, "refs/heads/main"), a_main);
+    assert_eq!(git_rev(&a, "refs/heads/feat"), b_feat);
+    assert_eq!(ra.op_heads().await.unwrap().len(), 1);
+}
+
+/// A receiver left with two op heads by a divergent sync (the daemon
+/// runs no jj command while divergent) must still mirror the next peer
+/// change: with the mirror skipped, jj's merge would revert it.
+#[tokio::test]
+async fn already_divergent_receiver_still_mirrors() {
+    let fx = Fixture::new();
+    let (a, b, ra, rb) = settled_colocated_pair(&fx).await;
+
+    move_bookmark(&fx, &a, "main", "a1.txt");
+    fx.jj(&b, &["new", "-m", "concurrent on b"]);
+    sync_missing(&rb, &ra).await;
+    assert_eq!(rb.op_heads().await.unwrap().len(), 2);
+
+    // a moves main again while b is still divergent.
+    let a_main = move_bookmark(&fx, &a, "main", "a2.txt");
+    sync_missing(&rb, &ra).await;
+    assert_eq!(git_rev(&b, "refs/heads/main"), a_main);
+
+    fx.jj(&b, &["status"]);
+    assert_eq!(git_rev(&b, "refs/heads/main"), a_main);
+    sync_missing(&ra, &rb).await;
+    fx.jj(&a, &["status"]);
+    assert_eq!(git_rev(&a, "refs/heads/main"), a_main);
+}
+
+/// Both sides moving a ref along one line (b's target descends from a's,
+/// with the commits reaching b through git rather than the mesh) is no
+/// conflict for jj, which picks the descendant. The mirror must land it in
+/// a's `.git` too, or a's next import reverts b's move.
+#[tokio::test]
+async fn divergent_moves_along_one_line_mirror_the_descendant() {
+    let fx = Fixture::new();
+    let (a, b, ra, rb) = settled_colocated_pair(&fx).await;
+
+    let a_main = move_bookmark(&fx, &a, "main", "a.txt");
+    let fetch = Command::new("git")
+        .current_dir(&b)
+        .arg("fetch")
+        .arg(a.join(".git"))
+        .arg("main:refs/heads/tmp")
+        .status()
+        .unwrap();
+    assert!(fetch.success());
+    fx.jj(&b, &["status"]);
+    fx.jj(&b, &["new", "tmp"]);
+    fx.commit_file(&b, "b.txt", "main moved again");
+    fx.jj(&b, &["bookmark", "set", "main", "-r", "@-"]);
+    fx.jj(&b, &["bookmark", "delete", "tmp"]);
+    fx.jj(&b, &["new", "-m", "export"]);
+    let b_main = git_rev(&b, "refs/heads/main");
+    assert_ne!(a_main, b_main);
+
+    sync_missing(&ra, &rb).await;
+    assert_eq!(ra.op_heads().await.unwrap().len(), 2);
+    assert_eq!(git_rev(&a, "refs/heads/main"), b_main);
+    // jj reconciles the divergence and finds nothing to import.
+    fx.jj(&a, &["status"]);
+    assert_eq!(git_rev(&a, "refs/heads/main"), b_main);
+    let main = fx.jj_output(&a, &["log", "-r", "main", "--no-graph", "-T", "commit_id"]);
+    assert_eq!(main, b_main);
+}
+
+/// A non-colocated pull target must mirror refs into its backing git
+/// repo too: jj only imports git when the user enables colocation, and
+/// then reads every ref the replicated view lists but git lacks as a
+/// deletion, abandoning the commits only those refs reached.
+#[tokio::test]
+async fn non_colocated_pull_target_survives_colocation_enable() {
+    let fx = Fixture::new();
+    let a = fx.init_repo("a");
+    fx.jj(&a, &["bookmark", "create", "main", "-r", "@"]);
+    fx.jj(&a, &["new", "-m", "export"]);
+    let b = fx.init_pull_target("b", "machine-b");
+    let (ra, rb) = (open(&a), open(&b));
+    assert!(!rb.is_colocated());
+
+    sync_missing(&rb, &ra).await;
+    let expected = git_rev(&a, "refs/heads/main");
+    assert_eq!(git_rev_at(&store_git_dir(&b), "refs/heads/main"), expected);
+
+    fx.jj(&b, &["status"]);
+    fx.jj(&b, &["git", "colocation", "enable"]);
+    let bookmarks = fx.jj_output(&b, &["bookmark", "list"]);
+    assert!(bookmarks.contains("main"), "{bookmarks}");
+    assert_eq!(git_rev(&b, "refs/heads/main"), expected);
+}
+
+/// The backing git repo of a non-colocated jj repo.
+fn store_git_dir(dir: &Path) -> PathBuf {
+    dir.join(".jj/repo/store/git")
+}
+
+/// Runs a git command against `git_dir`, panicking on failure.
+fn git(git_dir: &Path, args: &[&str]) {
+    assert!(git_ok(git_dir, args), "git {args:?} failed in {git_dir:?}");
+}
+
+/// Runs a git command against `git_dir`, returning whether it succeeded.
+fn git_ok(git_dir: &Path, args: &[&str]) -> bool {
+    Command::new("git")
+        .arg("--git-dir")
+        .arg(git_dir)
+        .args(args)
+        .output()
+        .is_ok_and(|out| out.status.success())
+}
+
+/// jj records a tag by the commit it peels to, while git stores the tag
+/// object of an annotated tag: the mirror must swap against the stored
+/// form, or a moved or deleted annotated tag never follows the mesh.
+#[tokio::test]
+async fn mirror_deletes_annotated_tags() {
+    let fx = Fixture::new();
+    let (a, b, ra, rb) = settled_colocated_pair(&fx).await;
+    let commit = git_rev(&a, "refs/heads/main");
+    git(&a.join(".git"), &["tag", "-a", "v1", "-m", "v1", &commit]);
+    fx.jj(&a, &["status"]);
+    sync_missing(&rb, &ra).await;
+    assert_eq!(git_rev(&b, "refs/tags/v1^{commit}"), commit);
+
+    // b stores the same tag annotated, as a git clone would.
+    let b_git = b.join(".git");
+    git(&b_git, &["tag", "-d", "v1"]);
+    git(&b_git, &["tag", "-a", "v1", "-m", "v1", &commit]);
+    fx.jj(&b, &["status"]);
+    sync_missing(&ra, &rb).await;
+    fx.jj(&a, &["status"]);
+
+    git(&a.join(".git"), &["tag", "-d", "v1"]);
+    fx.jj(&a, &["status"]);
+    sync_missing(&rb, &ra).await;
+    assert!(!git_ok(&b_git, &["rev-parse", "--verify", "refs/tags/v1"]));
 }

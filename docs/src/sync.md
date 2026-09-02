@@ -89,7 +89,7 @@ content-addressed and invisible until published), then come:
 2. views and ops, parents-first;
 3. change-id extras, imported from the new commits;
 4. the commit index, built for the incoming heads;
-5. on colocated repos, the git ref mirror (see below);
+5. the git ref mirror (see below);
 6. only at the very end, the op head publication that makes everything
    visible to jj.
 
@@ -97,24 +97,25 @@ Which local heads a new head supersedes is established by walking ancestry
 through validated data only; when in doubt the old head stays listed and jj
 reconciles the divergence.
 
-## Colocated repos
+## Git refs
 
-In colocated repos (where `.git` sits next to `.jj`), git tools read the git
-refs directly, so the apply mirrors the new view's git refs into `.git`
-(step 5 above, before anything is published). The mirror is deliberately
-conservative and follows jj's own exporter semantics:
+jj records the refs of its git repo in the view and, when it imports git,
+treats any ref that differs from that record as a move the user made in
+git. A sync that leaves the git repo stale is therefore undone at the next
+import, and the undo spreads to every peer: in a colocated repo (`.git`
+next to `.jj`) at the next jj command, and after a clone's first pull it
+deletes every bookmark mesh-wide. A non-colocated repo imports git only
+when the user enables colocation, with the same outcome.
 
-- each ref is compare-and-swapped from the value the previous view knew,
-  refs new to the view are created only if absent, and refs the view
-  dropped are deleted under the same compare-and-swap;
-- refs whose previous value was conflicted, and refs the user moved
-  directly in git, are left alone;
-- HEAD is never touched.
-
-The mirror only happens when the sync is a clean fast-forward; under
-divergence there is no single previous view to reconcile against, so it is
-skipped and jj's next import sorts it out.
-
+The apply thus mirrors the synced refs into the git repo before publishing
+(step 5 above). It computes what jj's own view merge gives each ref after
+the publication and moves the ref there by compare-and-swap. When the git
+repo lives inside `.jj`, nothing but jj writes to it, so the expected value
+is what the repo holds and any difference is staleness. For a colocated
+`.git` or an external git repo, the expected value is the merged view
+before the publication, so refs the user moved directly in git fail their
+swap and stay for jj to import. Only refs jj imports are touched, whatever
+names a peer's views carry; refs the op heads conflict on are left to jj.
 
 ## Cloning a repo
 

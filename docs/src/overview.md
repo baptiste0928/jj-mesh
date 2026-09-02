@@ -50,16 +50,17 @@ As `jj-mesh` synchronizes the full history of repositories, it is designed
 so no data gets corrupted or lost in the process, and users can always
 restore a good state. `jj`'s design makes this easy.
 
-- **The sync protocol is append-only.** No data ever gets deleted during a
-  sync to avoid any corruption. The op log is append-only by design, and `jj`
-  is designed to cleanly handle divergent op logs without losing any data.
+- **The sync protocol is append-only.** No op or object ever gets deleted
+  during a sync to avoid any corruption. The op log is append-only by design,
+  and `jj` is designed to cleanly handle divergent op logs without losing any
+  data. Only git refs move, to follow the synced state.
 - **Objects are never re-encoded.** Even if we need to *read* objects from
   both git and jj storage during the sync, all synced data is transferred as
   raw bytes and never re-encoded. We perform checksums to ensure the resulting
   on-disk files are identical and avoid corruption.
-- **Updates are atomic.** Especially when touching git storage on colocated
-  repos, we follow the same conventions as `jj` itself and perform atomic
-  swaps of git refs to never leave the repo in an invalid state.
+- **Updates are atomic.** Especially when touching git storage, we follow the
+  same conventions as `jj` itself and perform atomic swaps of git refs to
+  never leave the repo in an invalid state.
 - **`jj` version is strictly enforced.** As synchronization depends on
   internals of jj's default backend, the daemon enforces that users have a
   compatible jj version and that no custom backend is in use before

@@ -1,7 +1,7 @@
 //! Applying a validated batch, in the crash-safe order: anti-GC keep
 //! refs, views and ops (parents first, persisted with one batched
 //! durability sync), change-id extras, the commit index for the incoming
-//! heads, the colocated ref mirror, and only then the op head publication
+//! heads, the git ref mirror, and only then the op head publication
 //! that makes anything visible to jj.
 //!
 //! The apply is split in two so [`super::fetch`] can run the index build
@@ -14,15 +14,11 @@ use std::{
 };
 
 use color_eyre::eyre::{Result, eyre};
-use jj_lib::{
-    backend::CommitId,
-    object_id::ObjectId as _,
-    op_store::{OperationId, RefTarget, View},
-};
+use jj_lib::{backend::CommitId, object_id::ObjectId as _, op_store::OperationId};
 use pollster::FutureExt as _;
-use tracing::{info, warn};
+use tracing::info;
 
-use super::{OpBatch, to_gix_id};
+use super::{OpBatch, mirror, to_gix_id};
 use crate::repo::{OpenRepo, codec::OpMeta};
 
 /// Walk budget for [`superseded_by`]: stopping early is safe (unwalked
@@ -31,15 +27,10 @@ use crate::repo::{OpenRepo, codec::OpMeta};
 const SUPERSEDE_WALK_BUDGET: usize = 1 << 16;
 
 /// A staged batch: everything is on disk and readable; the index build,
-/// the colocated ref mirror and the op head publication remain.
+/// the git ref mirror and the op head publication remain.
 pub(super) struct Staged {
     /// Wants to publish, each with the local heads it supersedes.
     to_publish: Vec<(OperationId, Vec<OperationId>)>,
-    /// Set when the batch fast-forwards the repo's single local head:
-    /// that head, whose view the colocated ref mirror reconciles
-    /// against. `None` under divergence, where no single previous view
-    /// exists.
-    fast_forward: Option<OperationId>,
     /// Ops the batch carried, for the publication log line.
     ops: usize,
 }
@@ -86,16 +77,14 @@ pub(super) fn stage(
     // proof of ancestry: a hostile batch op naming a local head as its
     // parent must not unlist that head.
     let by_id = batch.ops_by_id();
-    let mut to_publish: Vec<(OperationId, Vec<OperationId>)> = Vec::new();
-    let mut all_superseded: HashSet<OperationId> = HashSet::new();
-    for want in wants {
-        if local_heads.contains(want) {
-            continue;
-        }
-        let superseded = superseded_by(repo, &by_id, want, local_heads);
-        all_superseded.extend(superseded.iter().cloned());
-        to_publish.push((want.clone(), superseded));
-    }
+    let to_publish: Vec<(OperationId, Vec<OperationId>)> = wants
+        .iter()
+        .filter(|want| !local_heads.contains(want))
+        .map(|want| {
+            let superseded = superseded_by(repo, &by_id, want, local_heads);
+            (want.clone(), superseded)
+        })
+        .collect();
 
     // Before any head points at the replicated bytes, jj itself must be
     // able to read the ops being published and their views.
@@ -104,42 +93,19 @@ pub(super) fn stage(
         repo.read_view(&op.view_id).block_on()?;
     }
 
-    // The colocated git mirror is only safe when the fetch fast-forwards
-    // a single old head to a single new one; under divergence the merged
-    // view decides, and with several old heads there is no single previous
-    // view to reconcile git refs against.
-    let fast_forward =
-        (to_publish.len() == 1 && local_heads.len() == 1 && all_superseded.len() == 1)
-            .then(|| local_heads[0].clone());
-
     Ok(Staged {
         to_publish,
-        fast_forward,
         ops: batch.ops.len(),
     })
 }
 
-/// Publishes a staged batch: the colocated ref mirror, then the op head
+/// Publishes a staged batch: the git ref mirror, then the op head
 /// publication that makes everything visible to jj. Runs on a blocking
 /// thread.
 pub(super) fn publish(repo: &Arc<OpenRepo>, staged: &Staged) -> Result<()> {
-    let Staged {
-        to_publish,
-        fast_forward,
-        ops,
-    } = staged;
+    let Staged { to_publish, ops } = staged;
 
-    if repo.is_colocated() && !to_publish.is_empty() {
-        if let Some(old_head) = fast_forward {
-            let new_op = repo.read_operation(&to_publish[0].0).block_on()?;
-            let new_view = repo.read_view(&new_op.view_id).block_on()?;
-            let old_op = repo.read_operation(old_head).block_on()?;
-            let old_view = repo.read_view(&old_op.view_id).block_on()?;
-            mirror_git_refs(repo, &new_view, &old_view)?;
-        } else {
-            warn!("divergent sync in colocated repo: git refs not mirrored");
-        }
-    }
+    mirror::run(repo, to_publish)?;
 
     // Each want removes exactly the heads its own ancestry covers, so a
     // crash between two to_publish cannot unlist a head whose replacement
@@ -153,8 +119,26 @@ pub(super) fn publish(repo: &Arc<OpenRepo>, staged: &Staged) -> Result<()> {
     Ok(())
 }
 
+/// Parents of an op, from the validated batch first and the local store
+/// as fallback. Empty when neither has the op: without it the ancestry
+/// below cannot be verified, and the walk treats that as a boundary.
+fn parents_of(
+    repo: &OpenRepo,
+    batch: &HashMap<&OperationId, &OpMeta>,
+    id: &OperationId,
+) -> Vec<OperationId> {
+    match batch.get(id) {
+        Some(meta) => meta.parents.clone(),
+        None => repo
+            .read_operation(id)
+            .block_on()
+            .map(|op| op.parents)
+            .unwrap_or_default(),
+    }
+}
+
 /// The local heads that are ancestors of `want`, walking parent links of
-/// validated ops (batch first, local store as fallback).
+/// validated ops.
 fn superseded_by(
     repo: &OpenRepo,
     batch: &HashMap<&OperationId, &OpMeta>,
@@ -178,16 +162,7 @@ fn superseded_by(
             superseded.push(id);
             continue;
         }
-        let parents = match batch.get(&id) {
-            Some(meta) => meta.parents.clone(),
-            None => match repo.read_operation(&id).block_on() {
-                Ok(op) => op.parents,
-                // Boundary: without the op the ancestry below cannot be
-                // verified; not superseding is the safe direction.
-                Err(_) => continue,
-            },
-        };
-        for parent in parents {
+        for parent in parents_of(repo, batch, &id) {
             if parent != *repo.root_operation_id() && !visited.contains(&parent) {
                 visited.insert(parent.clone());
                 stack.push(parent);
@@ -223,87 +198,5 @@ fn write_keep_refs(repo: &OpenRepo, commit_ids: &HashSet<CommitId>) -> Result<()
 
     git.edit_references(edits)
         .map_err(|err| eyre!("cannot write keep refs: {err}"))?;
-    Ok(())
-}
-
-/// Mirrors the applied view's `git_refs` (all namespaces: heads, tags,
-/// remotes) into the colocated `.git`, so the next git import does not
-/// misread the replicated refs as local git changes.
-///
-/// Exporter semantics, like jj's own: only refs known to the previous
-/// view are touched, each with compare-and-swap against its old value.
-/// Refs the user created or moved directly in git are left alone (a
-/// failed swap is logged and skipped; jj's importer reconciles it), and
-/// HEAD is never touched.
-fn mirror_git_refs(repo: &OpenRepo, view: &View, old_view: &View) -> Result<()> {
-    use gix::refs::transaction::{Change, LogChange, PreviousValue, RefEdit};
-
-    let git = repo.git_backend().git_repo();
-    let mut edits: Vec<RefEdit> = Vec::new();
-
-    // Create or move refs to the new view's targets.
-    for (name, target) in &view.git_refs {
-        let Some(new_id) = target.as_normal() else {
-            // Conflicted refs cannot be exported; leave the local ref.
-            continue;
-        };
-        let old = old_view.git_refs.get(name);
-        let expected = match old.map(RefTarget::as_normal) {
-            // Known before with a clean value: swap only if unchanged.
-            Some(Some(old_id)) if old_id == new_id => continue,
-            Some(Some(old_id)) => {
-                PreviousValue::MustExistAndMatch(gix::refs::Target::Object(to_gix_id(old_id)?))
-            }
-            // Previously conflicted: no reliable baseline, leave it.
-            Some(None) => continue,
-            // New ref: create, unless git already has one (user's).
-            None => PreviousValue::MustNotExist,
-        };
-        edits.push(RefEdit {
-            change: Change::Update {
-                log: LogChange::default(),
-                expected,
-                new: gix::refs::Target::Object(to_gix_id(new_id)?),
-            },
-            name: name
-                .as_str()
-                .try_into()
-                .map_err(|err| eyre!("bad ref name: {err}"))?,
-            deref: false,
-        });
-    }
-
-    // Prune refs the new view no longer has, again only from their known
-    // old value.
-    for (name, old_target) in &old_view.git_refs {
-        if view.git_refs.contains_key(name) {
-            continue;
-        }
-        let Some(old_id) = old_target.as_normal() else {
-            continue;
-        };
-        edits.push(RefEdit {
-            change: Change::Delete {
-                expected: PreviousValue::MustExistAndMatch(gix::refs::Target::Object(to_gix_id(
-                    old_id,
-                )?)),
-                log: gix::refs::transaction::RefLog::AndReference,
-            },
-            name: name
-                .as_str()
-                .try_into()
-                .map_err(|err| eyre!("bad ref name: {err}"))?,
-            deref: false,
-        });
-    }
-
-    // Edits apply individually: one ref the user raced must not abort the
-    // rest of the mirror.
-    for edit in edits {
-        let name = edit.name.as_bstr().to_owned();
-        if let Err(err) = git.edit_references(Some(edit)) {
-            warn!("skipping git ref mirror of {name}: {err}");
-        }
-    }
     Ok(())
 }

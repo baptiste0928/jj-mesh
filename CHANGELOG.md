@@ -14,8 +14,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Current machine can now be renamed with `jj-mesh peer rename`.
 
 ### Fixed
+- Git refs are now synced even for non-colocated repositories. This allows to to run
+  `jj git colocation enable` safely on any previously cloned repo.
 - Improved memory usage when idle, including a case where memory could grow
   multiple GB when you have a large `/etc/hosts`.
+- Improved reliability of git refs syncing on concurrent operations.
 
 ## [0.1.1] - 2026-08-10
 

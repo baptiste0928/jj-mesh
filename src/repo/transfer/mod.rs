@@ -35,13 +35,16 @@
 //!   during the transfer, [`apply`]'s stage step persists keep refs,
 //!   views and ops (parents first) and change-id extras, the commit
 //!   index is built for the incoming heads, and [`apply`]'s publish step
-//!   runs the colocated ref mirror and the op head publication.
+//!   runs the git ref mirror and the op head publication.
+//! - [`mirror`] keeps the git repo's refs in line with the synced views
+//!   before each publication.
 //!
 //! Bulk store and git work runs on blocking threads (see the `open` module
 //! docs).
 
 mod apply;
 mod fetch;
+mod mirror;
 mod pack;
 mod serve;
 #[cfg(test)]

@@ -85,7 +85,7 @@ impl JjRepo {
     }
 
     /// The repo storage directory (`.jj/repo`).
-    fn repo_dir(&self) -> PathBuf {
+    pub fn repo_dir(&self) -> PathBuf {
         self.root.join(".jj").join("repo")
     }
 
