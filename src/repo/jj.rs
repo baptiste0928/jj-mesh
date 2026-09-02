@@ -129,7 +129,7 @@ fn jj_version_supported(version: &str) -> bool {
     jj_series(version).is_some_and(|minor| SUPPORTED_JJ_MINORS.contains(&minor))
 }
 
-/// Human form of the supported series range (`0.43-0.44`).
+/// Human form of the supported series range (`0.45`, or `0.44-0.45`).
 pub(crate) fn supported_series() -> String {
     let (start, end) = (SUPPORTED_JJ_MINORS.start(), SUPPORTED_JJ_MINORS.end());
     if start == end {
@@ -196,35 +196,31 @@ mod tests {
         assert_eq!(parse_jj_version("jj whatever"), None);
         assert_eq!(parse_jj_version(""), None);
 
-        assert!(jj_version_supported("0.43.0"));
-        assert!(jj_version_supported("0.44.0"));
-        assert!(jj_version_supported("0.44.12"));
-        assert!(!jj_version_supported("0.42.0"));
-        assert!(!jj_version_supported("0.45.0"));
-        assert!(!jj_version_supported("0.4.40"));
-        assert!(!jj_version_supported("0.440.0"));
-        assert!(!jj_version_supported("0.44"));
-        assert!(!jj_version_supported("1.44.0"));
+        assert!(jj_version_supported("0.45.0"));
+        assert!(jj_version_supported("0.45.12"));
+        assert!(!jj_version_supported("0.44.0"));
+        assert!(!jj_version_supported("0.46.0"));
+        assert!(!jj_version_supported("0.4.50"));
+        assert!(!jj_version_supported("0.450.0"));
+        assert!(!jj_version_supported("0.45"));
+        assert!(!jj_version_supported("1.45.0"));
     }
 
     #[test]
     fn words_peer_version_warnings() {
         // Same series, patch differences included: silent.
-        assert_eq!(jj_peer_warning(Some("0.44.0"), Some("0.44.2")), None);
+        assert_eq!(jj_peer_warning(Some("0.45.0"), Some("0.45.2")), None);
 
-        let older = jj_peer_warning(Some("0.44.0"), Some("0.43.1")).unwrap();
-        assert!(older.contains("older"), "{older}");
-        let newer = jj_peer_warning(Some("0.43.1"), Some("0.44.0")).unwrap();
-        assert!(newer.contains("newer"), "{newer}");
-
-        let out_of_range = jj_peer_warning(Some("0.44.0"), Some("0.42.0")).unwrap();
+        // With a single supported series, any other series is out of
+        // range before it could count as older or newer.
+        let out_of_range = jj_peer_warning(Some("0.45.0"), Some("0.44.0")).unwrap();
         assert!(out_of_range.contains("unsupported"), "{out_of_range}");
-        let missing = jj_peer_warning(Some("0.44.0"), None).unwrap();
+        let missing = jj_peer_warning(Some("0.45.0"), None).unwrap();
         assert!(missing.contains("not found"), "{missing}");
 
         // A missing or unsupported local version is the local warning's
         // problem: no mismatch line per peer on top of it.
-        assert_eq!(jj_peer_warning(None, Some("0.43.0")), None);
-        assert_eq!(jj_peer_warning(Some("0.42.0"), Some("0.44.0")), None);
+        assert_eq!(jj_peer_warning(None, Some("0.45.0")), None);
+        assert_eq!(jj_peer_warning(Some("0.44.0"), Some("0.45.0")), None);
     }
 }

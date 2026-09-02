@@ -7,7 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Added
+### Changed
+- **`jj` 0.45 is required.** Older versions are no longer supported.
 - Current machine can now be renamed with `jj-mesh peer rename`.
 
 ### Fixed

@@ -30,7 +30,7 @@ pub use self::{
 
 /// The jj release series this build accepts, as minors of `0.<minor>.<patch>`
 /// versions.
-const SUPPORTED_JJ_MINORS: std::ops::RangeInclusive<u32> = 43..=44;
+const SUPPORTED_JJ_MINORS: std::ops::RangeInclusive<u32> = 45..=45;
 
 /// Store backends supported by jj-mesh, as `(<store dir>, <expected type>)`
 /// pairs relative to `.jj/repo`.

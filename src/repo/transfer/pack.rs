@@ -9,7 +9,8 @@
 //! atomically: a partially received pack never becomes visible.
 //!
 //! A received pack is peer-supplied data: its header is bounded here
-//! before gix allocates from it (see [`MAX_PACK_OBJECTS`]).
+//! before gix allocates from it (see [`MAX_PACK_OBJECTS`]), and every
+//! decoded object is capped like a loose one ([`MAX_GIT_OBJECT_SIZE`]).
 //!
 //! Both directions run blocking gix I/O and bridge to the async frame
 //! stream through the caller's channels, via [`ChunkReader`] and the chunk
@@ -24,6 +25,8 @@ use std::{
 use color_eyre::eyre::{Result, WrapErr as _, ensure, eyre};
 use gix::progress::{Count, Id, MessageLevel, NestedProgress, Progress, Step, StepShared, UNKNOWN};
 use tokio::sync::mpsc;
+
+use crate::net::fetch::MAX_GIT_OBJECT_SIZE;
 
 /// Pack bytes are buffered into chunks of this size before each emit, so
 /// the wire sees few large frames instead of one per written entry.
@@ -78,6 +81,7 @@ pub(super) fn write_pack(
             allow_thin_pack: false,
             chunk_size: 1000,
             version: gix_pack::data::Version::V2,
+            compression: gix::zlib::Compression::DEFAULT,
         },
     ));
 
@@ -303,11 +307,16 @@ pub(super) fn ingest_pack(
         // The mesh never generates thin packs, so there are no external
         // bases to look up.
         None::<gix::objs::find::Never>,
+        git.object_hash(),
         gix_pack::bundle::write::Options {
             thread_limit: None,
             iteration_mode: gix_pack::data::input::Mode::Verify,
             index_version: gix_pack::index::Version::default(),
-            object_hash: git.object_hash(),
+            // Bounds the buffers gix allocates while resolving deltas: a
+            // pack cannot name a larger decoded object than a loose frame
+            // may.
+            alloc_limit_bytes: Some(usize::try_from(MAX_GIT_OBJECT_SIZE).unwrap_or(usize::MAX)),
+            compression: gix::zlib::Compression::BEST_SPEED,
         },
     )
     .map_err(|err| eyre!("cannot ingest pack: {err}"))?;

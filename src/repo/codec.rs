@@ -8,12 +8,7 @@
 //! themselves are stored verbatim, so fields this build does not know
 //! about survive replication untouched.
 //!
-//! Parsing must reject every shape jj's own readers reject (or panic on):
-//! once stored and reachable from a published op head, an unreadable
-//! object would break every jj command in the repo. jj 0.44 requires a
-//! ref target's value oneof to be set, native ref conflicts to have one
-//! more add than removes, remote ref merges to have odd arity, and remote
-//! ref states to be known enum values.
+//! Parsing must reject every shape jj's own readers reject (or panic on).
 
 use std::collections::HashSet;
 
@@ -150,9 +145,14 @@ pub fn parse_view(bytes: &[u8]) -> Result<ViewMeta> {
             "unmigrated view collides with jj's Git-tracking tag migration",
         );
     }
+    // Repository-wide forms, read when the per-workspace map is empty.
     ids.add(&view.git_head_legacy);
     ids.add_target(view.git_head.as_ref())
         .wrap_err("git head")?;
+    for git_head in &view.git_heads {
+        ids.add_target(git_head.target.as_ref())
+            .wrap_err_with(|| format!("git head of workspace {}", git_head.name))?;
+    }
 
     Ok(ViewMeta {
         head_ids: heads.into_commit_ids(),
@@ -333,6 +333,12 @@ mod tests {
                 target: None,
             }],
             git_head_legacy: vec![3; 20],
+            git_heads: vec![proto::GitHead {
+                name: "machine-a".to_owned(),
+                target: Some(proto::RefTarget {
+                    value: Some(proto::ref_target::Value::CommitId(vec![7; 20])),
+                }),
+            }],
             bookmarks: vec![proto::Bookmark {
                 name: "conflicted".to_owned(),
                 local_target: Some(proto::RefTarget {
@@ -354,7 +360,7 @@ mod tests {
             .iter()
             .map(|id| id.as_bytes().to_vec())
             .collect();
-        for byte in 1..=6u8 {
+        for byte in 1..=7u8 {
             assert!(ids.contains(&vec![byte; 20]), "missing id {byte}");
         }
         assert!(meta.head_ids.is_empty());
@@ -366,7 +372,10 @@ mod tests {
     #[test]
     fn rejects_views_jj_cannot_read() {
         let with_git_head = |target: proto::RefTarget| proto::View {
-            git_head: Some(target),
+            git_heads: vec![proto::GitHead {
+                name: "default".to_owned(),
+                target: Some(target),
+            }],
             ..Default::default()
         };
 
