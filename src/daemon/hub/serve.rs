@@ -58,7 +58,7 @@ impl SyncHub {
         mut send: SendStream,
         mut recv: RecvStream,
     ) {
-        let Some(serving) = self.lookup_serving(&peer, &request) else {
+        let Some(serving) = self.lookup_serving(&request) else {
             return refuse_fetch(send, "repo not available");
         };
         let Ok(permit) = serving.permits.clone().try_acquire_owned() else {
@@ -84,7 +84,7 @@ impl SyncHub {
     /// refusal distinctly. The name needs no validation here: only names that
     /// passed it at registration are ever in the map, so an invalid one
     /// simply fails to match.
-    fn lookup_serving(&self, peer: &EndpointId, request: &FetchRequest) -> Option<Serving> {
+    fn lookup_serving(&self, request: &FetchRequest) -> Option<Serving> {
         let state = self.state.lock().unwrap();
         let Some(entry) = state.repos.get(&request.name) else {
             debug!(repo = %request.name, "refusing fetch: repo not registered here");
@@ -96,15 +96,6 @@ impl SyncHub {
             debug!(repo = %request.name, "refusing fetch: repo id mismatch");
             return None;
         }
-        // Refused only for the conflicting peer, not repo-wide: it should
-        // not be fetching while paused itself, but an older or hostile
-        // build must still be denied the ops that feed the colocation
-        // ping-pong. Everyone else is served normally.
-        if entry.local_colocated && entry.colocated_peers.contains(peer) {
-            debug!(repo = %request.name, "refusing fetch: colocation conflict with this peer");
-            return None;
-        }
-
         let serving = entry.serving.clone();
         if serving.is_none() {
             debug!(repo = %request.name, "refusing fetch: repo not open");

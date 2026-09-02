@@ -32,7 +32,6 @@ pub struct CloneSource {
 pub(super) struct OrphanAnnounce {
     pub(super) id: RepoId,
     pub(super) heads: Vec<Vec<u8>>,
-    pub(super) colocated: bool,
 }
 
 impl HubState {

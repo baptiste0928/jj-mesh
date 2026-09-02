@@ -20,8 +20,7 @@ use tracing::{debug, info, warn};
 use super::{
     clone,
     protocol::{
-        CLIENT_TIMEOUT, ConflictStatus, MAX_MESSAGE_SIZE, PausedStatus, PeerReport, Request,
-        Response, Status,
+        CLIENT_TIMEOUT, ConflictStatus, MAX_MESSAGE_SIZE, PeerReport, Request, Response, Status,
     },
 };
 use crate::{
@@ -83,16 +82,6 @@ impl ControlContext {
                 })
             })
             .collect();
-        let paused = self
-            .hub
-            .paused_repos()
-            .into_iter()
-            .map(|(repo, peers)| PausedStatus {
-                repo,
-                peers: peers.iter().filter_map(peer_name).collect(),
-            })
-            .filter(|paused| !paused.peers.is_empty())
-            .collect();
         let peer_reports = self
             .hub
             .peer_reports()
@@ -120,7 +109,6 @@ impl ControlContext {
             repos: self.repos.statuses(),
             available,
             conflicts,
-            paused,
             peer_reports,
         }
     }

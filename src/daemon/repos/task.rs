@@ -441,16 +441,6 @@ impl RepoTask {
             debug!(repo = %self.name, peer = %announce.peer, "ignoring malformed announcement");
             return Ok(Handled::Idle);
         }
-        // This check is what enforces the fetch side of the colocation
-        // pause: the hub keeps routing announcements while paused, and
-        // requeueing them here (silently, at the fetch-retry cadence)
-        // means the heads are fetched as soon as the pause lifts instead
-        // of being lost until the peer's next change.
-        if self.hub.is_paused(&self.name) {
-            debug!(repo = %self.name, "sync is paused; holding announcement");
-            return Ok(Handled::Failed);
-        }
-
         let mut missing = Vec::new();
         for head in &announce.heads {
             let head = OperationId::new(head.clone());

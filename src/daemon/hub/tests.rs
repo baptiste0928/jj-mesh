@@ -8,7 +8,6 @@ fn announce(name: &str, id: &RepoId, seq: u64, heads: Vec<Vec<u8>>) -> Announce 
         id: id.clone(),
         seq,
         heads,
-        colocated: false,
     }
 }
 
@@ -191,56 +190,6 @@ async fn orphans_are_bounded_per_peer() {
     );
     hub.register_repo("fresh".to_owned(), RepoId::generate());
     assert!(hub.conflicts().iter().any(|(name, _)| name == "fresh"));
-}
-
-/// A peer announcing a colocated instance while ours is colocated too
-/// pauses the repo, and the pause lifts when either side stops being
-/// colocated.
-#[tokio::test]
-async fn colocation_conflict_pauses_and_resumes() {
-    use crate::{repo::JjRepo, testing::Fixture};
-
-    // `jj git init` colocates by default, so the opened repo reports
-    // `is_colocated`.
-    let fx = Fixture::new();
-    let dir = fx.init_repo("a");
-    let repo = Arc::new(JjRepo::discover(&dir).unwrap().open().unwrap());
-    assert!(repo.is_colocated());
-
-    let hub = SyncHub::new();
-    let id = RepoId::generate();
-    let inbox = hub.register_repo("a".to_owned(), id.clone());
-    hub.repo_opened("a", &id, repo);
-    let peer = iroh::SecretKey::generate().public();
-
-    let colocated = |seq| Announce {
-        colocated: true,
-        ..announce("a", &id, seq, vec![vec![1; 64]])
-    };
-    hub.route(peer, colocated(1));
-    assert!(hub.is_paused("a"));
-    assert_eq!(hub.paused_repos().get("a"), Some(&vec![peer]));
-    // The heads still land in the inbox: the repo task requeues them
-    // while paused, so they are fetched once the pause lifts instead
-    // of being lost.
-    assert_eq!(inbox.drain().len(), 1);
-
-    // The peer de-colocating resumes sync with its own announcement.
-    hub.route(peer, announce("a", &id, 2, vec![vec![2; 64]]));
-    assert!(!hub.is_paused("a"));
-    assert_eq!(inbox.drain().len(), 1);
-
-    // So does the peer disconnecting.
-    hub.route(peer, colocated(3));
-    assert!(hub.is_paused("a"));
-    hub.peer_disconnected(&peer);
-    assert!(!hub.is_paused("a"));
-
-    // And so does a retraction (the peer forgot its instance).
-    hub.route(peer, colocated(1));
-    assert!(hub.is_paused("a"));
-    hub.route(peer, announce("a", &id, 2, vec![]));
-    assert!(!hub.is_paused("a"));
 }
 
 /// A repo unregistered locally keeps its peers' last announcements as

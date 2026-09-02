@@ -93,8 +93,8 @@ pub fn run(_args: StatusArgs, dir: &ConfigDir) -> Result<()> {
 }
 
 /// Gathers everything that needs the user's attention into one list:
-/// local name conflicts and pauses, plus the problems connected peers
-/// report about their own instances. Healthy peer reports stay silent.
+/// local name conflicts, plus the problems connected peers report about
+/// their own instances. Healthy peer reports stay silent.
 fn collect_issues(status: &control::Status) -> Vec<String> {
     let mut issues = Vec::new();
 
@@ -102,13 +102,6 @@ fn collect_issues(status: &control::Status) -> Vec<String> {
         issues.push(format!(
             "`{}`: peer {} announced a different repo under the same name",
             conflict.repo, conflict.peer,
-        ));
-    }
-    for paused in &status.paused {
-        issues.push(format!(
-            "`{}`: this machine and {} both have a colocated instance",
-            paused.repo,
-            paused.peers.join(", "),
         ));
     }
     for PeerReport { peer, report } in &status.peer_reports {
@@ -122,7 +115,6 @@ fn collect_issues(status: &control::Status) -> Vec<String> {
                 RepoHealthState::Ok => continue,
                 RepoHealthState::Failed => "sync error (see that machine's status)",
                 RepoHealthState::Missing => "directory missing on that machine",
-                RepoHealthState::Paused => "paused there (colocation conflict)",
             };
             issues.push(format!("`{}` on {peer}: {problem}", repo.name));
         }

@@ -53,11 +53,6 @@ const GOSSIP_INTERVAL: Duration = Duration::from_mins(5);
 /// instead of waiting out the transport-level timeout.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// How often the status report is re-broadcast without a repo state
-/// change. Also the staleness bound for the parts the repo set does not
-/// signal (colocation pauses, which flip on peer announcements).
-const STATUS_REFRESH: Duration = Duration::from_mins(1);
-
 /// Coalescing window for status changes: a failing repo can flip states
 /// quickly, and peers only care about the latest.
 const STATUS_DEBOUNCE: Duration = Duration::from_secs(1);
@@ -235,9 +230,9 @@ async fn accept_loop(endpoint: Endpoint, peers: Arc<PeerSet>, pairing: Arc<Pairi
     }
 }
 
-/// Broadcasts this machine's health to the peers, on repo state changes
-/// and periodically, publishing only when it changed: an idle mesh stays
-/// silent. A report lost with its connection is replayed on reconnect.
+/// Broadcasts this machine's health to the peers on repo state changes,
+/// publishing only when it changed: an idle mesh stays silent. A report
+/// lost with its connection is replayed on reconnect.
 async fn status_loop(repos: Arc<RepoSet>, hub: Arc<SyncHub>, jj_version: Option<String>) {
     let mut published: Option<sync::StatusReport> = None;
     loop {
@@ -250,10 +245,8 @@ async fn status_loop(repos: Arc<RepoSet>, hub: Arc<SyncHub>, jj_version: Option<
             hub.publish_status(report.clone());
             published = Some(report);
         }
-        tokio::select! {
-            () = repos.changed() => tokio::time::sleep(STATUS_DEBOUNCE).await,
-            () = tokio::time::sleep(STATUS_REFRESH) => {}
-        }
+        repos.changed().await;
+        tokio::time::sleep(STATUS_DEBOUNCE).await;
     }
 }
 

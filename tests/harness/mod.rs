@@ -269,7 +269,7 @@ impl Machine {
     }
 
     /// Clones the mesh repo `name` into `path` (which must be a freshly
-    /// initialized repo, see [`Fixture::init_clone_repo`]), retrying while the
+    /// initialized repo, see [`Fixture::init_pull_target`]), retrying while the
     /// daemon still lacks a usable source announcement.
     pub async fn clone_repo(&self, name: &str, path: &Path) {
         let request = Request::CloneRepo {
@@ -311,7 +311,7 @@ pub async fn add_and_clone(
 
     let cloned = mesh
         .jj
-        .init_clone_repo(&format!("{name}-on-{}", from.name), &from.name);
+        .init_pull_target(&format!("{name}-on-{}", from.name), &from.name);
     from.clone_repo(name, &cloned).await;
     // Any jj command merges the fresh workspace into the pulled history;
     // its operations then flow back until both sides agree.

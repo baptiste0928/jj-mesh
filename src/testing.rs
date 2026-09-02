@@ -76,9 +76,9 @@ impl Fixture {
         dir
     }
 
-    /// Initializes a fresh repo named `name` as `jj-mesh repo clone` does:
-    /// non-colocated, with a machine-unique workspace name.
-    pub fn init_clone_repo(&self, name: &str, workspace: &str) -> PathBuf {
+    /// Initializes a fresh non-colocated repo named `name` with a
+    /// machine-unique workspace name, ready to receive a pull.
+    pub fn init_pull_target(&self, name: &str, workspace: &str) -> PathBuf {
         let dir = self.tmp.path().join(name);
         self.jj(self.tmp.path(), &["git", "init", "--no-colocate", name]);
         self.jj(&dir, &["workspace", "rename", workspace]);

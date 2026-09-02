@@ -16,7 +16,7 @@ use crate::config::{MAX_MESH_PEERS, MAX_MESH_REPOS, Membership, RepoId};
 
 /// ALPN of the sync protocol. Bumped whenever the wire format changes, so
 /// mismatched daemons refuse each other instead of mis-decoding.
-pub const ALPN: &[u8] = b"jj-mesh/sync/0";
+pub const ALPN: &[u8] = b"jj-mesh/sync/1";
 
 /// Cap on uni-stream messages. Sized for the largest legitimate message, a
 /// full membership (peer records are ~100 bytes, repo records ~100), with
@@ -49,11 +49,6 @@ pub struct Announce {
     pub seq: u64,
     /// Current op head ids, as raw id bytes; the receiver validates them.
     pub heads: Vec<Vec<u8>>,
-    /// Whether the sender's instance of the repo is colocated (has a
-    /// user-visible `.git`). A mesh repo supports at most one colocated
-    /// instance (see `jj-mesh repo clone`'s docs); receivers use this to detect
-    /// a second one and pause the repo instead of corrupting its history.
-    pub colocated: bool,
 }
 
 /// One machine's self-reported health, shown by `jj-mesh status` on its
@@ -90,8 +85,6 @@ pub enum RepoHealthState {
     Failed,
     /// The repo directory is gone.
     Missing,
-    /// Sync suspended by a colocation conflict.
-    Paused,
 }
 
 /// Sends one message on a fresh uni stream.

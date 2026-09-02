@@ -115,26 +115,13 @@ The mirror only happens when the sync is a clean fast-forward; under
 divergence there is no single previous view to reconcile against, so it is
 skipped and jj's next import sorts it out.
 
-A mesh repo supports at most one colocated checkout. jj records the
-colocated `.git`'s HEAD in the view (`git_head`), which the mesh replicates,
-while the HEAD file itself is machine-local state jj pins to the local
-working copy's parent. Two colocated checkouts therefore permanently
-disagree on that field, and every sync makes jj re-import the local HEAD,
-ping-ponging `import git head` operations across the mesh. This is why
-clones never colocate; only the machine that originally added the repo gets
-git interop.
 
 ## Cloning a repo
 
-`jj-mesh repo clone` bootstraps a repo onto a new machine: it creates a fresh
-non-colocated jj repo (see above), gives its workspace a machine-unique name
-(mesh machines must never share one), and pulls the repo's full state from a
-peer that advertises it. The fresh repo's init operations are unrelated to
-the mesh history, so the pull is divergent by construction; the next jj
-command merges the fresh workspace into the replicated history. The working
-copy is then moved onto trunk (`trunk()`, falling back to a local
-`main`/`master`/`trunk` bookmark) on a best-effort basis, rather than left
-on the init commit off the root.
+`jj-mesh repo clone` bootstraps a repo onto a new machine: it creates a fresh jj
+repo (colocated depending on the user's jj settings, or as `--colocate`), gives
+its workspace a machine-unique name , and pulls the repo's full state from a
+peer that advertises it. 
 
 ## Safety properties
 

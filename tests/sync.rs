@@ -23,7 +23,7 @@ async fn clone_pulls_full_history() {
     // B clones it by name, as `jj-mesh repo clone` does: fresh repo with a
     // machine-unique workspace, merged by the next jj command.
     b.wait_available("proj").await;
-    let dir_b = mesh.jj.init_clone_repo("proj-b", "machine-b");
+    let dir_b = mesh.jj.init_pull_target("proj-b", "machine-b");
     b.clone_repo("proj", &dir_b).await;
     mesh.jj.jj(&dir_b, &["status"]);
     wait_converged(&dir_a, &dir_b).await;

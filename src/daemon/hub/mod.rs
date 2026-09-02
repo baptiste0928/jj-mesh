@@ -38,7 +38,7 @@ mod serve;
 mod tests;
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeMap,
     sync::{Arc, Mutex},
 };
 
@@ -113,27 +113,9 @@ struct RepoEntry {
     /// An entry clears when its peer announces the matching id again or
     /// disconnects.
     conflicts: BTreeMap<EndpointId, RepoId>,
-    /// Whether the local instance of the repo is colocated, learned when
-    /// the repo task opens it.
-    local_colocated: bool,
-    /// Peers whose last announcement claimed a colocated instance. An
-    /// entry clears when its peer announces non-colocated or disconnects.
-    colocated_peers: BTreeSet<EndpointId>,
     /// Serve handle, present while the repo task has the repo open (see
     /// [`serve`] for why the hub dispatches fetches itself).
     serving: Option<Serving>,
-}
-
-impl RepoEntry {
-    /// Whether sync is suspended for this repo: the local instance and at
-    /// least one peer's are both colocated (see the sync docs for why two
-    /// colocated instances must not exchange ops). While paused the repo
-    /// fetches from nobody; announcing and serving stay on. Detection
-    /// needs the colocated instances directly connected; in a relay-only
-    /// topology the conflict goes undetected.
-    fn paused(&self) -> bool {
-        self.local_colocated && !self.colocated_peers.is_empty()
-    }
 }
 
 /// Hub-side state of one connected peer.
@@ -159,7 +141,6 @@ impl SyncHub {
         let mut state = self.state.lock().unwrap();
 
         let mut conflicts = BTreeMap::new();
-        let mut colocated_peers = BTreeSet::new();
         for (peer, announce) in state.take_orphans(&name) {
             if announce.id != id {
                 warn!(
@@ -167,8 +148,6 @@ impl SyncHub {
                     "peer announces a different repo under this name; not syncing with it",
                 );
                 conflicts.insert(peer, announce.id);
-            } else if announce.colocated {
-                colocated_peers.insert(peer);
             }
         }
 
@@ -180,19 +159,16 @@ impl SyncHub {
                 published: None,
                 inbox: inbox.clone(),
                 conflicts,
-                local_colocated: false,
-                colocated_peers,
                 serving: None,
             },
         );
         inbox
     }
 
-    /// Makes an opened repo servable and records its colocation state.
-    /// Called by the repo task once its stores are open; replaces the
-    /// handle from a previous open. The id guards against a stale task of
-    /// a replaced same-name repo installing the wrong stores (aborts only
-    /// land at the task's next await point).
+    /// Makes an opened repo servable. Called by the repo task once its
+    /// stores are open; replaces the handle from a previous open. The id
+    /// guards against a stale task of a replaced same-name repo installing
+    /// the wrong stores (aborts only land at the task's next await point).
     pub fn repo_opened(&self, name: &str, id: &RepoId, repo: Arc<OpenRepo>) {
         if let Some(entry) = self
             .state
@@ -202,14 +178,7 @@ impl SyncHub {
             .get_mut(name)
             .filter(|entry| &entry.id == id)
         {
-            entry.local_colocated = repo.is_colocated();
             entry.serving = Some(Serving::new(repo));
-            if entry.paused() {
-                warn!(
-                    repo = %name,
-                    "this instance and a peer's are both colocated; sync is paused",
-                );
-            }
         }
     }
 
@@ -240,9 +209,8 @@ impl SyncHub {
     /// repo stays immediately clonable here: peers only re-announce on a
     /// head change or a reconnect, which could otherwise be arbitrarily
     /// far away. A retraction (an announcement with no heads) also goes
-    /// out, so peers holding a colocation pause or a name conflict against
-    /// this instance release it instead of staying stuck until this
-    /// machine disconnects.
+    /// out, so peers holding a name conflict against this instance release
+    /// it instead of staying stuck until this machine disconnects.
     pub fn unregister_repo(&self, name: &str) {
         let mut state = self.state.lock().unwrap();
         let Some(entry) = state.repos.remove(name) else {
@@ -256,7 +224,6 @@ impl SyncHub {
                 OrphanAnnounce {
                     id: entry.id.clone(),
                     heads,
-                    colocated: entry.colocated_peers.contains(&peer),
                 },
             );
         }
@@ -268,7 +235,6 @@ impl SyncHub {
                 id: entry.id,
                 seq: state.announce_seq,
                 heads: Vec::new(),
-                colocated: false,
             };
             state.broadcast(|outbox| outbox.push_announce(announce.clone()));
         }
@@ -293,7 +259,6 @@ impl SyncHub {
             id: entry.id.clone(),
             seq: entry.seq,
             heads,
-            colocated: entry.local_colocated,
         };
         state.broadcast(|outbox| outbox.push_announce(announce.clone()));
     }
@@ -337,7 +302,6 @@ impl SyncHub {
                     id: entry.id.clone(),
                     seq: entry.seq,
                     heads: heads.clone(),
-                    colocated: entry.local_colocated,
                 });
             }
         }
@@ -369,7 +333,6 @@ impl SyncHub {
             for entry in state.repos.values_mut() {
                 entry.inbox.forget(peer);
                 entry.conflicts.remove(peer);
-                entry.colocated_peers.remove(peer);
             }
             state.forget_orphan_peer(peer);
             state.reports.remove(peer);
@@ -412,7 +375,6 @@ impl SyncHub {
                 OrphanAnnounce {
                     id: announce.id,
                     heads: announce.heads,
-                    colocated: announce.colocated,
                 },
             );
             if !remembered {
@@ -423,7 +385,6 @@ impl SyncHub {
 
         if retraction {
             entry.conflicts.remove(&peer);
-            entry.colocated_peers.remove(&peer);
             entry.inbox.retract(peer, announce.seq);
             return;
         }
@@ -439,23 +400,6 @@ impl SyncHub {
             return;
         }
         entry.conflicts.remove(&peer);
-
-        let was_paused = entry.paused();
-        if announce.colocated {
-            entry.colocated_peers.insert(peer);
-        } else {
-            entry.colocated_peers.remove(&peer);
-        }
-        if entry.paused() && !was_paused {
-            warn!(
-                repo = %announce.name, peer = %peer,
-                "this instance and the peer's are both colocated; pausing sync \
-                 (de-colocate one side to resume)",
-            );
-        }
-        // Offered even while paused: the repo task requeues instead of
-        // fetching, so the heads are fetched once the pause lifts rather
-        // than lost until the peer's next change.
         entry.inbox.offer(peer, announce.seq, announce.heads);
     }
 
@@ -467,32 +411,6 @@ impl SyncHub {
             .iter()
             .flat_map(|(name, entry)| entry.conflicts.keys().map(|peer| (name.clone(), *peer)))
             .collect()
-    }
-
-    /// The repos whose sync is paused by a colocation conflict, keyed by
-    /// name, with the peers whose colocated instances cause it.
-    pub fn paused_repos(&self) -> BTreeMap<String, Vec<EndpointId>> {
-        let state = self.state.lock().unwrap();
-        state
-            .repos
-            .iter()
-            .filter(|(_, entry)| entry.paused())
-            .map(|(name, entry)| {
-                (
-                    name.clone(),
-                    entry.colocated_peers.iter().copied().collect(),
-                )
-            })
-            .collect()
-    }
-
-    /// Whether a repo's sync is paused (see [`RepoEntry::paused`]). Repo
-    /// tasks check this on every announcement they drain and requeue
-    /// instead of fetching, which is what enforces the fetch side of the
-    /// pause.
-    pub fn is_paused(&self, name: &str) -> bool {
-        let state = self.state.lock().unwrap();
-        state.repos.get(name).is_some_and(RepoEntry::paused)
     }
 
     /// Stores a peer's status report for `jj-mesh status`. The peer is

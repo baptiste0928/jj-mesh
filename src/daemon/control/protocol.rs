@@ -163,21 +163,8 @@ pub struct Status {
     pub available: Vec<String>,
     /// Repo names contested by peers announcing a different repo.
     pub conflicts: Vec<ConflictStatus>,
-    /// Repos whose sync is paused because a peer also holds a colocated
-    /// instance.
-    pub paused: Vec<PausedStatus>,
     /// The latest health each connected peer reported for itself.
     pub peer_reports: Vec<PeerReport>,
-}
-
-/// A repo whose sync is paused by a colocation conflict: this machine's
-/// instance and the named peers' are all colocated, which a mesh repo
-/// supports on at most one machine (see the sync docs).
-#[derive(Debug, Serialize, Deserialize)]
-pub struct PausedStatus {
-    pub repo: String,
-    /// Names of the peers claiming a colocated instance.
-    pub peers: Vec<String>,
 }
 
 /// One connected peer's self-reported health.

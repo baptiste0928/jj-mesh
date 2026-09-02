@@ -491,7 +491,7 @@ async fn clone_pull_into_fresh_repo() {
     fx.jj(&a, &["bookmark", "create", "main", "-r", "@-"]);
     fx.jj(&a, &["new", "-m", "second"]);
 
-    let b = fx.init_clone_repo("b", "machine-b");
+    let b = fx.init_pull_target("b", "machine-b");
 
     let (ra, rb) = (open(&a), open(&b));
     let wants = ra.op_heads().await.unwrap();
@@ -561,18 +561,13 @@ async fn clone_pull_into_fresh_repo() {
 
 /// Rewriting synced ancestors of another machine's working copy
 /// (describe, squash, sign) must arrive as a clean rebase of the tip,
-/// not as divergent changes. This holds only because cloned repos are
-/// never colocated: the view's `git_head` mirrors the colocated
-/// `.git`'s machine-local HEAD, and a second colocated checkout makes
-/// jj re-import its own HEAD after every sync, resurrecting the
-/// rewritten commits as divergent changes and ping-ponging
-/// `import git head` operations between the machines forever.
+/// not as divergent changes, with no op churn once both sides settle.
 #[tokio::test]
 async fn ancestor_rewrite_syncs_without_divergence() {
     let fx = Fixture::new();
     // The adding machine keeps jj's default (colocated) layout.
     let a = fx.init_repo("a");
-    let b = fx.init_clone_repo("b", "machine-b");
+    let b = fx.init_pull_target("b", "machine-b");
     let (ra, rb) = (open(&a), open(&b));
     sync_missing(&rb, &ra).await;
     // Merge the clone divergence on b and settle both sides.
@@ -645,7 +640,7 @@ async fn progress_reports_phases_and_exact_totals() {
     let a = fx.init_repo("a");
     fs::write(a.join("file.txt"), "mesh content\n").unwrap();
     fx.jj(&a, &["commit", "-m", "add file"]);
-    let b = fx.init_clone_repo("b", "machine-b");
+    let b = fx.init_pull_target("b", "machine-b");
 
     let (ra, rb) = (open(&a), open(&b));
     let wants = ra.op_heads().await.unwrap();

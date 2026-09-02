@@ -1,10 +1,9 @@
 //! `jj-mesh repo clone`: bootstrap a mesh repo onto this machine.
 //!
-//! Creates a fresh jj repo, gives its workspace a machine-unique name
-//! (mesh machines must never share one), asks the daemon to pull the mesh
-//! repo's full state from a peer and register it, lets jj merge the
-//! fresh workspace into the replicated history, and starts the working
-//! copy on trunk. A failed clone removes the directory it created.
+//! Creates a fresh jj repo, gives its workspace a machine-unique name, asks the
+//! daemon to pull the mesh repo's full state from a peer and register it, lets
+//! jj merge the fresh workspace into the replicated history, and starts the
+//! working copy on trunk. A failed clone removes the directory it created.
 
 use std::{
     path::{Path, PathBuf},
@@ -25,11 +24,9 @@ use crate::{
 
 /// Clone a repo from another machine
 ///
-/// The repo must have been added to the mesh with `jj-mesh repo add`.
-///
-/// Note that due to a limitation of `jj`, only one instance of each repo across
-/// the mesh can be co-located. This command will clone the repo without
-/// co-location enabled.
+/// The repo must have been added to the mesh with `jj-mesh repo add`. The
+/// clone follows jj's `git.colocate` setting unless `--colocate` or
+/// `--no-colocate` is given.
 #[derive(Debug, Args)]
 pub struct CloneArgs {
     /// Name of the repo in the mesh
@@ -49,6 +46,14 @@ pub struct CloneArgs {
     /// current head of each machine is displayed in `jj log`.
     #[arg(long)]
     workspace: Option<String>,
+
+    /// Colocate the repo with a `.git` usable by plain git tools
+    #[arg(long, conflicts_with = "no_colocate")]
+    colocate: bool,
+
+    /// Keep the git store inside `.jj`, hidden from git tools
+    #[arg(long)]
+    no_colocate: bool,
 }
 
 /// Runs the `repo clone` command.
@@ -73,11 +78,16 @@ pub fn run(args: CloneArgs, dir: &ConfigDir) -> Result<()> {
     let workspace = args.workspace.unwrap_or(state.machine.name);
 
     // Fresh repo with a machine-unique workspace name, using the user's
-    // own jj (their config applies to the repo from the start). Never
-    // colocated (see the module docs), whatever the user's `git.colocate`.
+    // own jj (their config applies to the repo from the start).
+    let colocate: &[&str] = match (args.colocate, args.no_colocate) {
+        (true, _) => &["--colocate"],
+        (_, true) => &["--no-colocate"],
+        _ => &[],
+    };
+    let path_arg = path.to_string_lossy();
     jj(
         None,
-        &["git", "init", "--no-colocate", &path.to_string_lossy()],
+        &[&["git", "init"], colocate, &["--", &path_arg]].concat(),
     )?;
 
     // The directory exists from here on: a failed pull removes it again so

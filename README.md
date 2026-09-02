@@ -108,10 +108,6 @@ $ jj-mesh repo add
 $ jj-mesh repo clone <name>
 ```
 
-> Due to a [current limitation of jj](https://github.com/jj-vcs/jj/issues/8052), **only one instance
-> of each repo can be colocated** (= with a `.git` folder usable by plain git tools). All repos
-> cloned by `jj-mesh repo clone` are not colocated to avoid any issues.
-
 From there, the daemon will keep both copies in sync. Use `jj-mesh status` to check the status,
 and `jj-mesh help` to list available commands.
 

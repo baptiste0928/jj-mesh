@@ -83,7 +83,7 @@ async fn forgetting_locally_keeps_the_repo_clonable() {
     assert!(matches!(again, Response::Error(_)), "{again:?}");
 
     // ...but the repo clones again into a fresh directory and catches up...
-    let dir_b2 = mesh.jj.init_clone_repo("proj-again", "machine-b-again");
+    let dir_b2 = mesh.jj.init_pull_target("proj-again", "machine-b-again");
     b.clone_repo("proj", &dir_b2).await;
     wait_converged(&dir_a, &dir_b2).await;
     assert!(descriptions(&mesh, &dir_b2).contains("before forget"));

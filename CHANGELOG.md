@@ -8,6 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **Repos can now be colocated on every machine.** `jj-mesh repo clone` respects your global jj
+  `git.colocate` setting (on by default).
 - **`jj` 0.45 is required.** Older versions are no longer supported.
 - Current machine can now be renamed with `jj-mesh peer rename`.
 

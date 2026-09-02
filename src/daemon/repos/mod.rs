@@ -131,22 +131,17 @@ impl RepoSet {
     /// Local detail (paths, error messages) deliberately stays out: error
     /// strings embed filesystem paths, which never leave this machine.
     pub fn health(&self) -> Vec<RepoHealth> {
-        let paused = self.hub.paused_repos();
         let repos = self.repos.lock().unwrap();
         repos
             .iter()
             .map(|(name, handle)| {
-                let state = if paused.contains_key(name) {
-                    RepoHealthState::Paused
-                } else {
-                    match &*handle.state.lock().unwrap() {
-                        // Opening and indexing are transitions, not faults.
-                        RepoState::Opening | RepoState::Watching { .. } | RepoState::Indexing => {
-                            RepoHealthState::Ok
-                        }
-                        RepoState::Backoff { .. } => RepoHealthState::Failed,
-                        RepoState::Missing { .. } => RepoHealthState::Missing,
+                let state = match &*handle.state.lock().unwrap() {
+                    // Opening and indexing are transitions, not faults.
+                    RepoState::Opening | RepoState::Watching { .. } | RepoState::Indexing => {
+                        RepoHealthState::Ok
                     }
+                    RepoState::Backoff { .. } => RepoHealthState::Failed,
+                    RepoState::Missing { .. } => RepoHealthState::Missing,
                 };
                 RepoHealth {
                     name: name.clone(),
