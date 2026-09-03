@@ -3,7 +3,10 @@
 //! The CLI talks to the running daemon over a unix socket with
 //! length-prefixed postcard messages (`net::wire` framing). Every
 //! request is one request/response exchange; joining a pairing merely keeps
-//! its connection open so the daemon notices a cancelling client.
+//! its connection open so the daemon notices a cancelling client. The
+//! daemon publishes its build beside the socket, and the CLI refuses to
+//! talk to another build: a daemon left running across an upgrade is a
+//! common state, and its answers may not decode.
 //!
 //! The daemon is the only holder of the machine-key endpoint and the only
 //! writer of the mesh state, so live peer state, pairing and every

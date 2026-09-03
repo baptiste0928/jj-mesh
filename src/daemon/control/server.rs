@@ -20,7 +20,8 @@ use tracing::{debug, info, warn};
 use super::{
     clone,
     protocol::{
-        CLIENT_TIMEOUT, ConflictStatus, MAX_MESSAGE_SIZE, PeerReport, Request, Response, Status,
+        BUILD, CLIENT_TIMEOUT, ConflictStatus, MAX_MESSAGE_SIZE, PeerReport, Request, Response,
+        Status, build_path,
     },
 };
 use crate::{
@@ -154,6 +155,10 @@ impl ControlServer {
         let listener = UnixListener::bind(&tmp)
             .wrap_err_with(|| format!("cannot bind control socket {}", tmp.display()))?;
         fs::set_permissions(&tmp, std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
+        // Published before the socket: a client that can connect always
+        // finds the build of the daemon it reached.
+        let build = build_path(&path);
+        fs::write(&build, BUILD).wrap_err_with(|| format!("cannot write {}", build.display()))?;
         fs::rename(&tmp, &path)
             .wrap_err_with(|| format!("cannot move control socket to {}", path.display()))?;
 
@@ -188,6 +193,7 @@ impl ControlServer {
 impl Drop for ControlServer {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.path);
+        let _ = fs::remove_file(build_path(&self.path));
     }
 }
 

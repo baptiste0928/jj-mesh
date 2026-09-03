@@ -3,7 +3,7 @@
 mod harness;
 
 use harness::{TestMesh, add_and_clone, connect, descriptions, wait_converged};
-use jj_mesh::daemon::control::{Request, Response};
+use jj_mesh::daemon::control::{ControlClient, Request, Response};
 
 /// Machines that never paired directly learn about each other through
 /// gossip: they connect on their own, repos added anywhere become
@@ -213,4 +213,26 @@ fn tamper_secret(ticket: &str) -> String {
         .encode(&bytes)
         .to_ascii_lowercase();
     format!("jjmesh-pair-{encoded}")
+}
+
+/// A CLI reaching a daemon of another build is told to restart it, before
+/// any exchange that would fail to decode.
+#[tokio::test]
+async fn refuses_daemon_of_another_build() {
+    let mesh = TestMesh::new();
+    let a = mesh.machine("machine-a").await;
+    let dir = a.config_dir();
+    let build_file = dir.socket_path().with_extension("build");
+    let build = std::fs::read_to_string(&build_file).unwrap();
+    if build.starts_with("unknown") {
+        return; // Built without a commit: nothing to compare.
+    }
+
+    std::fs::write(&build_file, "0000dead").unwrap();
+    let err = ControlClient::connect(&dir).await.unwrap_err();
+    assert!(err.to_string().contains("0000dead"), "{err}");
+    assert!(err.to_string().contains("service restart"), "{err}");
+
+    std::fs::write(&build_file, &build).unwrap();
+    assert!(ControlClient::connect(&dir).await.unwrap().is_some());
 }

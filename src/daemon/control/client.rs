@@ -2,12 +2,14 @@
 //! blocking helpers CLI commands use, which have no tokio runtime of their
 //! own.
 
-use std::{future::Future, io, time::Duration};
+use std::{fs, future::Future, io, time::Duration};
 
 use color_eyre::eyre::{Report, Result, WrapErr as _, bail, eyre};
 use tokio::net::UnixStream;
 
-use super::protocol::{CLIENT_TIMEOUT, CloneProgress, MAX_MESSAGE_SIZE, Request, Response, Status};
+use super::protocol::{
+    BUILD, CLIENT_TIMEOUT, CloneProgress, MAX_MESSAGE_SIZE, Request, Response, Status, build_path,
+};
 use crate::{
     config::ConfigDir,
     net::wire::{read_message, write_message},
@@ -40,22 +42,36 @@ pub struct ControlClient {
 
 impl ControlClient {
     /// Connects to the daemon serving this configuration, or `None` when no
-    /// daemon is running.
+    /// daemon is running. Errors when the daemon is another build than
+    /// this CLI: the exchange would likely fail to decode.
     pub async fn connect(dir: &ConfigDir) -> Result<Option<Self>> {
         let path = dir.socket_path();
 
-        match UnixStream::connect(&path).await {
-            Ok(stream) => Ok(Some(ControlClient { stream })),
+        let stream = match UnixStream::connect(&path).await {
+            Ok(stream) => stream,
             Err(err)
                 if matches!(
                     err.kind(),
                     io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
                 ) =>
             {
-                Ok(None)
+                return Ok(None);
             }
-            Err(err) => Err(err).wrap_err_with(|| format!("cannot connect to {}", path.display())),
+            Err(err) => {
+                return Err(err).wrap_err_with(|| format!("cannot connect to {}", path.display()));
+            }
+        };
+        // Daemons predating the build file are caught by the decode hint
+        // in `recv`; builds without a known commit cannot be compared.
+        let build = fs::read_to_string(build_path(&path)).unwrap_or_default();
+        let known = |build: &str| !build.is_empty() && !build.starts_with("unknown");
+        if known(&build) && known(BUILD) && build != BUILD {
+            bail!(
+                "the daemon runs jj-mesh build {build} while this command is build {BUILD}: \
+                 restart it with `jj-mesh service restart`"
+            );
         }
+        Ok(Some(ControlClient { stream }))
     }
 
     /// Connects to the daemon serving this configuration; errors with
@@ -72,15 +88,21 @@ impl ControlClient {
         write_message(&mut self.stream, request, MAX_MESSAGE_SIZE).await
     }
 
-    /// Receives the next response, bounded by `limit` when given.
+    /// Receives the next response, bounded by `limit` when given. A
+    /// response this build cannot decode most likely comes from a daemon
+    /// of another build, and says so.
     pub async fn recv(&mut self, limit: Option<Duration>) -> Result<Response> {
         let read = read_message(&mut self.stream, MAX_MESSAGE_SIZE);
-        match limit {
+        let response = match limit {
             Some(limit) => tokio::time::timeout(limit, read)
                 .await
                 .map_err(|_| eyre!("the daemon did not answer"))?,
             None => read.await,
-        }
+        };
+        response.wrap_err(
+            "cannot read the daemon's answer: if it runs another build of jj-mesh, \
+             restart it with `jj-mesh service restart`",
+        )
     }
 }
 

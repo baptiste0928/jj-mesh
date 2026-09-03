@@ -96,7 +96,7 @@ pub struct Machine {
 }
 
 impl Machine {
-    fn config_dir(&self) -> ConfigDir {
+    pub fn config_dir(&self) -> ConfigDir {
         ConfigDir::new(Some(self.config.path().to_owned())).unwrap()
     }
 

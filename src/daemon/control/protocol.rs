@@ -266,3 +266,15 @@ pub enum WatchStatus {
     /// there do not pay for it.
     Indexing,
 }
+
+/// The build (commit) this binary was made from, published by the daemon
+/// beside its socket and compared by the CLI before any exchange: the
+/// messages above only stay decodable across builds when the variants
+/// were appended, and a mismatch is reported as such instead of as a
+/// decode error.
+pub(super) const BUILD: &str = env!("JJ_MESH_COMMIT");
+
+/// Where the daemon publishes its [`BUILD`], beside the control socket.
+pub(super) fn build_path(socket: &std::path::Path) -> PathBuf {
+    socket.with_extension("build")
+}
