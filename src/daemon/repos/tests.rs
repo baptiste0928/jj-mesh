@@ -266,3 +266,45 @@ async fn reopens_when_store_configuration_changes() {
     std::fs::write(&target, original).unwrap();
     wait_watching(&set).await;
 }
+
+/// The staleness check gates update-stale: a head that moved the
+/// working-copy commit without updating the working copy reads as
+/// stale, one that only touched other state does not.
+#[tokio::test]
+async fn staleness_follows_the_working_copy_commit() {
+    use super::task::may_be_stale;
+
+    let fx = Fixture::new();
+    let dir = fx.init_repo("a");
+    let jj = JjRepo::discover(&dir).unwrap();
+    let repo = jj.open().unwrap();
+    let head = |repo: &crate::repo::OpenRepo| {
+        let heads = pollster::block_on(repo.op_heads()).unwrap();
+        assert_eq!(heads.len(), 1);
+        heads[0].clone()
+    };
+
+    assert!(!may_be_stale(&jj, &repo, &head(&repo)).await.unwrap());
+
+    // A new operation leaving the working-copy commit alone.
+    fx.jj(
+        &dir,
+        &[
+            "--ignore-working-copy",
+            "bookmark",
+            "create",
+            "b",
+            "-r",
+            "@",
+        ],
+    );
+    assert!(!may_be_stale(&jj, &repo, &head(&repo)).await.unwrap());
+
+    // One rewriting it behind the working copy's back.
+    fx.jj(&dir, &["--ignore-working-copy", "describe", "-m", "moved"]);
+    assert!(may_be_stale(&jj, &repo, &head(&repo)).await.unwrap());
+
+    // Updating the working copy settles it.
+    fx.jj(&dir, &["status"]);
+    assert!(!may_be_stale(&jj, &repo, &head(&repo)).await.unwrap());
+}

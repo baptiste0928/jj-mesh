@@ -46,6 +46,14 @@ pub struct JjRepo {
     root: PathBuf,
 }
 
+/// What a working copy was last updated to: its workspace, and the
+/// operation whose view it reflects.
+#[derive(Debug, Clone)]
+pub struct Checkout {
+    pub workspace: String,
+    pub operation: jj_lib::op_store::OperationId,
+}
+
 /// The store configuration captured at repo open, compared against a fresh
 /// capture to detect a repo changing underneath a running daemon (converted
 /// colocation, swapped backend, replaced repo).
@@ -104,6 +112,13 @@ impl JjRepo {
     /// The name of the workspace at the repo root (`default` until it is
     /// renamed).
     pub fn workspace_name(&self) -> Result<String> {
+        Ok(self.checkout()?.workspace)
+    }
+
+    /// What the working copy at the repo root was last updated to. Read
+    /// without the working-copy lock: a jj command racing this read only
+    /// makes the staleness check it feeds conservative.
+    pub fn checkout(&self) -> Result<Checkout> {
         use jj_lib::{
             default_backend_factories::{
                 default_backend_factories, default_working_copy_factories,
@@ -118,7 +133,10 @@ impl JjRepo {
             &default_working_copy_factories(),
         )
         .wrap_err_with(|| format!("cannot load the workspace at {}", self.root.display()))?;
-        Ok(workspace.workspace_name().as_str().to_owned())
+        Ok(Checkout {
+            workspace: workspace.workspace_name().as_str().to_owned(),
+            operation: workspace.working_copy().operation_id().clone(),
+        })
     }
 
     /// Captures the store configuration an open repo depends on. jj_lib

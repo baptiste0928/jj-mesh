@@ -26,7 +26,10 @@
 //! (updated by an operation the working copy never saw). When enabled,
 //! `jj workspace update-stale` runs after every sync that applied
 //! operations, and once on watch start for staleness accrued while the
-//! daemon was down, but only while the op head is single. Any jj
+//! daemon was down, but only while the op head is single and the head
+//! moved the working-copy commit since the working copy's last update:
+//! the command snapshots the whole working copy before checking anything,
+//! so it must not run on syncs that cannot have made it stale. Any jj
 //! command reconciles divergent op heads by writing a merge operation,
 //! so daemons doing this on both ends of a divergence would ping-pong
 //! fresh merge operations at each other. Divergence is left to the next
@@ -259,8 +262,8 @@ impl RepoTask {
         // before a crash); afterwards every applied sync triggers it
         // directly. The op-heads watch above is already live, so any
         // operation this creates is picked up like any other.
-        if heads.len() == 1 {
-            self.update_stale(&mut tree).await;
+        if let [head] = heads.as_slice() {
+            self.update_stale(&jj, &repo, head, &mut tree).await;
         }
         // Edits made while the watch was down produce no event, so the
         // working copy is snapshotted once on start for the same reason
@@ -346,8 +349,10 @@ impl RepoTask {
             // The applied operations may have left the working copy
             // stale. Only a single head is caught up on (see the module
             // docs on divergence).
-            if drained.synced && heads.len() == 1 {
-                self.update_stale(&mut tree).await;
+            if drained.synced
+                && let [head] = heads.as_slice()
+                && self.update_stale(&jj, &repo, head, &mut tree).await
+            {
                 // update-stale snapshots the working copy itself, so a
                 // pending snapshot has just been done.
                 snap.done();
@@ -544,17 +549,28 @@ impl RepoTask {
         }
     }
 
-    /// Runs `jj workspace update-stale` when enabled for this repo.
-    /// Note that it snapshots the working copy before checking staleness,
-    /// so it is never free even when nothing is stale. Failures only
-    /// warn: the working copy may be locked by an ongoing command, and
-    /// the next sync retries.
-    async fn update_stale(&self, tree: &mut Option<TreeWatcher>) {
+    /// Runs `jj workspace update-stale` when enabled for this repo and
+    /// the working copy may be stale at `head`; returns whether it ran.
+    /// Failures only warn: the working copy may be locked by an ongoing
+    /// command, and the next sync retries.
+    async fn update_stale(
+        &self,
+        jj: &JjRepo,
+        repo: &OpenRepo,
+        head: &OperationId,
+        tree: &mut Option<TreeWatcher>,
+    ) -> bool {
         if !self.settings().update_stale {
-            return;
+            return false;
+        }
+        match may_be_stale(jj, repo, head).await {
+            Ok(false) => return false,
+            Ok(true) => {}
+            Err(err) => debug!(repo = %self.name, "cannot check staleness: {err:#}"),
         }
         debug!(repo = %self.name, "checking for a stale working copy");
         self.run_jj(&["workspace", "update-stale"], tree).await;
+        true
     }
 
     /// Snapshots the working copy through the jj binary, which applies
@@ -683,6 +699,22 @@ async fn store_fingerprint(jj: &JjRepo) -> Result<StoreFingerprint> {
     tokio::task::spawn_blocking(move || jj.fingerprint())
         .await
         .wrap_err("fingerprint task failed")?
+}
+
+/// Whether the working copy may be stale at the op head `head`: it was
+/// last updated at another operation, one whose view gave its workspace a
+/// different working-copy commit. Same commit means same tree, which jj
+/// treats as fresh, whatever else the operations changed.
+pub(super) async fn may_be_stale(jj: &JjRepo, repo: &OpenRepo, head: &OperationId) -> Result<bool> {
+    let checkout = jj.checkout()?;
+    if &checkout.operation == head {
+        return Ok(false);
+    }
+    let at_checkout = repo
+        .wc_commit_id(&checkout.operation, &checkout.workspace)
+        .await?;
+    let at_head = repo.wc_commit_id(head, &checkout.workspace).await?;
+    Ok(at_checkout != at_head)
 }
 
 /// Reads the current op heads as a sorted set, comparable across reads.

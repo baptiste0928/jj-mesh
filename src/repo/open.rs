@@ -126,6 +126,17 @@ impl OpenRepo {
         Ok(self.loader.op_store().read_operation(id).await?)
     }
 
+    /// The working-copy commit of `workspace` in the view of operation
+    /// `op`, `None` when the view has no such workspace.
+    pub async fn wc_commit_id(
+        &self,
+        op: &OperationId,
+        workspace: &str,
+    ) -> Result<Option<CommitId>> {
+        let view = self.load_operation(op).await?.view().await?;
+        Ok(view.get_wc_commit_id(workspace.as_ref()).cloned())
+    }
+
     /// Loads an operation as jj_lib's handle, for its walks and views.
     pub async fn load_operation(&self, id: &OperationId) -> Result<jj_lib::operation::Operation> {
         Ok(self.loader.load_operation(id).await?)
