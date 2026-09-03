@@ -242,6 +242,7 @@ impl RepoTask {
         // build failed, or a repo synced by an older jj-mesh) before any
         // jj run below pays for the rebuild.
         self.heal_index(&repo, &heads).await;
+        self.heal_git_refs(&repo).await;
         self.set_state(RepoState::Watching {
             op_heads: heads.len(),
             last_change,
@@ -525,6 +526,21 @@ impl RepoTask {
         };
         if let Err(err) = build.await {
             warn!(repo = %self.name, "index build task failed: {err}");
+        }
+    }
+
+    /// Brings the git refs of a repo whose git store only jj writes in
+    /// line with the synced views. Failures only warn; the next watch
+    /// start retries.
+    async fn heal_git_refs(&self, repo: &Arc<OpenRepo>) {
+        let heal = {
+            let repo = repo.clone();
+            tokio::task::spawn_blocking(move || transfer::mirror::heal(&repo))
+        };
+        match heal.await {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => warn!(repo = %self.name, "git ref repair failed: {err:#}"),
+            Err(err) => warn!(repo = %self.name, "git ref repair task failed: {err}"),
         }
     }
 

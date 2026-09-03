@@ -111,11 +111,12 @@ The apply thus mirrors the synced refs into the git repo before publishing
 (step 5 above). It computes what jj's own view merge gives each ref after
 the publication and moves the ref there by compare-and-swap. When the git
 repo lives inside `.jj`, nothing but jj writes to it, so the expected value
-is what the repo holds and any difference is staleness. For a colocated
-`.git` or an external git repo, the expected value is the merged view
-before the publication, so refs the user moved directly in git fail their
-swap and stay for jj to import. Only refs jj imports are touched, whatever
-names a peer's views carry; refs the op heads conflict on are left to jj.
+is what the repo holds and any difference is staleness; the daemon runs the
+same repair when it starts watching the repo. For a colocated `.git` or an
+external git repo, the expected value is the merged view before the
+publication, so refs the user moved directly in git fail their swap and
+stay for jj to import. Only refs jj imports are touched, whatever names a
+peer's views carry; refs the op heads conflict on are left to jj.
 
 ## Cloning a repo
 

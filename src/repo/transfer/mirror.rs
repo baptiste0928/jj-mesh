@@ -12,7 +12,7 @@
 //!
 //! - Git repo inside `.jj`: only jj writes there, so "before" is what the
 //!   repo actually holds and any difference from the merged view is
-//!   staleness.
+//!   staleness. [`heal`] runs the same pass on watch start.
 //! - Colocated `.git` or an external git repo: the user may have moved
 //!   refs there that jj has not imported yet, so "before" is the merged
 //!   view of the heads before the publication, and a ref moved by the
@@ -83,6 +83,17 @@ pub(super) fn run(repo: &OpenRepo, to_publish: &[(OperationId, Vec<OperationId>)
         merger.merged_refs(&heads)?
     };
     swap(repo, &before, &after)
+}
+
+/// Brings a git repo only jj writes to in line with the merged refs of
+/// the current op heads. A no-op for a colocated or external git repo.
+pub fn heal(repo: &OpenRepo) -> Result<()> {
+    if !repo.owns_git_refs() {
+        return Ok(());
+    }
+    let heads = repo.op_heads().block_on()?;
+    let after = Merger::new(repo, heads.iter())?.merged_refs(&heads)?;
+    swap(repo, &stored_refs(repo, &after)?, &after)
 }
 
 /// Merges the git refs of sets of operations, over a commit index that

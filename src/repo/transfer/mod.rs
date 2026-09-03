@@ -36,15 +36,16 @@
 //!   views and ops (parents first) and change-id extras, the commit
 //!   index is built for the incoming heads, and [`apply`]'s publish step
 //!   runs the git ref mirror and the op head publication.
-//! - [`mirror`] keeps the git repo's refs in line with the synced views
-//!   before each publication.
+//! - [`mirror`] keeps the git repo's refs in line with the synced views,
+//!   before each publication and, through [`mirror::heal`], when the
+//!   daemon starts watching a repo.
 //!
 //! Bulk store and git work runs on blocking threads (see the `open` module
 //! docs).
 
 mod apply;
 mod fetch;
-mod mirror;
+pub mod mirror;
 mod pack;
 mod serve;
 #[cfg(test)]

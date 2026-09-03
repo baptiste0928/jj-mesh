@@ -996,6 +996,62 @@ async fn non_colocated_pull_target_survives_colocation_enable() {
     assert_eq!(git_rev(&b, "refs/heads/main"), expected);
 }
 
+/// Healing brings a stale non-colocated store in line with the merged
+/// view: missing refs come back and leftover ones go.
+#[tokio::test]
+async fn heal_repairs_stale_refs_of_non_colocated_store() {
+    let fx = Fixture::new();
+    let a = fx.init_repo("a");
+    fx.jj(&a, &["bookmark", "create", "main", "-r", "@"]);
+    fx.jj(&a, &["new", "-m", "export"]);
+    let b = fx.init_pull_target("b", "machine-b");
+    let (ra, rb) = (open(&a), open(&b));
+    sync_missing(&rb, &ra).await;
+    fx.jj(&b, &["status"]);
+
+    let store = store_git_dir(&b);
+    let expected = git_rev_at(&store, "refs/heads/main");
+    git(&store, &["update-ref", "-d", "refs/heads/main"]);
+    git(&store, &["update-ref", "refs/heads/stale", &expected]);
+
+    let heal = rb.clone();
+    tokio::task::spawn_blocking(move || mirror::heal(&heal))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(git_rev_at(&store, "refs/heads/main"), expected);
+    assert!(!git_ok(
+        &store,
+        &["rev-parse", "--verify", "refs/heads/stale"]
+    ));
+
+    // jj sees nothing to import.
+    fx.jj(&b, &["git", "colocation", "enable"]);
+    let bookmarks = fx.jj_output(&b, &["bookmark", "list"]);
+    assert!(bookmarks.contains("main"), "{bookmarks}");
+    assert!(!bookmarks.contains("stale"), "{bookmarks}");
+}
+
+/// Healing never touches a colocated `.git`: a ref missing there may be
+/// a deletion the user made in git that jj has not imported yet.
+#[tokio::test]
+async fn heal_leaves_colocated_git_alone() {
+    let fx = Fixture::new();
+    let (_a, b, _ra, rb) = settled_colocated_pair(&fx).await;
+    let git_dir = b.join(".git");
+    git(&git_dir, &["update-ref", "-d", "refs/heads/feat"]);
+
+    let heal = rb.clone();
+    tokio::task::spawn_blocking(move || mirror::heal(&heal))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!git_ok(
+        &git_dir,
+        &["rev-parse", "--verify", "refs/heads/feat"]
+    ));
+}
+
 /// The backing git repo of a non-colocated jj repo.
 fn store_git_dir(dir: &Path) -> PathBuf {
     dir.join(".jj/repo/store/git")
