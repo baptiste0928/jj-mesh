@@ -795,7 +795,7 @@ async fn syncs_trees_with_gitlink_entries() {
     // not exist here, as a submodule checkout would.
     let script = "tree=$(printf '160000 commit 1111111111111111111111111111111111111111\\tsub\\n' \
                   | git mktree --missing) && git branch gitlink $(git commit-tree $tree -m gitlink)";
-    let crafted = Command::new("sh")
+    let crafted = Fixture::git_identity(&mut Command::new("sh"))
         .current_dir(&dir_a)
         .args(["-ec", script])
         .status()
@@ -1064,7 +1064,7 @@ fn git(git_dir: &Path, args: &[&str]) {
 
 /// Runs a git command against `git_dir`, returning whether it succeeded.
 fn git_ok(git_dir: &Path, args: &[&str]) -> bool {
-    Command::new("git")
+    Fixture::git_identity(&mut Command::new("git"))
         .arg("--git-dir")
         .arg(git_dir)
         .args(args)

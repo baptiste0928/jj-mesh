@@ -28,12 +28,26 @@ fn quiet_repo_set() -> RepoSet {
 
 /// Polls until `pred` holds on the statuses, panicking after 10s.
 async fn wait_for(set: &RepoSet, pred: impl Fn(&[control::RepoStatus]) -> bool) {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    assert!(
+        wait_for_within(set, Duration::from_secs(10), pred).await,
+        "condition not reached in time"
+    );
+}
+
+/// Polls until `pred` holds on the statuses, giving up after `timeout`.
+async fn wait_for_within(
+    set: &RepoSet,
+    timeout: Duration,
+    pred: impl Fn(&[control::RepoStatus]) -> bool,
+) -> bool {
+    let deadline = Instant::now() + timeout;
     loop {
         if pred(&set.statuses()) {
-            return;
+            return true;
         }
-        assert!(Instant::now() < deadline, "condition not reached in time");
+        if Instant::now() >= deadline {
+            return false;
+        }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
@@ -116,18 +130,40 @@ async fn recovers_after_repo_recreation() {
     std::fs::remove_dir_all(&dir).unwrap();
     fx.init_repo("a");
 
-    // The dead watch must be noticed (Failed, or Missing when the
-    // failure lands in the removed-not-yet-recreated window), then
+    // With inotify the dead watch must be noticed (Failed, or Missing when
+    // the failure lands in the removed-not-yet-recreated window), then
     // rebuilt (Watching); both states persist long enough for the 50ms
     // polling to see them.
-    wait_watch(&set, |w| {
-        matches!(w, WatchStatus::Failed { .. } | WatchStatus::Missing { .. })
-    })
-    .await;
+    if cfg!(target_os = "linux") {
+        wait_watch(&set, |w| {
+            matches!(w, WatchStatus::Failed { .. } | WatchStatus::Missing { .. })
+        })
+        .await;
+    }
     wait_watching(&set).await;
 
-    fx.jj(&dir, &["new", "-m", "after-recreation"]);
-    wait_changed(&set).await;
+    // FSEvents follows the path, so on macOS the old watch stays up until
+    // the next wake, which then rebuilds it with the heads found at that
+    // point as its baseline. Nothing observable marks the rebuild, so
+    // keep changing the repo until a change is seen.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        fx.jj(&dir, &["new", "-m", "after-recreation"]);
+        let changed = wait_for_within(&set, Duration::from_secs(2), |s| {
+            matches!(
+                s,
+                [status] if matches!(
+                    status.watch,
+                    WatchStatus::Watching { last_change_secs: Some(_), .. }
+                )
+            )
+        })
+        .await;
+        if changed {
+            break;
+        }
+        assert!(Instant::now() < deadline, "change not observed in time");
+    }
 }
 
 /// A path with no repo directory at all is `Missing` (the state that

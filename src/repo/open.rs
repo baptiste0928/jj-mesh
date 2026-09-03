@@ -200,7 +200,7 @@ impl OpenRepo {
     /// terms and counts as built.
     // Async to match the sibling store queries, though the stat needs no
     // await.
-    #[expect(clippy::unused_async)]
+    #[expect(clippy::unused_async, clippy::unused_async_trait_impl)]
     pub async fn has_commit_index(&self, id: &OperationId) -> bool {
         if self.default_index_store().is_none() {
             return true;
@@ -465,7 +465,7 @@ fn read_raw(dir: &Path, id: &impl ObjectId) -> Result<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
-    use std::process::Command;
+    use std::{fs, process::Command};
 
     use super::*;
     use crate::testing::Fixture;
@@ -542,13 +542,10 @@ mod tests {
         // Mirror the sync write order: git objects must land before the ops
         // that reference them (jj indexes the referenced commits as soon as
         // it loads the repo at the new head).
-        let objects = Command::new("cp")
-            .arg("-rn")
-            .arg(format!("{}/objects/.", ra.git_repo_path().display()))
-            .arg(format!("{}/objects/", rb.git_repo_path().display()))
-            .status()
-            .unwrap();
-        assert!(objects.success());
+        copy_missing(
+            &ra.git_repo_path().join("objects"),
+            &rb.git_repo_path().join("objects"),
+        );
 
         let missing = ra.ancestors_until(&a_heads, &b_heads).await.unwrap();
         assert!(!missing.is_empty());
@@ -574,6 +571,20 @@ mod tests {
         assert_eq!(rb.op_heads().await.unwrap(), a_heads);
         // jj itself must accept the replicated op log.
         fx.jj(&b, &["op", "log"]);
+    }
+
+    /// Copies the files under `from` into `to`, leaving existing ones alone.
+    fn copy_missing(from: &Path, to: &Path) {
+        fs::create_dir_all(to).unwrap();
+        for entry in fs::read_dir(from).unwrap() {
+            let entry = entry.unwrap();
+            let target = to.join(entry.file_name());
+            if entry.file_type().unwrap().is_dir() {
+                copy_missing(&entry.path(), &target);
+            } else if !target.exists() {
+                fs::copy(entry.path(), target).unwrap();
+            }
+        }
     }
 
     /// A repo whose jj writes commits without the change-id header must

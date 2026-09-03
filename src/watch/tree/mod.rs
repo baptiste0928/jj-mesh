@@ -466,6 +466,8 @@ mod tests {
         fs::write(root.join(".git/info/exclude"), "*.log\n").unwrap();
         fs::write(root.join(GITIGNORE), "!important.log\n").unwrap();
         let mut watch = TreeWatcher::new(&root).await.unwrap();
+        // FSEvents may still deliver the writes made before the watch.
+        drain(&mut watch).await;
 
         fs::write(root.join("boring.log"), "x").unwrap();
         assert_quiet(&mut watch).await;

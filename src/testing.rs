@@ -68,6 +68,14 @@ impl Fixture {
         cmd
     }
 
+    /// Gives a plain `git` command the identity CI runners lack.
+    pub fn git_identity(cmd: &mut Command) -> &mut Command {
+        cmd.env("GIT_AUTHOR_NAME", "Test User")
+            .env("GIT_AUTHOR_EMAIL", "test@example.com")
+            .env("GIT_COMMITTER_NAME", "Test User")
+            .env("GIT_COMMITTER_EMAIL", "test@example.com")
+    }
+
     /// Creates a jj repo named `name` with an initial described commit.
     pub fn init_repo(&self, name: &str) -> PathBuf {
         let dir = self.tmp.path().join(name);
