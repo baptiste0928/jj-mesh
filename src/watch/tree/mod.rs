@@ -392,11 +392,23 @@ mod tests {
         root.canonicalize().unwrap()
     }
 
+    /// Starts a watch and settles it: FSEvents may still deliver the
+    /// writes that set the tree up before the watch, which would trip
+    /// the negative assertions that follow.
+    async fn watch(root: &Path) -> TreeWatcher {
+        let mut watch = tokio::time::timeout(WAIT, TreeWatcher::new(root))
+            .await
+            .expect("building the watcher must not hang")
+            .unwrap();
+        drain(&mut watch).await;
+        watch
+    }
+
     #[tokio::test]
     async fn reports_edits_to_tracked_files() {
         let tmp = tempfile::tempdir().unwrap();
         let root = workdir(&tmp);
-        let mut watch = TreeWatcher::new(&root).await.unwrap();
+        let mut watch = watch(&root).await;
 
         fs::write(root.join("file.rs"), "x").unwrap();
         assert_changed(&mut watch).await;
@@ -408,7 +420,7 @@ mod tests {
         let root = workdir(&tmp);
         fs::create_dir_all(root.join(".jj/repo")).unwrap();
         fs::create_dir_all(root.join(".git/objects")).unwrap();
-        let mut watch = TreeWatcher::new(&root).await.unwrap();
+        let mut watch = watch(&root).await;
 
         fs::write(root.join(".jj/repo/op"), "x").unwrap();
         fs::write(root.join(".git/objects/pack"), "x").unwrap();
@@ -426,7 +438,7 @@ mod tests {
         fs::write(root.join(GITIGNORE), "/target/\n*.log\n").unwrap();
         fs::create_dir(root.join("target")).unwrap();
         fs::create_dir(root.join("src")).unwrap();
-        let mut watch = TreeWatcher::new(&root).await.unwrap();
+        let mut watch = watch(&root).await;
 
         // The ignored directory holds no watch: churn inside is invisible.
         fs::create_dir(root.join("target/debug")).unwrap();
@@ -446,7 +458,7 @@ mod tests {
         fs::write(root.join(GITIGNORE), "*.log\n").unwrap();
         fs::create_dir(root.join("sub")).unwrap();
         fs::write(root.join("sub").join(GITIGNORE), "!keep.log\n").unwrap();
-        let mut watch = TreeWatcher::new(&root).await.unwrap();
+        let mut watch = watch(&root).await;
 
         fs::write(root.join("sub/noise.log"), "x").unwrap();
         assert_quiet(&mut watch).await;
@@ -465,7 +477,7 @@ mod tests {
         fs::create_dir_all(root.join(".git/info")).unwrap();
         fs::write(root.join(".git/info/exclude"), "*.log\n").unwrap();
         fs::write(root.join(GITIGNORE), "!important.log\n").unwrap();
-        let mut watch = TreeWatcher::new(&root).await.unwrap();
+        let mut watch = watch(&root).await;
 
         fs::write(root.join("boring.log"), "x").unwrap();
         assert_quiet(&mut watch).await;
@@ -478,7 +490,7 @@ mod tests {
     async fn new_directories_get_watched() {
         let tmp = tempfile::tempdir().unwrap();
         let root = workdir(&tmp);
-        let mut watch = TreeWatcher::new(&root).await.unwrap();
+        let mut watch = watch(&root).await;
 
         // The creation itself is a change (and triggers the walk that
         // watches the new directory).
@@ -498,7 +510,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let root = workdir(&tmp);
         fs::create_dir(root.join("before")).unwrap();
-        let mut watch = TreeWatcher::new(&root).await.unwrap();
+        let mut watch = watch(&root).await;
 
         fs::rename(root.join("before"), root.join("after")).unwrap();
         assert_changed(&mut watch).await;
@@ -515,7 +527,7 @@ mod tests {
         let root = workdir(&tmp);
         let outside = tmp.path().join("outside");
         fs::create_dir(&outside).unwrap();
-        let mut watch = TreeWatcher::new(&root).await.unwrap();
+        let mut watch = watch(&root).await;
 
         fs::rename(&outside, root.join("moved")).unwrap();
         assert_changed(&mut watch).await;
@@ -530,7 +542,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let root = workdir(&tmp);
         fs::create_dir(root.join("logs")).unwrap();
-        let mut watch = TreeWatcher::new(&root).await.unwrap();
+        let mut watch = watch(&root).await;
 
         fs::write(root.join(GITIGNORE), "/logs/\n").unwrap();
         // The rule edit is itself a change...
@@ -552,10 +564,7 @@ mod tests {
         symlink("/dev/zero", root.join(GITIGNORE)).unwrap();
 
         // Both the walk and the event path must survive it.
-        let mut watch = tokio::time::timeout(WAIT, TreeWatcher::new(&root))
-            .await
-            .expect("building the watcher must not hang on /dev/zero")
-            .unwrap();
+        let mut watch = watch(&root).await;
         fs::write(root.join("file.rs"), "x").unwrap();
         assert_changed(&mut watch).await;
     }
@@ -567,7 +576,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let root = workdir(&tmp);
         fs::create_dir(root.join("real")).unwrap();
-        let mut watch = TreeWatcher::new(&root).await.unwrap();
+        let mut watch = watch(&root).await;
 
         symlink(root.join("real"), root.join("link")).unwrap();
         assert_changed(&mut watch).await;
@@ -585,7 +594,7 @@ mod tests {
     async fn discards_queued_events() {
         let tmp = tempfile::tempdir().unwrap();
         let root = workdir(&tmp);
-        let mut watch = TreeWatcher::new(&root).await.unwrap();
+        let mut watch = watch(&root).await;
 
         fs::create_dir(root.join("dir")).unwrap();
         fs::write(root.join("file"), "x").unwrap();
@@ -602,7 +611,7 @@ mod tests {
     async fn root_removal_kills_the_watch() {
         let tmp = tempfile::tempdir().unwrap();
         let root = workdir(&tmp);
-        let mut watch = TreeWatcher::new(&root).await.unwrap();
+        let mut watch = watch(&root).await;
 
         fs::remove_dir_all(&root).unwrap();
         let outcome = tokio::time::timeout(WAIT, watch.changed()).await;

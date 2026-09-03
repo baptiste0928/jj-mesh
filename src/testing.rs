@@ -9,7 +9,8 @@ use std::{
     process::Command,
 };
 
-/// A tempdir with a hermetic jj setup: empty config, identity from env.
+/// A tempdir with a hermetic jj setup: empty jj and git configs, identity
+/// from env.
 pub struct Fixture {
     tmp: tempfile::TempDir,
     config: PathBuf,
@@ -58,7 +59,8 @@ impl Fixture {
     /// The hermetic jj invocation shared by all runners.
     fn jj_command(&self, dir: &Path, args: &[&str]) -> Command {
         let mut cmd = Command::new(crate::repo::jj_bin());
-        cmd.current_dir(dir)
+        Self::git_env(&mut cmd)
+            .current_dir(dir)
             .env("JJ_CONFIG", &self.config)
             .env("JJ_USER", "Test User")
             .env("JJ_EMAIL", "test@example.com")
@@ -66,6 +68,15 @@ impl Fixture {
             .env("JJ_OP_USERNAME", "test-user")
             .args(args);
         cmd
+    }
+
+    pub fn git_env(cmd: &mut Command) -> &mut Command {
+        cmd.env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_AUTHOR_NAME", "Test User")
+            .env("GIT_AUTHOR_EMAIL", "test@example.com")
+            .env("GIT_COMMITTER_NAME", "Test User")
+            .env("GIT_COMMITTER_EMAIL", "test@example.com")
     }
 
     /// Creates a jj repo named `name` with an initial described commit.

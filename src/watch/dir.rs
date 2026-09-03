@@ -36,7 +36,11 @@ impl DirWatcher {
     /// caller.
     pub fn new(dir: &Path, debounce: Duration, debounce_max: Duration) -> Result<Self> {
         let (tx, signals) = mpsc::unbounded_channel();
-        let target = dir.to_owned();
+        // Backends report canonical paths (FSEvents resolves symlinks such
+        // as macOS's /var), so death detection must compare against one.
+        let target = dir
+            .canonicalize()
+            .wrap_err_with(|| format!("cannot resolve {}", dir.display()))?;
 
         let mut watcher = backend::watcher(
             move |event| {

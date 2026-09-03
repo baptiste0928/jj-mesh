@@ -53,6 +53,9 @@ pub async fn bind_endpoint(
         EndpointOptions::LocalTest { lookup } => {
             let endpoint = Endpoint::builder(presets::Minimal)
                 .relay_mode(iroh::RelayMode::Disabled)
+                .portmapper_config(iroh::endpoint::PortmapperConfig::Disabled)
+                .clear_ip_transports()
+                .bind_addr("127.0.0.1:0")?
                 .secret_key(key.secret().clone())
                 .alpns(alpns)
                 .bind()

@@ -296,7 +296,7 @@ fn git_rev(dir: &Path, rev: &str) -> String {
 
 /// Resolves `rev` in the git repo at `git_dir`.
 fn git_rev_at(git_dir: &Path, rev: &str) -> String {
-    let out = Command::new("git")
+    let out = Fixture::git_env(&mut Command::new("git"))
         .arg("--git-dir")
         .arg(git_dir)
         .args(["rev-parse", rev])
@@ -507,7 +507,7 @@ async fn mirror_preserves_user_branches_and_propagates_deletions() {
 
     // A user-made branch in b's .git, invisible to every view.
     let user_commit = git_rev(&dir_b, "HEAD");
-    let branch = Command::new("git")
+    let branch = Fixture::git_env(&mut Command::new("git"))
         .current_dir(&dir_b)
         .args(["branch", "user-branch", &user_commit])
         .status()
@@ -524,7 +524,7 @@ async fn mirror_preserves_user_branches_and_propagates_deletions() {
 
     // The user's branch survived; the deleted bookmark propagated.
     assert_eq!(git_rev(&dir_b, "refs/heads/user-branch"), user_commit);
-    let gone = Command::new("git")
+    let gone = Fixture::git_env(&mut Command::new("git"))
         .current_dir(&dir_b)
         .args(["rev-parse", "--verify", "refs/heads/main"])
         .output()
@@ -795,7 +795,7 @@ async fn syncs_trees_with_gitlink_entries() {
     // not exist here, as a submodule checkout would.
     let script = "tree=$(printf '160000 commit 1111111111111111111111111111111111111111\\tsub\\n' \
                   | git mktree --missing) && git branch gitlink $(git commit-tree $tree -m gitlink)";
-    let crafted = Command::new("sh")
+    let crafted = Fixture::git_env(&mut Command::new("sh"))
         .current_dir(&dir_a)
         .args(["-ec", script])
         .status()
@@ -813,7 +813,7 @@ async fn syncs_trees_with_gitlink_entries() {
     // The gitlink commit's own objects arrived; the submodule target
     // was correctly skipped.
     let gitlink_commit = git_rev(&dir_a, "refs/heads/gitlink");
-    let present = Command::new("git")
+    let present = Fixture::git_env(&mut Command::new("git"))
         .current_dir(&dir_b)
         .args(["cat-file", "-e", &gitlink_commit])
         .status()
@@ -944,7 +944,7 @@ async fn divergent_moves_along_one_line_mirror_the_descendant() {
     let (a, b, ra, rb) = settled_colocated_pair(&fx).await;
 
     let a_main = move_bookmark(&fx, &a, "main", "a.txt");
-    let fetch = Command::new("git")
+    let fetch = Fixture::git_env(&mut Command::new("git"))
         .current_dir(&b)
         .arg("fetch")
         .arg(a.join(".git"))
@@ -1064,7 +1064,7 @@ fn git(git_dir: &Path, args: &[&str]) {
 
 /// Runs a git command against `git_dir`, returning whether it succeeded.
 fn git_ok(git_dir: &Path, args: &[&str]) -> bool {
-    Command::new("git")
+    Fixture::git_env(&mut Command::new("git"))
         .arg("--git-dir")
         .arg(git_dir)
         .args(args)

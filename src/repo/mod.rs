@@ -258,8 +258,9 @@ mod tests {
         assert_eq!(repo.fingerprint().unwrap(), before);
 
         // A replaced op heads directory (repo recreated wholesale) changes
-        // the fingerprint even when every file reads the same.
-        fs::remove_dir_all(&heads).unwrap();
+        // the fingerprint even when every file reads the same. Keep the
+        // old directory around: a freed inode may be handed straight back.
+        fs::rename(&heads, tmp.path().join("old-heads")).unwrap();
         fs::create_dir_all(&heads).unwrap();
         assert_ne!(repo.fingerprint().unwrap(), before);
     }
