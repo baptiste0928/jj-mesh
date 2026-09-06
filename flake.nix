@@ -56,7 +56,7 @@
             version = (nixpkgs.lib.importTOML ./Cargo.toml).package.version;
 
             src = self;
-            cargoHash = "sha256-96Lv+GsFvsCXK2uh0iyMksiV4/8fFUdMC1CWwqDogOQ=";
+            cargoHash = "sha256-RBI6tCc8PGF88TQ9TbHvqf8TDdqqh/dJZf4YPRbBuns=";
 
             doCheck = false; # Don't run tests on the flake
             env.JJ_MESH_COMMIT = self.shortRev or self.dirtyShortRev or "unknown";

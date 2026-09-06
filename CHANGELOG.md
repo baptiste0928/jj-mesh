@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-09-06
+
 ### Changed
 - **Repos can now be colocated on every machine.** `jj-mesh repo clone` respects your global jj
   `git.colocate` setting (on by default).
@@ -14,7 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Current machine can now be renamed with `jj-mesh peer rename`.
 
 ### Fixed
-- Git refs are now synced even for non-colocated repositories. This allows to to run
+- Git refs are now synced even for non-colocated repositories. This allows you to run
   `jj git colocation enable` safely on any previously cloned repo.
 - Improved memory usage when idle, including a case where memory could grow
   multiple GB when you have a large `/etc/hosts`.
@@ -41,6 +43,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Initial version of `jj-mesh`.
 
-[unreleased]: https://github.com/baptiste0928/jj-mesh/compare/v0.1.1...HEAD
+[unreleased]: https://github.com/baptiste0928/jj-mesh/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/baptiste0928/jj-mesh/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/baptiste0928/jj-mesh/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/baptiste0928/jj-mesh/releases/tag/v0.1.0
