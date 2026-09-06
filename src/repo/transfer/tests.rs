@@ -289,6 +289,40 @@ async fn mirror_detaches_head_before_moving_its_branch() {
     );
 }
 
+/// A fresh colocated repo has an unborn HEAD symbolic to `main`, and its
+/// directory is empty. When the mirror creates `main`, HEAD must stay
+/// unborn: otherwise jj's next import reads a checkout of `main`, and
+/// its snapshot of the empty directory records the deletion of every
+/// file. This is the clone flow.
+#[tokio::test]
+async fn mirror_keeps_head_unborn_when_creating_its_branch() {
+    let fx = Fixture::new();
+    let a = fx.init_repo("a");
+    fx.commit_file(&a, "file.txt", "content");
+    fx.jj(&a, &["bookmark", "create", "main", "-r", "@-"]);
+    fx.jj(&a, &["new", "-m", "export"]);
+    let b = fx.init_colocated_pull_target("b", "machine-b");
+    let (ra, rb) = (open(&a), open(&b));
+
+    sync_missing(&rb, &ra).await;
+    assert_eq!(
+        git_rev(&b, "refs/heads/main"),
+        git_rev(&a, "refs/heads/main")
+    );
+    assert!(
+        !git_ok(&b.join(".git"), &["rev-parse", "--verify", "-q", "HEAD"]),
+        "HEAD must stay unborn"
+    );
+
+    // jj merges the divergent heads: nothing to import, nothing to snapshot.
+    fx.jj(&b, &["status"]);
+    let stray = fx.jj_output(&b, &["log", "-r", "all() ~ ::main ~ empty()", "--no-graph"]);
+    assert_eq!(
+        stray, "",
+        "the merge must not commit the empty working copy"
+    );
+}
+
 /// Resolves `rev` in the colocated `.git` of `dir`.
 fn git_rev(dir: &Path, rev: &str) -> String {
     git_rev_at(&dir.join(".git"), rev)

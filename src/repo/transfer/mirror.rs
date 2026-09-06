@@ -281,11 +281,12 @@ fn swap(repo: &OpenRepo, before: &GitRefs, after: &GitRefs) -> Result<()> {
             name: full_name,
             deref: false,
         };
-        // Edits apply individually: one ref the user raced must not abort
-        // the rest of the mirror.
-        let moved = detach_head(&git, name).and_then(|()| {
-            git.edit_references(Some(edit))
-                .map_err(|err| eyre!("{err}"))
+        // Each ref moves in its own transaction, with HEAD: one ref the
+        // user raced must not abort the rest of the mirror, nor leave HEAD
+        // moved for nothing.
+        let moved = unpin_head(&git, name).and_then(|mut edits| {
+            edits.push(edit);
+            git.edit_references(edits).map_err(|err| eyre!("{err}"))
         });
         if let Err(err) = moved {
             warn!("skipping git ref mirror of {}: {err}", name.as_symbol());
@@ -294,36 +295,59 @@ fn swap(repo: &OpenRepo, before: &GitRefs, after: &GitRefs) -> Result<()> {
     Ok(())
 }
 
-/// Detaches HEAD at its current commit when it is symbolic to `name`, as
-/// jj's export does before moving a ref: a branch moved under HEAD leaves
-/// git's index and worktree behind, and jj's next import would read the
-/// jump as a checkout. A no-op when HEAD is detached, unborn, or on
-/// another ref.
-fn detach_head(git: &gix::Repository, name: &GitRefName) -> Result<()> {
-    use gix::refs::transaction::{Change, LogChange, PreviousValue, RefEdit};
+/// The placeholder jj points an unborn HEAD to (jj's `UNBORN_ROOT_REF_NAME`).
+/// Git tools treat it as a normal ref and may create it, so every use
+/// deletes it first: it must not resolve, or HEAD would be born on it.
+const UNBORN_HEAD: &str = "refs/jj/root";
+
+/// The edits moving HEAD off `name` without changing what it resolves
+/// to, when HEAD is symbolic to `name`, as jj's export does before moving
+/// a ref: a branch moved under HEAD leaves git's index and worktree
+/// behind, and jj's next import would read the jump as a checkout. HEAD
+/// is detached at its commit, or parked on [`UNBORN_HEAD`] when `name`
+/// does not exist (a fresh colocated repo, before its branch is created
+/// here). Empty when HEAD is detached or on another ref.
+fn unpin_head(
+    git: &gix::Repository,
+    name: &GitRefName,
+) -> Result<Vec<gix::refs::transaction::RefEdit>> {
+    use gix::refs::transaction::{Change, LogChange, PreviousValue, RefEdit, RefLog};
 
     let Some(mut head) = git.try_find_reference("HEAD")? else {
-        return Ok(());
+        return Ok(vec![]);
     };
     let stored = head.target().into_owned();
     if stored.try_name().map(gix::refs::FullNameRef::as_bstr) != Some(name.as_str().into()) {
-        return Ok(());
+        return Ok(vec![]);
     }
-    let Ok(commit) = head.peel_to_commit() else {
-        return Ok(());
+    let mut edits = Vec::new();
+    let new = if git.try_find_reference(name.as_str())?.is_some() {
+        let commit = head
+            .peel_to_commit()
+            .map_err(|err| eyre!("cannot resolve HEAD: {err}"))?;
+        gix::refs::Target::Object(commit.id)
+    } else {
+        let placeholder: gix::refs::FullName = UNBORN_HEAD.try_into().expect("valid ref name");
+        edits.push(RefEdit {
+            change: Change::Delete {
+                expected: PreviousValue::Any,
+                log: RefLog::AndReference,
+            },
+            name: placeholder.clone(),
+            deref: false,
+        });
+        gix::refs::Target::Symbolic(placeholder)
     };
-    let edit = RefEdit {
+    edits.push(RefEdit {
         change: Change::Update {
             log: LogChange::default(),
             expected: PreviousValue::MustExistAndMatch(stored),
-            new: gix::refs::Target::Object(commit.id),
+            new,
         },
         name: "HEAD".try_into().expect("valid ref name"),
         deref: false,
-    };
-    git.edit_references(Some(edit))
-        .map_err(|err| eyre!("cannot detach HEAD: {err}"))?;
-    Ok(())
+    });
+    Ok(edits)
 }
 
 /// What the git repo stores for a ref jj records at `commit`: the
