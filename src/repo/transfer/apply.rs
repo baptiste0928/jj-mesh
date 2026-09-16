@@ -52,6 +52,9 @@ pub(super) fn stage(
         .flat_map(|view| view.meta.head_ids.iter().cloned())
         .collect();
     write_keep_refs(repo, &new_commit_heads)?;
+    fail::fail_point!("stage.after_keep_refs", |_| Err(eyre!(
+        "crash point stage.after_keep_refs"
+    )));
 
     // Staged unsynced and persisted with one parallel sync pass, instead
     // of a serial fsync per file (a clone stages the whole op log here).
@@ -63,6 +66,9 @@ pub(super) fn stage(
         writes.write_operation_bytes(&op.id, &op.bytes)?;
     }
     writes.persist()?;
+    fail::fail_point!("stage.after_persist", |_| Err(eyre!(
+        "crash point stage.after_persist"
+    )));
 
     // Materialize change-id extras for the new commits eagerly instead of
     // relying on jj's lazy import fallback.
@@ -70,6 +76,9 @@ pub(super) fn stage(
     repo.git_backend()
         .import_head_commits(heads)
         .map_err(|err| eyre!("cannot import commit metadata: {err}"))?;
+    fail::fail_point!("stage.after_extras", |_| Err(eyre!(
+        "crash point stage.after_extras"
+    )));
 
     // Which local heads each want supersedes, established by walking the
     // want's ancestry through validated data only (the parsed batch and
@@ -106,12 +115,18 @@ pub(super) fn publish(repo: &Arc<OpenRepo>, staged: &Staged) -> Result<()> {
     let Staged { to_publish, ops } = staged;
 
     mirror::run(repo, to_publish)?;
+    fail::fail_point!("publish.after_mirror", |_| Err(eyre!(
+        "crash point publish.after_mirror"
+    )));
 
     // Each want removes exactly the heads its own ancestry covers, so a
     // crash between two to_publish cannot unlist a head whose replacement
     // was never published.
     for (want, covered) in to_publish {
         repo.update_op_heads(covered, want).block_on()?;
+        fail::fail_point!("publish.after_head", |_| Err(eyre!(
+            "crash point publish.after_head"
+        )));
     }
     if !to_publish.is_empty() {
         info!(heads = to_publish.len(), ops, "applied synced operations");

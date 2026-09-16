@@ -174,17 +174,15 @@ pub async fn fetch(
     // One blocking task from staging to publication: a started blocking
     // task always runs to completion, so an abandoned fetch (daemon
     // shutdown, clone client gone) cannot persist ops without publishing
-    // their heads. A crash still can; `OpenRepo::missing_heads` then
-    // fetches the head again and the retry publishes it. The index build
-    // stays best-effort: op data is valid without it, and the watch-start
-    // heal retries.
+    // their heads. A crash can: `OpenRepo::missing_heads` then reports
+    // the head as missing and the next fetch publishes it. The index build
+    // is best-effort: op data is valid without it, and the watch-start
+    // heal retries it.
     {
         let repo = repo.clone();
         let wants = wants.to_vec();
-        tokio::task::spawn_blocking(move || -> Result<()> {
-            let staged = apply::stage(&repo, &batch, &wants, &local_heads)?;
-            repo.build_commit_indexes(&to_index);
-            apply::publish(&repo, &staged)
+        tokio::task::spawn_blocking(move || {
+            apply_batch(&repo, &batch, &wants, &local_heads, &to_index)
         })
         .await
         .wrap_err("apply task failed")??;
@@ -196,6 +194,25 @@ pub async fn fetch(
         ops: ops_received,
         git_objects,
     })
+}
+
+/// Stages, indexes and publishes a fetched batch (see [`apply`]). Blocking.
+fn apply_batch(
+    repo: &Arc<OpenRepo>,
+    batch: &OpBatch,
+    wants: &[OperationId],
+    local_heads: &[OperationId],
+    to_index: &[OperationId],
+) -> Result<()> {
+    fail::fail_point!("fetch.before_stage", |_| Err(eyre!(
+        "crash point fetch.before_stage"
+    )));
+    let staged = apply::stage(repo, batch, wants, local_heads)?;
+    repo.build_commit_indexes(to_index);
+    fail::fail_point!("fetch.after_index", |_| Err(eyre!(
+        "crash point fetch.after_index"
+    )));
+    apply::publish(repo, &staged)
 }
 
 /// Fails the fetch when any of the `requested` commits is still absent

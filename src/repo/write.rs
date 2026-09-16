@@ -108,6 +108,9 @@ impl<'a> RawWriteBatch<'a> {
             temp.persist(&path)
                 .map_err(|err| err.error)
                 .wrap_err_with(|| format!("cannot persist {}", path.display()))?;
+            fail::fail_point!("persist.after_rename", |_| Err(color_eyre::eyre::eyre!(
+                "crash point persist.after_rename"
+            )));
         }
         Ok(())
     }

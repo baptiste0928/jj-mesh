@@ -13,6 +13,7 @@ color-eyre = "0.6.5"
 console = "0.16.4"
 data-encoding = "2.11.1"
 etcetera = "0.11.0"
+fail = "0.5.1"
 gethostname = "1.1.0"
 gix = { version = "0.87.1", default-features = false }
 gix-pack = "0.74.2"
@@ -39,7 +40,9 @@ zstd = "0.13.3"
 
 [features]
 test-util = []
+failpoints = ["fail/failpoints"]
 
 [dev-dependencies]
-jj-mesh = { path = ".", features = ["test-util"] }
+fail = "0.5.1"
+jj-mesh = { path = ".", features = ["test-util", "failpoints"] }
 tokio = { version = "1.53.1", features = ["macros"] }
