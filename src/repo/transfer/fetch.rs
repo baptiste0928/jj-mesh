@@ -174,10 +174,10 @@ pub async fn fetch(
     // One blocking task from staging to publication: a started blocking
     // task always runs to completion, so an abandoned fetch (daemon
     // shutdown, clone client gone) cannot persist ops without publishing
-    // their heads — a state no later sync would repair, since the stored
-    // ops would look like nothing is missing. The index build stays
-    // best-effort: op data is valid without it, and the watch-start heal
-    // retries.
+    // their heads. A crash still can; `OpenRepo::missing_heads` then
+    // fetches the head again and the retry publishes it. The index build
+    // stays best-effort: op data is valid without it, and the watch-start
+    // heal retries.
     {
         let repo = repo.clone();
         let wants = wants.to_vec();

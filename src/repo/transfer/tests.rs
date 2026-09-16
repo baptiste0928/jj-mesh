@@ -108,12 +108,7 @@ async fn assert_heads_indexed(repo: &Arc<OpenRepo>) {
 /// Fetches the heads `dst` lacks from `src`, as the daemon does on an
 /// announcement. Returns whether anything was fetched.
 async fn sync_missing(dst: &Arc<OpenRepo>, src: &Arc<OpenRepo>) -> bool {
-    let mut wants = Vec::new();
-    for head in src.op_heads().await.unwrap() {
-        if !dst.has_operation(&head).await.unwrap() {
-            wants.push(head);
-        }
-    }
+    let wants = dst.missing_heads(&src.op_heads().await.unwrap()).unwrap();
     if wants.is_empty() {
         return false;
     }
@@ -156,6 +151,42 @@ async fn fast_forward_sync_transfers_ops_and_git_objects() {
     let again = sync_once(&rb, &ra, &wants).await;
     assert_eq!(again.ops, 0);
     assert_eq!(rb.op_heads().await.unwrap(), wants);
+}
+
+/// Stored but unpublished heads are fetched again; published ones are not.
+#[tokio::test]
+async fn stored_but_unpublished_heads_are_missing() {
+    let fx = Fixture::new();
+    let a = fx.init_repo("a");
+    fork(&a, &fx.path().join("b"));
+    let b = fx.path().join("b");
+    fx.jj(&a, &["new", "-m", "on a"]);
+    let (ra, rb) = (open(&a), open(&b));
+    let a_heads = ra.op_heads().await.unwrap();
+    let b_heads = rb.op_heads().await.unwrap();
+
+    assert_eq!(rb.missing_heads(&a_heads).unwrap(), a_heads);
+    assert_eq!(ra.missing_heads(&b_heads).unwrap(), vec![]);
+    assert_eq!(ra.missing_heads(&a_heads).unwrap(), vec![]);
+    let root = ra.root_operation_id().clone();
+    assert_eq!(ra.missing_heads(&[root]).unwrap(), vec![]);
+
+    let head = &a_heads[0];
+    let op = ra.read_operation(head).await.unwrap();
+    let mut writes = rb.raw_write_batch();
+    writes
+        .write_view_bytes(&op.view_id, &ra.read_view_bytes(&op.view_id).unwrap())
+        .unwrap();
+    writes
+        .write_operation_bytes(head, &ra.read_operation_bytes(head).unwrap())
+        .unwrap();
+    writes.persist().unwrap();
+    assert!(rb.has_operation(head).await.unwrap());
+    assert_eq!(rb.missing_heads(&a_heads).unwrap(), a_heads);
+
+    sync_once(&rb, &ra, &a_heads).await;
+    assert_eq!(rb.op_heads().await.unwrap(), a_heads);
+    assert_eq!(rb.missing_heads(&a_heads).unwrap(), vec![]);
 }
 
 /// An incremental sync must carry only the objects the change touched,

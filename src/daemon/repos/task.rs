@@ -447,13 +447,26 @@ impl RepoTask {
             debug!(repo = %self.name, peer = %announce.peer, "ignoring malformed announcement");
             return Ok(Handled::Idle);
         }
-        let mut missing = Vec::new();
-        for head in &announce.heads {
-            let head = OperationId::new(head.clone());
-            if !repo.has_operation(&head).await? {
-                missing.push(head);
+        // Runs on a blocking thread: the check may walk the op log.
+        let heads: Vec<OperationId> = announce
+            .heads
+            .iter()
+            .map(|head| OperationId::new(head.clone()))
+            .collect();
+        let missing = {
+            let repo = repo.clone();
+            tokio::task::spawn_blocking(move || repo.missing_heads(&heads))
+                .await
+                .wrap_err("announcement check task failed")?
+        };
+        let missing = match missing {
+            Ok(missing) => missing,
+            // Retried like a failed fetch.
+            Err(err) => {
+                warn!(repo = %self.name, peer = %announce.peer, "cannot check announcement: {err:#}");
+                return Ok(Handled::Failed);
             }
-        }
+        };
         if missing.is_empty() {
             debug!(repo = %self.name, peer = %announce.peer, "in sync with peer");
             return Ok(Handled::Idle);

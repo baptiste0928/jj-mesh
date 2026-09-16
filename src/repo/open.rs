@@ -122,6 +122,56 @@ impl OpenRepo {
         Ok(matches!(resolution, PrefixResolution::SingleMatch(_)))
     }
 
+    /// The announced heads that are not stored or not published. Blocking.
+    pub fn missing_heads(&self, announced: &[OperationId]) -> Result<Vec<OperationId>> {
+        const WALK_BUDGET: usize = 1 << 16;
+
+        let mut missing: HashSet<&OperationId> = HashSet::new();
+        let mut unreached: HashSet<&OperationId> = HashSet::new();
+        for head in announced {
+            if head == self.root_operation_id() {
+                continue;
+            }
+            if self.has_operation(head).block_on()? {
+                unreached.insert(head);
+            } else {
+                missing.insert(head);
+            }
+        }
+
+        // A stored head is published if it is an op head or an ancestor of
+        // one; an interrupted apply leaves stored, unpublished heads. Past
+        // the budget the remaining heads count as published: publishing an
+        // ancestor of a local head would create a divergence.
+        let heads = self.op_heads().block_on()?;
+        let mut visited: HashSet<OperationId> = heads.iter().cloned().collect();
+        let mut stack = heads;
+        let mut budget = WALK_BUDGET;
+        while let Some(current) = stack.pop() {
+            unreached.remove(&current);
+            if unreached.is_empty() {
+                break;
+            }
+            if budget == 0 {
+                unreached.clear();
+                break;
+            }
+            budget -= 1;
+            for parent in self.read_operation(&current).block_on()?.parents {
+                if parent != *self.root_operation_id() && visited.insert(parent.clone()) {
+                    stack.push(parent);
+                }
+            }
+        }
+        missing.extend(unreached);
+
+        Ok(announced
+            .iter()
+            .filter(|head| missing.contains(head))
+            .cloned()
+            .collect())
+    }
+
     pub async fn read_operation(&self, id: &OperationId) -> Result<Operation> {
         Ok(self.loader.op_store().read_operation(id).await?)
     }
