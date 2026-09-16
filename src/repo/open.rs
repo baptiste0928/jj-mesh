@@ -328,7 +328,7 @@ impl OpenRepo {
     }
 
     /// The simple op store's storage directory.
-    pub(super) fn op_store_dir(&self) -> PathBuf {
+    pub fn op_store_dir(&self) -> PathBuf {
         self.repo.repo_dir().join("op_store")
     }
 
@@ -480,7 +480,7 @@ impl OpenRepo {
 
     /// Path to the git repository holding the commit data (the `.git`
     /// directory when colocated).
-    fn git_repo_path(&self) -> &Path {
+    pub fn git_repo_path(&self) -> &Path {
         self.git_backend().git_repo_path()
     }
 

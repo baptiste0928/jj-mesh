@@ -6,7 +6,6 @@ use std::{
     path::{Path, PathBuf},
     process::Command,
     sync::Arc,
-    time::Duration,
 };
 
 use jj_lib::object_id::ObjectId as _;
@@ -15,106 +14,13 @@ use super::*;
 use crate::{
     net::{
         fetch::{
-            FetchRequest, GitFrame, GitRequest, GitTransferFormat, MAX_GIT_FRAME_SIZE,
-            MAX_OP_FRAME_SIZE, OpFrame,
+            FetchRequest, GitFrame, GitRequest, MAX_GIT_FRAME_SIZE, MAX_OP_FRAME_SIZE, OpFrame,
         },
         wire::{read_message, write_message},
     },
-    repo::{JjRepo, OpenRepo},
-    testing::Fixture,
+    repo::OpenRepo,
+    testing::*,
 };
-
-/// Network deadline passed to test fetches; generous, never meant to fire.
-const NET_TIMEOUT: Duration = Duration::from_mins(1);
-
-fn open(dir: &Path) -> Arc<OpenRepo> {
-    Arc::new(JjRepo::discover(dir).unwrap().open().unwrap())
-}
-
-/// Copies a repo directory, forking its history.
-fn fork(from: &Path, to: &Path) {
-    let cp = Command::new("cp")
-        .arg("-r")
-        .args([from, to])
-        .status()
-        .unwrap();
-    assert!(cp.success());
-}
-
-/// Runs one fetch of `wants` from `server` into `fetcher` over an
-/// in-memory stream pair, as the daemon would over QUIC.
-async fn sync_once(
-    fetcher: &Arc<OpenRepo>,
-    server: &Arc<OpenRepo>,
-    wants: &[OperationId],
-) -> FetchOutcome {
-    sync_once_as(fetcher, server, wants, GitTransferFormat::Loose).await
-}
-
-/// [`sync_once`] with an explicit git transfer format.
-async fn sync_once_as(
-    fetcher: &Arc<OpenRepo>,
-    server: &Arc<OpenRepo>,
-    wants: &[OperationId],
-    format: GitTransferFormat,
-) -> FetchOutcome {
-    let (client, remote) = tokio::io::duplex(1 << 20);
-    let (mut client_rx, mut client_tx) = tokio::io::split(client);
-    let (mut server_rx, mut server_tx) = tokio::io::split(remote);
-
-    let server = server.clone();
-    let serve_task = tokio::spawn(async move {
-        let request: FetchRequest = read_message(&mut server_rx, MAX_OP_FRAME_SIZE)
-            .await
-            .unwrap();
-        serve(&server, request, &mut server_tx, &mut server_rx)
-            .await
-            .unwrap();
-    });
-
-    let outcome = fetch(
-        fetcher,
-        RepoIdent {
-            name: "test",
-            id: &crate::config::RepoId::generate(),
-        },
-        wants,
-        FetchOptions {
-            format,
-            net_timeout: NET_TIMEOUT,
-        },
-        &mut client_tx,
-        &mut client_rx,
-        ProgressSink::default(),
-    )
-    .await
-    .unwrap();
-    serve_task.await.unwrap();
-    outcome
-}
-
-/// Asserts every op head of `repo` has its commit index, so no jj command
-/// pays for a rebuild after a sync.
-async fn assert_heads_indexed(repo: &Arc<OpenRepo>) {
-    for head in repo.op_heads().await.unwrap() {
-        assert!(
-            repo.has_commit_index(&head).await,
-            "op head {} published without a commit index",
-            head.hex(),
-        );
-    }
-}
-
-/// Fetches the heads `dst` lacks from `src`, as the daemon does on an
-/// announcement. Returns whether anything was fetched.
-async fn sync_missing(dst: &Arc<OpenRepo>, src: &Arc<OpenRepo>) -> bool {
-    let wants = dst.missing_heads(&src.op_heads().await.unwrap()).unwrap();
-    if wants.is_empty() {
-        return false;
-    }
-    sync_once(dst, src, &wants).await;
-    true
-}
 
 #[tokio::test]
 async fn fast_forward_sync_transfers_ops_and_git_objects() {
@@ -354,27 +260,6 @@ async fn mirror_keeps_head_unborn_when_creating_its_branch() {
     );
 }
 
-/// Resolves `rev` in the colocated `.git` of `dir`.
-fn git_rev(dir: &Path, rev: &str) -> String {
-    git_rev_at(&dir.join(".git"), rev)
-}
-
-/// Resolves `rev` in the git repo at `git_dir`.
-fn git_rev_at(git_dir: &Path, rev: &str) -> String {
-    let out = Fixture::git_env(&mut Command::new("git"))
-        .arg("--git-dir")
-        .arg(git_dir)
-        .args(["rev-parse", rev])
-        .output()
-        .unwrap();
-    assert!(
-        out.status.success(),
-        "git rev-parse failed: {}",
-        String::from_utf8_lossy(&out.stderr),
-    );
-    String::from_utf8(out.stdout).unwrap().trim().to_owned()
-}
-
 /// A hostile batch op naming a local head as its parent, without being
 /// on the want's ancestry, must be rejected: accepting it would let a
 /// peer unlist that head (op-log rollback).
@@ -440,17 +325,10 @@ async fn rejects_ops_unreachable_from_wants() {
         }
     });
 
-    let err = fetch(
+    let err = fetch_from(
         &repo,
-        RepoIdent {
-            name: "test",
-            id: &crate::config::RepoId::generate(),
-        },
         &[want],
-        FetchOptions {
-            format: GitTransferFormat::Loose,
-            net_timeout: NET_TIMEOUT,
-        },
+        GitTransferFormat::Loose,
         &mut client_tx,
         &mut client_rx,
         ProgressSink::default(),
@@ -529,17 +407,10 @@ async fn rejects_fetch_when_referenced_git_objects_are_missing() {
             .unwrap();
     });
 
-    let err = fetch(
+    let err = fetch_from(
         &repo,
-        RepoIdent {
-            name: "test",
-            id: &crate::config::RepoId::generate(),
-        },
         &[OperationId::new(vec![1; 64])],
-        FetchOptions {
-            format: GitTransferFormat::Loose,
-            net_timeout: NET_TIMEOUT,
-        },
+        GitTransferFormat::Loose,
         &mut client_tx,
         &mut client_rx,
         ProgressSink::default(),
@@ -616,7 +487,9 @@ async fn clone_pull_into_fresh_repo() {
     let (ra, rb) = (open(&a), open(&b));
     let wants = ra.op_heads().await.unwrap();
     let init_heads = rb.op_heads().await.unwrap();
-    let outcome = sync_once_as(&rb, &ra, &wants, GitTransferFormat::Pack).await;
+    let outcome = try_sync(&rb, &ra, &wants, GitTransferFormat::Pack)
+        .await
+        .unwrap();
     assert!(outcome.git_objects > 0);
 
     // The wanted head was published next to the fresh repo's init head.
@@ -665,15 +538,7 @@ async fn clone_pull_into_fresh_repo() {
     // The next jj command merges: both workspaces coexist, and the
     // mesh history is visible from the fresh machine.
     fx.jj(&b, &["status"]);
-    let list = Command::new(crate::repo::jj_bin())
-        .current_dir(&b)
-        .env("JJ_CONFIG", "/dev/null")
-        .env("JJ_USER", "Test User")
-        .env("JJ_EMAIL", "test@example.com")
-        .args(["workspace", "list"])
-        .output()
-        .unwrap();
-    let list = String::from_utf8(list.stdout).unwrap();
+    let list = fx.jj_output(&b, &["workspace", "list"]);
     assert!(list.contains("machine-b:"), "{list}");
     assert!(list.contains("default:"), "{list}");
     assert_eq!(rb.op_heads().await.unwrap().len(), 1, "merged");
@@ -779,17 +644,10 @@ async fn progress_reports_phases_and_exact_totals() {
 
     let samples = std::sync::Mutex::new(Vec::<TransferProgress>::new());
     let sink = |progress: TransferProgress| samples.lock().unwrap().push(progress);
-    let outcome = fetch(
+    let outcome = fetch_from(
         &rb,
-        RepoIdent {
-            name: "test",
-            id: &crate::config::RepoId::generate(),
-        },
         &wants,
-        FetchOptions {
-            format: GitTransferFormat::Pack,
-            net_timeout: NET_TIMEOUT,
-        },
+        GitTransferFormat::Pack,
         &mut client_tx,
         &mut client_rx,
         ProgressSink::new(&sink),
@@ -1115,26 +973,6 @@ async fn heal_leaves_colocated_git_alone() {
         &git_dir,
         &["rev-parse", "--verify", "refs/heads/feat"]
     ));
-}
-
-/// The backing git repo of a non-colocated jj repo.
-fn store_git_dir(dir: &Path) -> PathBuf {
-    dir.join(".jj/repo/store/git")
-}
-
-/// Runs a git command against `git_dir`, panicking on failure.
-fn git(git_dir: &Path, args: &[&str]) {
-    assert!(git_ok(git_dir, args), "git {args:?} failed in {git_dir:?}");
-}
-
-/// Runs a git command against `git_dir`, returning whether it succeeded.
-fn git_ok(git_dir: &Path, args: &[&str]) -> bool {
-    Fixture::git_env(&mut Command::new("git"))
-        .arg("--git-dir")
-        .arg(git_dir)
-        .args(args)
-        .output()
-        .is_ok_and(|out| out.status.success())
 }
 
 /// jj records a tag by the commit it peels to, while git stores the tag
