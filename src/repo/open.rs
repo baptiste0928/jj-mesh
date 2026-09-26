@@ -489,11 +489,20 @@ impl OpenRepo {
         self.git_repo_path() == self.repo.root().join(".git")
     }
 
-    /// Whether the git repo lives inside `.jj`, where only jj writes refs.
-    /// False when colocated or backed by an external git repo (`jj git
-    /// init --git-repo`), whose refs the user may edit directly.
+    /// Whether the git repo lives inside `.jj` with no worktree attached,
+    /// where only jj writes refs. False when colocated, backed by an
+    /// external git repo (`jj git init --git-repo`), or when a git worktree
+    /// (a colocated secondary workspace) lets the user edit refs directly.
+    /// Checked on every call: worktrees come and go without a reopen.
     pub fn owns_git_refs(&self) -> bool {
-        self.git_repo_path() == self.repo.repo_dir().join("store").join("git")
+        let git = self.git_repo_path();
+        if git != self.repo.repo_dir().join("store").join("git") {
+            return false;
+        }
+        match std::fs::read_dir(git.join("worktrees")) {
+            Ok(mut worktrees) => worktrees.next().is_none(),
+            Err(err) => err.kind() == std::io::ErrorKind::NotFound,
+        }
     }
 }
 
@@ -691,5 +700,21 @@ mod tests {
 
         // The bogus publish must not have touched the existing heads.
         assert_eq!(repo.op_heads().await.unwrap(), heads);
+    }
+
+    /// A git worktree on the internal git repo (a colocated secondary
+    /// workspace) opens its refs to the user.
+    #[test]
+    fn worktrees_revoke_git_ref_ownership() {
+        let fx = Fixture::new();
+        let dir = fx.init_pull_target("a", "ws");
+        let repo = open(&dir);
+        assert!(repo.owns_git_refs());
+
+        let worktree = repo.git_repo_path().join("worktrees").join("wt");
+        fs::create_dir_all(&worktree).unwrap();
+        assert!(!repo.owns_git_refs());
+        fs::remove_dir(&worktree).unwrap();
+        assert!(repo.owns_git_refs());
     }
 }

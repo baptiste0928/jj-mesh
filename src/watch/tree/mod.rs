@@ -13,6 +13,7 @@
 //! absorbed by the next edit. The invariants that do matter:
 //! - `.jj` and `.git` never signal (the daemon's own syncs, and jj's and
 //!   the watcher's consumers' state churn, must not feed back);
+//! - nested repos and workspaces, which jj skips, are not watched;
 //! - a directory that appears non-ignored, however it appeared (created,
 //!   renamed in, unignored), starts being watched;
 //! - the watcher's own cost stays bounded whatever the tree contains:
@@ -238,6 +239,15 @@ impl TreeWatcher {
             return Ok(false);
         }
 
+        // A `.jj` or `.git` appearing or vanishing makes its directory a
+        // nested repo or a plain one again; the root's own are state.
+        if is_reserved(path) {
+            if path.parent() != Some(&self.root) {
+                self.stale = true;
+            }
+            return Ok(false);
+        }
+
         // An ignore-rule change moves the tracked/ignored boundary, and
         // is an edit in itself.
         if path.file_name().is_some_and(|name| name == GITIGNORE) {
@@ -253,7 +263,7 @@ impl TreeWatcher {
             Ok(meta) if meta.is_dir() => {
                 // Already watched: a metadata event on the directory
                 // itself, whose children report themselves.
-                if self.watched.contains(path) || self.ignored(path, true) {
+                if self.watched.contains(path) || self.ignored(path, true) || is_nested_repo(path) {
                     return Ok(false);
                 }
                 // It needs watches, and whatever landed inside it before
@@ -314,13 +324,14 @@ fn walk_dirs(root: &Path, rules: Arc<Mutex<Rules>>) -> Result<BTreeSet<PathBuf>>
         .require_git(false)
         .follow_links(false)
         .filter_entry(move |entry| {
-            if matches!(entry.file_name().to_str(), Some(".jj" | ".git")) {
+            if is_reserved(entry.path()) {
                 return false;
             }
             // Only directories are collected, so files are pruned before
             // they cost an ignore evaluation.
             entry.file_type().is_some_and(|ty| ty.is_dir())
                 && !rules.lock().unwrap().is_ignored(entry.path(), true)
+                && (entry.depth() == 0 || !is_nested_repo(entry.path()))
         })
         .build();
 
@@ -349,11 +360,29 @@ fn walk_dirs(root: &Path, rules: Arc<Mutex<Rules>>) -> Result<BTreeSet<PathBuf>>
     Ok(dirs)
 }
 
+/// jj's and git's state entries.
+const RESERVED: [&str; 2] = [".jj", ".git"];
+
 /// Whether a path is inside jj's or git's own state: never a working-copy
-/// change, and the bulk of self-inflicted event traffic.
+/// change, and the bulk of self-inflicted event traffic. The state entries
+/// themselves are not: they tell nested repos apart.
 fn is_internal(path: &Path) -> bool {
-    path.components()
-        .any(|c| matches!(c.as_os_str().to_str(), Some(".jj" | ".git")))
+    path.ancestors().skip(1).any(is_reserved)
+}
+
+/// Whether a path is a `.jj` or `.git` entry.
+fn is_reserved(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| RESERVED.contains(&name))
+}
+
+/// Whether a directory is a nested repo or workspace, which jj skips
+/// entirely when snapshotting.
+fn is_nested_repo(dir: &Path) -> bool {
+    RESERVED
+        .iter()
+        .any(|name| dir.join(name).symlink_metadata().is_ok())
 }
 
 #[cfg(test)]
@@ -429,6 +458,24 @@ mod tests {
         // .gitignore is not ".git": dotfiles still count.
         fs::write(root.join(".env"), "x").unwrap();
         assert_changed(&mut watch).await;
+    }
+
+    #[tokio::test]
+    async fn skips_nested_repos() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = workdir(&tmp);
+        fs::create_dir_all(root.join("nested/.jj")).unwrap();
+        fs::create_dir(root.join("sub")).unwrap();
+        let mut watch = watch(&root).await;
+
+        fs::write(root.join("nested/file"), "x").unwrap();
+        assert_quiet(&mut watch).await;
+
+        // A directory turning into a nested workspace stops signaling.
+        fs::write(root.join("sub/.git"), "gitdir: elsewhere").unwrap();
+        assert_quiet(&mut watch).await;
+        fs::write(root.join("sub/file"), "x").unwrap();
+        assert_quiet(&mut watch).await;
     }
 
     #[tokio::test]
