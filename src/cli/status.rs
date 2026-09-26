@@ -5,8 +5,10 @@ use color_eyre::eyre::Result;
 
 use super::ui;
 use crate::{
-    config::{ConfigDir, sanitize},
-    daemon::control::{self, ConnectionStatus, PeerReport, RepoHealthState, Route},
+    config::{ConfigDir, MAX_MACHINE_WORKSPACES, sanitize},
+    daemon::control::{
+        self, ConnectionStatus, PeerReport, RepoHealthState, Route, WorkspacePlace, WorkspaceState,
+    },
 };
 
 /// Show the daemon state and the live mesh status
@@ -76,10 +78,7 @@ pub fn run(_args: StatusArgs, dir: &ConfigDir) -> Result<()> {
                     repo.workspaces.iter().map(|w| sanitize(&w.name)).collect();
                 let width = ui::name_width(names.iter().map(String::as_str));
                 for (workspace, name) in repo.workspaces.iter().zip(&names) {
-                    println!(
-                        "    {name:width$}  {}",
-                        ui::dim(ui::display_path(&workspace.path)),
-                    );
+                    println!("    {name:width$}  {}", place_summary(&workspace.place));
                 }
             }
         }
@@ -110,6 +109,13 @@ pub fn run(_args: StatusArgs, dir: &ConfigDir) -> Result<()> {
 fn collect_issues(status: &control::Status) -> Vec<String> {
     let mut issues = Vec::new();
 
+    for repo in &status.repos {
+        for workspace in &repo.workspaces {
+            if let Some(issue) = workspace_issue(&workspace.name, &workspace.place) {
+                issues.push(format!("`{}`: {issue}", repo.name));
+            }
+        }
+    }
     for conflict in &status.conflicts {
         issues.push(format!(
             "`{}`: peer {} announced a different repo under the same name",
@@ -133,6 +139,61 @@ fn collect_issues(status: &control::Status) -> Vec<String> {
     }
 
     issues
+}
+
+/// One-line description of where a workspace lives.
+fn place_summary(place: &WorkspacePlace) -> String {
+    let (path, state) = match place {
+        WorkspacePlace::Local { path, state } => (path, state),
+        WorkspacePlace::Missing => return ui::warn("directory missing").to_string(),
+        WorkspacePlace::Peer { machine } => {
+            return ui::dim(format_args!("on {}", sanitize(machine))).to_string();
+        }
+    };
+    let path = ui::dim(ui::display_path(path));
+    match state {
+        WorkspaceState::Claimed => path.to_string(),
+        WorkspaceState::Contested { .. } => format!("{path}  {}", ui::bad("(contested)")),
+        WorkspaceState::Foreign { .. } | WorkspaceState::Stale | WorkspaceState::Unclaimable => {
+            format!("{path}  {}", ui::dim("(not synced)"))
+        }
+    }
+}
+
+/// What the user can do about a workspace this machine does not keep
+/// fresh.
+fn workspace_issue(name: &str, place: &WorkspacePlace) -> Option<String> {
+    let name = sanitize(name);
+    // jj workspace names are mesh-wide: renaming one copy renames both.
+    let recreate = format!(
+        "re-create it under another name (`jj workspace forget {name}`, then \
+         `jj workspace add --name <new>`)"
+    );
+    let issue = match place {
+        WorkspacePlace::Local { state, .. } => match state {
+            WorkspaceState::Claimed => return None,
+            WorkspaceState::Contested { machines } => format!(
+                "workspace `{name}` also exists on {}, so neither copy is synced; on one machine, {recreate}",
+                sanitize(&machines.join(", ")),
+            ),
+            WorkspaceState::Foreign { machines } => format!(
+                "workspace `{name}` here is not synced, it belongs to {}; to sync it, {recreate}",
+                sanitize(&machines.join(", ")),
+            ),
+            WorkspaceState::Stale => format!(
+                "workspace `{name}` was stale when found; run `jj workspace update-stale` in it to sync it"
+            ),
+            WorkspaceState::Unclaimable => format!(
+                "workspace `{name}` cannot be synced: its name is not valid in the mesh, or this \
+                 machine syncs {MAX_MACHINE_WORKSPACES} workspaces already"
+            ),
+        },
+        WorkspacePlace::Missing => format!(
+            "workspace `{name}` is missing; run `jj workspace forget {name}` if it was deleted"
+        ),
+        WorkspacePlace::Peer { .. } => return None,
+    };
+    Some(issue)
 }
 
 /// One-line description of a repo watch.

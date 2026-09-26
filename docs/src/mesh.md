@@ -42,7 +42,12 @@ The name can then be reused, since the re-registration outranks the
 tombstone. Repos also carry a random internal id, used to catch the case where
 two machines concurrently create different repos under the same name.
 
-Both replicated sets are capped so a machine can always gossip its whole
+Each machine also gossips the workspaces it *claims* (keeps fresh). jj
+replicates workspace names but not their files, so a name claimed by two
+machines is left alone by both. Claims are versioned registers written only
+by their owner.
+
+The replicated sets are capped so a machine can always gossip its whole
 view in one message: past the cap, new entries stop being adopted. The caps
 sit far above what a personal mesh reaches.
 
@@ -74,8 +79,8 @@ Each machine stores everything mesh-related in its config directory
 - **The identity key**, in its own file, only ever read by the daemon.
 - **`mesh.json`**, this machine's copy of the mesh state, in two parts: what
   is replicated by the gossip (this machine's own record, the peer records,
-  tombstones included, and the mesh-wide repo list) and what is strictly
-  local (the repos registered here, with their paths). Only the daemon writes it: the CLI mutates it
+  tombstones included, the mesh-wide repo list and the workspace claims) and
+  what is strictly local (the repos registered here, with their paths). Only the daemon writes it: the CLI mutates it
   through the daemon's control socket, and reads it directly only for
   pre-checks and completion, treating what it sees as advisory.
 - **The user configuration**, the only hand-edited file, holding local

@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 - **Auto-snapshot and update-stale now run on secondary workspaces**, which are listed in
   `jj-mesh status`.
+- Syncing is now paused for a workspace if it is claimed by multiple machines in the mesh.
 
 ## [0.2.0] - 2026-09-06
 

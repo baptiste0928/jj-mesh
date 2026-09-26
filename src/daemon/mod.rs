@@ -29,7 +29,7 @@ use self::{
     hub::SyncHub,
     pairing::Pairing,
     peers::PeerSet,
-    repos::RepoSet,
+    repos::{ClaimUpdate, RepoSet},
     store::MeshStore,
 };
 use crate::{
@@ -116,7 +116,8 @@ impl Daemon {
             hub.clone(),
             gossip_tx,
         ));
-        let repos = Arc::new(RepoSet::new(hub.clone(), settings));
+        let (claim_tx, claim_rx) = mpsc::unbounded_channel();
+        let repos = Arc::new(RepoSet::new(hub.clone(), settings, claim_tx));
         let store = Arc::new(MeshStore::new(
             dir.clone(),
             key.endpoint_id(),
@@ -146,6 +147,7 @@ impl Daemon {
         tasks.spawn(async move { server.serve(ctx).await });
         tasks.spawn(accept_loop(endpoint.clone(), peers, pairing));
         tasks.spawn(membership_loop(gossip_rx, store.clone()));
+        tasks.spawn(claim_loop(claim_rx, store.clone()));
         tasks.spawn(status_loop(repos, hub, jj_version));
         tasks.spawn(gossip_loop(store));
 
@@ -258,6 +260,16 @@ async fn membership_loop(
     while let Some((peer, membership)) = gossip.recv().await {
         if let Err(err) = store.merge_membership(&membership) {
             warn!("cannot apply membership from {peer}: {err:#}");
+        }
+    }
+}
+
+/// Persists the workspace claims repo tasks make; the store then gossips
+/// them and feeds them back to the repo tasks.
+async fn claim_loop(mut claims: mpsc::UnboundedReceiver<ClaimUpdate>, store: Arc<MeshStore>) {
+    while let Some(ClaimUpdate { repo, names }) = claims.recv().await {
+        if let Err(err) = store.update(|state| state.set_claims(&repo, names)) {
+            warn!(%repo, "cannot claim workspaces: {err:#}");
         }
     }
 }

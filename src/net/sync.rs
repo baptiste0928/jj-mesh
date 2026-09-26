@@ -12,17 +12,18 @@ use iroh::endpoint::{Connection, RecvStream};
 use serde::{Deserialize, Serialize};
 
 use super::wire::{read_message, write_message};
-use crate::config::{MAX_MESH_PEERS, MAX_MESH_REPOS, Membership, RepoId};
+use crate::config::{MAX_MESH_PEERS, MAX_MESH_REPOS, MAX_MESH_WORKSPACES, Membership, RepoId};
 
 /// ALPN of the sync protocol. Bumped whenever the wire format changes, so
 /// mismatched daemons refuse each other instead of mis-decoding.
-pub const ALPN: &[u8] = b"jj-mesh/sync/1";
+pub const ALPN: &[u8] = b"jj-mesh/sync/2";
 
 /// Cap on uni-stream messages. Sized for the largest legitimate message, a
-/// full membership (peer records are ~100 bytes, repo records ~100), with
-/// headroom; the peer, while authenticated, is not trusted with our
-/// memory, and every byte here is decoded before we can check anything.
-const MAX_UNI_SIZE: u32 = 192 * 1024;
+/// full membership (peer records are ~100 bytes, repo records and
+/// workspace claims ~100), with headroom; the peer, while authenticated, is
+/// not trusted with our memory, and every byte here is decoded before we
+/// can check anything.
+const MAX_UNI_SIZE: u32 = 320 * 1024;
 
 /// A message carried by a one-shot uni stream.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -104,9 +105,20 @@ pub async fn recv_uni(stream: &mut RecvStream) -> Result<UniMessage> {
 
     match &message {
         UniMessage::Membership(membership) => {
+            // Claimed repos are counted apart from names: an empty claim
+            // costs no name but still takes wire space.
+            let (repos, names) = membership
+                .claims
+                .values()
+                .fold((0, 0), |(repos, names), c| {
+                    (repos + c.repos.len(), names + c.count())
+                });
             ensure!(
                 membership.peers.len() <= MAX_MESH_PEERS
-                    && membership.repos.len() <= MAX_MESH_REPOS,
+                    && membership.repos.len() <= MAX_MESH_REPOS
+                    && membership.claims.len() <= MAX_MESH_PEERS
+                    && repos <= MAX_MESH_WORKSPACES
+                    && names <= MAX_MESH_WORKSPACES,
                 "membership too large",
             );
         }
@@ -121,10 +133,11 @@ pub async fn recv_uni(stream: &mut RecvStream) -> Result<UniMessage> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
 
     use crate::config::{
-        MAX_MESH_PEERS, MAX_MESH_REPOS, MAX_NAME_LEN, Membership, MeshRepo, Peer, RepoId,
+        MAX_MESH_PEERS, MAX_MESH_REPOS, MAX_MESH_WORKSPACES, MAX_NAME_LEN, Membership, MeshRepo,
+        Peer, RepoId, WorkspaceClaims,
     };
 
     /// A membership carrying the largest state we accept must stay inside
@@ -132,7 +145,7 @@ mod tests {
     /// gossip at all, and its sender task would die on every reconnect.
     #[test]
     fn a_full_membership_fits_on_the_wire() {
-        let peers = (0..MAX_MESH_PEERS)
+        let peers: BTreeMap<_, _> = (0..MAX_MESH_PEERS)
             .map(|_| {
                 (
                     iroh::SecretKey::generate().public(),
@@ -159,9 +172,31 @@ mod tests {
             })
             .collect();
 
-        let encoded =
-            postcard::to_stdvec(&super::UniMessage::Membership(Membership { peers, repos }))
-                .unwrap();
+        // Every machine holding a record, the mesh-wide names spread one
+        // per repo (the costliest layout).
+        let claims = peers
+            .keys()
+            .map(|endpoint| {
+                let repos = (0..MAX_MESH_WORKSPACES / MAX_MESH_PEERS)
+                    .map(|n| {
+                        let name = format!("{n:0>64}");
+                        (RepoId::generate(), BTreeSet::from([name]))
+                    })
+                    .collect();
+                let claims = WorkspaceClaims {
+                    version: u64::from(u32::MAX),
+                    repos,
+                };
+                (*endpoint, claims)
+            })
+            .collect();
+
+        let membership = Membership {
+            peers,
+            repos,
+            claims,
+        };
+        let encoded = postcard::to_stdvec(&super::UniMessage::Membership(membership)).unwrap();
         assert!(
             encoded.len() <= super::MAX_UNI_SIZE as usize,
             "a full membership is {} bytes, over the {} byte cap",

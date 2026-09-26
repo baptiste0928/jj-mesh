@@ -5,8 +5,13 @@
 //! removed. Each repo task runs one task per local workspace, keeping its
 //! working copy fresh (see the `workspace` submodule).
 //!
+//! Repo tasks decide which workspaces this machine claims (see
+//! [`crate::config::WorkspaceClaims`]), which round-trip through the store:
+//!
 //! ```text
-//! RepoSet ──► repo task ──► workspace task (per local workspace)
+//! RepoSet::sync ──RepoClaims──► repo task ──► workspace tasks
+//!       ▲                           │
+//!       └───── store ◄─ClaimUpdate──┘
 //! ```
 
 mod task;
@@ -15,19 +20,20 @@ mod tests;
 mod workspace;
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     path::PathBuf,
     sync::{Arc, Mutex},
     time::{Instant, SystemTime},
 };
 
-use tokio::sync::Notify;
+use serde::{Deserialize, Serialize};
+use tokio::sync::{Notify, mpsc, watch};
 use tracing::info;
 
 use self::task::spawn_repo;
 use super::{control, hub::SyncHub};
 use crate::{
-    config::{MeshState, RepoId, Settings},
+    config::{MeshState, RepoClaims, RepoId, Settings},
     net::sync::{RepoHealth, RepoHealthState},
 };
 
@@ -42,6 +48,32 @@ pub struct RepoSet {
     /// Daemon settings, loaded once at start and shared with every repo
     /// task.
     settings: Arc<Settings>,
+    /// Where repo tasks send the claims to persist.
+    claim: mpsc::UnboundedSender<ClaimUpdate>,
+}
+
+/// Whether this machine keeps a local workspace fresh (see the `task`
+/// module docs for the claim rules).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WorkspaceState {
+    /// Claimed here: auto-snapshot and update-stale run.
+    Claimed,
+    /// Claimed here and by these peers: left alone everywhere.
+    Contested { machines: Vec<String> },
+    /// Claimed by these peers only: a directory of theirs, left alone.
+    Foreign { machines: Vec<String> },
+    /// Stale when found: claimed once its working copy is updated.
+    Stale,
+    /// Not claimable: its name is not valid in the mesh, or the machine
+    /// reached its claim cap.
+    Unclaimable,
+}
+
+/// The workspaces of a repo this machine claims, to persist.
+#[derive(Debug)]
+pub struct ClaimUpdate {
+    pub repo: RepoId,
+    pub names: BTreeSet<String>,
 }
 
 /// Book-keeping for one repo task.
@@ -50,6 +82,8 @@ struct RepoHandle {
     id: RepoId,
     path: PathBuf,
     state: Arc<Mutex<RepoState>>,
+    /// The claims on the repo's workspaces, fed to its task.
+    claims: watch::Sender<RepoClaims>,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -62,8 +96,8 @@ enum RepoState {
         op_heads: usize,
         last_change: Option<SystemTime>,
         last_sync: Option<SystemTime>,
-        /// The local workspaces kept fresh, as `(name, root)`.
-        workspaces: Vec<(String, PathBuf)>,
+        /// The workspaces on this machine.
+        workspaces: Vec<control::WorkspaceStatus>,
     },
     /// Rebuilding the commit index for op heads that lack one; jj commands
     /// in the repo would otherwise pay for the rebuild themselves.
@@ -81,12 +115,17 @@ enum RepoState {
 }
 
 impl RepoSet {
-    pub fn new(hub: Arc<SyncHub>, settings: Arc<Settings>) -> Self {
+    pub fn new(
+        hub: Arc<SyncHub>,
+        settings: Arc<Settings>,
+        claim: mpsc::UnboundedSender<ClaimUpdate>,
+    ) -> Self {
         RepoSet {
             hub,
             repos: Mutex::new(BTreeMap::new()),
             changed: Arc::new(Notify::new()),
             settings,
+            claim,
         }
     }
 
@@ -99,8 +138,8 @@ impl RepoSet {
     }
 
     /// Aligns the managed repos with the mesh state: spawns tasks for new
-    /// repos and shuts down removed ones. A repo whose path or id changed
-    /// is respawned.
+    /// repos, shuts down removed ones and passes on workspace claims. A
+    /// repo whose path or id changed is respawned.
     pub fn sync(&self, state: &MeshState) {
         let mut repos = self.repos.lock().unwrap();
 
@@ -118,19 +157,16 @@ impl RepoSet {
         });
 
         for (name, repo) in &state.repos {
-            repos.entry(name.clone()).or_insert_with(|| {
+            let claims = state.repo_claims(&repo.id);
+            if let Some(handle) = repos.get(name) {
+                if *handle.claims.borrow() != claims {
+                    handle.claims.send_replace(claims);
+                }
+            } else {
                 info!(repo = %name, path = %repo.path.display(), "managing repo");
-                let announcements = self.hub.register_repo(name.clone(), repo.id.clone());
-                spawn_repo(
-                    repo.id.clone(),
-                    name.clone(),
-                    repo.path.clone(),
-                    self.hub.clone(),
-                    announcements,
-                    self.changed.clone(),
-                    self.settings.clone(),
-                )
-            });
+                let handle = spawn_repo(self, name.clone(), repo, claims);
+                repos.insert(name.clone(), handle);
+            }
         }
         self.changed.notify_one();
     }
@@ -174,15 +210,9 @@ impl RepoSet {
                         op_heads,
                         last_change,
                         last_sync,
-                        workspaces: watched,
+                        workspaces: local,
                     } => {
-                        workspaces = watched
-                            .iter()
-                            .map(|(name, path)| control::WorkspaceStatus {
-                                name: name.clone(),
-                                path: path.clone(),
-                            })
-                            .collect();
+                        workspaces.clone_from(local);
                         control::WatchStatus::Watching {
                             op_heads: *op_heads as u64,
                             last_change_secs: last_change
@@ -200,6 +230,14 @@ impl RepoSet {
                     },
                 };
 
+                for (workspace, machines) in &handle.claims.borrow().others {
+                    workspaces.extend(machines.iter().map(|machine| control::WorkspaceStatus {
+                        name: workspace.clone(),
+                        place: control::WorkspacePlace::Peer {
+                            machine: machine.clone(),
+                        },
+                    }));
+                }
                 control::RepoStatus {
                     name: name.clone(),
                     path: handle.path.clone(),

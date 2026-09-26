@@ -15,8 +15,17 @@
 //! comparison, so self-triggered events are suppressed the same way.
 //!
 //! The workspaces are found again whenever the op heads change (adding,
-//! forgetting and renaming a workspace are operations) and on idle
-//! liveness checks; a workspace gone from disk only loses its task.
+//! forgetting and renaming a workspace are operations), when the claims
+//! change and on idle liveness checks. Only claimed workspaces get a task,
+//! once the store has recorded the claim. A workspace is claimed when:
+//! - its name is valid, no peer claims it, and the machine's cap allows;
+//! - it is the main workspace, or a fresh one (its working copy reflects
+//!   the op head): a stale one may be a forgotten workspace that a peer
+//!   reusing its name brought back into the view (jj keeps forgotten
+//!   workspaces in its store).
+//!
+//! A claim is released only when its name leaves the view, so a workspace
+//! briefly gone from disk (an unmounted disk) keeps it.
 //!
 //! On watch start the task also rebuilds the commit index for op heads
 //! that lack one (a fetch whose build failed, a repo synced by an older
@@ -24,7 +33,7 @@
 //! user's next jj command would pay for the rebuild.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     path::PathBuf,
     sync::{Arc, Mutex},
     time::{Duration, Instant, SystemTime},
@@ -34,17 +43,18 @@ use color_eyre::eyre::{Result, WrapErr as _, ensure, eyre};
 use iroh::EndpointId;
 use jj_lib::{object_id::ObjectId as _, op_store::OperationId};
 use pollster::FutureExt as _;
-use tokio::sync::{Notify, watch};
+use tokio::sync::{Notify, mpsc, watch};
 use tracing::{debug, info, warn};
 
 use super::{
-    RepoHandle, RepoState, sleep_until,
-    workspace::{RepoContext, WorkspaceHandle, spawn_workspace},
+    ClaimUpdate, RepoHandle, RepoSet, RepoState, WorkspaceState, sleep_until,
+    workspace::{RepoContext, WorkspaceHandle, may_be_stale, spawn_workspace},
 };
 use crate::{
-    config::{RepoId, Settings},
+    config::{Repo, RepoClaims, RepoId, Settings, validate_name},
     daemon::{
         backoff::Backoff,
+        control::{WorkspacePlace, WorkspaceStatus},
         hub::{Inbox, PeerAnnounce, SyncHub},
     },
     net::fetch::GitTransferFormat,
@@ -99,33 +109,35 @@ const OPEN_STREAM_TIMEOUT: Duration = Duration::from_secs(30);
 /// or reconnects. Kept coarse: the failures it covers are not urgent.
 const FETCH_RETRY: Duration = Duration::from_secs(30);
 
-/// Spawns the watch task for one repo.
+/// Spawns the watch task for the repo registered as `name`.
 pub(super) fn spawn_repo(
-    id: RepoId,
+    set: &RepoSet,
     name: String,
-    path: PathBuf,
-    hub: Arc<SyncHub>,
-    announcements: Arc<Inbox>,
-    changed: Arc<Notify>,
-    settings: Arc<Settings>,
+    repo: &Repo,
+    claims: RepoClaims,
 ) -> RepoHandle {
     let state = Arc::new(Mutex::new(RepoState::Opening));
+    let announcements = set.hub.register_repo(name.clone(), repo.id.clone());
+    let (claims, claims_rx) = watch::channel(claims);
 
     let task = tokio::spawn(run_repo(RepoTask {
-        id: id.clone(),
+        id: repo.id.clone(),
         name,
-        path: path.clone(),
+        path: repo.path.clone(),
         state: state.clone(),
-        hub,
+        hub: set.hub.clone(),
         announcements,
-        changed,
-        settings,
+        changed: set.changed.clone(),
+        settings: set.settings.clone(),
+        claims: claims_rx,
+        claim: set.claim.clone(),
     }));
 
     RepoHandle {
-        id,
-        path,
+        id: repo.id.clone(),
+        path: repo.path.clone(),
         state,
+        claims,
         task,
     }
 }
@@ -142,6 +154,9 @@ struct RepoTask {
     changed: Arc<Notify>,
     /// Daemon settings, fixed for the daemon's lifetime.
     settings: Arc<Settings>,
+    /// The claims on the repo's workspaces.
+    claims: watch::Receiver<RepoClaims>,
+    claim: mpsc::UnboundedSender<ClaimUpdate>,
 }
 
 /// Opens and watches one repo forever: reopening immediately when the
@@ -238,14 +253,16 @@ impl RepoTask {
             self.settings.for_repo(&self.name),
         ));
         let (synced, _) = watch::channel(None);
-        let mut workspaces = BTreeMap::new();
-        self.track_workspaces(&jj, &ctx, &heads, &synced, &mut workspaces)
+        let mut claims = self.claims.clone();
+        let mut workspaces = Workspaces::default();
+        let current = claims.borrow_and_update().clone();
+        self.track_workspaces(&jj, &ctx, &heads, &synced, &current, &mut workspaces)
             .await;
         self.set_state(RepoState::Watching {
             op_heads: heads.len(),
             last_change,
             last_sync,
-            workspaces: listed(&workspaces),
+            workspaces: workspaces.listed.clone(),
         });
 
         // When set, the time to wake and retry fetches that failed and were
@@ -266,6 +283,7 @@ impl RepoTask {
                     }
                 }
                 () = self.announcements.changed() => {}
+                Ok(()) = claims.changed() => rescan = true,
                 () = sleep_until(retry_at) => {}
             }
 
@@ -304,7 +322,8 @@ impl RepoTask {
                 rescan = true;
             }
             if rescan {
-                self.track_workspaces(&jj, &ctx, &heads, &synced, &mut workspaces)
+                let current = claims.borrow_and_update().clone();
+                self.track_workspaces(&jj, &ctx, &heads, &synced, &current, &mut workspaces)
                     .await;
             }
 
@@ -317,7 +336,7 @@ impl RepoTask {
                 op_heads: heads.len(),
                 last_change,
                 last_sync,
-                workspaces: listed(&workspaces),
+                workspaces: workspaces.listed.clone(),
             });
         }
     }
@@ -345,41 +364,63 @@ impl RepoTask {
         Ok((jj, Arc::new(repo), fingerprint))
     }
 
-    /// Aligns the workspace tasks with the workspaces found on disk.
+    /// Aligns the workspace tasks and this machine's claims with the
+    /// workspaces found on disk.
     async fn track_workspaces(
         &self,
         jj: &JjRepo,
         ctx: &Arc<RepoContext>,
         heads: &[OperationId],
         synced: &watch::Sender<Option<OperationId>>,
-        workspaces: &mut BTreeMap<PathBuf, WorkspaceHandle>,
+        claims: &RepoClaims,
+        workspaces: &mut Workspaces,
     ) {
-        let found = match find_workspaces(jj, &ctx.repo, heads).await {
-            Ok(found) => found,
+        if workspaces.sent.as_ref() == Some(&claims.ours) {
+            workspaces.sent = None;
+        }
+        let mut held = claims.ours.clone();
+        held.extend(workspaces.sent.iter().flatten().cloned());
+        let scan = match find_workspaces(jj, &ctx.repo, heads, claims, held).await {
+            Ok(scan) => scan,
             Err(err) => return warn!(repo = %self.name, "cannot list workspaces: {err:#}"),
         };
 
-        workspaces.retain(|root, handle| {
+        if scan.claimed != claims.ours && workspaces.sent.as_ref() != Some(&scan.claimed) {
+            let _ = self.claim.send(ClaimUpdate {
+                repo: self.id.clone(),
+                names: scan.claimed.clone(),
+            });
+            workspaces.sent = Some(scan.claimed.clone());
+        }
+
+        let automated = |found: &Found| {
+            found.state == WorkspaceState::Claimed && claims.ours.contains(&found.name)
+        };
+        workspaces.tasks.retain(|root, handle| {
             let keep = !handle.is_finished()
-                && found
-                    .iter()
-                    .any(|(name, ws)| ws.root() == root && *name == handle.name);
+                && scan.found.iter().any(|found| {
+                    found.workspace.root() == root && found.name == handle.name && automated(found)
+                });
             if !keep {
                 info!(repo = %self.name, workspace = %handle.name, "stopping workspace watch");
             }
             keep
         });
-        for (name, workspace) in found {
-            let root = workspace.root().to_owned();
-            workspaces.entry(root).or_insert_with(|| {
+        workspaces.listed = scan.listed();
+        for found in scan.found {
+            if !automated(&found) {
+                continue;
+            }
+            let root = found.workspace.root().to_owned();
+            workspaces.tasks.entry(root).or_insert_with(|| {
                 info!(
-                    repo = %self.name, workspace = %name,
-                    path = %workspace.root().display(), "watching workspace",
+                    repo = %self.name, workspace = %found.name,
+                    path = %found.workspace.root().display(), "watching workspace",
                 );
                 spawn_workspace(
                     ctx.clone(),
-                    name,
-                    workspace,
+                    found.name,
+                    found.workspace,
                     single_head(heads),
                     synced.subscribe(),
                 )
@@ -571,28 +612,107 @@ async fn store_fingerprint(jj: &JjRepo) -> Result<StoreFingerprint> {
         .wrap_err("fingerprint task failed")?
 }
 
-/// The workspaces of the repo on this machine that the views of `heads`
-/// name. Runs on a blocking thread: decodes a view per head.
+/// The workspace tasks of one repo watch, and what status shows of its
+/// local workspaces.
+#[derive(Default)]
+struct Workspaces {
+    tasks: BTreeMap<PathBuf, WorkspaceHandle>,
+    listed: Vec<WorkspaceStatus>,
+    /// The claims last sent, until the store records them.
+    sent: Option<BTreeSet<String>>,
+}
+
+/// The outcome of one workspace scan.
+struct Scan {
+    /// The local workspaces the view names.
+    found: Vec<Found>,
+    /// The names this machine claims, found or not.
+    claimed: BTreeSet<String>,
+}
+
+/// A local workspace, and whether this machine claims it.
+struct Found {
+    name: String,
+    workspace: Workspace,
+    state: WorkspaceState,
+}
+
+impl Scan {
+    /// The local workspaces as status shows them: those found, then the
+    /// claimed ones whose directory is not.
+    fn listed(&self) -> Vec<WorkspaceStatus> {
+        let found = self.found.iter().map(|found| WorkspaceStatus {
+            name: found.name.clone(),
+            place: WorkspacePlace::Local {
+                path: found.workspace.root().to_owned(),
+                state: found.state.clone(),
+            },
+        });
+        let missing = self
+            .claimed
+            .iter()
+            .filter(|name| !self.found.iter().any(|found| found.name == **name))
+            .map(|name| WorkspaceStatus {
+                name: name.clone(),
+                place: WorkspacePlace::Missing,
+            });
+        found.chain(missing).collect()
+    }
+}
+
+/// Finds the local workspaces the views of `heads` name and decides the
+/// claims on them (see the module docs), `held` being the names claimed
+/// so far. Runs on a blocking thread: decodes a view per head, and two per
+/// freshness check.
 async fn find_workspaces(
     jj: &JjRepo,
     repo: &Arc<OpenRepo>,
     heads: &[OperationId],
-) -> Result<Vec<(String, Workspace)>> {
-    let (jj, repo, heads) = (jj.clone(), repo.clone(), heads.to_vec());
+    claims: &RepoClaims,
+    held: BTreeSet<String>,
+) -> Result<Scan> {
+    let (jj, repo, heads, claims) = (jj.clone(), repo.clone(), heads.to_vec(), claims.clone());
     tokio::task::spawn_blocking(move || {
         let names = repo.workspace_names(&heads).block_on()?;
-        jj.workspaces(&names)
+        let single = single_head(&heads);
+        let fresh = |workspace: &Workspace| {
+            single.as_ref().is_some_and(|head| {
+                matches!(may_be_stale(workspace, &repo, head).block_on(), Ok(false))
+            })
+        };
+
+        let mut claimed: BTreeSet<String> = held.intersection(&names).cloned().collect();
+        let mut found = Vec::new();
+        for (name, workspace) in jj.workspaces(&names)? {
+            let state = match claims.others.get(&name) {
+                Some(machines) if claimed.contains(&name) => WorkspaceState::Contested {
+                    machines: machines.clone(),
+                },
+                Some(machines) => WorkspaceState::Foreign {
+                    machines: machines.clone(),
+                },
+                None if claimed.contains(&name) => WorkspaceState::Claimed,
+                None if validate_name("workspace", &name).is_err()
+                    || claimed.len() >= claims.limit =>
+                {
+                    WorkspaceState::Unclaimable
+                }
+                None if workspace.is_main() || fresh(&workspace) => {
+                    claimed.insert(name.clone());
+                    WorkspaceState::Claimed
+                }
+                None => WorkspaceState::Stale,
+            };
+            found.push(Found {
+                name,
+                workspace,
+                state,
+            });
+        }
+        Ok(Scan { found, claimed })
     })
     .await
     .wrap_err("workspace search task failed")?
-}
-
-/// The `(name, root)` list of the watched workspaces, for status.
-fn listed(workspaces: &BTreeMap<PathBuf, WorkspaceHandle>) -> Vec<(String, PathBuf)> {
-    workspaces
-        .iter()
-        .map(|(root, handle)| (handle.name.clone(), root.clone()))
-        .collect()
 }
 
 /// The op head, when single: working copies are only caught up on then

@@ -7,7 +7,9 @@ use std::{path::PathBuf, time::Duration};
 use iroh::EndpointId;
 use serde::{Deserialize, Serialize};
 
-use crate::{net::sync::StatusReport, repo::transfer::TransferProgress};
+use crate::{
+    daemon::repos::WorkspaceState, net::sync::StatusReport, repo::transfer::TransferProgress,
+};
 
 /// Maximum accepted size of a control message.
 pub(super) const MAX_MESSAGE_SIZE: u32 = 1 << 20;
@@ -241,15 +243,30 @@ pub struct RepoStatus {
     pub name: String,
     pub path: PathBuf,
     pub watch: WatchStatus,
-    /// Its workspaces on this machine, known while watching.
+    /// Its workspaces across the mesh: those on this machine (known while
+    /// watching), then those peers claim.
     pub workspaces: Vec<WorkspaceStatus>,
 }
 
 /// A workspace of a registered repo.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkspaceStatus {
     pub name: String,
-    pub path: PathBuf,
+    pub place: WorkspacePlace,
+}
+
+/// Where a workspace lives.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum WorkspacePlace {
+    /// On this machine.
+    Local {
+        path: PathBuf,
+        state: WorkspaceState,
+    },
+    /// Claimed by this machine, but its directory is not found.
+    Missing,
+    /// On the peer of this name, which claims it.
+    Peer { machine: String },
 }
 
 /// State of the op-heads watch on a repo.

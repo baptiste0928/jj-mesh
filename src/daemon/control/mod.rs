@@ -34,6 +34,7 @@ pub(super) use server::{ControlContext, ControlServer};
 // crate-private; this is their only public path, so protocol consumers
 // (CLI, integration tests) depend on the control vocabulary alone.
 pub use crate::{
+    daemon::repos::WorkspaceState,
     net::sync::{RepoHealthState, StatusReport},
     repo::transfer::{TransferPhase, TransferProgress},
 };

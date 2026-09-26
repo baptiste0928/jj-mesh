@@ -1,21 +1,20 @@
 //! Mesh state file (`mesh.json`).
 //!
 //! This file holds the machine's copy of the mesh state, in two parts:
-//! what is replicated across the mesh by the membership gossip (this
-//! machine's own record, the peer records, tombstones included, and the
-//! mesh-wide repo list) and what is strictly local (the repos registered
-//! here, with their paths).
+//! what is replicated across the mesh by the membership gossip, and what
+//! is strictly local (the repos registered here, with their paths).
 //!
 //! The daemon is the only writer; the CLI mutates it through the control
 //! socket, and may read the file directly (for pre-checks and completion),
 //! treating what it sees as advisory.
 
+mod claims;
 mod machine;
 mod membership;
 mod repo;
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs, io,
     io::Write as _,
     path::{Path, PathBuf},
@@ -24,10 +23,16 @@ use std::{
 use color_eyre::eyre::{Result, WrapErr as _, bail, ensure};
 use iroh::EndpointId;
 use serde::{Deserialize, Serialize};
-use tracing::debug;
+use tracing::{debug, warn};
 
-use self::membership::{MAX_OTHER_PEERS, MAX_RECORD_VERSION, bumped_version, should_adopt};
+use self::{
+    claims::MAX_OTHER_WORKSPACES,
+    membership::{
+        MAX_OTHER_PEERS, MAX_RECORD_VERSION, Register as _, bumped_version, should_adopt,
+    },
+};
 pub use self::{
+    claims::{MAX_MACHINE_WORKSPACES, MAX_MESH_WORKSPACES, RepoClaims, WorkspaceClaims},
     machine::Machine,
     membership::{
         MAX_MESH_PEERS, MAX_MESH_REPOS, Membership, MeshRepo, MeshRepoStatus, Peer, PeerStatus,
@@ -38,9 +43,8 @@ use super::{ConfigDir, validate_name};
 
 /// This machine's copy of the mesh state.
 ///
-/// `machine`, `peers` and `mesh_repos` are replicated across the mesh by
-/// the membership gossip; `repos` (with its local paths) never leaves this
-/// machine.
+/// `repos` (with its local paths) never leaves this machine; the rest is
+/// replicated across the mesh by the membership gossip.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct MeshState {
@@ -56,6 +60,10 @@ pub struct MeshState {
     /// tombstones (removed repos), which gossip must remember so a
     /// machine that missed the removal cannot resurrect the name.
     pub mesh_repos: BTreeMap<String, MeshRepo>,
+    /// The workspaces this machine keeps fresh.
+    pub claims: WorkspaceClaims,
+    /// The workspaces the other alive machines keep fresh.
+    pub peer_claims: BTreeMap<EndpointId, WorkspaceClaims>,
 }
 
 impl MeshState {
@@ -113,6 +121,38 @@ impl MeshState {
             .iter()
             .find(|(_, repo)| &repo.id == id)
             .map(|(name, _)| name.as_str())
+    }
+
+    /// The claims on the workspaces of a repo.
+    pub fn repo_claims(&self, id: &RepoId) -> RepoClaims {
+        let mut others: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for (endpoint, claims) in &self.peer_claims {
+            let (Some(peer), Some(names)) = (self.peer_name(endpoint), claims.repos.get(id)) else {
+                continue;
+            };
+            for name in names {
+                others
+                    .entry(name.clone())
+                    .or_default()
+                    .push(peer.to_owned());
+            }
+        }
+        let ours = self.claims.repos.get(id).cloned().unwrap_or_default();
+        let limit = MAX_MACHINE_WORKSPACES - (self.claims.count() - ours.len());
+        RepoClaims {
+            ours,
+            others,
+            limit,
+        }
+    }
+
+    /// Sets the workspaces of a registered repo this machine claims. A repo
+    /// unregistered meanwhile is left unclaimed.
+    pub fn set_claims(&mut self, id: &RepoId, names: BTreeSet<String>) -> Result<()> {
+        if self.repo_name(id).is_none() {
+            return Ok(());
+        }
+        self.claims.set(id, names)
     }
 
     /// Checks that a peer can be paired under this name and endpoint.
@@ -212,6 +252,7 @@ impl MeshState {
         let peer = self.peers.get_mut(&endpoint).expect("resolved above");
         peer.version = version;
         peer.status = PeerStatus::Removed;
+        self.prune_claims();
 
         Ok(endpoint)
     }
@@ -298,7 +339,7 @@ impl MeshState {
             },
         );
 
-        Ok(self.repos.remove(name).is_some())
+        Ok(self.unregister_repo(name).is_some())
     }
 
     /// Unregisters a repo on this machine only, returning its record. The
@@ -306,21 +347,31 @@ impl MeshState {
     /// among themselves, and it stays clonable here (that is also the only
     /// way back in, since re-adding it would fork the name).
     pub fn forget_repo(&mut self, name: &str) -> Result<Repo> {
-        match self.repos.remove(name) {
+        match self.unregister_repo(name) {
             Some(repo) => Ok(repo),
             None => bail!("no repo named `{name}` is registered on this machine"),
         }
     }
 
-    /// The membership this machine gossips: its own record under `local`,
-    /// every peer record (tombstones included) and the mesh-wide repo
-    /// list.
+    /// Unregisters a repo here, releasing its workspace claims.
+    fn unregister_repo(&mut self, name: &str) -> Option<Repo> {
+        let repo = self.repos.remove(name)?;
+        if let Err(err) = self.claims.set(&repo.id, BTreeSet::new()) {
+            warn!(repo = %name, "cannot release workspace claims: {err:#}");
+        }
+        Some(repo)
+    }
+
+    /// The membership this machine gossips, its own records under `local`.
     pub fn membership(&self, local: EndpointId) -> Membership {
         let mut peers = self.peers.clone();
         peers.insert(local, self.machine.record());
+        let mut claims = self.peer_claims.clone();
+        claims.insert(local, self.claims.clone());
         Membership {
             peers,
             repos: self.mesh_repos.clone(),
+            claims,
         }
     }
 
@@ -330,6 +381,8 @@ impl MeshState {
         self.machine != other.machine
             || self.peers != other.peers
             || self.mesh_repos != other.mesh_repos
+            || self.claims != other.claims
+            || self.peer_claims != other.peer_claims
     }
 
     /// Merges a peer's membership into ours. `local` is this machine's own
@@ -381,10 +434,48 @@ impl MeshState {
             self.mesh_repos.insert(name.clone(), record.clone());
             // A repo removed mesh-wide stops being synced here; its
             // files stay where they are.
-            if record.id().is_none() && self.repos.remove(name).is_some() {
+            if record.id().is_none() && self.unregister_repo(name).is_some() {
                 debug!(repo = %name, "repo removed from the mesh; no longer syncing it");
             }
         }
+
+        self.merge_claims(remote, local);
+    }
+
+    /// Merges the gossiped workspace claims: only alive peers' are kept,
+    /// and new or grown records stop being adopted at the cap.
+    fn merge_claims(&mut self, remote: &Membership, local: &EndpointId) {
+        let mut others: usize = self.peer_claims.values().map(WorkspaceClaims::count).sum();
+        for (endpoint, record) in &remote.claims {
+            if record.version >= MAX_RECORD_VERSION {
+                continue;
+            }
+            if endpoint == local {
+                self.claims.observe(record);
+                continue;
+            }
+            let held = self.peer_claims.get(endpoint);
+            if self.peer_name(endpoint).is_none()
+                || held.is_some_and(|held| !record.outranks(held))
+                || !record.is_valid()
+            {
+                continue;
+            }
+            let adopted = others - held.map_or(0, WorkspaceClaims::count) + record.count();
+            if adopted > MAX_OTHER_WORKSPACES {
+                continue;
+            }
+            others = adopted;
+            self.peer_claims.insert(*endpoint, record.clone());
+        }
+        self.prune_claims();
+    }
+
+    /// Drops the claims of machines no longer alive in the mesh.
+    fn prune_claims(&mut self) {
+        let peers = &self.peers;
+        self.peer_claims
+            .retain(|endpoint, _| peers.get(endpoint).and_then(Peer::name).is_some());
     }
 }
 
@@ -399,7 +490,7 @@ fn canonical_path(path: &Path) -> PathBuf {
 mod tests {
     use iroh::SecretKey;
 
-    use super::{membership::Register as _, *};
+    use super::*;
 
     impl Machine {
         fn new(name: &str, version: u64) -> Self {
@@ -502,6 +593,7 @@ mod tests {
         let membership = |record: Peer| Membership {
             peers: BTreeMap::from([(peer, record)]),
             repos: BTreeMap::new(),
+            ..Default::default()
         };
 
         let mut state = MeshState::default();
@@ -546,6 +638,7 @@ mod tests {
         let about_us = |record: Peer| Membership {
             peers: BTreeMap::from([(local, record)]),
             repos: BTreeMap::new(),
+            ..Default::default()
         };
 
         let mut state = MeshState::default();
@@ -627,7 +720,14 @@ mod tests {
                     )
                 })
                 .collect();
-            state.merge_membership(&Membership { peers, repos }, &local);
+            state.merge_membership(
+                &Membership {
+                    peers,
+                    repos,
+                    ..Default::default()
+                },
+                &local,
+            );
         }
 
         assert_eq!(state.peers.len(), MAX_OTHER_PEERS);
@@ -658,6 +758,7 @@ mod tests {
                         },
                     )]),
                     repos: BTreeMap::new(),
+                    ..Default::default()
                 },
                 &local,
             );
@@ -681,6 +782,7 @@ mod tests {
         let membership = |id: &RepoId| Membership {
             peers: BTreeMap::new(),
             repos: BTreeMap::from([("a".to_owned(), present(1, id))]),
+            ..Default::default()
         };
 
         // Both machines must settle on the same id whichever they held
@@ -723,6 +825,7 @@ mod tests {
                         present(1, &RepoId::generate()),
                     ),
                 ]),
+                ..Default::default()
             },
             &local,
         );
@@ -840,6 +943,7 @@ mod tests {
         let membership = |record: MeshRepo| Membership {
             peers: BTreeMap::new(),
             repos: BTreeMap::from([("proj".to_owned(), record)]),
+            ..Default::default()
         };
         state.merge_membership(&membership(removed), &local);
         assert!(state.repos.is_empty());
@@ -908,5 +1012,109 @@ mod tests {
 
         state.add_peer(endpoint, "laptop".to_owned()).unwrap();
         assert!(state.add_peer(endpoint, "desktop".to_owned()).is_err());
+    }
+
+    /// Claims of `names` on repo `id`, at `version`.
+    fn claims(version: u64, id: &RepoId, names: &[&str]) -> WorkspaceClaims {
+        let names = names.iter().map(|name| (*name).to_owned()).collect();
+        WorkspaceClaims {
+            version,
+            repos: BTreeMap::from([(id.clone(), names)]),
+        }
+    }
+
+    #[test]
+    fn merges_claims_of_alive_peers_only() {
+        let local = SecretKey::generate().public();
+        let (peer, stranger) = (
+            SecretKey::generate().public(),
+            SecretKey::generate().public(),
+        );
+        let id = RepoId::generate();
+        let mut state = MeshState::default();
+        state.add_peer(peer, "desktop".to_owned()).unwrap();
+        let membership = |endpoint, record| Membership {
+            claims: BTreeMap::from([(endpoint, record)]),
+            ..Default::default()
+        };
+
+        state.merge_membership(&membership(stranger, claims(1, &id, &["x"])), &local);
+        assert!(state.peer_claims.is_empty());
+
+        state.merge_membership(&membership(peer, claims(2, &id, &["x"])), &local);
+        state.merge_membership(&membership(peer, claims(1, &id, &["y"])), &local);
+        assert_eq!(state.repo_claims(&id).others["x"], ["desktop"]);
+        assert!(!state.repo_claims(&id).others.contains_key("y"));
+
+        // Invalid names poison the whole record.
+        state.merge_membership(&membership(peer, claims(3, &id, &["bad\u{202E}"])), &local);
+        assert!(state.repo_claims(&id).others.contains_key("x"));
+
+        state.remove_peer("desktop").unwrap();
+        assert!(state.peer_claims.is_empty());
+    }
+
+    #[test]
+    fn own_claims_outrank_gossiped_copies_and_are_released() {
+        let local = SecretKey::generate().public();
+        let mut state = MeshState::default();
+        let id = RepoId::generate();
+        state
+            .add_repo(
+                "proj".to_owned(),
+                Repo {
+                    id: id.clone(),
+                    path: "/tmp/proj".into(),
+                },
+            )
+            .unwrap();
+        state
+            .set_claims(&id, BTreeSet::from(["laptop".to_owned()]))
+            .unwrap();
+
+        // A stale copy of our record with other content is outranked.
+        let copy = Membership {
+            claims: BTreeMap::from([(local, claims(5, &id, &["old"]))]),
+            ..Default::default()
+        };
+        state.merge_membership(&copy, &local);
+        assert_eq!(state.claims.version, 6);
+        assert_eq!(
+            state.repo_claims(&id).ours,
+            BTreeSet::from(["laptop".to_owned()])
+        );
+
+        // Claims on unregistered repos are refused, and forgetting a repo
+        // releases its claims.
+        let other = RepoId::generate();
+        state
+            .set_claims(&other, BTreeSet::from(["x".to_owned()]))
+            .unwrap();
+        assert!(!state.claims.repos.contains_key(&other));
+        state.forget_repo("proj").unwrap();
+        assert!(state.claims.repos.is_empty());
+    }
+
+    #[test]
+    fn caps_own_claims() {
+        let mut state = MeshState::default();
+        let id = RepoId::generate();
+        state
+            .add_repo(
+                "proj".to_owned(),
+                Repo {
+                    id: id.clone(),
+                    path: "/tmp/proj".into(),
+                },
+            )
+            .unwrap();
+        let names = |n: usize| (0..n).map(|i| format!("w{i}")).collect::<BTreeSet<_>>();
+
+        assert!(state.set_claims(&id, names(MAX_MACHINE_WORKSPACES)).is_ok());
+        assert!(
+            state
+                .set_claims(&id, names(MAX_MACHINE_WORKSPACES + 1))
+                .is_err()
+        );
     }
 }

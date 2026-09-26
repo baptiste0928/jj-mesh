@@ -1,29 +1,56 @@
 use std::{
+    collections::BTreeSet,
+    path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant},
 };
 
-use super::RepoSet;
+use tokio::sync::mpsc;
+
+use super::{ClaimUpdate, RepoSet};
 use crate::{
-    config::{MeshState, Repo, RepoId},
+    config::{MeshState, Repo, RepoId, WorkspaceClaims},
     daemon::{
-        control::{self, WatchStatus},
+        control::{self, WatchStatus, WorkspacePlace, WorkspaceState},
         hub::SyncHub,
     },
     repo::JjRepo,
     testing::Fixture,
 };
 
-/// A repo set with the given `config.toml` contents.
-fn repo_set(config: &str) -> RepoSet {
+/// A repo set with the given `config.toml` contents, and the claims its
+/// repo tasks send.
+fn claiming_repo_set(config: &str) -> (RepoSet, mpsc::UnboundedReceiver<ClaimUpdate>) {
     let settings = Arc::new(toml::from_str(config).unwrap());
-    RepoSet::new(Arc::new(SyncHub::new()), settings)
+    let (claim, claims) = mpsc::unbounded_channel();
+    (
+        RepoSet::new(Arc::new(SyncHub::new()), settings, claim),
+        claims,
+    )
 }
 
-/// A repo set with auto-snapshot and update-stale disabled: hermetic
-/// (the daemon spawns no jj, which would read the user's real config).
-fn quiet_repo_set() -> RepoSet {
-    repo_set("snapshot-interval = 0\nupdate-stale = false")
+/// Settings with auto-snapshot and update-stale disabled: hermetic (the
+/// daemon spawns no jj, which would read the user's real config).
+const QUIET: &str = "snapshot-interval = 0\nupdate-stale = false";
+
+/// A repo set with the given `config.toml` contents, synced to `state`
+/// and recording the claims its repo tasks make like the daemon's store.
+fn start(config: &str, state: MeshState) -> Arc<RepoSet> {
+    let (set, mut claims) = claiming_repo_set(config);
+    let set = Arc::new(set);
+    set.sync(&state);
+    let weak = Arc::downgrade(&set);
+    tokio::spawn(async move {
+        let mut state = state;
+        while let Some(update) = claims.recv().await {
+            let Some(set) = weak.upgrade() else {
+                return;
+            };
+            state.set_claims(&update.repo, update.names).unwrap();
+            set.sync(&state);
+        }
+    });
+    set
 }
 
 /// Polls until `pred` holds on the statuses, panicking after 10s.
@@ -85,7 +112,7 @@ async fn wait_changed(set: &RepoSet) {
     .await;
 }
 
-fn state_with(name: &str, path: &std::path::Path) -> MeshState {
+fn state_with(name: &str, path: &Path) -> MeshState {
     let mut state = MeshState::default();
     state.repos.insert(
         name.to_owned(),
@@ -102,8 +129,7 @@ async fn watches_and_detects_head_changes() {
     let fx = Fixture::new();
     let dir = fx.init_repo("a");
 
-    let set = quiet_repo_set();
-    set.sync(&state_with("a", &dir));
+    let set = start(QUIET, state_with("a", &dir));
 
     wait_watch(&set, |w| {
         matches!(
@@ -132,8 +158,7 @@ async fn recovers_after_repo_recreation() {
     let fx = Fixture::new();
     let dir = fx.init_repo("a");
 
-    let set = quiet_repo_set();
-    set.sync(&state_with("a", &dir));
+    let set = start(QUIET, state_with("a", &dir));
     wait_watching(&set).await;
 
     std::fs::remove_dir_all(&dir).unwrap();
@@ -180,8 +205,7 @@ async fn recovers_after_repo_recreation() {
 #[tokio::test]
 async fn reports_missing_for_absent_repo_dir() {
     let fx = Fixture::new();
-    let set = quiet_repo_set();
-    set.sync(&state_with("ghost", &fx.path().join("missing")));
+    let set = start(QUIET, state_with("ghost", &fx.path().join("missing")));
 
     wait_watch(&set, |w| matches!(w, WatchStatus::Missing { .. })).await;
 }
@@ -194,8 +218,7 @@ async fn reports_failure_for_invalid_repo() {
     let dir = fx.path().join("broken");
     std::fs::create_dir_all(dir.join(".jj")).unwrap();
 
-    let set = quiet_repo_set();
-    set.sync(&state_with("broken", &dir));
+    let set = start(QUIET, state_with("broken", &dir));
 
     wait_watch(&set, |w| matches!(w, WatchStatus::Failed { .. })).await;
 }
@@ -207,8 +230,10 @@ async fn auto_snapshots_working_copy_edits() {
     let fx = Fixture::new();
     let dir = fx.init_repo("a");
 
-    let set = repo_set("snapshot-interval = 1\nupdate-stale = false");
-    set.sync(&state_with("a", &dir));
+    let set = start(
+        "snapshot-interval = 1\nupdate-stale = false",
+        state_with("a", &dir),
+    );
     wait_watch(&set, |w| {
         matches!(
             w,
@@ -241,8 +266,10 @@ async fn updates_stale_working_copy() {
         "the working copy must start stale for this test to mean anything",
     );
 
-    let set = repo_set("snapshot-interval = 0\nupdate-stale = true");
-    set.sync(&state_with("a", &dir));
+    let _set = start(
+        "snapshot-interval = 0\nupdate-stale = true",
+        state_with("a", &dir),
+    );
 
     eventually("working copy still stale", || fx.jj_ok(&dir, &["status"])).await;
 }
@@ -263,8 +290,7 @@ async fn heals_missing_commit_index_on_watch_start() {
     std::fs::remove_file(&op_link).unwrap();
     assert!(!repo.has_commit_index(&head).await);
 
-    let set = quiet_repo_set();
-    set.sync(&state_with("a", &dir));
+    let set = start(QUIET, state_with("a", &dir));
     // The heal runs before the watch reports itself up.
     wait_watching(&set).await;
 
@@ -284,8 +310,7 @@ async fn reopens_when_store_configuration_changes() {
     let repo = JjRepo::discover(&dir).unwrap();
     let before = repo.fingerprint().unwrap();
 
-    let set = quiet_repo_set();
-    set.sync(&state_with("a", &dir));
+    let set = start(QUIET, state_with("a", &dir));
     wait_watching(&set).await;
 
     // Point git_target somewhere unusable, then wake the watch with a
@@ -366,8 +391,10 @@ async fn tracks_and_snapshots_secondary_workspaces() {
     let fx = Fixture::new();
     let dir = fx.init_repo("a");
 
-    let set = repo_set("snapshot-interval = 1\nupdate-stale = false");
-    set.sync(&state_with("a", &dir));
+    let set = start(
+        "snapshot-interval = 1\nupdate-stale = false",
+        state_with("a", &dir),
+    );
     wait_for(&set, |s| workspace_names(s) == ["default"]).await;
 
     fx.jj(&dir, &["workspace", "add", "../child"]);
@@ -393,23 +420,167 @@ async fn tracks_and_snapshots_secondary_workspaces() {
     wait_for(&set, |s| workspace_names(s) == ["default"]).await;
 }
 
-/// A stale secondary working copy is healed like the main one.
+/// A stale claimed secondary working copy is healed like the main one.
 #[tokio::test]
 async fn updates_stale_secondary_workspace() {
     let fx = Fixture::new();
     let dir = fx.init_repo("a");
-    fx.jj(&dir, &["workspace", "add", "../child"]);
+    let child = stale_child(&fx, &dir);
+
+    let mut state = state_with("a", &dir);
+    claim(&mut state, &["default", "child"]);
+    let _set = start("snapshot-interval = 0\nupdate-stale = true", state);
+
+    eventually("working copy still stale", || fx.jj_ok(&child, &["status"])).await;
+}
+
+/// Adds a secondary workspace `child` to the repo at `dir`, left stale:
+/// its working-copy commit is rewritten to another tree behind its back.
+fn stale_child(fx: &Fixture, dir: &Path) -> PathBuf {
+    fx.jj(dir, &["workspace", "add", "../child"]);
     let child = fx.path().join("child");
     std::fs::write(child.join("f.txt"), "content").unwrap();
     fx.jj(&child, &["status"]);
-    fx.jj(&dir, &["--ignore-working-copy", "abandon", "child@"]);
+    fx.jj(dir, &["--ignore-working-copy", "abandon", "child@"]);
     assert!(
         !fx.jj_ok(&child, &["status"]),
         "the working copy must start stale for this test to mean anything",
     );
+    child
+}
 
-    let set = repo_set("snapshot-interval = 0\nupdate-stale = true");
+/// Claims the named workspaces of the single repo in `state`.
+fn claim(state: &mut MeshState, names: &[&str]) {
+    let id = state.repos.values().next().unwrap().id.clone();
+    let names = names.iter().map(|name| (*name).to_owned()).collect();
+    state.set_claims(&id, names).unwrap();
+}
+
+/// The state of the single repo's local workspace `name`, if listed.
+fn local_state(statuses: &[control::RepoStatus], name: &str) -> Option<WorkspaceState> {
+    let [status] = statuses else {
+        return None;
+    };
+    status.workspaces.iter().find_map(|w| match &w.place {
+        WorkspacePlace::Local { state, .. } if w.name == name => Some(state.clone()),
+        _ => None,
+    })
+}
+
+/// Fresh workspaces are claimed, the main one whatever its freshness.
+#[tokio::test]
+async fn claims_fresh_workspaces() {
+    let fx = Fixture::new();
+    let dir = fx.init_repo("a");
+    fx.jj(&dir, &["workspace", "add", "../child"]);
+
+    let (set, mut claims) = claiming_repo_set("snapshot-interval = 0\nupdate-stale = false");
     set.sync(&state_with("a", &dir));
 
-    eventually("working copy still stale", || fx.jj_ok(&child, &["status"])).await;
+    let update = tokio::time::timeout(Duration::from_secs(10), claims.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let expected: BTreeSet<String> = ["child", "default"].map(str::to_owned).into();
+    assert_eq!(update.names, expected);
+}
+
+/// A workspace found stale is not claimed: it may be a forgotten one that
+/// a peer reusing its name brought back into the view.
+#[tokio::test]
+async fn leaves_stale_unclaimed_workspaces_alone() {
+    let fx = Fixture::new();
+    let dir = fx.init_repo("a");
+    let child = stale_child(&fx, &dir);
+
+    let set = start(
+        "snapshot-interval = 0\nupdate-stale = true",
+        state_with("a", &dir),
+    );
+
+    wait_for(&set, |s| {
+        local_state(s, "child") == Some(WorkspaceState::Stale)
+    })
+    .await;
+    assert_eq!(
+        local_state(&set.statuses(), "default"),
+        Some(WorkspaceState::Claimed)
+    );
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        !fx.jj_ok(&child, &["status"]),
+        "an unclaimed workspace must stay untouched"
+    );
+}
+
+/// A name claimed here and by a peer is contested and left alone; the
+/// peer's claims show up in the status.
+#[tokio::test]
+async fn leaves_contested_workspaces_alone() {
+    let fx = Fixture::new();
+    let dir = fx.init_repo("a");
+    let child = stale_child(&fx, &dir);
+
+    let mut state = state_with("a", &dir);
+    claim(&mut state, &["default", "child"]);
+    let peer = iroh::SecretKey::generate().public();
+    state.add_peer(peer, "desktop".to_owned()).unwrap();
+    let id = state.repos["a"].id.clone();
+    let names = BTreeSet::from(["child".to_owned(), "desktop".to_owned()]);
+    state.peer_claims.insert(
+        peer,
+        WorkspaceClaims {
+            version: 1,
+            repos: [(id, names)].into(),
+        },
+    );
+
+    let set = start("snapshot-interval = 0\nupdate-stale = true", state);
+
+    wait_for(&set, |s| {
+        matches!(
+            local_state(s, "child"),
+            Some(WorkspaceState::Contested { .. })
+        )
+    })
+    .await;
+    let [status] = &set.statuses()[..] else {
+        panic!("one repo expected");
+    };
+    let peers: Vec<&str> = status
+        .workspaces
+        .iter()
+        .filter(|w| matches!(&w.place, WorkspacePlace::Peer { machine } if machine == "desktop"))
+        .map(|w| w.name.as_str())
+        .collect();
+    assert_eq!(peers, ["child", "desktop"]);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        !fx.jj_ok(&child, &["status"]),
+        "a contested workspace must stay untouched"
+    );
+}
+
+/// A claimed workspace whose directory goes missing keeps its claim while
+/// the view names it, and shows as missing.
+#[tokio::test]
+async fn keeps_claims_of_missing_workspaces() {
+    let fx = Fixture::new();
+    let dir = fx.init_repo("a");
+    fx.jj(&dir, &["workspace", "add", "../child"]);
+    let mut state = state_with("a", &dir);
+    claim(&mut state, &["default", "child"]);
+    let parked = fx.path().join("parked");
+    std::fs::rename(fx.path().join("child"), &parked).unwrap();
+
+    let (set, mut claims) = claiming_repo_set(QUIET);
+    set.sync(&state);
+
+    wait_for(&set, |s| {
+        matches!(s, [status] if status.workspaces.iter().any(|w| {
+            w.name == "child" && matches!(w.place, WorkspacePlace::Missing)
+        }))
+    })
+    .await;
+    assert!(claims.try_recv().is_err(), "the claim must be kept");
 }

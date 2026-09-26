@@ -1,10 +1,10 @@
 //! Gossip-replicated membership records.
 //!
-//! [`Peer`] and [`MeshRepo`] are versioned registers: the higher version
-//! wins, and ties resolve to the retired state (removed), then to the
-//! smaller payload, so every machine converges on the same record without
-//! clocks. Tombstones are records too and must be remembered, so a machine
-//! that missed a removal cannot undo it.
+//! Membership records are versioned registers ([`Register`]): the higher
+//! version wins, and each record type breaks ties the same way everywhere,
+//! so every machine converges on the same record without clocks.
+//! Tombstones are records too and must be remembered, so a machine that
+//! missed a removal cannot undo it.
 
 use std::{borrow::Borrow, cmp, collections::BTreeMap, fmt};
 
@@ -12,7 +12,7 @@ use color_eyre::eyre::{Result, ensure};
 use iroh::EndpointId;
 use serde::{Deserialize, Serialize};
 
-use super::RepoId;
+use super::{RepoId, WorkspaceClaims};
 
 /// Cap on machines tracked in the mesh state, tombstones included. A
 /// personal mesh is a handful of machines; the cap keeps a peer from
@@ -41,10 +41,11 @@ pub struct Membership {
     pub peers: BTreeMap<EndpointId, Peer>,
     /// The mesh-wide repo list, tombstones included.
     pub repos: BTreeMap<String, MeshRepo>,
+    /// The workspace claims of every alive machine.
+    pub claims: BTreeMap<EndpointId, WorkspaceClaims>,
 }
 
-/// A gossip-replicated versioned register. [`Peer`] and [`MeshRepo`] are
-/// the two implementors.
+/// A gossip-replicated versioned register.
 pub(super) trait Register: Clone {
     /// Bumped on every local change, so the change outranks other machines.
     fn version(&self) -> u64;
