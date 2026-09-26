@@ -21,7 +21,7 @@
 //! raw byte reads/writes here are plain blocking I/O.
 
 use std::{
-    collections::HashSet,
+    collections::{BTreeSet, HashSet},
     path::{Path, PathBuf},
     sync::LazyLock,
 };
@@ -185,6 +185,20 @@ impl OpenRepo {
     ) -> Result<Option<CommitId>> {
         let view = self.load_operation(op).await?.view().await?;
         Ok(view.get_wc_commit_id(workspace.as_ref()).cloned())
+    }
+
+    /// The workspaces named in the views of `ops`.
+    pub async fn workspace_names(&self, ops: &[OperationId]) -> Result<BTreeSet<String>> {
+        let mut names = BTreeSet::new();
+        for op in ops {
+            let view = self.load_operation(op).await?.view().await?;
+            names.extend(
+                view.wc_commit_ids()
+                    .keys()
+                    .map(|name| name.as_str().to_owned()),
+            );
+        }
+        Ok(names)
     }
 
     /// Loads an operation as jj_lib's handle, for its walks and views.

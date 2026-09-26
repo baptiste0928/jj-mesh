@@ -70,6 +70,18 @@ pub fn run(_args: StatusArgs, dir: &ConfigDir) -> Result<()> {
                 ui::dim(format_args!("{path:path_width$}")),
                 watch_summary(&repo.watch),
             );
+            // A single workspace is the repo itself.
+            if repo.workspaces.len() > 1 {
+                let names: Vec<String> =
+                    repo.workspaces.iter().map(|w| sanitize(&w.name)).collect();
+                let width = ui::name_width(names.iter().map(String::as_str));
+                for (workspace, name) in repo.workspaces.iter().zip(&names) {
+                    println!(
+                        "    {name:width$}  {}",
+                        ui::dim(ui::display_path(&workspace.path)),
+                    );
+                }
+            }
         }
     }
     if !status.available.is_empty() {

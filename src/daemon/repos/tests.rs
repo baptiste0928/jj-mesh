@@ -57,6 +57,15 @@ async fn wait_watch(set: &RepoSet, pred: impl Fn(&WatchStatus) -> bool) {
     wait_for(set, |s| matches!(s, [status] if pred(&status.watch))).await;
 }
 
+/// Polls until `cond` holds, panicking with `what` after 10s.
+async fn eventually(what: &str, cond: impl Fn() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !cond() {
+        assert!(Instant::now() < deadline, "{what}");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
 /// Polls until the single repo's watch is up.
 async fn wait_watching(set: &RepoSet) {
     wait_watch(set, |w| matches!(w, WatchStatus::Watching { .. })).await;
@@ -235,11 +244,7 @@ async fn updates_stale_working_copy() {
     let set = repo_set("snapshot-interval = 0\nupdate-stale = true");
     set.sync(&state_with("a", &dir));
 
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while !fx.jj_ok(&dir, &["status"]) {
-        assert!(Instant::now() < deadline, "working copy still stale");
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
+    eventually("working copy still stale", || fx.jj_ok(&dir, &["status"])).await;
 }
 
 /// An op head without a commit index (published by a fetch whose index
@@ -308,11 +313,12 @@ async fn reopens_when_store_configuration_changes() {
 /// stale, one that only touched other state does not.
 #[tokio::test]
 async fn staleness_follows_the_working_copy_commit() {
-    use super::task::may_be_stale;
+    use super::workspace::may_be_stale;
 
     let fx = Fixture::new();
     let dir = fx.init_repo("a");
     let jj = JjRepo::discover(&dir).unwrap();
+    let workspace = jj.workspace().unwrap();
     let repo = jj.open().unwrap();
     let head = |repo: &crate::repo::OpenRepo| {
         let heads = pollster::block_on(repo.op_heads()).unwrap();
@@ -320,7 +326,7 @@ async fn staleness_follows_the_working_copy_commit() {
         heads[0].clone()
     };
 
-    assert!(!may_be_stale(&jj, &repo, &head(&repo)).await.unwrap());
+    assert!(!may_be_stale(&workspace, &repo, &head(&repo)).await.unwrap());
 
     // A new operation leaving the working-copy commit alone.
     fx.jj(
@@ -334,13 +340,76 @@ async fn staleness_follows_the_working_copy_commit() {
             "@",
         ],
     );
-    assert!(!may_be_stale(&jj, &repo, &head(&repo)).await.unwrap());
+    assert!(!may_be_stale(&workspace, &repo, &head(&repo)).await.unwrap());
 
     // One rewriting it behind the working copy's back.
     fx.jj(&dir, &["--ignore-working-copy", "describe", "-m", "moved"]);
-    assert!(may_be_stale(&jj, &repo, &head(&repo)).await.unwrap());
+    assert!(may_be_stale(&workspace, &repo, &head(&repo)).await.unwrap());
 
     // Updating the working copy settles it.
     fx.jj(&dir, &["status"]);
-    assert!(!may_be_stale(&jj, &repo, &head(&repo)).await.unwrap());
+    assert!(!may_be_stale(&workspace, &repo, &head(&repo)).await.unwrap());
+}
+
+/// The workspace names the single repo's status lists.
+fn workspace_names(statuses: &[control::RepoStatus]) -> Vec<&str> {
+    match statuses {
+        [status] => status.workspaces.iter().map(|w| w.name.as_str()).collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Workspaces added and forgotten while the repo is watched are picked up
+/// and dropped, and edits in a secondary one are snapshotted.
+#[tokio::test]
+async fn tracks_and_snapshots_secondary_workspaces() {
+    let fx = Fixture::new();
+    let dir = fx.init_repo("a");
+
+    let set = repo_set("snapshot-interval = 1\nupdate-stale = false");
+    set.sync(&state_with("a", &dir));
+    wait_for(&set, |s| workspace_names(s) == ["default"]).await;
+
+    fx.jj(&dir, &["workspace", "add", "../child"]);
+    wait_for(&set, |s| {
+        let mut names = workspace_names(s);
+        names.sort_unstable();
+        names == ["child", "default"]
+    })
+    .await;
+
+    let child = fx.path().join("child");
+    std::fs::write(child.join("edited.txt"), "content").unwrap();
+    eventually("secondary workspace not snapshotted", || {
+        let files = fx.jj_output(
+            &dir,
+            &["--ignore-working-copy", "file", "list", "-r", "child@"],
+        );
+        files.contains("edited.txt")
+    })
+    .await;
+
+    fx.jj(&dir, &["workspace", "forget", "child"]);
+    wait_for(&set, |s| workspace_names(s) == ["default"]).await;
+}
+
+/// A stale secondary working copy is healed like the main one.
+#[tokio::test]
+async fn updates_stale_secondary_workspace() {
+    let fx = Fixture::new();
+    let dir = fx.init_repo("a");
+    fx.jj(&dir, &["workspace", "add", "../child"]);
+    let child = fx.path().join("child");
+    std::fs::write(child.join("f.txt"), "content").unwrap();
+    fx.jj(&child, &["status"]);
+    fx.jj(&dir, &["--ignore-working-copy", "abandon", "child@"]);
+    assert!(
+        !fx.jj_ok(&child, &["status"]),
+        "the working copy must start stale for this test to mean anything",
+    );
+
+    let set = repo_set("snapshot-interval = 0\nupdate-stale = true");
+    set.sync(&state_with("a", &dir));
+
+    eventually("working copy still stale", || fx.jj_ok(&child, &["status"])).await;
 }

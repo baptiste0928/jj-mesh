@@ -9,13 +9,15 @@ use crate::{
     cli::{machine_name, ui},
     config::ConfigDir,
     daemon::control::{self, Request, Response},
-    repo::JjRepo,
+    repo::Workspace,
 };
 
 /// Add a repo to the mesh
 ///
 /// The repo will be made available for other machines to clone with
 /// `jj-mesh repo clone`, and any changes will be synced across the mesh.
+/// Every workspace of the repo on this machine is kept up to date; run from
+/// a secondary workspace, this adds the repo it belongs to.
 #[derive(Debug, Args)]
 pub struct AddArgs {
     /// Path inside the jj repo to add (defaults to the current directory)
@@ -26,7 +28,7 @@ pub struct AddArgs {
     #[arg(long)]
     name: Option<String>,
 
-    /// Override the workspace name (defaults to this machine name)
+    /// Override the main workspace name (defaults to this machine name)
     ///
     /// We assign a workspace for each copy of the repo across the mesh, so
     /// the current head of each machine is displayed in `jj log`.
@@ -37,7 +39,16 @@ pub struct AddArgs {
 /// Runs the `repo add` command.
 pub fn run(args: AddArgs, dir: &ConfigDir) -> Result<()> {
     let path = args.path.unwrap_or_else(|| PathBuf::from("."));
-    let repo = JjRepo::discover(&path)?;
+    let workspace = Workspace::discover(&path)?;
+    let repo = workspace.repo()?;
+    if !workspace.is_main() {
+        eprintln!(
+            "{} {} is a secondary workspace, adding its repo at {} (all its workspaces are synced)",
+            ui::warn("warning:").for_stderr(),
+            workspace.root().display(),
+            repo.root().display(),
+        );
+    }
 
     let name = match args.name {
         Some(name) => name,
@@ -49,16 +60,16 @@ pub fn run(args: AddArgs, dir: &ConfigDir) -> Result<()> {
             .into_owned(),
     };
 
-    // A repo still on jj's `default` workspace name gets the machine name,
+    // A main workspace still on jj's `default` name gets the machine name,
     // so workspace names stay unique across the mesh; a deliberately named
     // workspace is kept as-is.
-    let workspace = match args.workspace {
+    let rename = match args.workspace {
         Some(name) => Some(name),
-        None if repo.workspace_name()? == "default" => Some(machine_name(dir)?),
+        None if repo.workspace()?.name()? == "default" => Some(machine_name(dir)?),
         None => None,
     };
-    if let Some(workspace) = &workspace {
-        super::jj(Some(repo.root()), &["workspace", "rename", workspace])?;
+    if let Some(rename) = &rename {
+        super::jj(Some(repo.root()), &["workspace", "rename", rename])?;
     }
 
     let request = Request::AddRepo {

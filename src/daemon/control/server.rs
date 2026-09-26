@@ -302,9 +302,9 @@ async fn pair_join(stream: &mut UnixStream, ctx: &ControlContext, ticket: &str) 
 /// Registers the repo at `path` under `name` with a fresh id. The path is
 /// validated to be a mesh-compatible repo here, not just in the CLI: the
 /// daemon is the authority, and registering an invalid path would only
-/// surface later as a watch failure. Storing the discovered workspace root
-/// (canonicalized) also keeps two spellings of one repo from registering
-/// twice.
+/// surface later as a watch failure. Storing the discovered main workspace
+/// root (canonicalized) also keeps two spellings of one repo, or two of its
+/// workspaces, from registering twice.
 async fn add_repo(ctx: &ControlContext, name: String, path: PathBuf) -> Result<Response> {
     let root = tokio::task::spawn_blocking(move || -> Result<PathBuf> {
         Ok(JjRepo::discover(&path)?.root().to_owned())

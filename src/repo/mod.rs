@@ -4,16 +4,17 @@
 //! we verify its store `type` files match the backends this build supports
 //! (git commit backend, simple op store and op heads store).
 //!
-//! [`JjRepo`] is a validated repo on disk and [`StoreFingerprint`] its
-//! captured store configuration. The `jj` module invokes the user's jj
-//! binary, `open` opens the stores through jj_lib (with raw batched
-//! writes in `write`), `codec` validates replicated bytes, and
-//! `transfer` moves them between peers.
+//! [`JjRepo`] is a validated repo on disk, [`StoreFingerprint`] its
+//! captured store configuration, and [`Workspace`] one of its working
+//! copies. The `jj` module invokes the user's jj binary, `open` opens the
+//! stores through jj_lib (with raw batched writes in `write`), `codec`
+//! validates replicated bytes, and `transfer` moves them between peers.
 
 mod codec;
 mod jj;
 mod open;
 pub(crate) mod transfer;
+mod workspace;
 mod write;
 
 use std::{
@@ -21,11 +22,12 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use color_eyre::eyre::{Result, WrapErr as _, ensure, eyre};
+use color_eyre::eyre::{Result, WrapErr as _, ensure};
 
 pub use self::{
     jj::{jj_bin, jj_peer_warning, jj_version_warning, local_jj_version, repo_present, run_jj},
     open::OpenRepo,
+    workspace::{Checkout, Workspace},
 };
 
 /// The jj release series this build accepts, as minors of `0.<minor>.<patch>`
@@ -46,14 +48,6 @@ pub struct JjRepo {
     root: PathBuf,
 }
 
-/// What a working copy was last updated to: its workspace, and the
-/// operation whose view it reflects.
-#[derive(Debug, Clone)]
-pub struct Checkout {
-    pub workspace: String,
-    pub operation: jj_lib::op_store::OperationId,
-}
-
 /// The store configuration captured at repo open, compared against a fresh
 /// capture to detect a repo changing underneath a running daemon (converted
 /// colocation, swapped backend, replaced repo).
@@ -69,25 +63,22 @@ pub struct StoreFingerprint {
 }
 
 impl JjRepo {
-    /// Finds the repo containing `path` (like jj, by walking up to the
-    /// closest `.jj` directory) and validates it.
+    /// Finds the repo of the workspace containing `path` (see
+    /// [`Workspace::discover`]) and validates it.
     pub fn discover(path: &Path) -> Result<Self> {
-        let path = fs::canonicalize(path)
-            .wrap_err_with(|| format!("cannot resolve {}", path.display()))?;
-        let root = path
-            .ancestors()
-            .find(|dir| dir.join(".jj").is_dir())
-            .ok_or_else(|| eyre!("no jj repo found in {} or its parents", path.display()))?;
+        Workspace::discover(path)?.repo()
+    }
 
+    /// The repo whose main workspace is rooted at `root`, validated.
+    fn at(root: &Path) -> Result<Self> {
         let repo = JjRepo {
             root: root.to_owned(),
         };
         repo.validate()?;
-
         Ok(repo)
     }
 
-    /// The workspace root (the directory containing `.jj`).
+    /// The main workspace root (the directory containing `.jj/repo`).
     pub fn root(&self) -> &Path {
         &self.root
     }
@@ -107,36 +98,6 @@ impl JjRepo {
     /// Opens the repo's stores through jj_lib for sync operations.
     pub fn open(&self) -> Result<OpenRepo> {
         OpenRepo::open(self.clone())
-    }
-
-    /// The name of the workspace at the repo root (`default` until it is
-    /// renamed).
-    pub fn workspace_name(&self) -> Result<String> {
-        Ok(self.checkout()?.workspace)
-    }
-
-    /// What the working copy at the repo root was last updated to. Read
-    /// without the working-copy lock: a jj command racing this read only
-    /// makes the staleness check it feeds conservative.
-    pub fn checkout(&self) -> Result<Checkout> {
-        use jj_lib::{
-            default_backend_factories::{
-                default_backend_factories, default_working_copy_factories,
-            },
-            workspace::Workspace,
-        };
-
-        let workspace = Workspace::load(
-            open::settings()?,
-            &self.root,
-            &default_backend_factories(),
-            &default_working_copy_factories(),
-        )
-        .wrap_err_with(|| format!("cannot load the workspace at {}", self.root.display()))?;
-        Ok(Checkout {
-            workspace: workspace.workspace_name().as_str().to_owned(),
-            operation: workspace.working_copy().operation_id().clone(),
-        })
     }
 
     /// Captures the store configuration an open repo depends on. jj_lib
@@ -176,16 +137,8 @@ impl JjRepo {
         Ok(types)
     }
 
-    /// Checks that the repo owns its storage and uses supported backends.
+    /// Checks that the repo uses supported backends.
     fn validate(&self) -> Result<()> {
-        // In workspaces created by `jj workspace add`, `.jj/repo` is a file
-        // pointing to the main workspace's repo directory.
-        ensure!(
-            self.repo_dir().is_dir(),
-            "{} is a secondary workspace, add the main workspace instead",
-            self.root.display(),
-        );
-
         for (actual, (store, expected)) in self.store_types()?.iter().zip(SUPPORTED_STORES) {
             ensure!(
                 actual == expected,
@@ -229,16 +182,6 @@ mod tests {
     }
 
     #[test]
-    fn discover_rejects_secondary_workspace() {
-        let tmp = tempfile::tempdir().unwrap();
-        fs::create_dir_all(tmp.path().join(".jj")).unwrap();
-        fs::write(tmp.path().join(".jj/repo"), "../main/.jj/repo").unwrap();
-
-        let err = JjRepo::discover(tmp.path()).unwrap_err();
-        assert!(err.to_string().contains("secondary workspace"));
-    }
-
-    #[test]
     fn fingerprint_detects_store_changes() {
         let tmp = tempfile::tempdir().unwrap();
         fake_repo(tmp.path());
@@ -270,11 +213,11 @@ mod tests {
         let fixture = crate::testing::Fixture::new();
         let dir = fixture.init_repo("proj");
 
-        let repo = JjRepo::discover(&dir).unwrap();
-        assert_eq!(repo.workspace_name().unwrap(), "default");
+        let workspace = JjRepo::discover(&dir).unwrap().workspace().unwrap();
+        assert_eq!(workspace.name().unwrap(), "default");
 
         fixture.jj(&dir, &["workspace", "rename", "machine-a"]);
-        assert_eq!(repo.workspace_name().unwrap(), "machine-a");
+        assert_eq!(workspace.name().unwrap(), "machine-a");
     }
 
     #[test]

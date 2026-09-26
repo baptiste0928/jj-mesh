@@ -241,6 +241,15 @@ pub struct RepoStatus {
     pub name: String,
     pub path: PathBuf,
     pub watch: WatchStatus,
+    /// Its workspaces on this machine, known while watching.
+    pub workspaces: Vec<WorkspaceStatus>,
+}
+
+/// A workspace of a registered repo.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct WorkspaceStatus {
+    pub name: String,
+    pub path: PathBuf,
 }
 
 /// State of the op-heads watch on a repo.

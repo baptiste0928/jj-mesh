@@ -1,12 +1,18 @@
 //! Registered repo management.
 //!
-//! One watch task per registered repo syncs it (see the `task` submodule);
-//! [`RepoSet`] keeps the tasks aligned with the mesh state, spawning and
-//! aborting them as repos are registered and removed.
+//! [`RepoSet`] keeps one watch task per registered repo (see the `task`
+//! submodule), spawning and aborting them as repos are registered and
+//! removed. Each repo task runs one task per local workspace, keeping its
+//! working copy fresh (see the `workspace` submodule).
+//!
+//! ```text
+//! RepoSet ──► repo task ──► workspace task (per local workspace)
+//! ```
 
 mod task;
 #[cfg(test)]
 mod tests;
+mod workspace;
 
 use std::{
     collections::BTreeMap,
@@ -56,6 +62,8 @@ enum RepoState {
         op_heads: usize,
         last_change: Option<SystemTime>,
         last_sync: Option<SystemTime>,
+        /// The local workspaces kept fresh, as `(name, root)`.
+        workspaces: Vec<(String, PathBuf)>,
     },
     /// Rebuilding the commit index for op heads that lack one; jj commands
     /// in the repo would otherwise pay for the rebuild themselves.
@@ -158,6 +166,7 @@ impl RepoSet {
         repos
             .iter()
             .map(|(name, handle)| {
+                let mut workspaces = Vec::new();
                 let watch = match &*handle.state.lock().unwrap() {
                     RepoState::Opening => control::WatchStatus::Opening,
                     RepoState::Indexing => control::WatchStatus::Indexing,
@@ -165,13 +174,23 @@ impl RepoSet {
                         op_heads,
                         last_change,
                         last_sync,
-                    } => control::WatchStatus::Watching {
-                        op_heads: *op_heads as u64,
-                        last_change_secs: last_change
-                            .map(|at| at.elapsed().unwrap_or_default().as_secs()),
-                        last_sync_secs: last_sync
-                            .map(|at| at.elapsed().unwrap_or_default().as_secs()),
-                    },
+                        workspaces: watched,
+                    } => {
+                        workspaces = watched
+                            .iter()
+                            .map(|(name, path)| control::WorkspaceStatus {
+                                name: name.clone(),
+                                path: path.clone(),
+                            })
+                            .collect();
+                        control::WatchStatus::Watching {
+                            op_heads: *op_heads as u64,
+                            last_change_secs: last_change
+                                .map(|at| at.elapsed().unwrap_or_default().as_secs()),
+                            last_sync_secs: last_sync
+                                .map(|at| at.elapsed().unwrap_or_default().as_secs()),
+                        }
+                    }
                     RepoState::Backoff { until, error } => control::WatchStatus::Failed {
                         error: error.clone(),
                         retry_in_secs: until.saturating_duration_since(Instant::now()).as_secs(),
@@ -185,8 +204,18 @@ impl RepoSet {
                     name: name.clone(),
                     path: handle.path.clone(),
                     watch,
+                    workspaces,
                 }
             })
             .collect()
+    }
+}
+
+/// Sleeps until `deadline`, or never when it is `None`, so an optional
+/// deadline can sit in a `select!` uniformly.
+async fn sleep_until(deadline: Option<Instant>) {
+    match deadline {
+        Some(at) => tokio::time::sleep_until(at.into()).await,
+        None => std::future::pending().await,
     }
 }

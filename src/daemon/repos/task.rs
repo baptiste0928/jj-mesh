@@ -1,6 +1,5 @@
 //! The per-repo watch task: open, watch op heads, announce local changes,
-//! fetch announced changes from peers, and drive the optional auto-snapshot
-//! and update-stale jj runs.
+//! fetch announced changes from peers, and run the workspace tasks.
 //!
 //! The task watches the repo's op-heads directory: every mutating jj
 //! command atomically swaps head marker files there, so a change event
@@ -15,26 +14,9 @@
 //! writes (applying fetched operations) fold into that baseline before the
 //! comparison, so self-triggered events are suppressed the same way.
 //!
-//! When auto-snapshotting is enabled, the task also watches the working
-//! copy files: the first edit arms a snapshot one interval later (never
-//! immediately), and edits during the wait do not postpone it, so
-//! continuous editing snapshots at the configured cadence. The snapshot
-//! runs through the jj binary and produces a regular operation, which the
-//! op-heads watch then picks up and announces like any local change.
-//!
-//! Syncing operations from peers can leave the local working copy stale
-//! (updated by an operation the working copy never saw). When enabled,
-//! `jj workspace update-stale` runs after every sync that applied
-//! operations, and once on watch start for staleness accrued while the
-//! daemon was down, but only while the op head is single and the head
-//! moved the working-copy commit since the working copy's last update:
-//! the command snapshots the whole working copy before checking anything,
-//! so it must not run on syncs that cannot have made it stale. Any jj
-//! command reconciles divergent op heads by writing a merge operation,
-//! so daemons doing this on both ends of a divergence would ping-pong
-//! fresh merge operations at each other. Divergence is left to the next
-//! actual jj activity (a user command, an auto-snapshot), whose merge
-//! then arrives here as a single head.
+//! The workspaces are found again whenever the op heads change (adding,
+//! forgetting and renaming a workspace are operations) and on idle
+//! liveness checks; a workspace gone from disk only loses its task.
 //!
 //! On watch start the task also rebuilds the commit index for op heads
 //! that lack one (a fetch whose build failed, a repo synced by an older
@@ -42,7 +24,8 @@
 //! user's next jj command would pay for the rebuild.
 
 use std::{
-    path::{Path, PathBuf},
+    collections::BTreeMap,
+    path::PathBuf,
     sync::{Arc, Mutex},
     time::{Duration, Instant, SystemTime},
 };
@@ -50,19 +33,23 @@ use std::{
 use color_eyre::eyre::{Result, WrapErr as _, ensure, eyre};
 use iroh::EndpointId;
 use jj_lib::{object_id::ObjectId as _, op_store::OperationId};
-use tokio::sync::Notify;
+use pollster::FutureExt as _;
+use tokio::sync::{Notify, watch};
 use tracing::{debug, info, warn};
 
-use super::{RepoHandle, RepoState};
+use super::{
+    RepoHandle, RepoState, sleep_until,
+    workspace::{RepoContext, WorkspaceHandle, spawn_workspace},
+};
 use crate::{
-    config::{RepoId, RepoSettings, Settings},
+    config::{RepoId, Settings},
     daemon::{
         backoff::Backoff,
         hub::{Inbox, PeerAnnounce, SyncHub},
     },
     net::fetch::GitTransferFormat,
-    repo::{JjRepo, OpenRepo, StoreFingerprint, repo_present, run_jj, transfer},
-    watch::{DirWatcher, TreeWatcher},
+    repo::{JjRepo, OpenRepo, StoreFingerprint, Workspace, repo_present, transfer},
+    watch::DirWatcher,
 };
 
 /// Retry delay after a failure to open or watch; doubles up to
@@ -111,10 +98,6 @@ const OPEN_STREAM_TIMEOUT: Duration = Duration::from_secs(30);
 /// a dropped stream) would strand the change until the peer next announces
 /// or reconnects. Kept coarse: the failures it covers are not urgent.
 const FETCH_RETRY: Duration = Duration::from_secs(30);
-
-/// Budget for one spawned jj command. Generous: the first snapshot of a
-/// large working copy legitimately takes a while.
-const JJ_TIMEOUT: Duration = Duration::from_mins(5);
 
 /// Spawns the watch task for one repo.
 pub(super) fn spawn_repo(
@@ -246,30 +229,24 @@ impl RepoTask {
         // jj run below pays for the rebuild.
         self.heal_index(&repo, &heads).await;
         self.heal_git_refs(&repo).await;
+
+        // The op-heads watch above is already live, so any operation the
+        // workspace tasks create is picked up like any other.
+        let ctx = Arc::new(RepoContext::new(
+            self.name.clone(),
+            repo.clone(),
+            self.settings.for_repo(&self.name),
+        ));
+        let (synced, _) = watch::channel(None);
+        let mut workspaces = BTreeMap::new();
+        self.track_workspaces(&jj, &ctx, &heads, &synced, &mut workspaces)
+            .await;
         self.set_state(RepoState::Watching {
             op_heads: heads.len(),
             last_change,
             last_sync,
+            workspaces: listed(&workspaces),
         });
-
-        let mut snap = Snapshotting::default();
-        let mut tree = match self.settings().snapshot_interval {
-            Some(_) => self.watch_tree(jj.root()).await,
-            None => None,
-        };
-
-        // Heal staleness accrued while the daemon was down (or right
-        // before a crash); afterwards every applied sync triggers it
-        // directly. The op-heads watch above is already live, so any
-        // operation this creates is picked up like any other.
-        if let [head] = heads.as_slice() {
-            self.update_stale(&jj, &repo, head, &mut tree).await;
-        }
-        // Edits made while the watch was down produce no event, so the
-        // working copy is snapshotted once on start for the same reason
-        // the heads are published above: it is the only anti-entropy the
-        // snapshot path has.
-        snap.arm(self.settings().snapshot_interval);
 
         // When set, the time to wake and retry fetches that failed and were
         // requeued into the inbox. Requeued heads are re-drained on any
@@ -278,38 +255,18 @@ impl RepoTask {
         let mut retry_at: Option<Instant> = None;
 
         loop {
+            let mut rescan = false;
             tokio::select! {
                 changed = watch.changed_or_idle(LIVENESS_INTERVAL) => {
                     if !changed? {
                         // No events for a while: check the watch is not
                         // dead in a way that produces none (unmount).
                         ensure!(heads_dir.is_dir(), "the op heads directory is gone");
+                        rescan = true;
                     }
                 }
                 () = self.announcements.changed() => {}
                 () = sleep_until(retry_at) => {}
-                outcome = tree_changed(&mut tree) => {
-                    match outcome {
-                        Ok(()) => snap.arm(self.settings().snapshot_interval),
-                        Err(err) => {
-                            warn!(
-                                repo = %self.name,
-                                "working copy watch failed, auto-snapshot \
-                                 disabled until the repo reopens: {err:#}",
-                            );
-                            tree = None;
-                        }
-                    }
-                    // Edits are frequent and arming is all that is needed:
-                    // skip the fingerprint and head re-checks below.
-                    continue;
-                }
-                () = sleep_until(snap.deadline) => {
-                    self.snapshot(&mut snap, &mut tree).await;
-                    // The snapshot operation wakes the op-heads watch,
-                    // which then re-reads and announces the heads.
-                    continue;
-                }
             }
 
             // jj_lib resolved the store configuration once at open and
@@ -344,23 +301,23 @@ impl RepoTask {
                 last_change = Some(SystemTime::now());
                 info!(repo = %self.name, op_heads = heads.len(), "op heads changed");
                 self.hub.publish(&self.name, &self.id, wire_heads(&heads));
+                rescan = true;
+            }
+            if rescan {
+                self.track_workspaces(&jj, &ctx, &heads, &synced, &mut workspaces)
+                    .await;
             }
 
-            // The applied operations may have left the working copy
-            // stale. Only a single head is caught up on (see the module
-            // docs on divergence).
-            if drained.synced
-                && let [head] = heads.as_slice()
-                && self.update_stale(&jj, &repo, head, &mut tree).await
-            {
-                // update-stale snapshots the working copy itself, so a
-                // pending snapshot has just been done.
-                snap.done();
+            // The applied operations may have left the working copies
+            // stale.
+            if drained.synced {
+                synced.send_replace(single_head(&heads));
             }
             self.set_state(RepoState::Watching {
                 op_heads: heads.len(),
                 last_change,
                 last_sync,
+                workspaces: listed(&workspaces),
             });
         }
     }
@@ -369,8 +326,6 @@ impl RepoTask {
     /// the self-check reads whole views), so it runs on a blocking
     /// thread: a hung disk must stall this repo, not the daemon.
     async fn open(&self) -> Result<(JjRepo, Arc<OpenRepo>, StoreFingerprint)> {
-        use pollster::FutureExt as _;
-
         let path = self.path.clone();
         let (jj, repo, fingerprint) =
             tokio::task::spawn_blocking(move || -> Result<(JjRepo, OpenRepo, _)> {
@@ -390,25 +345,46 @@ impl RepoTask {
         Ok((jj, Arc::new(repo), fingerprint))
     }
 
-    /// Builds the working-copy watcher, degrading to `None` instead of
-    /// failing the repo: op sync must survive a tree too large or busted
-    /// to watch. `None` means no snapshots for this repo, nothing else.
-    async fn watch_tree(&self, root: &Path) -> Option<TreeWatcher> {
-        match TreeWatcher::new(root).await {
-            Ok(tree) => Some(tree),
-            Err(err) => {
-                warn!(
-                    repo = %self.name,
-                    "cannot watch working copy files, auto-snapshot disabled: {err:#}",
-                );
-                None
-            }
-        }
-    }
+    /// Aligns the workspace tasks with the workspaces found on disk.
+    async fn track_workspaces(
+        &self,
+        jj: &JjRepo,
+        ctx: &Arc<RepoContext>,
+        heads: &[OperationId],
+        synced: &watch::Sender<Option<OperationId>>,
+        workspaces: &mut BTreeMap<PathBuf, WorkspaceHandle>,
+    ) {
+        let found = match find_workspaces(jj, &ctx.repo, heads).await {
+            Ok(found) => found,
+            Err(err) => return warn!(repo = %self.name, "cannot list workspaces: {err:#}"),
+        };
 
-    /// The effective settings for this repo.
-    fn settings(&self) -> RepoSettings {
-        self.settings.for_repo(&self.name)
+        workspaces.retain(|root, handle| {
+            let keep = !handle.is_finished()
+                && found
+                    .iter()
+                    .any(|(name, ws)| ws.root() == root && *name == handle.name);
+            if !keep {
+                info!(repo = %self.name, workspace = %handle.name, "stopping workspace watch");
+            }
+            keep
+        });
+        for (name, workspace) in found {
+            let root = workspace.root().to_owned();
+            workspaces.entry(root).or_insert_with(|| {
+                info!(
+                    repo = %self.name, workspace = %name,
+                    path = %workspace.root().display(), "watching workspace",
+                );
+                spawn_workspace(
+                    ctx.clone(),
+                    name,
+                    workspace,
+                    single_head(heads),
+                    synced.subscribe(),
+                )
+            });
+        }
     }
 
     /// Drains the announcement inbox, handling every entry. Failed
@@ -562,110 +538,9 @@ impl RepoTask {
         }
     }
 
-    /// Runs `jj workspace update-stale` when enabled for this repo and
-    /// the working copy may be stale at `head`; returns whether it ran.
-    /// Failures only warn: the working copy may be locked by an ongoing
-    /// command, and the next sync retries.
-    async fn update_stale(
-        &self,
-        jj: &JjRepo,
-        repo: &OpenRepo,
-        head: &OperationId,
-        tree: &mut Option<TreeWatcher>,
-    ) -> bool {
-        if !self.settings().update_stale {
-            return false;
-        }
-        match may_be_stale(jj, repo, head).await {
-            Ok(false) => return false,
-            Ok(true) => {}
-            Err(err) => debug!(repo = %self.name, "cannot check staleness: {err:#}"),
-        }
-        debug!(repo = %self.name, "checking for a stale working copy");
-        self.run_jj(&["workspace", "update-stale"], tree).await;
-        true
-    }
-
-    /// Snapshots the working copy through the jj binary, which applies
-    /// the user's snapshot configuration and takes the working-copy lock.
-    async fn snapshot(&self, snap: &mut Snapshotting, tree: &mut Option<TreeWatcher>) {
-        debug!(repo = %self.name, "snapshotting working copy");
-        let started = Instant::now();
-        self.run_jj(&["util", "snapshot"], tree).await;
-        snap.finished(started);
-    }
-
-    /// Runs one working-copy jj command, then drops the events it caused:
-    /// update-stale writes working-copy files, and letting the watcher
-    /// see them would schedule a snapshot of the daemon's own work, on
-    /// and on. Failures only warn, the repo is fine either way.
-    async fn run_jj(&self, args: &[&str], tree: &mut Option<TreeWatcher>) {
-        if let Err(err) = run_jj(&self.path, args, JJ_TIMEOUT).await {
-            warn!(repo = %self.name, "jj {} failed: {err:#}", args.join(" "));
-        }
-        if let Some(watcher) = tree
-            && let Err(err) = watcher.discard_queued().await
-        {
-            warn!(
-                repo = %self.name,
-                "working copy watch failed, auto-snapshot disabled until the \
-                 repo reopens: {err:#}",
-            );
-            *tree = None;
-        }
-    }
-
     fn set_state(&self, state: RepoState) {
         *self.state.lock().unwrap() = state;
         self.changed.notify_one();
-    }
-}
-
-/// Scheduling state of one repo's auto-snapshots.
-///
-/// The first edit arms a snapshot one interval out and later edits never
-/// postpone it, so continuous editing snapshots at the configured
-/// cadence. A snapshot walks the whole working copy though, which on a
-/// large repo can take longer than the interval; the last one's duration
-/// therefore also sets a floor on the gap to the next, so the daemon
-/// cannot end up snapshotting an unbounded fraction of the time.
-#[derive(Debug, Default)]
-struct Snapshotting {
-    /// When the pending snapshot is due, if one is pending.
-    deadline: Option<Instant>,
-    /// Earliest acceptable time for the next snapshot, from the cost of
-    /// the last one.
-    earliest: Option<Instant>,
-}
-
-/// How much of the time a repeated snapshot may occupy, as the ratio of
-/// the enforced gap to the snapshot's own duration. Only binds on repos
-/// where a snapshot outlasts the configured interval.
-const SNAPSHOT_DUTY_DIVISOR: u32 = 2;
-
-impl Snapshotting {
-    /// Schedules a snapshot `interval` from now unless one is already
-    /// pending, or auto-snapshotting is off (`interval` is `None`).
-    fn arm(&mut self, interval: Option<Duration>) {
-        let Some(interval) = interval else {
-            return;
-        };
-        if self.deadline.is_some() {
-            return;
-        }
-        let due = Instant::now() + interval;
-        self.deadline = Some(self.earliest.map_or(due, |floor| due.max(floor)));
-    }
-
-    /// Records a snapshot that ran, from the instant it started.
-    fn finished(&mut self, started: Instant) {
-        self.done();
-        self.earliest = Some(Instant::now() + started.elapsed() * SNAPSHOT_DUTY_DIVISOR);
-    }
-
-    /// Clears the pending snapshot, after something else did the work.
-    fn done(&mut self) {
-        self.deadline = None;
     }
 }
 
@@ -687,24 +562,6 @@ enum Handled {
     Failed,
 }
 
-/// Sleeps until `deadline`, or never when it is `None`, so an optional
-/// retry deadline can sit in a `select!` uniformly.
-async fn sleep_until(deadline: Option<Instant>) {
-    match deadline {
-        Some(at) => tokio::time::sleep_until(at.into()).await,
-        None => std::future::pending().await,
-    }
-}
-
-/// Waits for the next working-copy change, or forever when tree watching
-/// is disabled, so it can sit in a `select!` uniformly.
-async fn tree_changed(tree: &mut Option<TreeWatcher>) -> Result<()> {
-    match tree {
-        Some(tree) => tree.changed().await,
-        None => std::future::pending().await,
-    }
-}
-
 /// Re-captures the store fingerprint: a handful of tiny reads, but on a
 /// blocking thread since a hung mount is one of the probed conditions.
 async fn store_fingerprint(jj: &JjRepo) -> Result<StoreFingerprint> {
@@ -714,20 +571,37 @@ async fn store_fingerprint(jj: &JjRepo) -> Result<StoreFingerprint> {
         .wrap_err("fingerprint task failed")?
 }
 
-/// Whether the working copy may be stale at the op head `head`: it was
-/// last updated at another operation, one whose view gave its workspace a
-/// different working-copy commit. Same commit means same tree, which jj
-/// treats as fresh, whatever else the operations changed.
-pub(super) async fn may_be_stale(jj: &JjRepo, repo: &OpenRepo, head: &OperationId) -> Result<bool> {
-    let checkout = jj.checkout()?;
-    if &checkout.operation == head {
-        return Ok(false);
+/// The workspaces of the repo on this machine that the views of `heads`
+/// name. Runs on a blocking thread: decodes a view per head.
+async fn find_workspaces(
+    jj: &JjRepo,
+    repo: &Arc<OpenRepo>,
+    heads: &[OperationId],
+) -> Result<Vec<(String, Workspace)>> {
+    let (jj, repo, heads) = (jj.clone(), repo.clone(), heads.to_vec());
+    tokio::task::spawn_blocking(move || {
+        let names = repo.workspace_names(&heads).block_on()?;
+        jj.workspaces(&names)
+    })
+    .await
+    .wrap_err("workspace search task failed")?
+}
+
+/// The `(name, root)` list of the watched workspaces, for status.
+fn listed(workspaces: &BTreeMap<PathBuf, WorkspaceHandle>) -> Vec<(String, PathBuf)> {
+    workspaces
+        .iter()
+        .map(|(root, handle)| (handle.name.clone(), root.clone()))
+        .collect()
+}
+
+/// The op head, when single: working copies are only caught up on then
+/// (see the `workspace` module docs on divergence).
+fn single_head(heads: &[OperationId]) -> Option<OperationId> {
+    match heads {
+        [head] => Some(head.clone()),
+        _ => None,
     }
-    let at_checkout = repo
-        .wc_commit_id(&checkout.operation, &checkout.workspace)
-        .await?;
-    let at_head = repo.wc_commit_id(head, &checkout.workspace).await?;
-    Ok(at_checkout != at_head)
 }
 
 /// Reads the current op heads as a sorted set, comparable across reads.
