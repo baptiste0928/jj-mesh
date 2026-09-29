@@ -1,6 +1,6 @@
 use super::orphans::MAX_ORPHAN_REPOS_PER_PEER;
 use super::*;
-use crate::net::sync::UniMessage;
+use crate::net::sync::{self, UniMessage};
 
 fn announce(name: &str, id: &RepoId, seq: u64, heads: Vec<Vec<u8>>) -> Announce {
     Announce {
@@ -9,6 +9,26 @@ fn announce(name: &str, id: &RepoId, seq: u64, heads: Vec<Vec<u8>>) -> Announce 
         seq,
         heads,
     }
+}
+
+/// A connection between two local endpoints, which must outlive it.
+async fn connection() -> (Connection, [iroh::Endpoint; 2]) {
+    let lookup = iroh::address_lookup::MemoryLookup::new();
+    let options = crate::net::EndpointOptions::LocalTest { lookup };
+    let bind = async || {
+        let dir = tempfile::tempdir().unwrap();
+        let config = crate::config::ConfigDir::new(Some(dir.path().to_owned())).unwrap();
+        let key = crate::config::MachineKey::from_config(&config).unwrap();
+        crate::net::bind_endpoint(&key, vec![sync::ALPN.to_vec()], &options)
+            .await
+            .unwrap()
+    };
+    let (dialer, server) = (bind().await, bind().await);
+
+    let (conn, _) = tokio::join!(dialer.connect(server.id(), sync::ALPN), async {
+        server.accept().await.unwrap().await.unwrap()
+    });
+    (conn.unwrap(), [dialer, server])
 }
 
 #[tokio::test]
@@ -247,6 +267,25 @@ async fn retraction_releases_peer_state() {
     hub.route(peer, announce("b", &RepoId::generate(), 5, vec![]));
     hub.register_repo("b".to_owned(), RepoId::generate());
     assert!(hub.conflicts().is_empty());
+}
+
+#[tokio::test]
+async fn reconnection_resets_sequence_tracking() {
+    let hub = SyncHub::new();
+    let id = RepoId::generate();
+    let inbox = hub.register_repo("a".to_owned(), id.clone());
+    let (conn, _endpoints) = connection().await;
+    let peer = conn.remote_id();
+
+    hub.peer_connected(peer, &conn);
+    hub.route(peer, announce("a", &id, 5, vec![vec![1; 64]]));
+    assert_eq!(inbox.drain().len(), 1);
+
+    hub.peer_connected(peer, &conn);
+    hub.route(peer, announce("a", &id, 1, vec![vec![2; 64]]));
+    let drained = inbox.drain();
+    assert_eq!(drained.len(), 1);
+    assert_eq!(drained[0].heads, vec![vec![2; 64]]);
 }
 
 #[tokio::test]

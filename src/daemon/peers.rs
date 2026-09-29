@@ -383,6 +383,7 @@ impl PeerTask {
                         new.close(0u32.into(), b"duplicate");
                     } else {
                         conn.close(0u32.into(), b"duplicate");
+                        info!(peer = %self.name, "peer reconnected");
                         conn = new;
                         outbound = false;
                         since = SystemTime::now();

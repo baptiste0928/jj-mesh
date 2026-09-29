@@ -12,6 +12,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `jj-mesh status`.
 - Syncing is now paused for a workspace if it is claimed by multiple machines in the mesh.
 
+### Fixed
+- Peers changes were sometimes rejected after a restart when the local machine did not
+  notice the old connection drop (e.g. while suspended).
+
 ## [0.2.0] - 2026-09-06
 
 ### Changed

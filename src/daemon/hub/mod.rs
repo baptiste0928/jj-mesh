@@ -71,7 +71,7 @@ struct HubState {
     /// Announcement sequence, monotonic across every repo for the whole
     /// daemon run. Shared rather than per repo so a repo forgotten and
     /// cloned again keeps outranking its old announcements: receivers only
-    /// reset their per-repo watermark when the connection drops.
+    /// reset their per-repo watermark on a new connection.
     announce_seq: u64,
     /// See [`orphans`].
     orphans: BTreeMap<String, BTreeMap<EndpointId, OrphanAnnounce>>,
@@ -92,6 +92,19 @@ impl HubState {
         for sender in self.peers.values() {
             push(&sender.outbox);
         }
+    }
+
+    /// Drops everything learned from `peer` over its previous connection.
+    /// Sequence tracking is per connection (a restarted peer daemon starts
+    /// over from 1), and conflicts, orphan announcements and reports come
+    /// back with the replay if still real.
+    fn forget_peer(&mut self, peer: &EndpointId) {
+        for entry in self.repos.values_mut() {
+            entry.inbox.forget(peer);
+            entry.conflicts.remove(peer);
+        }
+        self.forget_orphan_peer(peer);
+        self.reports.remove(peer);
     }
 }
 
@@ -285,12 +298,15 @@ impl SyncHub {
 
     /// Marks a peer connected: spawns its sender task and seeds the outbox
     /// with the membership and every published repo, so a (re)connecting
-    /// peer learns state it missed while away.
+    /// peer learns state it missed while away. Resets per-peer state (see
+    /// [`HubState::forget_peer`]): the connection may replace one whose
+    /// loss went unnoticed.
     pub fn peer_connected(&self, peer: EndpointId, conn: &Connection) {
         let outbox = Arc::new(Outbox::default());
         let task = tokio::spawn(run_sender(conn.clone(), outbox.clone()));
 
         let mut state = self.state.lock().unwrap();
+        state.forget_peer(&peer);
         outbox.push_membership(state.membership.clone());
         if let Some(report) = &state.status {
             outbox.push_status(report.clone());
@@ -325,17 +341,9 @@ impl SyncHub {
         let removed = {
             let mut state = self.state.lock().unwrap();
             // Per-peer state is dropped even when no sender was registered
-            // (the peer may be mid-setup): sequence tracking is per
-            // connection (a restarted peer daemon starts over from 1), and
-            // conflicts and orphan announcements attributed to the peer
-            // come back with the replay if still real. Pruning orphans here
-            // also keeps a revoked peer's entries from lingering forever.
-            for entry in state.repos.values_mut() {
-                entry.inbox.forget(peer);
-                entry.conflicts.remove(peer);
-            }
-            state.forget_orphan_peer(peer);
-            state.reports.remove(peer);
+            // (the peer may be mid-setup). Pruning orphans here also keeps
+            // a revoked peer's entries from lingering forever.
+            state.forget_peer(peer);
             state.peers.remove(peer)
         };
 
