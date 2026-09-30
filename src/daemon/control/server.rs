@@ -14,20 +14,26 @@ use iroh::Endpoint;
 use tokio::{
     io::{AsyncRead, AsyncReadExt as _},
     net::{UnixListener, UnixStream},
+    sync::broadcast::error::RecvError,
 };
 use tracing::{debug, info, warn};
 
 use super::{
     clone,
     protocol::{
-        BUILD, CLIENT_TIMEOUT, ConflictStatus, MAX_MESSAGE_SIZE, PeerReport, Request, Response,
-        Status, build_path,
+        BUILD, CLIENT_TIMEOUT, ConflictStatus, LogsStart, MAX_MESSAGE_SIZE, PeerReport, Request,
+        Response, Status, build_path,
     },
 };
 use crate::{
     config::{ConfigDir, Repo, RepoId},
     daemon::{
-        backoff::Backoff, hub::SyncHub, pairing::Pairing, peers::PeerSet, repos::RepoSet,
+        backoff::Backoff,
+        hub::SyncHub,
+        logs::{LogBuffer, Subscription},
+        pairing::Pairing,
+        peers::PeerSet,
+        repos::RepoSet,
         store::MeshStore,
     },
     net::{
@@ -54,6 +60,7 @@ pub struct ControlContext {
     pub hub: Arc<SyncHub>,
     pub store: Arc<MeshStore>,
     pub pairing: Arc<Pairing>,
+    pub logs: LogBuffer,
     /// The jj version found on PATH at daemon start, for status warnings.
     pub jj_version: Option<String>,
 }
@@ -208,9 +215,9 @@ async fn handle_client(mut stream: UnixStream, ctx: Arc<ControlContext>) {
             Err(_) => return debug!("control client timed out"),
         };
 
-    // PairJoin and CloneRepo own their stream (client-cancel handling, and
-    // progress streaming for the clone); the rest return a single response
-    // and share one error conversion.
+    // PairJoin, CloneRepo and Logs own their stream (client-cancel
+    // handling, and streaming for the clone and logs); the rest return a
+    // single response and share one error conversion.
     let served = match request {
         Request::Status => reply(&mut stream, Ok(Response::Status(ctx.status()))).await,
         Request::PairHost => reply(&mut stream, pair_host(&ctx).await).await,
@@ -225,6 +232,7 @@ async fn handle_client(mut stream: UnixStream, ctx: Arc<ControlContext>) {
         Request::RemovePeer { peer } => reply(&mut stream, remove_peer(&ctx, &peer)).await,
         Request::ForgetRepo { name } => reply(&mut stream, forget_repo(&ctx, &name)).await,
         Request::RenameMachine { name } => reply(&mut stream, rename_machine(&ctx, &name)).await,
+        Request::Logs { follow } => stream_logs(&mut stream, &ctx, follow).await,
     };
 
     if let Err(err) = served {
@@ -355,6 +363,45 @@ fn rename_machine(ctx: &ControlContext, name: &str) -> Result<Response> {
         .update(|state| state.rename_machine(name.to_owned()))?;
     info!(name = %name, "machine renamed");
     Ok(Response::MachineRenamed)
+}
+
+/// Streams the buffered daemon events, then the new ones when following,
+/// until the client disconnects. Writes are unbounded: a follower may sit
+/// behind a paused pager, and a gone one fails the write.
+async fn stream_logs(stream: &mut UnixStream, ctx: &ControlContext, follow: bool) -> Result<()> {
+    let (mut read_half, mut write_half) = stream.split();
+    let mut send =
+        async |response| write_message(&mut write_half, &response, MAX_MESSAGE_SIZE).await;
+    let Subscription {
+        entries,
+        dropped,
+        mut live,
+    } = ctx.logs.subscribe();
+
+    send(Response::LogsStart(LogsStart {
+        uptime_secs: ctx.started.elapsed().unwrap_or_default().as_secs(),
+        dropped,
+        backlog: entries.len() as u64,
+    }))
+    .await?;
+    for entry in entries {
+        send(Response::Log(entry)).await?;
+    }
+    if !follow {
+        return Ok(());
+    }
+
+    loop {
+        let response = tokio::select! {
+            entry = live.recv() => match entry {
+                Ok(entry) => Response::Log(entry),
+                Err(RecvError::Lagged(missed)) => Response::LogsSkipped(missed),
+                Err(RecvError::Closed) => return Ok(()),
+            },
+            () = client_gone(&mut read_half) => return Ok(()),
+        };
+        send(response).await?;
+    }
 }
 
 /// Resolves when the client closes its end of the connection.

@@ -2,7 +2,10 @@
 //! daemon exchange, and the timing budgets that bound the exchange. Shared
 //! by [`super::server`] and [`super::client`], and re-exported for the CLI.
 
-use std::{path::PathBuf, time::Duration};
+use std::{
+    path::PathBuf,
+    time::{Duration, SystemTime},
+};
 
 use iroh::EndpointId;
 use serde::{Deserialize, Serialize};
@@ -15,7 +18,7 @@ use crate::{
 pub(super) const MAX_MESSAGE_SIZE: u32 = 1 << 20;
 
 /// Time budget for the quick parts of an exchange (request, status answer).
-pub(super) const CLIENT_TIMEOUT: Duration = Duration::from_secs(2);
+pub const CLIENT_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Time budget the CLI grants quick mutating requests (add, remove).
 pub const MUTATE_WAIT: Duration = Duration::from_secs(10);
@@ -84,6 +87,11 @@ pub enum Request {
     /// Rename this machine; peers learn the new name through the gossip.
     /// Answered with [`Response::MachineRenamed`] or [`Response::Error`].
     RenameMachine { name: String },
+    /// Stream the daemon's recent events: answered with
+    /// [`Response::LogsStart`], then one [`Response::Log`] per buffered
+    /// entry. With `follow`, new entries (or [`Response::LogsSkipped`])
+    /// keep coming until the client disconnects.
+    Logs { follow: bool },
 }
 
 /// A daemon answer to a [`Request`].
@@ -128,6 +136,46 @@ pub enum Response {
     },
     /// This machine's name is changed in the mesh state.
     MachineRenamed,
+    /// Opens a [`Request::Logs`] stream.
+    LogsStart(LogsStart),
+    /// One daemon event.
+    Log(LogEntry),
+    /// This many events were skipped in a followed [`Request::Logs`]
+    /// stream: the client read too slowly.
+    LogsSkipped(u64),
+}
+
+/// Header of a [`Request::Logs`] stream.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct LogsStart {
+    /// Seconds since the daemon started, when its history begins.
+    pub uptime_secs: u64,
+    /// Older entries evicted from the history.
+    pub dropped: u64,
+    /// Buffered entries sent next.
+    pub backlog: u64,
+}
+
+/// One daemon event, from its `tracing` record.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LogEntry {
+    pub time: SystemTime,
+    pub level: LogLevel,
+    /// The `repo` field, if any.
+    pub repo: Option<String>,
+    /// The `peer` field, if any.
+    pub peer: Option<String>,
+    pub message: String,
+    /// The other fields, as `key=value` pairs.
+    pub fields: String,
+}
+
+/// Severity of a [`LogEntry`], from its `tracing` level.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LogLevel {
+    Info,
+    Warn,
+    Error,
 }
 
 /// A snapshot of a running clone pull, for progress display.

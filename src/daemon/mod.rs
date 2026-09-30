@@ -9,6 +9,7 @@
 mod backoff;
 pub mod control;
 mod hub;
+mod logs;
 mod pairing;
 mod peers;
 mod repos;
@@ -24,6 +25,7 @@ use iroh::{Endpoint, EndpointId};
 use tokio::sync::{Semaphore, mpsc};
 use tracing::{debug, info, warn};
 
+pub use self::logs::LogBuffer;
 use self::{
     control::{ControlContext, ControlServer},
     hub::SyncHub,
@@ -75,8 +77,13 @@ pub struct Daemon {
 }
 
 impl Daemon {
-    /// Starts every daemon subsystem.
-    pub async fn start(dir: &ConfigDir, options: &EndpointOptions) -> Result<Self> {
+    /// Starts every daemon subsystem; `logs` is the buffer its tracing
+    /// layer feeds, served to `jj-mesh logs`.
+    pub async fn start(
+        dir: &ConfigDir,
+        options: &EndpointOptions,
+        logs: LogBuffer,
+    ) -> Result<Self> {
         let key = MachineKey::from_config(dir)?;
         let state = MeshState::load(dir)?;
 
@@ -140,6 +147,7 @@ impl Daemon {
             hub: hub.clone(),
             store: store.clone(),
             pairing: pairing.clone(),
+            logs,
             jj_version: jj_version.clone(),
         });
 
@@ -173,8 +181,8 @@ impl Daemon {
 }
 
 /// Runs the daemon until SIGINT or SIGTERM.
-pub async fn run(dir: &ConfigDir) -> Result<()> {
-    let mut daemon = Daemon::start(dir, &EndpointOptions::default()).await?;
+pub async fn run(dir: &ConfigDir, logs: LogBuffer) -> Result<()> {
+    let mut daemon = Daemon::start(dir, &EndpointOptions::default(), logs).await?;
 
     let outcome = tokio::select! {
         () = wait_for_shutdown() => {

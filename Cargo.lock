@@ -3018,6 +3018,7 @@ dependencies = [
 name = "jj-mesh"
 version = "0.2.0"
 dependencies = [
+ "chrono",
  "clap",
  "clap_complete",
  "color-eyre",

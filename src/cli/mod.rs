@@ -1,6 +1,7 @@
 //! Command-line interface for `jj-mesh`.
 
 mod complete;
+mod logs;
 mod peer;
 mod repo;
 mod run_daemon;
@@ -49,6 +50,7 @@ enum Command {
     Peer(peer::PeerArgs),
     Service(service::ServiceArgs),
     Status(status::StatusArgs),
+    Logs(logs::LogsArgs),
     // Hidden: this is what the installed service runs; users manage the
     // daemon through `jj-mesh service`.
     #[command(hide = true)]
@@ -70,6 +72,7 @@ pub fn run() -> Result<()> {
         Command::Peer(args) => peer::run(args, &dir),
         Command::Service(args) => service::run(args, &dir),
         Command::Status(args) => status::run(args, &dir),
+        Command::Logs(args) => logs::run(&args, &dir),
         Command::RunDaemon(args) => run_daemon::run(args, &dir),
     }
 }

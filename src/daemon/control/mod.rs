@@ -1,9 +1,10 @@
 //! Daemon control socket.
 //!
 //! The CLI talks to the running daemon over a unix socket with
-//! length-prefixed postcard messages (`net::wire` framing). Every
-//! request is one request/response exchange; joining a pairing merely keeps
-//! its connection open so the daemon notices a cancelling client. The
+//! length-prefixed postcard messages (`net::wire` framing), one request
+//! per connection. Most get a single response; a clone streams progress,
+//! logs stream events, and joining a pairing keeps its connection open so
+//! the daemon notices a cancelling client. The
 //! daemon publishes its build beside the socket, and the CLI refuses to
 //! talk to another build: a daemon left running across an upgrade is a
 //! common state, and its answers may not decode.

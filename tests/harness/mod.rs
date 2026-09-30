@@ -20,7 +20,7 @@ use iroh::address_lookup::MemoryLookup;
 use jj_mesh::{
     config::{ConfigDir, MeshState},
     daemon::{
-        Daemon,
+        Daemon, LogBuffer,
         control::{ConnectionStatus, ControlClient, Request, Response, Status},
     },
     net::EndpointOptions,
@@ -58,6 +58,7 @@ impl TestMesh {
             config: tempfile::tempdir().unwrap(),
             lookup: self.lookup.clone(),
             daemon: None,
+            logs: LogBuffer::default(),
         };
         machine.start().await;
         machine.rename(name).await;
@@ -93,6 +94,9 @@ pub struct Machine {
     config: tempfile::TempDir,
     lookup: MemoryLookup,
     daemon: Option<Daemon>,
+    /// The running daemon's event buffer, fresh at each start. Fed only
+    /// where a test installs its layer.
+    pub logs: LogBuffer,
 }
 
 impl Machine {
@@ -110,7 +114,8 @@ impl Machine {
         let options = EndpointOptions::LocalTest {
             lookup: self.lookup.clone(),
         };
-        let daemon = Daemon::start(&self.config_dir(), &options)
+        self.logs = LogBuffer::default();
+        let daemon = Daemon::start(&self.config_dir(), &options, self.logs.clone())
             .await
             .unwrap_or_else(|err| panic!("{}: daemon failed to start: {err:#}", self.name));
         self.daemon = Some(daemon);
@@ -136,7 +141,7 @@ impl Machine {
     }
 
     /// Connects a control client, as the CLI would.
-    async fn client(&self) -> ControlClient {
+    pub async fn client(&self) -> ControlClient {
         ControlClient::connect(&self.config_dir())
             .await
             .unwrap()
