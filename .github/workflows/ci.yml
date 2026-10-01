@@ -21,11 +21,11 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Install jj 0.45
+      - name: Install jj 0.46
         uses: baptiste0928/cargo-install@f204293d9709061b7bc1756fec3ec4e2cd57dec0 # v3.4.0
         with:
           crate: jj-cli
-          version: =0.45.1
+          version: =0.46.0
 
       - name: Install Rust toolchain
         run: rustup toolchain install

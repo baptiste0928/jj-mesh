@@ -27,7 +27,7 @@ between your desktop and laptop.
 need to compile it from source, as we don't provide pre-built binaries. You can watch this
 repository on GitHub to be notified of any updates.
 
-It is currently tested on Linux and supports macOS as well, and **supports `jj` 0.45**.
+It is currently tested on Linux and supports macOS as well, and **supports `jj` 0.46**.
 Windows is unsupported.
 
 ### With `cargo`

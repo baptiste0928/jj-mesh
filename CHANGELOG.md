@@ -16,6 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `jj-mesh repo add`. Clone now asks which repo to clone when no name is given.
 
 ### Changed
+- **`jj` 0.46 is required.** Older versions are no longer supported.
 - **Auto-snapshot and update-stale now run on secondary workspaces**, which are listed in
   `jj-mesh status`.
 - **Settings moved to the `[jj-mesh]` table of your jj config**, and can now be set per user, repo

@@ -69,7 +69,8 @@ impl std::fmt::Debug for OpenRepo {
 /// The daemon must not depend on the user's jj configuration; settings
 /// affect commit creation and merges, neither of which happens here.
 static SETTINGS: LazyLock<Result<UserSettings, String>> = LazyLock::new(|| {
-    UserSettings::from_config(StackedConfig::with_defaults()).map_err(|err| err.to_string())
+    UserSettings::from_config_and_home_dir(StackedConfig::with_defaults(), None)
+        .map_err(|err| err.to_string())
 });
 
 /// The shared built-in-defaults jj settings (see [`SETTINGS`]).

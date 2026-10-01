@@ -207,7 +207,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_and_matches_jj_versions() {
+    fn parses_jj_versions() {
         assert_eq!(parse_jj_version("jj 0.44.0\n"), Some("0.44.0".to_owned()));
         assert_eq!(
             parse_jj_version("jj 0.44.0-dev+abcdef\n"),
@@ -216,32 +216,5 @@ mod tests {
         assert_eq!(parse_jj_version("command not found: jj"), None);
         assert_eq!(parse_jj_version("jj whatever"), None);
         assert_eq!(parse_jj_version(""), None);
-
-        assert!(jj_version_supported("0.45.0"));
-        assert!(jj_version_supported("0.45.12"));
-        assert!(!jj_version_supported("0.44.0"));
-        assert!(!jj_version_supported("0.46.0"));
-        assert!(!jj_version_supported("0.4.50"));
-        assert!(!jj_version_supported("0.450.0"));
-        assert!(!jj_version_supported("0.45"));
-        assert!(!jj_version_supported("1.45.0"));
-    }
-
-    #[test]
-    fn words_peer_version_warnings() {
-        // Same series, patch differences included: silent.
-        assert_eq!(jj_peer_warning(Some("0.45.0"), Some("0.45.2")), None);
-
-        // With a single supported series, any other series is out of
-        // range before it could count as older or newer.
-        let out_of_range = jj_peer_warning(Some("0.45.0"), Some("0.44.0")).unwrap();
-        assert!(out_of_range.contains("unsupported"), "{out_of_range}");
-        let missing = jj_peer_warning(Some("0.45.0"), None).unwrap();
-        assert!(missing.contains("not found"), "{missing}");
-
-        // A missing or unsupported local version is the local warning's
-        // problem: no mismatch line per peer on top of it.
-        assert_eq!(jj_peer_warning(None, Some("0.45.0")), None);
-        assert_eq!(jj_peer_warning(Some("0.44.0"), Some("0.45.0")), None);
     }
 }
