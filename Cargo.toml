@@ -15,6 +15,7 @@ console = "0.16.4"
 data-encoding = "2.11.1"
 etcetera = "0.11.0"
 fail = "0.5.1"
+futures = { version = "0.3.34", default-features = false, features = ["std"] }
 gethostname = "1.1.0"
 gix = { version = "0.87.1", default-features = false }
 gix-pack = "0.74.2"

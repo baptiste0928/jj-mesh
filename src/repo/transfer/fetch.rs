@@ -23,8 +23,8 @@ use crate::{
     net::{
         fetch::{
             FetchRequest, GitFrame, GitRequest, GitTransferFormat, MAX_GIT_FRAME_SIZE,
-            MAX_GIT_HAVES, MAX_GIT_OBJECT_SIZE, MAX_HAVES, MAX_OP_FRAME_SIZE, MAX_WANTS, OpFrame,
-            WireObjectKind, decompress_payload,
+            MAX_GIT_HAVES, MAX_GIT_OBJECT_SIZE, MAX_GIT_REQUEST_SIZE, MAX_HAVES, MAX_OP_FRAME_SIZE,
+            MAX_WANTS, OpFrame, WireObjectKind, decompress_payload,
         },
         wire::{read_message, write_message},
     },
@@ -89,30 +89,35 @@ pub async fn fetch(
     let ops_received = batch.ops.len();
 
     // Everything the new views (and op predecessor records) reference and
-    // the local git store lacks is requested from the peer.
+    // the local git store lacks is requested from the peer. The haves are
+    // our view heads (the server ignores those it lacks), then what the
+    // views reference and we hold: the peer knows those, and the new
+    // commits build on them.
     let referenced = referenced_commits(&batch);
     let (missing, git_haves) = {
         let repo = repo.clone();
         let local_heads = local_heads.clone();
         crate::spawn_blocking(move || -> Result<_> {
             let git = repo.git_backend().git_repo();
-            let mut missing: Vec<CommitId> = Vec::new();
-            for id in referenced {
-                if is_virtual_root(&id) {
-                    continue;
-                }
-                if !git.has_object(to_gix_id(&id)?) {
-                    missing.push(id);
-                }
-            }
             let mut git_haves: Vec<CommitId> = Vec::new();
             for head in &local_heads {
                 let op = repo.read_operation(head).block_on()?;
                 let view = repo.read_view(&op.view_id).block_on()?;
                 git_haves.extend(view.head_ids.iter().cloned());
             }
-            git_haves.sort_unstable();
-            git_haves.dedup();
+            let mut missing: Vec<CommitId> = Vec::new();
+            for id in referenced {
+                if is_virtual_root(&id) {
+                    continue;
+                }
+                if git.has_object(to_gix_id(&id)?) {
+                    git_haves.push(id);
+                } else {
+                    missing.push(id);
+                }
+            }
+            let mut unique = HashSet::new();
+            git_haves.retain(|id| unique.insert(id.clone()));
             git_haves.truncate(MAX_GIT_HAVES);
             Ok((missing, git_haves))
         })
@@ -134,7 +139,7 @@ pub async fn fetch(
     bounded(
         deadline,
         "git",
-        write_message(send, &git_request, MAX_GIT_FRAME_SIZE),
+        write_message(send, &git_request, MAX_GIT_REQUEST_SIZE),
     )
     .await?;
     // The keep guard holds a received pack against git GC until the stage

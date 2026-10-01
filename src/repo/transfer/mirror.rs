@@ -170,15 +170,7 @@ impl<'a> Merger<'a> {
     /// their views.
     fn index(&self) -> Result<&dyn Index> {
         if self.index.get().is_none() {
-            let (first, rest) = self
-                .ops
-                .split_first()
-                .ok_or_else(|| eyre!("no op head to index"))?;
-            let mut index = self.repo.index_at(first)?.start_modification();
-            for op in rest {
-                index.merge_in(self.repo.index_at(op)?.as_ref())?;
-            }
-            self.index.set(index).ok();
+            self.index.set(self.repo.merged_index(&self.ops)?).ok();
         }
         Ok(self.index.get().expect("set above").as_index())
     }

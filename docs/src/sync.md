@@ -48,9 +48,11 @@ pulls them, in two phases:
    divergence). The server walks its op log and streams back the delta of
    views and operations.
 2. **Git phase.** From the fetched views and ops, the fetcher computes which
-   commits they reference that its git store lacks, and requests them. The
-   server streams the full object closure, stopping at the fetcher's current
-   heads.
+   commits they reference that its git store lacks, and requests them. Its
+   haves are its own view heads and the referenced commits it holds. The
+   server streams the `haves..wants` range of its commit index, each commit
+   with the trees and files that differ from its parents' and from its other
+   versions' (the same change before a rewrite).
 
 Serving is read-only, concurrency-limited, and dispatched independently of the
 serving daemon's own sync work, so two machines can fetch from each other

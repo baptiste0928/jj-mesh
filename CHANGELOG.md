@@ -17,6 +17,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Syncing is now paused for a workspace if it is claimed by multiple machines in the mesh.
 
 ### Fixed
+- **Syncs use less data.** Missing objects are now computed much more accurately, we could
+  previously sometimes re-send hundreds of objects for a single-line change.
 - Peers changes were sometimes rejected after a restart when the local machine did not
   notice the old connection drop (e.g. while suspended).
 

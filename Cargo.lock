@@ -3026,6 +3026,7 @@ dependencies = [
  "data-encoding",
  "etcetera",
  "fail",
+ "futures",
  "gethostname",
  "gix",
  "gix-pack",

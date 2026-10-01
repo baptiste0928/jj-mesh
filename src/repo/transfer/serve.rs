@@ -8,12 +8,13 @@
 //! failure.
 
 use std::{
-    collections::{HashSet, VecDeque},
+    collections::{HashMap, HashSet},
     sync::Arc,
 };
 
 use color_eyre::eyre::{Result, WrapErr as _, eyre};
 use jj_lib::{
+    backend::CommitId,
     object_id::ObjectId as _,
     op_store::{OperationId, ViewId},
 };
@@ -24,13 +25,13 @@ use tokio::{
 };
 use tracing::debug;
 
-use super::pack;
+use super::{is_virtual_root, pack, to_gix_id};
 use crate::{
     net::{
         fetch::{
             FetchRequest, GitFrame, GitRequest, GitTransferFormat, MAX_GIT_FRAME_SIZE,
-            MAX_GIT_HAVES, MAX_HAVES, MAX_OP_FRAME_SIZE, MAX_WANTS, OpFrame, WireObjectKind,
-            compress_payload,
+            MAX_GIT_HAVES, MAX_GIT_REQUEST_SIZE, MAX_HAVES, MAX_OP_FRAME_SIZE, MAX_WANTS, OpFrame,
+            WireObjectKind, compress_payload,
         },
         wire::{read_message, write_message},
     },
@@ -154,13 +155,14 @@ fn validate_request(repo: &OpenRepo, request: &FetchRequest) -> Result<(), Strin
 }
 
 /// Serves the git phase: answers the fetcher's commit wants with the raw
-/// object closure, stopping at its haves, in the requested format.
+/// object closure it lacks (see [`walk_git_closure`]), in the requested
+/// format.
 async fn serve_git_phase(
     repo: &Arc<OpenRepo>,
     send: &mut (impl AsyncWrite + Unpin),
     recv: &mut (impl AsyncRead + Unpin),
 ) -> Result<()> {
-    let request: GitRequest = read_message(recv, MAX_GIT_FRAME_SIZE).await?;
+    let request: GitRequest = read_message(recv, MAX_GIT_REQUEST_SIZE).await?;
 
     let hash_len = repo.git_backend().git_repo().object_hash().len_in_bytes();
     let ok = request.haves.len() <= MAX_GIT_HAVES
@@ -340,184 +342,177 @@ fn produce<T>(tx: &mpsc::Sender<Result<T>>, frame: T) -> Result<()> {
         .map_err(|_| eyre!("fetcher went away"))
 }
 
-/// Walks the object closure of the wanted commits, stopping at haves, and
-/// emits every object's id once. Trees and blobs the fetcher already has
-/// (those reachable from its have commits) are pruned, so a sync transfers
-/// only the objects the change actually introduced, not the whole working
-/// tree.
+/// Walks the object closure of the wanted commits, minus what the fetcher
+/// holds, and emits every object's id once.
+///
+/// The fetcher holds the full closure of each have (our own emit order
+/// guarantees a stored commit implies its trees and ancestry), so the
+/// commits sent are the `haves..wants` range of jj's commit index at our
+/// op heads. Wants outside that index are refused: only what the op log
+/// references is served. Each commit's tree is compared against trees the
+/// fetcher holds or receives first, its bases: its parents' and those of
+/// its other versions (same change id, as a snapshot, describe or rebase
+/// leaves), so mostly only the paths the commit changed are read and sent.
 ///
 /// Only ids are emitted: blob contents are never loaded here, and each
 /// format reads what it needs (the loose server per object, the pack
 /// pipeline itself).
-fn walk_git_closure(
+pub(super) fn walk_git_closure(
     repo: &OpenRepo,
     request: &GitRequest,
     mut emit: impl FnMut(gix::ObjectId, WireObjectKind) -> Result<()>,
 ) -> Result<()> {
-    let git = repo.git_backend().git_repo();
-    let haves: HashSet<gix::ObjectId> = request
-        .haves
+    let ids =
+        |ids: &[Vec<u8>]| -> Vec<CommitId> { ids.iter().cloned().map(CommitId::new).collect() };
+    let (haves, wants) = (ids(&request.haves), ids(&request.wants));
+    let heads = repo
+        .op_heads()
+        .block_on()?
         .iter()
-        .map(|id| gix::ObjectId::try_from(id.as_slice()))
-        .collect::<Result<_, _>>()?;
+        .map(|id| repo.load_operation(id).block_on())
+        .collect::<Result<Vec<_>>>()?;
+    let commits = repo.commit_range(&heads, &haves, &wants)?;
 
-    // Seed the seen set with everything reachable from the haves' trees, so
-    // the emit walk below skips the (often vast) part of the tree the change
-    // left untouched.
+    let git = repo.git_backend().git_repo();
+    // The trees of each change's versions the fetcher holds or received.
+    let mut versions: HashMap<Vec<u8>, Vec<gix::ObjectId>> = HashMap::new();
+    for have in haves.iter().filter(|have| !is_virtual_root(have)) {
+        // Haves we lack cannot serve as bases.
+        if let Ok(have) = Commit::read(&git, to_gix_id(have)?)
+            && let Some(change) = have.change
+        {
+            versions.entry(change).or_default().push(have.tree);
+        }
+    }
+
+    // Parents first, each commit's tree closure before the commit itself.
+    // Any crash-truncated prefix of the stream then upholds "a stored
+    // commit implies its trees and ancestry are stored", which the
+    // fetcher's missing-commit check relies on when retrying.
     let mut seen: HashSet<gix::ObjectId> = HashSet::new();
-    mark_have_trees(&git, &haves, &mut seen);
-
-    // Pass 1: collect wanted commits, children before parents. Non-commit
-    // wants (tags, arbitrary git ref targets) join the tree walk at the
-    // end.
-    let mut queue: VecDeque<gix::ObjectId> = VecDeque::new();
-    for want in &request.wants {
-        let id = gix::ObjectId::try_from(want.as_slice())?;
-        if !haves.contains(&id) && seen.insert(id) {
-            queue.push_back(id);
-        }
-    }
-
-    let mut commits: Vec<(gix::ObjectId, gix::ObjectId)> = Vec::new();
-    let mut extras: Vec<gix::ObjectId> = Vec::new();
-    while let Some(id) = queue.pop_front() {
-        let object = git
-            .find_object(id)
-            .wrap_err_with(|| format!("missing wanted object {id}"))?;
-        if object.kind == gix::object::Kind::Commit {
-            let commit = object.try_into_commit().map_err(|err| eyre!("{err}"))?;
-            let tree = commit.tree_id().map_err(|err| eyre!("{err}"))?.detach();
-            for parent in commit.parent_ids() {
-                let parent = parent.detach();
-                if !haves.contains(&parent) && seen.insert(parent) {
-                    queue.push_back(parent);
-                }
+    // jj's virtual root commit is in the index, not in git.
+    for commit in commits.iter().filter(|commit| !is_virtual_root(commit)) {
+        let id = to_gix_id(commit)?;
+        let commit = Commit::read(&git, id)?;
+        let mut bases = Vec::with_capacity(MAX_BASES);
+        let parents = commit
+            .parents
+            .iter()
+            .map(|parent| Commit::read(&git, *parent).map(|parent| parent.tree));
+        let others = commit
+            .change
+            .as_ref()
+            .and_then(|change| versions.get(change))
+            .into_iter()
+            .flatten()
+            .map(|tree| Ok(*tree));
+        for base in parents.chain(others) {
+            let base = base?;
+            if bases.len() == MAX_BASES {
+                break;
             }
-            commits.push((id, tree));
-        } else {
-            seen.remove(&id);
-            extras.push(id);
+            if !bases.contains(&base) {
+                bases.push(base);
+            }
         }
-    }
-
-    // Pass 2: emit oldest-first, each commit's tree closure before the
-    // commit itself. Any crash-truncated prefix of the stream then upholds
-    // "a stored commit implies its trees and ancestry are stored", which
-    // the fetcher's missing-commit check relies on when retrying.
-    for (commit, tree) in commits.iter().rev() {
-        walk_tree(&git, *tree, &mut seen, &mut emit)?;
-        emit(*commit, WireObjectKind::Commit)?;
-    }
-    for id in extras {
-        walk_tree(&git, id, &mut seen, &mut emit)?;
+        walk_tree(&git, commit.tree, &bases, &mut seen, &mut emit)?;
+        emit(id, WireObjectKind::Commit)?;
+        if let Some(change) = commit.change {
+            versions.entry(change).or_default().push(commit.tree);
+        }
     }
     Ok(())
 }
 
-/// Emits a tree (or tag/blob) and its transitive entries.
+/// Bases a tree is compared against at most: an octopus merge must not
+/// multiply the walk.
+const MAX_BASES: usize = 8;
+
+/// What the closure walk reads of a commit.
+struct Commit {
+    tree: gix::ObjectId,
+    parents: Vec<gix::ObjectId>,
+    /// jj's change id header, shared by a change's versions.
+    change: Option<Vec<u8>>,
+}
+
+impl Commit {
+    fn read(git: &gix::Repository, id: gix::ObjectId) -> Result<Self> {
+        let object = git
+            .find_commit(id)
+            .wrap_err_with(|| format!("missing commit {id}"))?;
+        let commit = object.decode().map_err(|err| eyre!("{err}"))?;
+        Ok(Commit {
+            tree: commit.tree(),
+            parents: commit.parents().collect(),
+            change: commit
+                .extra_headers()
+                .find("change-id")
+                .map(|change| change.to_vec()),
+        })
+    }
+}
+
+/// Emits a tree and its transitive entries, skipping those equal to the
+/// entry at the same path in one of `bases`, and those already emitted.
 fn walk_tree(
     git: &gix::Repository,
     root: gix::ObjectId,
+    bases: &[gix::ObjectId],
     seen: &mut HashSet<gix::ObjectId>,
     emit: &mut impl FnMut(gix::ObjectId, WireObjectKind) -> Result<()>,
 ) -> Result<()> {
-    let mut stack = vec![(root, None::<WireObjectKind>)];
-    while let Some((id, known_kind)) = stack.pop() {
+    if bases.contains(&root) {
+        return Ok(());
+    }
+    let mut stack = vec![(root, bases.to_vec())];
+    while let Some((id, subtree_bases)) = stack.pop() {
         if !seen.insert(id) {
             continue;
         }
-        // Blobs are leaves: their kind is known from the tree entry that
-        // named them, so they are emitted without ever being loaded.
-        if known_kind == Some(WireObjectKind::Blob) {
-            emit(id, WireObjectKind::Blob)?;
-            continue;
-        }
-        let object = git
-            .find_object(id)
-            .wrap_err_with(|| format!("missing object {id}"))?;
-        match object.kind {
-            gix::object::Kind::Tree => {
-                let tree = object.try_into_tree().map_err(|err| eyre!("{err}"))?;
-                for entry in tree.iter() {
-                    let entry = entry.map_err(|err| eyre!("{err}"))?;
-                    let mode = entry.mode();
-                    // Gitlink (submodule) entries point at commits in a
-                    // different repository; they are not ours to send.
-                    if mode.is_commit() {
-                        continue;
-                    }
-                    let kind = (!mode.is_tree()).then_some(WireObjectKind::Blob);
-                    stack.push((entry.oid().to_owned(), kind));
-                }
-                emit(id, WireObjectKind::Tree)?;
-            }
-            gix::object::Kind::Blob => emit(id, WireObjectKind::Blob)?,
-            gix::object::Kind::Commit => {
-                // A tree entry cannot be a commit, but a tag can point at
-                // one; treat it as a boundary (it was either walked as a
-                // commit already or is outside the requested closure).
-            }
-            gix::object::Kind::Tag => {
-                let tag = object.try_into_tag().map_err(|err| eyre!("{err}"))?;
-                let target = tag.target_id().map_err(|err| eyre!("{err}"))?.detach();
-                stack.push((target, None));
-                emit(id, WireObjectKind::Tag)?;
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Marks every tree and blob reachable from the have commits as already
-/// present, so [`walk_git_closure`] does not re-send subtrees the fetcher
-/// shares with its haves. The fetcher holds each have's full object closure
-/// (our own emit order guarantees a stored commit implies its trees), so
-/// pruning against it is sound. Best-effort: haves the server lacks, or that
-/// are not commits, are skipped, at worst re-sending more.
-fn mark_have_trees(
-    git: &gix::Repository,
-    haves: &HashSet<gix::ObjectId>,
-    seen: &mut HashSet<gix::ObjectId>,
-) {
-    let mut stack: Vec<gix::ObjectId> = Vec::new();
-    for have in haves {
-        let Ok(object) = git.find_object(*have) else {
-            continue;
+        let find = |id: gix::ObjectId| {
+            git.find_tree(id)
+                .wrap_err_with(|| format!("missing tree {id}"))
         };
-        let Ok(commit) = object.try_into_commit() else {
-            continue;
-        };
-        if let Ok(tree) = commit.tree_id() {
-            let tree = tree.detach();
-            if seen.insert(tree) {
-                stack.push(tree);
-            }
-        }
-    }
-    while let Some(id) = stack.pop() {
-        let Ok(object) = git.find_object(id) else {
-            continue;
-        };
-        let Ok(tree) = object.try_into_tree() else {
-            continue;
-        };
-        for entry in tree.iter().flatten() {
-            let mode = entry.mode();
-            // Gitlink (submodule) entries point outside this repo and are
-            // never sent, so they need no marking.
-            if mode.is_commit() {
+        let tree = find(id)?;
+        let base_trees = subtree_bases
+            .iter()
+            .map(|base| find(*base))
+            .collect::<Result<Vec<_>>>()?;
+        let base_refs = base_trees
+            .iter()
+            .map(|base| base.decode().map_err(|err| eyre!("{err}")))
+            .collect::<Result<Vec<_>>>()?;
+        for entry in tree.decode().map_err(|err| eyre!("{err}"))?.entries {
+            // Gitlinks point at commits in other repositories, never ours
+            // to send.
+            if entry.mode.is_commit() {
                 continue;
             }
-            let oid = entry.oid().to_owned();
-            // Only trees need descending; blobs are leaves, mark and move on
-            // (their content is not even loaded here).
-            if mode.is_tree() {
-                if seen.insert(oid) {
-                    stack.push(oid);
-                }
-            } else {
-                seen.insert(oid);
+            let is_tree = entry.mode.is_tree();
+            let same: Vec<gix::ObjectId> = base_refs
+                .iter()
+                .filter_map(|base| base.bisect_entry(entry.filename, is_tree))
+                .map(|base| base.oid.to_owned())
+                .collect();
+            if same.contains(&entry.oid.to_owned()) {
+                continue;
+            }
+            if is_tree {
+                // jj stores a conflict's sides as `.jjconflict-*` subtrees
+                // of the root, each a near-copy of a whole tree.
+                let next = if same.is_empty() && entry.filename.starts_with(b".jjconflict") {
+                    bases.to_vec()
+                } else {
+                    same
+                };
+                stack.push((entry.oid.to_owned(), next));
+            } else if seen.insert(entry.oid.to_owned()) {
+                // Blobs are leaves: emitted without ever being loaded.
+                emit(entry.oid.to_owned(), WireObjectKind::Blob)?;
             }
         }
+        emit(id, WireObjectKind::Tree)?;
     }
+    Ok(())
 }

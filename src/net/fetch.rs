@@ -40,13 +40,18 @@ pub const MAX_OP_FRAME_SIZE: u32 = 4 << 20;
 /// proportionality.
 pub const MAX_GIT_FRAME_SIZE: u32 = u32::MAX;
 
+/// Cap on a git phase request: its want and have lists. Generous, a clone
+/// wants every commit the op log references.
+pub const MAX_GIT_REQUEST_SIZE: u32 = 64 << 20;
+
 /// Cap on op ids in a fetch's want list.
 pub const MAX_WANTS: usize = 64;
 
 /// Cap on op ids in a fetch's have sample.
 pub const MAX_HAVES: usize = 256;
 
-/// Cap on commit haves sent in the git phase (current view heads).
+/// Cap on commit haves sent in the git phase (the fetcher's view heads,
+/// then the commits the fetched ops reference that it holds).
 pub const MAX_GIT_HAVES: usize = 4096;
 
 /// Cap on a single git object once decompressed.

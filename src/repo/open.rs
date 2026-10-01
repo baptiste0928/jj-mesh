@@ -27,16 +27,18 @@ use std::{
 };
 
 use color_eyre::eyre::{Result, WrapErr as _, ensure, eyre};
+use futures::TryStreamExt as _;
 use jj_lib::{
     backend::CommitId,
     config::StackedConfig,
     default_backend_factories::default_backend_factories,
     default_index::DefaultIndexStore,
     git_backend::GitBackend,
-    index::ReadonlyIndex,
+    index::MutableIndex,
     object_id::{HexPrefix, ObjectId, PrefixResolution},
     op_store::{Operation, OperationId, View, ViewId},
     repo::RepoLoader,
+    revset::{GENERATION_RANGE_FULL, PARENTS_RANGE_FULL, ResolvedExpression},
     settings::UserSettings,
 };
 use pollster::FutureExt as _;
@@ -206,14 +208,65 @@ impl OpenRepo {
         Ok(self.loader.load_operation(id).await?)
     }
 
-    /// The commit index at an operation, built first when missing.
+    /// The commit index covering every op in `ops`, merged as jj does to
+    /// merge their views; each op's index is built first when missing.
     /// Blocking.
-    pub fn index_at(&self, op: &jj_lib::operation::Operation) -> Result<Box<dyn ReadonlyIndex>> {
-        Ok(self
-            .loader
-            .index_store()
-            .get_index_at_op(op, self.loader.store())
-            .block_on()?)
+    pub fn merged_index(
+        &self,
+        ops: &[jj_lib::operation::Operation],
+    ) -> Result<Box<dyn MutableIndex>> {
+        let index_at = |op| {
+            self.loader
+                .index_store()
+                .get_index_at_op(op, self.loader.store())
+                .block_on()
+        };
+        let (first, rest) = ops
+            .split_first()
+            .ok_or_else(|| eyre!("no operation to index"))?;
+        let mut index = index_at(first)?.start_modification();
+        for op in rest {
+            index.merge_in(index_at(op)?.as_ref())?;
+        }
+        Ok(index)
+    }
+
+    /// The `roots..heads` revset (ancestors of `heads` that are not
+    /// ancestors of `roots`), parents first, over the commit index of
+    /// `ops`. Roots outside that index are ignored; heads outside it are
+    /// an error. Blocking.
+    pub fn commit_range(
+        &self,
+        ops: &[jj_lib::operation::Operation],
+        roots: &[CommitId],
+        heads: &[CommitId],
+    ) -> Result<Vec<CommitId>> {
+        let index = self.merged_index(ops)?;
+        let index = index.as_index();
+        let mut known = Vec::with_capacity(roots.len());
+        for root in roots {
+            if index.has_id(root).block_on()? {
+                known.push(root.clone());
+            }
+        }
+        for head in heads {
+            ensure!(
+                index.has_id(head).block_on()?,
+                "commit {} is not in the operation log",
+                head.hex(),
+            );
+        }
+        let range = ResolvedExpression::Range {
+            roots: Box::new(ResolvedExpression::Commits(known)),
+            heads: Box::new(ResolvedExpression::Commits(heads.to_vec())),
+            generation: GENERATION_RANGE_FULL,
+            parents_range: PARENTS_RANGE_FULL,
+        };
+        let revset = index.evaluate_revset(&range, self.loader.store())?;
+        // Index order is topological, children first.
+        let mut commits: Vec<CommitId> = revset.stream().try_collect().block_on()?;
+        commits.reverse();
+        Ok(commits)
     }
 
     /// Builds the commit index at the given operation, incrementally from

@@ -2,6 +2,7 @@
 //! pairs against real jj repos, as the daemon runs them over QUIC.
 
 use std::{
+    collections::HashSet,
     fs,
     path::{Path, PathBuf},
     process::Command,
@@ -15,6 +16,7 @@ use crate::{
     net::{
         fetch::{
             FetchRequest, GitFrame, GitRequest, MAX_GIT_FRAME_SIZE, MAX_OP_FRAME_SIZE, OpFrame,
+            WireObjectKind,
         },
         wire::{read_message, write_message},
     },
@@ -116,17 +118,313 @@ async fn incremental_sync_transfers_only_changed_objects() {
 
     let (ra, rb) = (open(&a), open(&b));
     let wants = ra.op_heads().await.unwrap();
-    let outcome = sync_once(&rb, &ra, &wants).await;
+    let outcome = sync_exact(&rb, &ra, &wants, GitTransferFormat::Loose).await;
 
-    // The delta is the one changed blob, the trees on its path, and the
-    // commits, nowhere near the 20-plus objects a full resend carries.
-    assert!(outcome.git_objects > 0);
+    // The changed blob, the root tree and the commits, nowhere near the
+    // 20-plus objects a full resend carries.
     assert!(
         outcome.git_objects < 10,
-        "sent {} objects for a one-file change",
-        outcome.git_objects,
+        "sent {} objects",
+        outcome.git_objects
     );
     assert_eq!(rb.op_heads().await.unwrap(), wants);
+}
+
+/// A commit on an older commit, which the fetcher holds but not as a
+/// head (what rebases and `jj new <rev>` produce), sends only its own
+/// objects: not the base's history, nor the files changed since the base.
+#[tokio::test]
+async fn sync_on_top_of_an_older_commit_transfers_only_new_objects() {
+    let fx = Fixture::new();
+    let a = fx.init_repo("a");
+    for n in 0..20 {
+        fs::create_dir_all(a.join("dir")).unwrap();
+        fs::write(a.join(format!("dir/file{n}.txt")), format!("content {n}\n")).unwrap();
+        fx.jj(&a, &["commit", "-m", &format!("commit {n}")]);
+    }
+    fork(&a, &fx.path().join("loose"));
+    fork(&a, &fx.path().join("pack"));
+
+    fx.jj(&a, &["new", "-r", "description(substring:\"commit 10\")"]);
+    fx.commit_file(&a, "dir/side.txt", "side");
+
+    let ra = open(&a);
+    let wants = ra.op_heads().await.unwrap();
+    for format in [GitTransferFormat::Loose, GitTransferFormat::Pack] {
+        let fetcher = open(&fx.path().join(format!("{format:?}").to_lowercase()));
+        sync_exact(&fetcher, &ra, &wants, format).await;
+        assert_eq!(fetcher.op_heads().await.unwrap(), wants);
+    }
+}
+
+/// A fetcher with commits of its own, unknown to the server, still gets
+/// only what it lacks: its haves are the commits the fetched views share
+/// with it, not its own heads.
+#[tokio::test]
+async fn sync_with_local_commits_transfers_only_new_objects() {
+    let fx = Fixture::new();
+    let a = fx.init_repo("a");
+    for n in 0..5 {
+        fx.commit_file(&a, &format!("file{n}.txt"), &format!("commit {n}"));
+    }
+    fork(&a, &fx.path().join("b"));
+    let b = fx.path().join("b");
+    fx.commit_file(&b, "b.txt", "from b");
+    fx.commit_file(&a, "a.txt", "from a");
+
+    let (ra, rb) = (open(&a), open(&b));
+    let wants = ra.op_heads().await.unwrap();
+    sync_exact(&rb, &ra, &wants, GitTransferFormat::Loose).await;
+}
+
+/// The closure is emitted parents first, each commit after its whole
+/// closure, with no duplicates, across merges: any prefix of the stream
+/// leaves a store where every commit has its trees and ancestry.
+#[tokio::test]
+async fn closure_is_emitted_parents_first() {
+    let fx = Fixture::new();
+    let a = fx.init_repo("a");
+    fx.commit_file(&a, "base.txt", "base");
+    // Two branches and their merge, plus a merge with an older parent.
+    fx.jj(&a, &["new", "-r", "@-", "-m", "left"]);
+    fx.commit_file(&a, "left.txt", "left");
+    fx.jj(&a, &["new", "-r", "root()", "-m", "right"]);
+    fx.commit_file(&a, "right.txt", "right");
+    fx.jj(
+        &a,
+        &[
+            "new",
+            "description(substring:\"left\")",
+            "description(substring:\"right\")",
+        ],
+    );
+    fx.commit_file(&a, "merge.txt", "merged");
+    fx.jj(&a, &["new", "description(substring:\"base\")", "@-"]);
+
+    let ra = open(&a);
+    let emitted = closure(&ra, &view_heads(&ra).await, &[]);
+    let git_dir = ra.git_backend().git_repo().path().to_owned();
+    for (n, (id, kind)) in emitted.iter().enumerate() {
+        assert!(
+            !emitted[..n].iter().any(|(other, _)| other == id),
+            "{id} emitted twice"
+        );
+        if *kind != WireObjectKind::Commit {
+            continue;
+        }
+        for object in git_output(&git_dir, &["rev-list", "--objects", &id.to_string()]).lines() {
+            let object =
+                gix::ObjectId::from_hex(object.split(' ').next().unwrap().as_bytes()).unwrap();
+            assert!(
+                object == *id || emitted[..n].iter().any(|(other, _)| *other == object),
+                "{id} emitted before {object}",
+            );
+        }
+    }
+}
+
+/// Rewriting a commit the fetcher holds (a working-copy snapshot, a
+/// description, a rebase) sends only what changed since that version.
+#[tokio::test]
+async fn sync_after_rewrites_transfers_only_new_objects() {
+    let fx = Fixture::new();
+    let a = fx.init_repo("a");
+    fx.commit_file(&a, "trunk.txt", "trunk");
+    for n in 0..5 {
+        fs::write(a.join(format!("wip{n}.txt")), format!("wip {n}\n")).unwrap();
+    }
+    fx.jj(&a, &["commit", "-m", "wip"]);
+    fx.commit_file(&a, "next.txt", "next");
+    let b = fx.path().join("b");
+    fork(&a, &b);
+    let (ra, rb) = (open(&a), open(&b));
+
+    // A snapshot of one more edit to the working copy.
+    fs::write(a.join("wip0.txt"), "edited\n").unwrap();
+    fx.jj(&a, &["status"]);
+    let wants = ra.op_heads().await.unwrap();
+    let outcome = sync_exact(&rb, &ra, &wants, GitTransferFormat::Loose).await;
+    assert!(
+        outcome.git_objects <= 3,
+        "sent {} objects",
+        outcome.git_objects
+    );
+
+    // A description, and the stack rebased onto a new trunk commit.
+    fx.jj(
+        &a,
+        &[
+            "describe",
+            "-r",
+            "description(substring:\"wip\")",
+            "-m",
+            "described",
+        ],
+    );
+    fx.jj(
+        &a,
+        &[
+            "new",
+            "-r",
+            "description(substring:\"trunk\")",
+            "-m",
+            "trunk 2",
+        ],
+    );
+    fx.commit_file(&a, "trunk2.txt", "trunk 2");
+    fx.jj(
+        &a,
+        &[
+            "rebase",
+            "-s",
+            "description(substring:\"described\")",
+            "-d",
+            "description(substring:\"trunk 2\")",
+        ],
+    );
+    let wants = ra.op_heads().await.unwrap();
+    sync_exact(&rb, &ra, &wants, GitTransferFormat::Loose).await;
+}
+
+/// A conflicted commit stores its terms as whole-tree subtrees: its sides
+/// are compared against its parents' and other versions' trees, so only
+/// the base term's differences are resent, not whole trees.
+#[tokio::test]
+async fn sync_of_a_conflict_transfers_its_terms_sparsely() {
+    let fx = Fixture::new();
+    let a = fx.init_repo("a");
+    for n in 0..10 {
+        fs::write(a.join(format!("file{n}.txt")), format!("content {n}\n")).unwrap();
+    }
+    fx.jj(&a, &["commit", "-m", "base"]);
+    fx.commit_file(&a, "file0.txt", "left");
+    fx.jj(&a, &["new", "-r", "description(substring:\"base\")"]);
+    fx.commit_file(&a, "file0.txt", "right");
+    fork(&a, &fx.path().join("b"));
+    let b = fx.path().join("b");
+
+    fx.jj(
+        &a,
+        &[
+            "rebase",
+            "-r",
+            "description(substring:\"right\")",
+            "-d",
+            "description(substring:\"left\")",
+        ],
+    );
+    let (ra, rb) = (open(&a), open(&b));
+    let wants = ra.op_heads().await.unwrap();
+    let outcome = try_sync(&rb, &ra, &wants, GitTransferFormat::Loose)
+        .await
+        .unwrap();
+    assert_complete(&rb);
+    // A full resend of the three terms carries over 30 objects.
+    assert!(
+        outcome.git_objects < 12,
+        "sent {} objects",
+        outcome.git_objects
+    );
+}
+
+/// A new empty commit on the working copy, whose op references nothing
+/// else (no git HEAD outside colocated repos): the fetcher's view heads
+/// still bound what is sent.
+#[tokio::test]
+async fn sync_of_a_new_commit_transfers_only_new_objects() {
+    let fx = Fixture::new();
+    let a = fx.init_repo("a");
+    for n in 0..5 {
+        fx.commit_file(&a, &format!("file{n}.txt"), &format!("commit {n}"));
+    }
+    fork(&a, &fx.path().join("b"));
+    let b = fx.path().join("b");
+    fx.jj(&a, &["new"]);
+
+    let (ra, rb) = (open(&a), open(&b));
+    let wants = ra.op_heads().await.unwrap();
+    let outcome = sync_exact(&rb, &ra, &wants, GitTransferFormat::Loose).await;
+    assert!(
+        outcome.git_objects <= 1,
+        "sent {} objects",
+        outcome.git_objects
+    );
+}
+
+/// Divergent op heads on the server are served from their merged index.
+#[tokio::test]
+async fn sync_of_divergent_server_heads_transfers_only_new_objects() {
+    let fx = Fixture::new();
+    let a = fx.init_repo("a");
+    fx.commit_file(&a, "base.txt", "base");
+    fork(&a, &fx.path().join("b"));
+    let b = fx.path().join("b");
+    let ra = open(&a);
+    let base = ra.op_heads().await.unwrap().remove(0);
+    fx.commit_file(&a, "left.txt", "left");
+    fx.jj(
+        &a,
+        &[
+            "--at-op",
+            &base.hex(),
+            "--ignore-working-copy",
+            "new",
+            "-m",
+            "right",
+        ],
+    );
+
+    let wants = ra.op_heads().await.unwrap();
+    assert_eq!(wants.len(), 2);
+    let rb = open(&b);
+    sync_exact(&rb, &ra, &wants, GitTransferFormat::Loose).await;
+}
+
+/// Wants the op log does not reference are refused: a peer cannot pull
+/// arbitrary objects out of the git store.
+#[tokio::test]
+async fn closure_refuses_wants_outside_the_op_log() {
+    let fx = Fixture::new();
+    let a = fx.init_repo("a");
+    let ra = open(&a);
+    let git_dir = ra.git_backend().git_repo().path().to_owned();
+    let tree = git_output(&git_dir, &["hash-object", "-t", "tree", "-w", "/dev/null"]);
+    let stray = git_output(&git_dir, &["commit-tree", &tree, "-m", "stray"]);
+
+    let request = GitRequest {
+        wants: vec![data_encoding::HEXLOWER.decode(stray.as_bytes()).unwrap()],
+        haves: Vec::new(),
+        format: GitTransferFormat::Loose,
+    };
+    let err = serve::walk_git_closure(&ra, &request, |_, _| Ok(())).unwrap_err();
+    assert!(
+        format!("{err:#}").contains("not in the operation log"),
+        "{err:#}"
+    );
+}
+
+/// Moving a directory resends its content, matched by path only, but the
+/// fetcher still ends complete.
+#[tokio::test]
+async fn sync_of_a_moved_directory_is_complete() {
+    let fx = Fixture::new();
+    let a = fx.init_repo("a");
+    fs::create_dir(a.join("old")).unwrap();
+    for n in 0..5 {
+        fs::write(a.join(format!("old/file{n}.txt")), format!("content {n}\n")).unwrap();
+    }
+    fx.jj(&a, &["commit", "-m", "old"]);
+    fork(&a, &fx.path().join("b"));
+    let b = fx.path().join("b");
+    fs::rename(a.join("old"), a.join("new")).unwrap();
+    fx.jj(&a, &["commit", "-m", "moved"]);
+
+    let (ra, rb) = (open(&a), open(&b));
+    let wants = ra.op_heads().await.unwrap();
+    try_sync(&rb, &ra, &wants, GitTransferFormat::Loose)
+        .await
+        .unwrap();
+    assert_complete(&rb);
 }
 
 #[tokio::test]
@@ -1000,4 +1298,86 @@ async fn mirror_deletes_annotated_tags() {
     fx.jj(&a, &["status"]);
     sync_missing(&rb, &ra).await;
     assert!(!git_ok(&b_git, &["rev-parse", "--verify", "refs/tags/v1"]));
+}
+
+/// Syncs, asserting the fetcher ends complete and received exactly the
+/// objects it lacked.
+async fn sync_exact(
+    fetcher: &Arc<OpenRepo>,
+    server: &Arc<OpenRepo>,
+    wants: &[OperationId],
+    format: GitTransferFormat,
+) -> FetchOutcome {
+    let git_dir = fetcher.git_backend().git_repo().path().to_owned();
+    let before = object_ids(&git_dir, None);
+    let outcome = try_sync(fetcher, server, wants, format).await.unwrap();
+    assert_complete(fetcher);
+    let gained = object_ids(&git_dir, None).difference(&before).count();
+    assert_eq!(outcome.git_objects, gained, "sent objects the fetcher had");
+    outcome
+}
+
+/// Asserts every commit in the repo's git store has its whole closure
+/// stored, whether a ref reaches it or not.
+fn assert_complete(repo: &OpenRepo) {
+    let git_dir = repo.git_backend().git_repo().path().to_owned();
+    let commits: Vec<String> = object_ids(&git_dir, Some("commit")).into_iter().collect();
+    let mut args = vec!["rev-list", "--objects", "--missing=print"];
+    args.extend(commits.iter().map(String::as_str));
+    let missing: Vec<String> = git_output(&git_dir, &args)
+        .lines()
+        .filter(|line| line.starts_with('?'))
+        .map(str::to_owned)
+        .collect();
+    assert!(missing.is_empty(), "missing objects: {missing:?}");
+}
+
+/// The ids of every object in a git store, of `kind` when given.
+fn object_ids(git_dir: &Path, kind: Option<&str>) -> HashSet<String> {
+    git_output(
+        git_dir,
+        &[
+            "cat-file",
+            "--batch-all-objects",
+            "--batch-check=%(objectname) %(objecttype)",
+        ],
+    )
+    .lines()
+    .filter_map(|line| line.split_once(' '))
+    .filter(|(_, object_kind)| kind.is_none_or(|kind| *object_kind == kind))
+    .map(|(id, _)| id.to_owned())
+    .collect()
+}
+
+/// The commit ids of the repo's current view heads.
+async fn view_heads(repo: &OpenRepo) -> Vec<Vec<u8>> {
+    let op = repo
+        .read_operation(&repo.op_heads().await.unwrap()[0])
+        .await
+        .unwrap();
+    let view = repo.read_view(&op.view_id).await.unwrap();
+    view.head_ids
+        .iter()
+        .map(|id| id.as_bytes().to_vec())
+        .collect()
+}
+
+/// The objects the server emits for `wants` minus `haves`, in order.
+fn closure(
+    repo: &OpenRepo,
+    wants: &[Vec<u8>],
+    haves: &[Vec<u8>],
+) -> Vec<(gix::ObjectId, WireObjectKind)> {
+    let request = GitRequest {
+        wants: wants.to_vec(),
+        haves: haves.to_vec(),
+        format: GitTransferFormat::Loose,
+    };
+    let mut emitted = Vec::new();
+    serve::walk_git_closure(repo, &request, |id, kind| {
+        emitted.push((id, kind));
+        Ok(())
+    })
+    .unwrap();
+    emitted
 }
