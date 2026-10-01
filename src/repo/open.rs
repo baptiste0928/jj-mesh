@@ -37,6 +37,7 @@ use jj_lib::{
     index::MutableIndex,
     object_id::{HexPrefix, ObjectId, PrefixResolution},
     op_store::{Operation, OperationId, View, ViewId},
+    op_walk,
     repo::RepoLoader,
     revset::{GENERATION_RANGE_FULL, PARENTS_RANGE_FULL, ResolvedExpression},
     settings::UserSettings,
@@ -420,61 +421,47 @@ impl OpenRepo {
         Ok(())
     }
 
-    /// Collects the ancestor operations of `heads` down to (excluding) the
-    /// `known` ops and the root, returned in parents-first order — the safe
-    /// order to replicate them in. `heads` and `known` must be stored.
-    ///
-    /// Only the exact `known` ids are excluded, not their ancestors: if a
-    /// head reaches past `known` through another path (typical for
-    /// divergence-merge ops), the shared history below it is emitted again.
-    /// Replication stays correct because writes are idempotent, but callers
-    /// negotiating a transfer should pass a frontier that covers all paths,
-    /// not just their current heads.
+    /// Collects the ancestor operations of `heads` that are not ancestors
+    /// of the `known` ops (nor the root), in parents-first order: the safe
+    /// order to replicate them in. `heads` must be stored; `known` ops this
+    /// repo lacks are ignored.
     pub async fn ancestors_until(
         &self,
         heads: &[OperationId],
         known: &[OperationId],
     ) -> Result<Vec<(OperationId, Operation)>> {
-        enum Frame {
-            Enter(OperationId),
-            Exit(OperationId, Box<Operation>),
+        let mut head_ops = Vec::with_capacity(heads.len());
+        for id in heads {
+            head_ops.push(self.load_operation(id).await?);
         }
-
-        let known: HashSet<&OperationId> = known.iter().collect();
-        let mut visited: HashSet<OperationId> = HashSet::new();
-        let mut order = Vec::new();
-        let mut stack: Vec<Frame> = heads.iter().cloned().map(Frame::Enter).collect();
-
-        while let Some(frame) = stack.pop() {
-            match frame {
-                Frame::Enter(id) => {
-                    if known.contains(&id)
-                        || id == *self.root_operation_id()
-                        || !visited.insert(id.clone())
-                    {
-                        continue;
-                    }
-                    let op = self.read_operation(&id).await.wrap_err_with(|| {
-                        format!("op DAG walk reached unreadable operation {}", id.hex())
-                    })?;
-                    let parents = op.parents.clone();
-                    stack.push(Frame::Exit(id, Box::new(op)));
-                    stack.extend(parents.into_iter().map(Frame::Enter));
-                }
-                // All parents were pushed above this frame, so they are
-                // fully emitted by the time it pops: parents-first holds.
-                Frame::Exit(id, op) => order.push((id, *op)),
+        // The root op is never a root of the walk: jj's walk would then
+        // load the whole op log to reach it.
+        let mut root_ops = Vec::with_capacity(known.len());
+        for id in known {
+            if self.has_operation(id).await? {
+                root_ops.push(self.load_operation(id).await?);
             }
         }
-
-        Ok(order)
+        let mut ops: Vec<jj_lib::operation::Operation> =
+            op_walk::walk_ancestors_range(&head_ops, &root_ops)
+                .try_collect()
+                .await?;
+        // jj walks children first.
+        ops.reverse();
+        Ok(ops
+            .into_iter()
+            .filter(|op| op.id() != self.root_operation_id())
+            .map(|op| (op.id().clone(), op.store_operation().clone()))
+            .collect())
     }
 
-    /// Proves the repo's stored formats are ones this build understands:
-    /// reads every current op head and its view through the mesh codec,
+    /// Proves this build can sync the repo, at open rather than obscurely
+    /// mid-sync.
+    ///
+    /// Its stored formats must be ones this build understands: reads every
+    /// current op head and its view through the mesh codec,
     /// the same validation applied to replicated bytes. A repo written by
-    /// a different jj series fails here at open, with a pointed error,
-    /// instead of failing obscurely mid-sync.
+    /// a different jj series fails here with a pointed error.
     ///
     /// Also verifies the working-copy commits carry the `change-id` git
     /// header: change ids replicate through the git objects alone (the
@@ -484,7 +471,23 @@ impl OpenRepo {
     /// checked because it is always jj-written; commits imported from
     /// plain git legitimately lack the header and are consistent anyway
     /// (their synthetic change ids derive from the commit id).
+    ///
+    /// Shallow and partial git clones are refused: syncing assumes a
+    /// stored commit has its whole closure, which they cut.
     pub async fn self_check(&self) -> Result<()> {
+        let git = self.git_backend().git_repo();
+        ensure!(
+            !git.is_shallow(),
+            "the git repo is shallow, which syncing does not support; fetch \
+             its full history with `git --git-dir {} fetch --unshallow`",
+            self.git_repo_path().display(),
+        );
+        ensure!(
+            git.config_snapshot()
+                .string("extensions.partialClone")
+                .is_none(),
+            "the git repo is a partial clone, which syncing does not support",
+        );
         for head in self.op_heads().await? {
             if head == *self.root_operation_id() {
                 continue;
@@ -699,6 +702,51 @@ mod tests {
         fx.jj(&b, &["op", "log"]);
     }
 
+    /// A known op excludes its whole ancestry, also where the heads reach
+    /// it through another path, as an op merging divergent heads does.
+    #[tokio::test]
+    async fn ancestors_until_excludes_the_known_ops_ancestry() {
+        let fx = Fixture::new();
+        let a = fx.init_repo("a");
+        fx.commit_file(&a, "base.txt", "base");
+        let repo = open(&a);
+        let base = repo.op_heads().await.unwrap().remove(0);
+        fx.jj(&a, &["describe", "-m", "left"]);
+        let left = repo.op_heads().await.unwrap().remove(0);
+        fx.jj(
+            &a,
+            &[
+                "--at-op",
+                &base.hex(),
+                "--ignore-working-copy",
+                "describe",
+                "-m",
+                "right",
+            ],
+        );
+        // Any command merges the divergent op heads.
+        fx.jj(&a, &["status"]);
+
+        let heads = repo.op_heads().await.unwrap();
+        let delta = repo
+            .ancestors_until(&heads, std::slice::from_ref(&left))
+            .await
+            .unwrap();
+        let ids: Vec<&OperationId> = delta.iter().map(|(id, _)| id).collect();
+        assert!(!ids.contains(&&base), "base resent: {ids:?}");
+        assert!(!ids.contains(&&left));
+        // The right-side op, the merge and the heads, parents first.
+        assert!(ids.len() >= 2 && ids.len() <= 3, "{ids:?}");
+        for head in &heads {
+            assert!(ids.contains(&head), "head {} missing", head.hex());
+        }
+        for (n, (_, op)) in delta.iter().enumerate() {
+            for parent in &op.parents {
+                assert!(!ids[n..].contains(&parent), "parent after its child");
+            }
+        }
+    }
+
     /// Copies the files under `from` into `to`, leaving existing ones alone.
     fn copy_missing(from: &Path, to: &Path) {
         fs::create_dir_all(to).unwrap();
@@ -752,6 +800,35 @@ mod tests {
         );
         fx.jj(&dir, &["new", "-m", "healed"]);
         open(&dir).self_check().await.unwrap();
+    }
+
+    /// A shallow git repo must fail the self-check: its commits lack
+    /// their ancestry.
+    #[tokio::test]
+    async fn self_check_rejects_shallow_repo() {
+        let fx = Fixture::new();
+        let dir = fx.init_repo("a");
+        fx.commit_file(&dir, "file.txt", "content");
+        let repo = open(&dir);
+        let commit = fx.jj_output(&dir, &["log", "-r", "@-", "--no-graph", "-T", "commit_id"]);
+        fs::write(repo.git_repo_path().join("shallow"), format!("{commit}\n")).unwrap();
+
+        let err = open(&dir).self_check().await.unwrap_err();
+        assert!(format!("{err:#}").contains("shallow"), "{err:#}");
+    }
+
+    /// A partial clone must fail the self-check: objects are missing.
+    #[tokio::test]
+    async fn self_check_rejects_partial_clone() {
+        let fx = Fixture::new();
+        let dir = fx.init_repo("a");
+        let config = open(&dir).git_repo_path().join("config");
+        let mut contents = fs::read_to_string(&config).unwrap();
+        contents.push_str("[extensions]\n\tpartialClone = origin\n");
+        fs::write(&config, contents).unwrap();
+
+        let err = open(&dir).self_check().await.unwrap_err();
+        assert!(format!("{err:#}").contains("partial clone"), "{err:#}");
     }
 
     #[tokio::test]

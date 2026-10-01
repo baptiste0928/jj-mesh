@@ -32,10 +32,11 @@
 //!   [`crate::net::fetch::GitTransferFormat`]).
 //! - [`fetch`] pulls and validates that delta, then orchestrates the
 //!   local write in the crash-safe order: git objects already landed
-//!   during the transfer, [`apply`]'s stage step persists keep refs,
-//!   views and ops (parents first) and change-id extras, the commit
-//!   index is built for the incoming heads, and [`apply`]'s publish step
-//!   runs the git ref mirror and the op head publication.
+//!   during the transfer, [`apply`]'s stage step imports the new head
+//!   commits (keep refs and change-id extras) and persists views and ops
+//!   (parents first), the commit index is built for the incoming heads,
+//!   and [`apply`]'s publish step runs the git ref mirror and the op head
+//!   publication.
 //! - [`mirror`] keeps the git repo's refs in line with the synced views,
 //!   before each publication and, through [`mirror::heal`], when the
 //!   daemon starts watching a repo.

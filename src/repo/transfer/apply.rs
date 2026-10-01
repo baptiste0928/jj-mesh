@@ -1,8 +1,8 @@
-//! Applying a validated batch, in the crash-safe order: anti-GC keep
-//! refs, views and ops (parents first, persisted with one batched
-//! durability sync), change-id extras, the commit index for the incoming
-//! heads, the git ref mirror, and only then the op head publication
-//! that makes anything visible to jj.
+//! Applying a validated batch, in the crash-safe order: the new head
+//! commits' import (anti-GC keep refs and change-id extras), views and ops
+//! (parents first, persisted with one batched durability sync), the commit
+//! index for the incoming heads, the git ref mirror, and only then the op
+//! head publication that makes anything visible to jj.
 //!
 //! The apply is split in two so [`super::fetch`] can run the index build
 //! in between: [`stage`] lands everything on disk and computes what to
@@ -14,11 +14,11 @@ use std::{
 };
 
 use color_eyre::eyre::{Result, eyre};
-use jj_lib::{backend::CommitId, object_id::ObjectId as _, op_store::OperationId};
+use jj_lib::{backend::CommitId, op_store::OperationId};
 use pollster::FutureExt as _;
 use tracing::debug;
 
-use super::{OpBatch, mirror, to_gix_id};
+use super::{OpBatch, mirror};
 use crate::repo::{OpenRepo, codec::OpMeta};
 
 /// Walk budget for [`superseded_by`]: stopping early is safe (unwalked
@@ -35,25 +35,28 @@ pub(super) struct Staged {
     ops: usize,
 }
 
-/// Stages a validated batch: keep refs, views, ops, extras, and the
-/// supersession computation, leaving nothing visible to jj yet. Runs on a
-/// blocking thread.
+/// Stages a validated batch: the head commits' import, views, ops, and
+/// the supersession computation, leaving nothing visible to jj yet. Runs
+/// on a blocking thread.
 pub(super) fn stage(
     repo: &Arc<OpenRepo>,
     batch: &OpBatch,
     wants: &[OperationId],
     local_heads: &[OperationId],
 ) -> Result<Staged> {
-    // Anti-GC keep refs for every new view head, before anything
-    // references those commits.
+    // Import every new view head before anything references it: jj
+    // writes its anti-GC keep ref, then its change-id extras (eagerly,
+    // instead of relying on jj's lazy import fallback).
     let new_commit_heads: HashSet<CommitId> = batch
         .views
         .iter()
         .flat_map(|view| view.meta.head_ids.iter().cloned())
         .collect();
-    write_keep_refs(repo, &new_commit_heads)?;
-    fail::fail_point!("stage.after_keep_refs", |_| Err(eyre!(
-        "crash point stage.after_keep_refs"
+    repo.git_backend()
+        .import_head_commits(&new_commit_heads)
+        .map_err(|err| eyre!("cannot import commit metadata: {err}"))?;
+    fail::fail_point!("stage.after_import", |_| Err(eyre!(
+        "crash point stage.after_import"
     )));
 
     // Staged unsynced and persisted with one parallel sync pass, instead
@@ -68,16 +71,6 @@ pub(super) fn stage(
     writes.persist()?;
     fail::fail_point!("stage.after_persist", |_| Err(eyre!(
         "crash point stage.after_persist"
-    )));
-
-    // Materialize change-id extras for the new commits eagerly instead of
-    // relying on jj's lazy import fallback.
-    let heads: Vec<&CommitId> = new_commit_heads.iter().collect();
-    repo.git_backend()
-        .import_head_commits(heads)
-        .map_err(|err| eyre!("cannot import commit metadata: {err}"))?;
-    fail::fail_point!("stage.after_extras", |_| Err(eyre!(
-        "crash point stage.after_extras"
     )));
 
     // Which local heads each want supersedes, established by walking the
@@ -186,32 +179,4 @@ fn superseded_by(
     }
 
     superseded
-}
-
-/// Writes `refs/jj/keep/*` refs so git GC cannot prune commits jj has not
-/// imported yet (mirrors the git backend's own convention).
-fn write_keep_refs(repo: &OpenRepo, commit_ids: &HashSet<CommitId>) -> Result<()> {
-    use gix::refs::transaction::{Change, LogChange, PreviousValue, RefEdit};
-
-    let git = repo.git_backend().git_repo();
-    let edits: Vec<RefEdit> = commit_ids
-        .iter()
-        .map(|id| -> Result<RefEdit> {
-            Ok(RefEdit {
-                change: Change::Update {
-                    log: LogChange::default(),
-                    expected: PreviousValue::Any,
-                    new: gix::refs::Target::Object(to_gix_id(id)?),
-                },
-                name: format!("refs/jj/keep/{}", id.hex())
-                    .try_into()
-                    .map_err(|err| eyre!("bad ref name: {err}"))?,
-                deref: false,
-            })
-        })
-        .collect::<Result<_>>()?;
-
-    git.edit_references(edits)
-        .map_err(|err| eyre!("cannot write keep refs: {err}"))?;
-    Ok(())
 }

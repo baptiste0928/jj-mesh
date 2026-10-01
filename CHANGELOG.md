@@ -21,6 +21,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   previously sometimes re-send hundreds of objects for a single-line change.
 - Peers changes were sometimes rejected after a restart when the local machine did not
   notice the old connection drop (e.g. while suspended).
+- Shallow and partial git clones are now explicitely refused.
 
 ## [0.2.0] - 2026-09-06
 

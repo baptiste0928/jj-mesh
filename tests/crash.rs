@@ -24,10 +24,10 @@ use jj_mesh::{repo::OpenRepo, testing::*};
 enum Landed {
     /// The git objects, written before the apply.
     Objects,
-    KeepRefs,
+    /// The head commits' keep refs and change-id extras.
+    Import,
     /// All ops and views.
     Persist,
-    Extras,
     Index,
     Mirror,
     /// The first of the wants.
@@ -47,32 +47,27 @@ const BEFORE_STAGE: Point = Point {
     action: "return",
     landed: Landed::Objects,
 };
-const AFTER_KEEP_REFS: Point = Point {
-    name: "stage.after_keep_refs",
+const AFTER_IMPORT: Point = Point {
+    name: "stage.after_import",
     action: "return",
-    landed: Landed::KeepRefs,
+    landed: Landed::Import,
 };
 /// After the first view file is renamed into place: a partial persist.
 const AFTER_VIEW_RENAME: Point = Point {
     name: "persist.after_rename",
     action: "return",
-    landed: Landed::KeepRefs,
+    landed: Landed::Import,
 };
 /// After the fourth rename, the first op: needs three ops or more.
 const AFTER_OP_RENAME: Point = Point {
     name: "persist.after_rename",
     action: "3*off->return",
-    landed: Landed::KeepRefs,
+    landed: Landed::Import,
 };
 const AFTER_PERSIST: Point = Point {
     name: "stage.after_persist",
     action: "return",
     landed: Landed::Persist,
-};
-const AFTER_EXTRAS: Point = Point {
-    name: "stage.after_extras",
-    action: "return",
-    landed: Landed::Extras,
 };
 const AFTER_INDEX: Point = Point {
     name: "fetch.after_index",
@@ -284,7 +279,7 @@ async fn run(build: impl AsyncFnOnce() -> Scenario, point: Point) {
             &["op", "log", "--ignore-working-copy", "--at-op", &head.hex()],
         );
     }
-    if point.landed >= Landed::KeepRefs {
+    if point.landed >= Landed::Import {
         assert_keep_refs(&fetcher, &server, &wants).await;
     }
     for want in &wants {
@@ -437,9 +432,9 @@ fn walk(dir: &Path, files: &mut BTreeMap<PathBuf, (u64, i64, i64)>) {
 macro_rules! cases {
     ($($scenario:ident $(: $($extra:ident $extra_name:ident),+)?;)+) => {$(
         mod $scenario {
-            cases!(@ $scenario: BEFORE_STAGE before_stage, AFTER_KEEP_REFS after_keep_refs,
+            cases!(@ $scenario: BEFORE_STAGE before_stage, AFTER_IMPORT after_import,
                 AFTER_VIEW_RENAME after_view_rename, AFTER_PERSIST after_persist,
-                AFTER_EXTRAS after_extras, AFTER_INDEX after_index, AFTER_MIRROR after_mirror);
+                AFTER_INDEX after_index, AFTER_MIRROR after_mirror);
             $(cases!(@ $scenario: $($extra $extra_name),+);)?
         }
     )+};

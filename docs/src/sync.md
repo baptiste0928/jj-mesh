@@ -87,12 +87,12 @@ The apply then writes in an order chosen so that a crash at any point leaves
 the repo consistent. Git objects already landed during the fetch (they are
 content-addressed and invisible until published), then come:
 
-1. anti-GC keep refs for the new views' head commits;
+1. the new views' head commits, imported: anti-GC keep refs and change-id
+   extras;
 2. views and ops, parents-first;
-3. change-id extras, imported from the new commits;
-4. the commit index, built for the incoming heads;
-5. the git ref mirror (see below);
-6. only at the very end, the op head publication that makes everything
+3. the commit index, built for the incoming heads;
+4. the git ref mirror (see below);
+5. only at the very end, the op head publication that makes everything
    visible to jj.
 
 Which local heads a new head supersedes is established by walking ancestry
