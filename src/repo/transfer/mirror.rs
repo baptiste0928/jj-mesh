@@ -38,7 +38,7 @@ use jj_lib::{
     backend::CommitId,
     git::{RESERVED_REMOTE_REF_NAMESPACE, parse_git_ref},
     index::{Index, MutableIndex},
-    op_store::{OperationId, RefTarget},
+    op_store::{OperationId, RefTarget, RefTargetOptionExt as _},
     op_walk,
     operation::Operation,
     ref_name::{GitRefName, GitRefNameBuf},
@@ -221,7 +221,7 @@ fn stored_refs(repo: &OpenRepo, hint: &GitRefs) -> Result<GitRefs> {
 
 /// The ref's target in a view, absent when unlisted.
 fn target<'a>(refs: &'a GitRefs, name: &GitRefName) -> &'a RefTarget {
-    refs.get(name).unwrap_or(RefTarget::absent_ref())
+    refs.get(name).flatten()
 }
 
 /// Moves each imported ref in the git repo from its `before` value to

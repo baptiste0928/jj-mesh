@@ -287,7 +287,7 @@ mod tests {
                 assert!(referenced.contains(head));
             }
             for target in view.local_bookmarks.values() {
-                for id in target.as_merge().iter().flatten() {
+                for id in target.iter().flatten() {
                     assert!(referenced.contains(id), "missing bookmark target {id:?}");
                 }
             }

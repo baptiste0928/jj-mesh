@@ -7,6 +7,11 @@
       url = "github:oxalica/rust-overlay";
       inputs.nixpkgs.follows = "nixpkgs";
     };
+    jj = {
+      url = "github:jj-vcs/jj/0cb02a837f28459cd698734264c9fcd3712ec0d1";
+      inputs.nixpkgs.follows = "nixpkgs";
+      inputs.rust-overlay.follows = "rust-overlay";
+    };
   };
 
   outputs =
@@ -14,6 +19,7 @@
       self,
       nixpkgs,
       rust-overlay,
+      jj,
       ...
     }:
     let
@@ -56,7 +62,7 @@
             version = (nixpkgs.lib.importTOML ./Cargo.toml).package.version;
 
             src = self;
-            cargoHash = "sha256-aT/BUMhe92yUGt54NS8FXpNrgs83lN1TPTNodX0/8M8=";
+            cargoHash = "sha256-msagQt0C7SyMIHMukXnd5MlAkxv15So69Sv0zFvr4U8=";
 
             doCheck = false; # Don't run tests on the flake
             env.JJ_MESH_COMMIT = self.shortRev or self.dirtyShortRev or "unknown";
@@ -98,6 +104,7 @@
             packages = with pkgs; [
               rustup
               pinact # pin github actions versions
+              (jj.packages.${system}.jujutsu.overrideAttrs { doCheck = false; })
             ];
             env.RUSTUP_TOOLCHAIN = "${toolchain}";
           };
