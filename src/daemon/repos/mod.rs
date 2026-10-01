@@ -28,7 +28,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Notify, mpsc, watch};
-use tracing::info;
+use tracing::debug;
 
 use self::task::spawn_repo;
 use super::{control, hub::SyncHub};
@@ -149,7 +149,7 @@ impl RepoSet {
                 .get(name)
                 .is_some_and(|repo| handle.path == repo.path && handle.id == repo.id);
             if !keep {
-                info!(repo = %name, "removing repo watch");
+                debug!(repo = %name, "removing repo watch");
                 handle.task.abort();
                 self.hub.unregister_repo(name);
             }
@@ -163,7 +163,7 @@ impl RepoSet {
                     handle.claims.send_replace(claims);
                 }
             } else {
-                info!(repo = %name, path = %repo.path.display(), "managing repo");
+                debug!(repo = %name, "managing repo");
                 let handle = spawn_repo(self, name.clone(), repo, claims);
                 repos.insert(name.clone(), handle);
             }

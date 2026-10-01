@@ -121,7 +121,7 @@ async fn clone_pull(
     use jj_lib::op_store::OperationId;
 
     let repo_path = path.to_owned();
-    let repo = tokio::task::spawn_blocking(move || -> Result<_> {
+    let repo = crate::spawn_blocking(move || -> Result<_> {
         Ok(Arc::new(JjRepo::discover(&repo_path)?.open()?))
     })
     .await
@@ -138,11 +138,7 @@ async fn clone_pull(
         // connection task samples and forwards it on its heartbeat. Reset
         // to zeroed counters before dialing, so a fallback to this source
         // is visible and a stalled dial still heartbeats fresh state.
-        let peer_name = ctx
-            .store
-            .snapshot()
-            .peer_name(&peer)
-            .map_or_else(|| peer.to_string(), str::to_owned);
+        let peer_name = ctx.hub.peer_name(&peer);
         let sink = |transfer: transfer::TransferProgress| {
             progress.send_replace(CloneProgress {
                 peer: peer_name.clone(),

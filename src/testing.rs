@@ -152,7 +152,7 @@ pub async fn open_healed(dir: &Path) -> Arc<OpenRepo> {
     let heads = repo.op_heads().await.unwrap();
     let missing = repo.unindexed(&heads).await;
     let healed = repo.clone();
-    tokio::task::spawn_blocking(move || {
+    crate::spawn_blocking(move || {
         healed.build_commit_indexes(&missing);
         mirror::heal(&healed)
     })

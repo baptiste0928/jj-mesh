@@ -302,7 +302,7 @@ async fn serve_phase<T: PhaseFrame + Send + 'static>(
     mut on_frame: impl FnMut(&T),
 ) -> Result<bool> {
     let (tx, mut rx) = mpsc::channel(buffer);
-    let producer = tokio::task::spawn_blocking(move || {
+    let producer = crate::spawn_blocking(move || {
         // The error, if any, is forwarded as the final channel item.
         if let Err(err) = work(&tx) {
             let _ = tx.blocking_send(Err(err));

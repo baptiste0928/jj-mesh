@@ -94,7 +94,7 @@ pub async fn fetch(
     let (missing, git_haves) = {
         let repo = repo.clone();
         let local_heads = local_heads.clone();
-        tokio::task::spawn_blocking(move || -> Result<_> {
+        crate::spawn_blocking(move || -> Result<_> {
             let git = repo.git_backend().git_repo();
             let mut missing: Vec<CommitId> = Vec::new();
             for id in referenced {
@@ -181,11 +181,9 @@ pub async fn fetch(
     {
         let repo = repo.clone();
         let wants = wants.to_vec();
-        tokio::task::spawn_blocking(move || {
-            apply_batch(&repo, &batch, &wants, &local_heads, &to_index)
-        })
-        .await
-        .wrap_err("apply task failed")??;
+        crate::spawn_blocking(move || apply_batch(&repo, &batch, &wants, &local_heads, &to_index))
+            .await
+            .wrap_err("apply task failed")??;
     }
     // The stage's keep refs now protect the pack's commits.
     drop(pack_keep);
@@ -226,7 +224,7 @@ async fn ensure_git_wants_arrived(repo: &Arc<OpenRepo>, requested: Vec<CommitId>
         return Ok(());
     }
     let repo = repo.clone();
-    let absent = tokio::task::spawn_blocking(move || -> Result<Vec<CommitId>> {
+    let absent = crate::spawn_blocking(move || -> Result<Vec<CommitId>> {
         let git = repo.git_backend().git_repo();
         let mut absent = Vec::new();
         for id in requested {
@@ -501,7 +499,7 @@ async fn receive_git_pack(
     let mut ingest = {
         let repo = repo.clone();
         let indexed = indexed.clone();
-        tokio::task::spawn_blocking(move || {
+        crate::spawn_blocking(move || {
             let git = repo.git_backend().git_repo();
             pack::ingest_pack(&git, pack::ChunkReader::new(rx), &indexed)
         })
@@ -585,7 +583,7 @@ fn write_git_chunk(
     chunk: Vec<(gix::ObjectId, gix::object::Kind, Vec<u8>)>,
 ) -> tokio::task::JoinHandle<Result<()>> {
     let repo = repo.clone();
-    tokio::task::spawn_blocking(move || -> Result<()> {
+    crate::spawn_blocking(move || -> Result<()> {
         use gix::prelude::Write as _;
         let git = repo.git_backend().git_repo();
         let hash_kind = git.object_hash();

@@ -16,7 +16,7 @@ use std::{
 use color_eyre::eyre::{Result, eyre};
 use jj_lib::{backend::CommitId, object_id::ObjectId as _, op_store::OperationId};
 use pollster::FutureExt as _;
-use tracing::info;
+use tracing::debug;
 
 use super::{OpBatch, mirror, to_gix_id};
 use crate::repo::{OpenRepo, codec::OpMeta};
@@ -129,7 +129,7 @@ pub(super) fn publish(repo: &Arc<OpenRepo>, staged: &Staged) -> Result<()> {
         )));
     }
     if !to_publish.is_empty() {
-        info!(heads = to_publish.len(), ops, "applied synced operations");
+        debug!(heads = to_publish.len(), ops, "applied synced operations");
     }
     Ok(())
 }

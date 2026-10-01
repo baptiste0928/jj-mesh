@@ -35,7 +35,7 @@ use color_eyre::eyre::Result;
 use jj_lib::op_store::OperationId;
 use pollster::FutureExt as _;
 use tokio::sync::{Mutex, watch};
-use tracing::{debug, warn};
+use tracing::{Instrument as _, debug, info, info_span, warn};
 
 use super::sleep_until;
 use crate::{
@@ -54,8 +54,6 @@ pub(super) type Synced = watch::Receiver<Option<OperationId>>;
 
 /// What the workspace tasks of one repo share.
 pub(super) struct RepoContext {
-    /// The repo's mesh-wide name.
-    name: String,
     pub repo: Arc<OpenRepo>,
     settings: RepoSettings,
     /// Serializes the jj runs of all workspaces: concurrent ones would
@@ -64,9 +62,8 @@ pub(super) struct RepoContext {
 }
 
 impl RepoContext {
-    pub fn new(name: String, repo: Arc<OpenRepo>, settings: RepoSettings) -> Self {
+    pub fn new(repo: Arc<OpenRepo>, settings: RepoSettings) -> Self {
         RepoContext {
-            name,
             repo,
             settings,
             jj: Mutex::new(()),
@@ -103,22 +100,21 @@ pub(super) fn spawn_workspace(
     head: Option<OperationId>,
     synced: Synced,
 ) -> WorkspaceHandle {
+    let span = info_span!("workspace", workspace = %name);
     let task = WorkspaceTask {
         ctx,
-        name: name.clone(),
         workspace,
         synced,
     };
     WorkspaceHandle {
         name,
-        task: tokio::spawn(task.run(head)),
+        task: tokio::spawn(task.run(head).instrument(span)),
     }
 }
 
 /// Everything a workspace task owns.
 struct WorkspaceTask {
     ctx: Arc<RepoContext>,
-    name: String,
     workspace: Workspace,
     synced: Synced,
 }
@@ -128,10 +124,7 @@ impl WorkspaceTask {
     /// working copy watch fails.
     async fn run(mut self, head: Option<OperationId>) {
         if let Err(err) = self.keep_fresh(head).await {
-            warn!(
-                repo = %self.ctx.name, workspace = %self.name,
-                "working copy watch failed: {err:#}",
-            );
+            warn!("working copy watch failed: {err:#}");
         }
     }
 
@@ -183,10 +176,7 @@ impl WorkspaceTask {
         match TreeWatcher::new(root).await {
             Ok(tree) => Some(tree),
             Err(err) => {
-                warn!(
-                    repo = %self.ctx.name, workspace = %self.name,
-                    "cannot watch working copy files, auto-snapshot disabled: {err:#}",
-                );
+                warn!("cannot watch working copy files, auto-snapshot disabled: {err:#}");
                 None
             }
         }
@@ -206,20 +196,23 @@ impl WorkspaceTask {
         let stale = {
             let (workspace, repo, head) =
                 (self.workspace.clone(), self.ctx.repo.clone(), head.clone());
-            tokio::task::spawn_blocking(move || may_be_stale(&workspace, &repo, &head).block_on())
+            crate::spawn_blocking(move || may_be_stale(&workspace, &repo, &head).block_on())
                 .await
                 .unwrap_or_else(|err| Err(err.into()))
         };
-        match stale {
+        // Logged only when known stale: update-stale succeeds on a fresh
+        // working copy too.
+        let known = match stale {
             Ok(false) => return Ok(false),
-            Ok(true) => {}
-            Err(err) => debug!(
-                repo = %self.ctx.name, workspace = %self.name,
-                "cannot check staleness: {err:#}",
-            ),
+            Ok(true) => true,
+            Err(err) => {
+                debug!("cannot check staleness, updating anyway: {err:#}");
+                false
+            }
+        };
+        if self.run_jj(&["workspace", "update-stale"], tree).await? && known {
+            info!("updated stale working copy");
         }
-        debug!(repo = %self.ctx.name, workspace = %self.name, "checking for a stale working copy");
-        self.run_jj(&["workspace", "update-stale"], tree).await?;
         Ok(true)
     }
 
@@ -230,7 +223,7 @@ impl WorkspaceTask {
         snap: &mut Snapshotting,
         tree: &mut Option<TreeWatcher>,
     ) -> Result<()> {
-        debug!(repo = %self.ctx.name, workspace = %self.name, "snapshotting working copy");
+        debug!("snapshotting working copy");
         let started = Instant::now();
         self.run_jj(&["util", "snapshot"], tree).await?;
         snap.finished(started);
@@ -241,22 +234,20 @@ impl WorkspaceTask {
     /// update-stale writes working-copy files, and letting the watcher
     /// see them would schedule a snapshot of the daemon's own work, on
     /// and on. A failed command only warns: the working copy may be locked
-    /// by an ongoing command, and the next trigger retries.
-    async fn run_jj(&self, args: &[&str], tree: &mut Option<TreeWatcher>) -> Result<()> {
+    /// by an ongoing command, and the next trigger retries. Returns whether
+    /// the command succeeded.
+    async fn run_jj(&self, args: &[&str], tree: &mut Option<TreeWatcher>) -> Result<bool> {
         let result = {
             let _serial = self.ctx.jj.lock().await;
             run_jj(self.workspace.root(), args, JJ_TIMEOUT).await
         };
-        if let Err(err) = result {
-            warn!(
-                repo = %self.ctx.name, workspace = %self.name,
-                "jj {} failed: {err:#}", args.join(" "),
-            );
+        if let Err(err) = &result {
+            warn!("jj {} failed: {err:#}", args.join(" "));
         }
-        match tree {
-            Some(watcher) => watcher.discard_queued().await,
-            None => Ok(()),
+        if let Some(watcher) = tree {
+            watcher.discard_queued().await?;
         }
+        Ok(result.is_ok())
     }
 }
 

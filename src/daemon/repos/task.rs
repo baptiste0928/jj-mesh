@@ -44,7 +44,7 @@ use iroh::EndpointId;
 use jj_lib::{object_id::ObjectId as _, op_store::OperationId};
 use pollster::FutureExt as _;
 use tokio::sync::{Notify, mpsc, watch};
-use tracing::{debug, info, warn};
+use tracing::{Instrument as _, debug, info, info_span, warn};
 
 use super::{
     ClaimUpdate, RepoHandle, RepoSet, RepoState, WorkspaceState, sleep_until,
@@ -109,7 +109,8 @@ const OPEN_STREAM_TIMEOUT: Duration = Duration::from_secs(30);
 /// or reconnects. Kept coarse: the failures it covers are not urgent.
 const FETCH_RETRY: Duration = Duration::from_secs(30);
 
-/// Spawns the watch task for the repo registered as `name`.
+/// Spawns the watch task for the repo registered as `name`, in a span
+/// that gives its events (and its workspace tasks') the repo field.
 pub(super) fn spawn_repo(
     set: &RepoSet,
     name: String,
@@ -120,18 +121,22 @@ pub(super) fn spawn_repo(
     let announcements = set.hub.register_repo(name.clone(), repo.id.clone());
     let (claims, claims_rx) = watch::channel(claims);
 
-    let task = tokio::spawn(run_repo(RepoTask {
-        id: repo.id.clone(),
-        name,
-        path: repo.path.clone(),
-        state: state.clone(),
-        hub: set.hub.clone(),
-        announcements,
-        changed: set.changed.clone(),
-        settings: set.settings.clone(),
-        claims: claims_rx,
-        claim: set.claim.clone(),
-    }));
+    let span = info_span!("repo", repo = %name);
+    let task = tokio::spawn(
+        run_repo(RepoTask {
+            id: repo.id.clone(),
+            name,
+            path: repo.path.clone(),
+            state: state.clone(),
+            hub: set.hub.clone(),
+            announcements,
+            changed: set.changed.clone(),
+            settings: set.settings.clone(),
+            claims: claims_rx,
+            claim: set.claim.clone(),
+        })
+        .instrument(span),
+    );
 
     RepoHandle {
         id: repo.id.clone(),
@@ -173,14 +178,14 @@ async fn run_repo(task: RepoTask) {
             // A reconfiguration is expected behavior, not a fault: reopen
             // cleanly instead of sitting out a backoff unserved.
             Ok(()) => {
-                info!(repo = %task.name, "repo configuration changed; reopening");
+                info!("repo configuration changed; reopening");
                 task.hub.repo_closed(&task.name, &task.id);
                 backoff.reset();
                 continue;
             }
             Err(err) => err,
         };
-        warn!(repo = %task.name, "repo watch failed: {err:#}");
+        warn!("repo watch failed: {err:#}");
         // The stores may be stale (moved disk, replaced repo): stop
         // serving fetches from them until the reopen succeeds.
         task.hub.repo_closed(&task.name, &task.id);
@@ -196,7 +201,7 @@ async fn run_repo(task: RepoTask) {
         // stat runs on a blocking thread; a hung mount is one of the very
         // conditions being probed.
         let path = task.path.clone();
-        let present = tokio::task::spawn_blocking(move || repo_present(&path))
+        let present = crate::spawn_blocking(move || repo_present(&path))
             .await
             .unwrap_or(true);
         if present {
@@ -234,7 +239,7 @@ impl RepoTask {
         let mut last_change = None;
         let mut last_sync = None;
 
-        info!(repo = %self.name, "watching repo");
+        info!(path = %self.path.display(), "watching repo");
         // Publishing on watch start doubles as anti-entropy: changes made
         // while the watch was down are absorbed into the baseline above and
         // would otherwise never be announced.
@@ -248,7 +253,6 @@ impl RepoTask {
         // The op-heads watch above is already live, so any operation the
         // workspace tasks create is picked up like any other.
         let ctx = Arc::new(RepoContext::new(
-            self.name.clone(),
             repo.clone(),
             self.settings.for_repo(&self.name),
         ));
@@ -317,7 +321,13 @@ impl RepoTask {
             if new != heads {
                 heads = new;
                 last_change = Some(SystemTime::now());
-                info!(repo = %self.name, op_heads = heads.len(), "op heads changed");
+                // Synced operations were logged by their fetch; a local
+                // change landing in the same wake only shows at debug.
+                if drained.synced {
+                    debug!(op_heads = heads.len(), "op heads changed");
+                } else {
+                    info!("announcing local change");
+                }
                 self.hub.publish(&self.name, &self.id, wire_heads(&heads));
                 rescan = true;
             }
@@ -347,7 +357,7 @@ impl RepoTask {
     async fn open(&self) -> Result<(JjRepo, Arc<OpenRepo>, StoreFingerprint)> {
         let path = self.path.clone();
         let (jj, repo, fingerprint) =
-            tokio::task::spawn_blocking(move || -> Result<(JjRepo, OpenRepo, _)> {
+            crate::spawn_blocking(move || -> Result<(JjRepo, OpenRepo, _)> {
                 let jj = JjRepo::discover(&path)?;
                 // The fingerprint is captured before the open: taken after,
                 // a reconfiguration racing the open could leave stale
@@ -382,7 +392,7 @@ impl RepoTask {
         held.extend(workspaces.sent.iter().flatten().cloned());
         let scan = match find_workspaces(jj, &ctx.repo, heads, claims, held).await {
             Ok(scan) => scan,
-            Err(err) => return warn!(repo = %self.name, "cannot list workspaces: {err:#}"),
+            Err(err) => return warn!("cannot list workspaces: {err:#}"),
         };
 
         if scan.claimed != claims.ours && workspaces.sent.as_ref() != Some(&scan.claimed) {
@@ -402,7 +412,7 @@ impl RepoTask {
                     found.workspace.root() == root && found.name == handle.name && automated(found)
                 });
             if !keep {
-                info!(repo = %self.name, workspace = %handle.name, "stopping workspace watch");
+                info!(workspace = %handle.name, "stopping workspace watch");
             }
             keep
         });
@@ -414,7 +424,7 @@ impl RepoTask {
             let root = found.workspace.root().to_owned();
             workspaces.tasks.entry(root).or_insert_with(|| {
                 info!(
-                    repo = %self.name, workspace = %found.name,
+                    workspace = %found.name,
                     path = %found.workspace.root().display(), "watching workspace",
                 );
                 spawn_workspace(
@@ -457,11 +467,12 @@ impl RepoTask {
         repo: &Arc<OpenRepo>,
         announce: &PeerAnnounce,
     ) -> Result<Handled> {
+        let peer = self.hub.peer_name(&announce.peer);
         let id_len = repo.root_operation_id().as_bytes().len();
         if announce.heads.len() > MAX_ANNOUNCED_HEADS
             || announce.heads.iter().any(|head| head.len() != id_len)
         {
-            debug!(repo = %self.name, peer = %announce.peer, "ignoring malformed announcement");
+            debug!(%peer, "ignoring malformed announcement");
             return Ok(Handled::Idle);
         }
         // Runs on a blocking thread: the check may walk the op log.
@@ -472,7 +483,7 @@ impl RepoTask {
             .collect();
         let missing = {
             let repo = repo.clone();
-            tokio::task::spawn_blocking(move || repo.missing_heads(&heads))
+            crate::spawn_blocking(move || repo.missing_heads(&heads))
                 .await
                 .wrap_err("announcement check task failed")?
         };
@@ -480,12 +491,12 @@ impl RepoTask {
             Ok(missing) => missing,
             // Retried like a failed fetch.
             Err(err) => {
-                warn!(repo = %self.name, peer = %announce.peer, "cannot check announcement: {err:#}");
+                warn!(%peer, "cannot check announcement: {err:#}");
                 return Ok(Handled::Failed);
             }
         };
         if missing.is_empty() {
-            debug!(repo = %self.name, peer = %announce.peer, "in sync with peer");
+            debug!(%peer, "in sync with peer");
             return Ok(Handled::Idle);
         }
 
@@ -494,14 +505,14 @@ impl RepoTask {
         match self.fetch_missing(repo, announce.peer, &missing).await {
             Ok(outcome) => {
                 info!(
-                    repo = %self.name, peer = %announce.peer,
+                    %peer,
                     ops = outcome.ops, objects = outcome.git_objects,
                     "synced from peer",
                 );
                 Ok(Handled::Fetched)
             }
             Err(err) => {
-                warn!(repo = %self.name, peer = %announce.peer, "sync failed: {err:#}");
+                warn!(%peer, "sync failed: {err:#}");
                 Ok(Handled::Failed)
             }
         }
@@ -553,14 +564,14 @@ impl RepoTask {
         if missing.is_empty() {
             return;
         }
-        info!(repo = %self.name, heads = missing.len(), "building the commit index");
+        info!(heads = missing.len(), "building the commit index");
         self.set_state(RepoState::Indexing);
         let build = {
             let repo = repo.clone();
-            tokio::task::spawn_blocking(move || repo.build_commit_indexes(&missing))
+            crate::spawn_blocking(move || repo.build_commit_indexes(&missing))
         };
         if let Err(err) = build.await {
-            warn!(repo = %self.name, "index build task failed: {err}");
+            warn!("index build task failed: {err}");
         }
     }
 
@@ -570,12 +581,12 @@ impl RepoTask {
     async fn heal_git_refs(&self, repo: &Arc<OpenRepo>) {
         let heal = {
             let repo = repo.clone();
-            tokio::task::spawn_blocking(move || transfer::mirror::heal(&repo))
+            crate::spawn_blocking(move || transfer::mirror::heal(&repo))
         };
         match heal.await {
             Ok(Ok(())) => {}
-            Ok(Err(err)) => warn!(repo = %self.name, "git ref repair failed: {err:#}"),
-            Err(err) => warn!(repo = %self.name, "git ref repair task failed: {err}"),
+            Ok(Err(err)) => warn!("git ref repair failed: {err:#}"),
+            Err(err) => warn!("git ref repair task failed: {err}"),
         }
     }
 
@@ -607,7 +618,7 @@ enum Handled {
 /// blocking thread since a hung mount is one of the probed conditions.
 async fn store_fingerprint(jj: &JjRepo) -> Result<StoreFingerprint> {
     let jj = jj.clone();
-    tokio::task::spawn_blocking(move || jj.fingerprint())
+    crate::spawn_blocking(move || jj.fingerprint())
         .await
         .wrap_err("fingerprint task failed")?
 }
@@ -672,7 +683,7 @@ async fn find_workspaces(
     held: BTreeSet<String>,
 ) -> Result<Scan> {
     let (jj, repo, heads, claims) = (jj.clone(), repo.clone(), heads.to_vec(), claims.clone());
-    tokio::task::spawn_blocking(move || {
+    crate::spawn_blocking(move || {
         let names = repo.workspace_names(&heads).block_on()?;
         let single = single_head(&heads);
         let fresh = |workspace: &Workspace| {

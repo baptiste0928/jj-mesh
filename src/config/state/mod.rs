@@ -23,7 +23,7 @@ use std::{
 use color_eyre::eyre::{Result, WrapErr as _, bail, ensure};
 use iroh::EndpointId;
 use serde::{Deserialize, Serialize};
-use tracing::{debug, warn};
+use tracing::warn;
 
 use self::{
     claims::MAX_OTHER_WORKSPACES,
@@ -398,7 +398,11 @@ impl MeshState {
     ///
     /// New entries stop being adopted at the caps ([`MAX_MESH_PEERS`],
     /// [`MAX_MESH_REPOS`]) while updates to known ones keep flowing.
-    pub fn merge_membership(&mut self, remote: &Membership, local: &EndpointId) {
+    ///
+    /// Returns the names of the repos unregistered here because the mesh
+    /// removed them.
+    pub fn merge_membership(&mut self, remote: &Membership, local: &EndpointId) -> Vec<String> {
+        let mut removed = Vec::new();
         for (endpoint, record) in &remote.peers {
             // Strictly below the ceiling: a record *at* it could never be
             // superseded by a local change, freezing the machine's status.
@@ -435,11 +439,12 @@ impl MeshState {
             // A repo removed mesh-wide stops being synced here; its
             // files stay where they are.
             if record.id().is_none() && self.unregister_repo(name).is_some() {
-                debug!(repo = %name, "repo removed from the mesh; no longer syncing it");
+                removed.push(name.clone());
             }
         }
 
         self.merge_claims(remote, local);
+        removed
     }
 
     /// Merges the gossiped workspace claims: only alive peers' are kept,

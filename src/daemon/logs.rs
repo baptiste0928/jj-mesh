@@ -1,8 +1,9 @@
 //! Recent daemon events, kept in memory for `jj-mesh logs`.
 //!
-//! A `tracing` layer copies the daemon's own info-and-above events into a
-//! bounded buffer and broadcasts them to followers; the control server
-//! serves both. Nothing is persisted: history starts at daemon start.
+//! A `tracing` layer copies the daemon's own info-and-above events, with
+//! the fields of their enclosing spans, into a bounded buffer and
+//! broadcasts them to followers; the control server serves both. Nothing
+//! is persisted: history starts at daemon start.
 //!
 //! ```text
 //! info!/warn! ──► LogLayer ──► LogBuffer ──► backlog  ──► control server
@@ -17,7 +18,7 @@ use std::{
 };
 
 use tokio::sync::broadcast;
-use tracing::{Event, Level, Subscriber, field::Field};
+use tracing::{Event, Level, Subscriber, field::Field, span};
 use tracing_subscriber::{Layer, filter::Targets, layer::Context, registry::LookupSpan};
 
 use super::control::{LogEntry, LogLevel};
@@ -102,32 +103,84 @@ impl LogBuffer {
 /// The `tracing` layer behind [`LogBuffer::layer`].
 struct LogLayer(LogBuffer);
 
-impl<S: Subscriber> Layer<S> for LogLayer {
-    fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
+impl<S> Layer<S> for LogLayer
+where
+    S: Subscriber + for<'a> LookupSpan<'a>,
+{
+    fn on_new_span(&self, attrs: &span::Attributes<'_>, id: &span::Id, ctx: Context<'_, S>) {
+        let mut fields = Fields::default();
+        attrs.record(&mut fields);
+        if let Some(span) = ctx.span(id) {
+            span.extensions_mut().insert(fields);
+        }
+    }
+
+    fn on_event(&self, event: &Event<'_>, ctx: Context<'_, S>) {
+        let mut fields = Fields::default();
+        event.record(&mut fields);
+        // Enclosing spans (repo, workspace) fill in what the event lacks,
+        // innermost first.
+        for span in ctx.event_scope(event).into_iter().flatten() {
+            if let Some(outer) = span.extensions().get::<Fields>() {
+                fields.inherit(outer);
+            }
+        }
+
         let level = match *event.metadata().level() {
             Level::ERROR => LogLevel::Error,
             Level::WARN => LogLevel::Warn,
             // Lower levels are filtered out by `LogBuffer::layer`.
             _ => LogLevel::Info,
         };
-        let mut visitor = Visitor(LogEntry {
+        let mut entry = LogEntry {
             time: SystemTime::now(),
             level,
             repo: None,
             peer: None,
             message: String::new(),
             fields: String::new(),
-        });
-        event.record(&mut visitor);
-        self.0.push(visitor.0);
+        };
+        for (name, value) in fields.0 {
+            match name {
+                "message" => entry.message = value,
+                "repo" => entry.repo = Some(value),
+                "peer" => entry.peer = Some(value),
+                name => {
+                    if !entry.fields.is_empty() {
+                        entry.fields.push(' ');
+                    }
+                    let _ = write!(entry.fields, "{name}={value}");
+                }
+            }
+        }
+        self.0.push(entry);
     }
 }
 
-/// Sorts an event's fields into a [`LogEntry`]: `repo` and `peer` apart
-/// (commands filter on them), the rest as `key=value` pairs.
-struct Visitor(LogEntry);
+/// The recorded fields of an event or span, in order.
+#[derive(Debug, Default)]
+struct Fields(Vec<(&'static str, String)>);
 
-impl tracing::field::Visit for Visitor {
+impl Fields {
+    /// Appends the fields of an enclosing span not already set.
+    fn inherit(&mut self, outer: &Fields) {
+        for (name, value) in &outer.0 {
+            if !self.0.iter().any(|(own, _)| own == name) {
+                self.0.push((name, value.clone()));
+            }
+        }
+    }
+
+    fn record(&mut self, field: &Field, mut value: String) {
+        if value.len() > MAX_VALUE_LEN {
+            value.truncate(value.floor_char_boundary(MAX_VALUE_LEN));
+            value.push('…');
+        }
+        self.0.push((field.name(), value));
+    }
+}
+
+impl tracing::field::Visit for Fields {
     fn record_str(&mut self, field: &Field, value: &str) {
         self.record(field, value.to_owned());
     }
@@ -137,29 +190,9 @@ impl tracing::field::Visit for Visitor {
     }
 }
 
-impl Visitor {
-    fn record(&mut self, field: &Field, mut value: String) {
-        if value.len() > MAX_VALUE_LEN {
-            value.truncate(value.floor_char_boundary(MAX_VALUE_LEN));
-            value.push('…');
-        }
-        let entry = &mut self.0;
-        match field.name() {
-            "message" => entry.message = value,
-            "repo" => entry.repo = Some(value),
-            "peer" => entry.peer = Some(value),
-            name => {
-                if !entry.fields.is_empty() {
-                    entry.fields.push(' ');
-                }
-                let _ = write!(entry.fields, "{name}={value}");
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    use tracing::Instrument as _;
     use tracing_subscriber::layer::SubscriberExt as _;
 
     use super::*;
@@ -191,6 +224,43 @@ mod tests {
         assert_eq!(entry.repo.as_deref(), Some("r"));
         assert_eq!(entry.peer.as_deref(), Some("p"));
         assert_eq!(entry.fields, "ops=3");
+    }
+
+    #[test]
+    fn inherits_span_fields() {
+        let logs = LogBuffer::default();
+        record(&logs, || {
+            let _repo = tracing::info_span!("repo", repo = "r", workspace = "outer").entered();
+            let _workspace = tracing::info_span!("workspace", workspace = "w").entered();
+            tracing::info!("updated");
+            tracing::info!(workspace = "own", "snapshotted");
+        });
+
+        let entries = logs.subscribe().entries;
+        assert_eq!(entries[0].repo.as_deref(), Some("r"));
+        assert_eq!(entries[0].fields, "workspace=w");
+        assert_eq!(entries[1].fields, "workspace=own");
+    }
+
+    #[tokio::test]
+    async fn blocking_work_keeps_the_span() {
+        let logs = LogBuffer::default();
+        let dispatch = tracing::Dispatch::new(tracing_subscriber::registry().with(logs.layer()));
+        let _guard = tracing::dispatcher::set_default(&dispatch);
+
+        // Blocking threads see the global default, not this thread's: the
+        // closure installs the dispatch itself, as production's global one.
+        let work = async {
+            crate::spawn_blocking(move || {
+                tracing::dispatcher::with_default(&dispatch, || tracing::warn!("failed"));
+            })
+            .await
+            .unwrap();
+        };
+        work.instrument(tracing::info_span!("repo", repo = "r"))
+            .await;
+
+        assert_eq!(logs.subscribe().entries[0].repo.as_deref(), Some("r"));
     }
 
     #[test]

@@ -29,6 +29,10 @@
 //! replayed (before any announcement) to every connecting peer. It holds
 //! the latest report of each connected peer as well. And it serves inbound
 //! fetches for the repos it has open (see [`serve`]).
+//!
+//! Peers are identified by endpoint id; the hub also holds their current
+//! paired names (see [`SyncHub::peer_name`]), so both sides log peers the
+//! way the user knows them.
 
 mod inbox;
 mod orphans;
@@ -84,6 +88,16 @@ struct HubState {
     /// The latest (sanitized) status report of each connected peer.
     /// Dropped on disconnect: stale health is worse than none.
     reports: BTreeMap<EndpointId, StatusReport>,
+    /// The paired name of every managed peer, set by the peer set.
+    names: BTreeMap<EndpointId, String>,
+}
+
+/// See [`SyncHub::peer_name`]. Takes the map alone so it can be read
+/// while a repo entry is borrowed.
+fn peer_name(names: &BTreeMap<EndpointId, String>, peer: &EndpointId) -> String {
+    names
+        .get(peer)
+        .map_or_else(|| peer.fmt_short().to_string(), String::clone)
 }
 
 impl HubState {
@@ -157,7 +171,7 @@ impl SyncHub {
         for (peer, announce) in state.take_orphans(&name) {
             if announce.id != id {
                 warn!(
-                    repo = %name, peer = %peer,
+                    repo = %name, peer = %peer_name(&state.names, &peer),
                     "peer announces a different repo under this name; not syncing with it",
                 );
                 conflicts.insert(peer, announce.id);
@@ -296,6 +310,17 @@ impl SyncHub {
         state.membership = membership;
     }
 
+    /// Replaces the paired names of the managed peers.
+    pub fn set_peer_names(&self, names: BTreeMap<EndpointId, String>) {
+        self.state.lock().unwrap().names = names;
+    }
+
+    /// The paired name of a peer, or its short endpoint id when it is not
+    /// (or no longer) managed.
+    pub fn peer_name(&self, peer: &EndpointId) -> String {
+        peer_name(&self.state.lock().unwrap().names, peer)
+    }
+
     /// Marks a peer connected: spawns its sender task and seeds the outbox
     /// with the membership and every published repo, so a (re)connecting
     /// peer learns state it missed while away. Resets per-peer state (see
@@ -366,12 +391,14 @@ impl SyncHub {
         // they end up in logs and as map keys, and must never carry
         // unbounded length or confusables.
         if validate_name("repo", &announce.name).is_err() {
-            debug!(peer = %peer, "dropping announcement with an invalid repo name");
+            let peer = self.peer_name(&peer);
+            debug!(%peer, "dropping announcement with an invalid repo name");
             return;
         }
         let retraction = announce.heads.is_empty();
 
-        let mut state = self.state.lock().unwrap();
+        let mut guard = self.state.lock().unwrap();
+        let state = &mut *guard;
         let Some(entry) = state.repos.get_mut(&announce.name) else {
             if retraction {
                 state.forget_orphan(&announce.name, &peer);
@@ -386,7 +413,8 @@ impl SyncHub {
                 },
             );
             if !remembered {
-                debug!(peer = %peer, "dropping announcement: too many unregistered repos");
+                let peer = peer_name(&state.names, &peer);
+                debug!(%peer, "dropping announcement: too many unregistered repos");
             }
             return;
         };
@@ -400,7 +428,7 @@ impl SyncHub {
         if entry.id != announce.id {
             if !entry.conflicts.contains_key(&peer) {
                 warn!(
-                    repo = %announce.name, peer = %peer,
+                    repo = %announce.name, peer = %peer_name(&state.names, &peer),
                     "peer announces a different repo under this name; not syncing with it",
                 );
             }

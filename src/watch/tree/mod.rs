@@ -89,7 +89,7 @@ impl TreeWatcher {
     /// blocking thread.
     pub async fn new(root: &Path) -> Result<Self> {
         let root = root.to_owned();
-        tokio::task::spawn_blocking(move || Self::build(&root))
+        crate::spawn_blocking(move || Self::build(&root))
             .await
             .wrap_err("working copy watch task failed")?
     }
@@ -182,7 +182,7 @@ impl TreeWatcher {
             let rules = self.rules.clone();
             // On a large tree the walk is hundreds of milliseconds of
             // syscalls: it must not sit on a runtime worker.
-            let dirs = tokio::task::spawn_blocking(move || walk_dirs(&root, rules))
+            let dirs = crate::spawn_blocking(move || walk_dirs(&root, rules))
                 .await
                 .wrap_err("working copy walk task failed")??;
             self.apply(dirs);

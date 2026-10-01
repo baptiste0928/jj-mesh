@@ -66,16 +66,17 @@ impl SyncHub {
             return refuse_fetch(send, "busy, retry later");
         };
 
+        let peer = self.peer_name(&peer);
         tokio::spawn(async move {
             let _permit = permit;
             let serve = transfer::serve(&serving.repo, request, &mut send, &mut recv);
             match tokio::time::timeout(SERVE_TIMEOUT, serve).await {
                 Ok(Ok(())) => {
                     let _ = send.finish();
-                    debug!(peer = %peer, "served fetch");
+                    debug!(%peer, "served fetch");
                 }
-                Ok(Err(err)) => debug!(peer = %peer, "serve failed: {err:#}"),
-                Err(_) => debug!(peer = %peer, "serve timed out"),
+                Ok(Err(err)) => debug!(%peer, "serve failed: {err:#}"),
+                Err(_) => debug!(%peer, "serve timed out"),
             }
         });
     }

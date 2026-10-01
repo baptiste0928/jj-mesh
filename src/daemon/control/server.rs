@@ -314,7 +314,7 @@ async fn pair_join(stream: &mut UnixStream, ctx: &ControlContext, ticket: &str) 
 /// root (canonicalized) also keeps two spellings of one repo, or two of its
 /// workspaces, from registering twice.
 async fn add_repo(ctx: &ControlContext, name: String, path: PathBuf) -> Result<Response> {
-    let root = tokio::task::spawn_blocking(move || -> Result<PathBuf> {
+    let root = crate::spawn_blocking(move || -> Result<PathBuf> {
         Ok(JjRepo::discover(&path)?.root().to_owned())
     })
     .await
@@ -361,7 +361,7 @@ fn remove_peer(ctx: &ControlContext, peer: &str) -> Result<Response> {
 fn rename_machine(ctx: &ControlContext, name: &str) -> Result<Response> {
     ctx.store
         .update(|state| state.rename_machine(name.to_owned()))?;
-    info!(name = %name, "machine renamed");
+    info!(machine = %name, "machine renamed");
     Ok(Response::MachineRenamed)
 }
 

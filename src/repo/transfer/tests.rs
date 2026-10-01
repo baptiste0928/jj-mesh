@@ -938,7 +938,7 @@ async fn heal_repairs_stale_refs_of_non_colocated_store() {
     git(&store, &["update-ref", "refs/heads/stale", &expected]);
 
     let heal = rb.clone();
-    tokio::task::spawn_blocking(move || mirror::heal(&heal))
+    crate::spawn_blocking(move || mirror::heal(&heal))
         .await
         .unwrap()
         .unwrap();
@@ -965,7 +965,7 @@ async fn heal_leaves_colocated_git_alone() {
     git(&git_dir, &["update-ref", "-d", "refs/heads/feat"]);
 
     let heal = rb.clone();
-    tokio::task::spawn_blocking(move || mirror::heal(&heal))
+    crate::spawn_blocking(move || mirror::heal(&heal))
         .await
         .unwrap()
         .unwrap();

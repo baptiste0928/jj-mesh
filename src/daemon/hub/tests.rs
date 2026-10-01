@@ -325,3 +325,13 @@ fn outbox_coalesces_per_repo_with_membership_first() {
         .collect();
     assert!(seqs.contains(&("a", 2)) && seqs.contains(&("b", 1)));
 }
+
+#[test]
+fn names_managed_peers() {
+    let hub = SyncHub::new();
+    let peer = iroh::SecretKey::generate().public();
+    assert_eq!(hub.peer_name(&peer), peer.fmt_short().to_string());
+
+    hub.set_peer_names(BTreeMap::from([(peer, "laptop".to_owned())]));
+    assert_eq!(hub.peer_name(&peer), "laptop");
+}

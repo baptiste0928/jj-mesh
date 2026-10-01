@@ -21,7 +21,7 @@ use std::{
 };
 
 use color_eyre::eyre::{Result, eyre};
-use iroh::{Endpoint, EndpointId};
+use iroh::Endpoint;
 use tokio::sync::{Semaphore, mpsc};
 use tracing::{debug, info, warn};
 
@@ -92,12 +92,12 @@ impl Daemon {
         let server = ControlServer::bind(dir)?;
 
         let endpoint = bind_endpoint(&key, alpns(), options).await?;
-        info!("daemon started, endpoint id {}", key.endpoint_id());
+        info!(endpoint = %key.endpoint_id(), "daemon started");
 
         // The local jj version is a warning signal, never a gate: the
         // binary on the daemon's PATH is only a proxy for whichever jj
         // actually writes the repos.
-        let jj_version = tokio::task::spawn_blocking(repo::local_jj_version)
+        let jj_version = crate::spawn_blocking(repo::local_jj_version)
             .await
             .unwrap_or(None);
         if let Some(warning) = repo::jj_version_warning(jj_version.as_deref()) {
@@ -261,13 +261,10 @@ async fn status_loop(repos: Arc<RepoSet>, hub: Arc<SyncHub>, jj_version: Option<
 }
 
 /// Merges memberships received from peers into the mesh state.
-async fn membership_loop(
-    mut gossip: mpsc::Receiver<(EndpointId, Membership)>,
-    store: Arc<MeshStore>,
-) {
+async fn membership_loop(mut gossip: mpsc::Receiver<(String, Membership)>, store: Arc<MeshStore>) {
     while let Some((peer, membership)) = gossip.recv().await {
         if let Err(err) = store.merge_membership(&membership) {
-            warn!("cannot apply membership from {peer}: {err:#}");
+            warn!(%peer, "cannot apply membership: {err:#}");
         }
     }
 }
@@ -277,6 +274,8 @@ async fn membership_loop(
 async fn claim_loop(mut claims: mpsc::UnboundedReceiver<ClaimUpdate>, store: Arc<MeshStore>) {
     while let Some(ClaimUpdate { repo, names }) = claims.recv().await {
         if let Err(err) = store.update(|state| state.set_claims(&repo, names)) {
+            let snapshot = store.snapshot();
+            let repo = snapshot.repo_name(&repo).unwrap_or("(removed)");
             warn!(%repo, "cannot claim workspaces: {err:#}");
         }
     }

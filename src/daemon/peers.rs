@@ -14,7 +14,7 @@ use std::{
 
 use iroh::{
     Endpoint, EndpointId, TransportAddr,
-    endpoint::{Connection, RecvStream, SendStream},
+    endpoint::{Connection, ConnectionError, RecvStream, SendStream},
 };
 use tokio::sync::{Semaphore, mpsc};
 use tracing::{debug, info};
@@ -61,15 +61,15 @@ pub struct PeerSet {
     endpoint: Endpoint,
     local_id: EndpointId,
     hub: Arc<SyncHub>,
-    /// Inbound memberships, drained by the daemon's membership loop.
-    gossip: mpsc::Sender<(EndpointId, Membership)>,
+    /// Inbound memberships with their sender's name, drained by the
+    /// daemon's membership loop.
+    gossip: mpsc::Sender<(String, Membership)>,
     peers: Mutex<BTreeMap<EndpointId, PeerHandle>>,
 }
 
-/// Book-keeping for one peer task.
+/// Book-keeping for one peer task. Its name lives in the hub.
 #[derive(Debug)]
 struct PeerHandle {
-    name: String,
     state: Arc<Mutex<PeerState>>,
     inbound: mpsc::Sender<Connection>,
     task: tokio::task::JoinHandle<()>,
@@ -98,7 +98,7 @@ impl PeerSet {
         endpoint: Endpoint,
         local_id: EndpointId,
         hub: Arc<SyncHub>,
-        gossip: mpsc::Sender<(EndpointId, Membership)>,
+        gossip: mpsc::Sender<(String, Membership)>,
     ) -> Self {
         PeerSet {
             endpoint,
@@ -110,11 +110,12 @@ impl PeerSet {
     }
 
     /// Aligns the managed peers with the mesh state: spawns tasks for new
-    /// (alive) peers and shuts down removed ones.
+    /// (alive) peers, shuts down removed ones, and publishes the names to
+    /// the hub.
     pub fn sync(&self, state: &MeshState) {
-        let desired: BTreeMap<EndpointId, &str> = state
+        let desired: BTreeMap<EndpointId, String> = state
             .alive_peers()
-            .map(|(endpoint, name)| (*endpoint, name))
+            .map(|(endpoint, name)| (*endpoint, name.to_owned()))
             .collect();
 
         let mut peers = self.peers.lock().unwrap();
@@ -126,7 +127,7 @@ impl PeerSet {
             .collect();
         for id in removed {
             let handle = peers.remove(&id).expect("id was collected from the map");
-            info!(peer = %handle.name, "removing peer");
+            info!(peer = %self.hub.peer_name(&id), "removing peer");
             handle.shutdown();
             // The aborted task cannot run its own hub cleanup, and it may
             // even register its connection *after* the abort (it only stops
@@ -142,20 +143,20 @@ impl PeerSet {
             });
         }
 
-        for (id, handle) in peers.iter_mut() {
-            let name = desired[id];
-            if handle.name != name {
-                // Renaming must not drop the live connection; the task
-                // keeps logging under its spawn-time name.
-                info!(old = %handle.name, new = %name, "renaming peer");
-                name.clone_into(&mut handle.name);
+        for id in peers.keys() {
+            let (old, new) = (self.hub.peer_name(id), &desired[id]);
+            if &old != new {
+                info!(peer = %new, previous = %old, "renaming peer");
             }
         }
+        // Before spawning, so new tasks log under their name. Running tasks
+        // follow renames without dropping their connection.
+        self.hub.set_peer_names(desired.clone());
 
         for (id, name) in desired {
             peers.entry(id).or_insert_with(|| {
-                info!(peer = %name, "managing peer");
-                self.spawn_peer(id, name.to_owned())
+                debug!(peer = %name, "managing peer");
+                self.spawn_peer(id)
             });
         }
     }
@@ -175,7 +176,7 @@ impl PeerSet {
         };
 
         if let Err(err) = handle.inbound.try_send(conn) {
-            debug!(peer = %handle.name, "dropping surplus inbound connection");
+            debug!(peer = %self.hub.peer_name(&id), "dropping surplus inbound connection");
             err.into_inner().close(0u32.into(), b"busy");
         }
     }
@@ -202,7 +203,7 @@ impl PeerSet {
                 };
 
                 control::PeerStatus {
-                    name: handle.name.clone(),
+                    name: self.hub.peer_name(id),
                     endpoint: *id,
                     connection,
                 }
@@ -210,7 +211,7 @@ impl PeerSet {
             .collect()
     }
 
-    fn spawn_peer(&self, peer_id: EndpointId, name: String) -> PeerHandle {
+    fn spawn_peer(&self, peer_id: EndpointId) -> PeerHandle {
         let state = Arc::new(Mutex::new(PeerState::Connecting { failures: 0 }));
         let (tx, rx) = mpsc::channel(4);
 
@@ -218,7 +219,6 @@ impl PeerSet {
             endpoint: self.endpoint.clone(),
             local_id: self.local_id,
             peer_id,
-            name: name.clone(),
             state: state.clone(),
             hub: self.hub.clone(),
             gossip: self.gossip.clone(),
@@ -226,7 +226,6 @@ impl PeerSet {
         }));
 
         PeerHandle {
-            name,
             state,
             inbound: tx,
             task,
@@ -271,10 +270,9 @@ struct PeerTask {
     endpoint: Endpoint,
     local_id: EndpointId,
     peer_id: EndpointId,
-    name: String,
     state: Arc<Mutex<PeerState>>,
     hub: Arc<SyncHub>,
-    gossip: mpsc::Sender<(EndpointId, Membership)>,
+    gossip: mpsc::Sender<(String, Membership)>,
     inbound: mpsc::Receiver<Connection>,
 }
 
@@ -285,6 +283,9 @@ async fn run_peer(mut task: PeerTask) {
     let mut failures = 0u32;
     // Why the last attempt failed, to be waited out before the next one.
     let mut failure: Option<String> = None;
+    // Whether the current outage was logged: a sleeping or offline peer
+    // fails every retry.
+    let mut unreachable = false;
 
     loop {
         // Wait out the backoff, adopting an inbound connection if one
@@ -310,17 +311,26 @@ async fn run_peer(mut task: PeerTask) {
         let (conn, outbound) = match established {
             Ok(established) => established,
             Err(error) => {
+                if !unreachable {
+                    info!(peer = %task.name(), %error, "cannot reach peer, retrying");
+                    unreachable = true;
+                }
                 failure = Some(error);
                 continue;
             }
         };
 
+        unreachable = false;
         let held = Instant::now();
-        info!(peer = %task.name, outbound, "peer connected");
-        task.connected(conn, outbound).await;
-        info!(peer = %task.name, "peer disconnected");
+        info!(peer = %task.name(), outbound, "peer connected");
+        let reason = task.connected(conn, outbound).await;
+        let uptime = held.elapsed();
+        info!(
+            peer = %task.name(), %reason, uptime = %format_args!("{}s", uptime.as_secs()),
+            "peer disconnected",
+        );
 
-        if held.elapsed() >= STABLE_UPTIME {
+        if uptime >= STABLE_UPTIME {
             backoff.reset();
             failures = 0;
         } else {
@@ -341,12 +351,12 @@ impl PeerTask {
         self.set_state(PeerState::Connecting { failures });
 
         if self.local_id < self.peer_id {
-            dial(&self.endpoint, self.peer_id, &self.name)
+            dial(&self.endpoint, self.peer_id, &self.hub)
                 .await
                 .map(|conn| (conn, true))
         } else {
             tokio::select! {
-                dialed = dial(&self.endpoint, self.peer_id, &self.name) => {
+                dialed = dial(&self.endpoint, self.peer_id, &self.hub) => {
                     dialed.map(|conn| (conn, true))
                 }
                 Some(conn) = self.inbound.recv() => Ok((conn, false)),
@@ -356,25 +366,22 @@ impl PeerTask {
 
     /// Holds an established connection until it closes, resolving duplicate
     /// connections, serving inbound announcement streams, and keeping the
-    /// hub's registration current.
-    async fn connected(&mut self, mut conn: Connection, mut outbound: bool) {
+    /// hub's registration current. Returns why the connection ended.
+    async fn connected(&mut self, mut conn: Connection, mut outbound: bool) -> ConnectionError {
         let mut since = SystemTime::now();
         // The peer is authenticated but must not spawn unbounded work.
         let announce_permits = Arc::new(Semaphore::new(MAX_UNI_STREAMS));
         let fetch_permits = Arc::new(Semaphore::new(MAX_FETCH_STREAMS));
 
         self.hub.peer_connected(self.peer_id, &conn);
-        loop {
+        let reason = loop {
             self.set_state(PeerState::Connected {
                 conn: conn.clone(),
                 since,
             });
 
             tokio::select! {
-                reason = conn.closed() => {
-                    debug!(peer = %self.name, "connection closed: {reason}");
-                    break;
-                }
+                reason = conn.closed() => break reason,
                 Some(new) = self.inbound.recv() => {
                     // Keep the connection dialed by the lower endpoint id:
                     // both sides pick the same one, so the duplicate dies
@@ -383,7 +390,7 @@ impl PeerTask {
                         new.close(0u32.into(), b"duplicate");
                     } else {
                         conn.close(0u32.into(), b"duplicate");
-                        info!(peer = %self.name, "peer reconnected");
+                        info!(peer = %self.name(), "peer reconnected");
                         conn = new;
                         outbound = false;
                         since = SystemTime::now();
@@ -391,37 +398,35 @@ impl PeerTask {
                     }
                 }
                 stream = conn.accept_uni() => {
-                    let Ok(stream) = stream else {
-                        // The connection is going away; the closed() branch
-                        // would report the same on the next iteration.
-                        debug!(peer = %self.name, "connection lost");
-                        break;
+                    let stream = match stream {
+                        Ok(stream) => stream,
+                        Err(err) => break err,
                     };
                     self.serve_uni(stream, &announce_permits);
                 }
                 stream = conn.accept_bi() => {
-                    let Ok((send, recv)) = stream else {
-                        debug!(peer = %self.name, "connection lost");
-                        break;
+                    let (send, recv) = match stream {
+                        Ok(stream) => stream,
+                        Err(err) => break err,
                     };
                     self.accept_fetch(send, recv, &fetch_permits);
                 }
             }
-        }
+        };
         self.hub.peer_disconnected(&self.peer_id);
+        reason
     }
 
     /// Reads a fetch request from a fresh bi stream and routes it to the
     /// owning repo task; refused fetches get an error frame back.
     fn accept_fetch(&self, send: SendStream, mut recv: RecvStream, permits: &Arc<Semaphore>) {
         let Ok(permit) = permits.clone().try_acquire_owned() else {
-            debug!(peer = %self.name, "dropping fetch: too many open streams");
+            debug!(peer = %self.name(), "dropping fetch: too many open streams");
             return;
         };
 
         let hub = self.hub.clone();
         let peer = self.peer_id;
-        let name = self.name.clone();
         tokio::spawn(async move {
             let _permit = permit;
             let request = tokio::time::timeout(
@@ -431,8 +436,10 @@ impl PeerTask {
             .await;
             let request: fetch::FetchRequest = match request {
                 Ok(Ok(request)) => request,
-                Ok(Err(err)) => return debug!(peer = %name, "bad fetch request: {err:#}"),
-                Err(_) => return debug!(peer = %name, "fetch request timed out"),
+                Ok(Err(err)) => {
+                    return debug!(peer = %hub.peer_name(&peer), "bad fetch request: {err:#}");
+                }
+                Err(_) => return debug!(peer = %hub.peer_name(&peer), "fetch request timed out"),
             };
 
             hub.serve_fetch(peer, request, send, recv);
@@ -443,14 +450,13 @@ impl PeerTask {
     /// routes it.
     fn serve_uni(&self, mut stream: RecvStream, permits: &Arc<Semaphore>) {
         let Ok(permit) = permits.clone().try_acquire_owned() else {
-            debug!(peer = %self.name, "dropping message: too many open streams");
+            debug!(peer = %self.name(), "dropping message: too many open streams");
             return;
         };
 
         let hub = self.hub.clone();
         let gossip = self.gossip.clone();
         let peer = self.peer_id;
-        let name = self.name.clone();
         tokio::spawn(async move {
             let _permit = permit;
             match tokio::time::timeout(STREAM_READ_TIMEOUT, sync::recv_uni(&mut stream)).await {
@@ -459,14 +465,21 @@ impl PeerTask {
                 Ok(Ok(sync::UniMessage::Membership(membership))) => {
                     // A full queue means a membership flood; dropping is
                     // safe, the next change or reconnect re-sends.
-                    if gossip.try_send((peer, membership)).is_err() {
+                    let name = hub.peer_name(&peer);
+                    if let Err(err) = gossip.try_send((name, membership)) {
+                        let (name, _) = err.into_inner();
                         debug!(peer = %name, "dropping membership: gossip queue full");
                     }
                 }
-                Ok(Err(err)) => debug!(peer = %name, "bad message: {err:#}"),
-                Err(_) => debug!(peer = %name, "message timed out"),
+                Ok(Err(err)) => debug!(peer = %hub.peer_name(&peer), "bad message: {err:#}"),
+                Err(_) => debug!(peer = %hub.peer_name(&peer), "message timed out"),
             }
         });
+    }
+
+    /// The peer's current name, following renames.
+    fn name(&self) -> String {
+        self.hub.peer_name(&self.peer_id)
     }
 
     fn set_state(&self, state: PeerState) {
@@ -476,12 +489,12 @@ impl PeerTask {
 
 /// Dials the peer on the sync ALPN within [`DIAL_TIMEOUT`], returning why it
 /// failed otherwise.
-async fn dial(endpoint: &Endpoint, peer: EndpointId, name: &str) -> Result<Connection, String> {
+async fn dial(endpoint: &Endpoint, peer: EndpointId, hub: &SyncHub) -> Result<Connection, String> {
     let error = match tokio::time::timeout(DIAL_TIMEOUT, endpoint.connect(peer, sync::ALPN)).await {
         Ok(Ok(conn)) => return Ok(conn),
         Ok(Err(err)) => format!("{err:#}"),
         Err(_) => format!("no answer within {}s", DIAL_TIMEOUT.as_secs()),
     };
-    debug!(peer = %name, "dial failed: {error}");
+    debug!(peer = %hub.peer_name(&peer), "dial failed: {error}");
     Err(error)
 }

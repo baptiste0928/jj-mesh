@@ -48,8 +48,13 @@ mod tests {
     fn output_filter_spares_logs() {
         let logs = LogBuffer::default();
         let subscriber = subscriber(EnvFilter::new("off"), &logs);
-        tracing::subscriber::with_default(subscriber, || tracing::info!("synced"));
+        tracing::subscriber::with_default(subscriber, || {
+            let _repo = tracing::info_span!("repo", repo = "r").entered();
+            tracing::info!("synced");
+        });
 
-        assert_eq!(logs.subscribe().entries.len(), 1);
+        let entries = logs.subscribe().entries;
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].repo.as_deref(), Some("r"));
     }
 }

@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex};
 
 use color_eyre::eyre::Result;
 use iroh::EndpointId;
+use tracing::info;
 
 use super::{hub::SyncHub, peers::PeerSet, repos::RepoSet};
 use crate::{
@@ -75,10 +76,11 @@ impl MeshStore {
     /// that are not directly exchanging, while one that changes nothing is
     /// silent, which stops the echo.
     pub fn merge_membership(&self, remote: &Membership) -> Result<()> {
-        self.update(|state| {
-            state.merge_membership(remote, &self.local);
-            Ok(())
-        })
+        let removed = self.update(|state| Ok(state.merge_membership(remote, &self.local)))?;
+        for repo in removed {
+            info!(%repo, "repo removed from the mesh by a peer; no longer syncing it");
+        }
+        Ok(())
     }
 
     /// Registers a paired peer; a no-op when the endpoint is already alive

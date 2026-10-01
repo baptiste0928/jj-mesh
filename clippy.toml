@@ -1,0 +1,3 @@
+disallowed-methods = [
+    { path = "tokio::task::spawn_blocking", reason = "use `crate::spawn_blocking`, which keeps the tracing span" },
+]
