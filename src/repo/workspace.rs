@@ -4,9 +4,9 @@
 //! secondary one (`jj workspace add`) has a `.jj/repo` file pointing there
 //! instead. jj records every workspace's root in the repo's workspace
 //! store, which stays on the machine (it is not part of the op log).
-//! Entries outlive deleted workspaces (and forgotten ones, in later jj
-//! releases), so a recorded root only counts while it still points back
-//! to the repo and the view still names the workspace it holds.
+//! Entries outlive deleted and forgotten workspaces, so a recorded root
+//! only counts while it still points back to the repo and the view still
+//! names the workspace it holds.
 
 use std::{
     collections::BTreeSet,
@@ -20,7 +20,7 @@ use color_eyre::eyre::{Result, WrapErr as _, eyre};
 use jj_lib::{op_store::OperationId, protos};
 use prost::Message as _;
 
-use super::JjRepo;
+use super::{JjRepo, OpenRepo};
 
 /// A jj workspace on disk.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -134,13 +134,15 @@ impl JjRepo {
     pub fn workspace(&self) -> Result<Workspace> {
         Workspace::at(self.root())
     }
+}
 
+impl OpenRepo {
     /// The workspaces of this repo on this machine that the view names
-    /// (`names`), with their names: the main one, then the recorded roots
-    /// that still point back to this repo. Workspaces that cannot be read
-    /// are skipped.
+    /// (`names`), with their names: the main one, then the roots the
+    /// workspace store records that still point back to this repo.
+    /// Workspaces that cannot be read are skipped.
     pub fn workspaces(&self, names: &BTreeSet<String>) -> Result<Vec<(String, Workspace)>> {
-        let main = self.workspace()?;
+        let main = self.jj().workspace()?;
         let mut roots = vec![main.root.clone()];
         roots.extend(self.recorded_roots(names)?);
 
@@ -161,31 +163,24 @@ impl JjRepo {
         Ok(found)
     }
 
-    /// The canonical roots the workspace store records for `names`. The
-    /// index is decoded directly: loading the store through jj_lib creates
-    /// it when missing, and the daemon never writes to a repo it does not
-    /// sync.
+    /// The canonical roots the workspace store records for `names`.
     fn recorded_roots(&self, names: &BTreeSet<String>) -> Result<Vec<PathBuf>> {
-        let index = self.repo_dir().join("workspace_store").join("index");
-        let bytes = match fs::read(&index) {
-            Ok(bytes) => bytes,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(err) => {
-                return Err(err).wrap_err_with(|| format!("cannot read {}", index.display()));
-            }
-        };
-        let store = protos::simple_workspace_store::Workspaces::decode(&*bytes)
-            .wrap_err_with(|| format!("cannot decode {}", index.display()))?;
-
-        Ok(store
-            .workspaces
-            .into_iter()
-            .filter(|entry| names.contains(&entry.name))
+        let store = self.workspace_store();
+        let repo_dir = self.jj().repo_dir();
+        let mut roots = Vec::new();
+        for name in names {
+            let Some(path) = store
+                .get_workspace_path(name.as_ref())
+                .wrap_err("cannot read the workspace store")?
+            else {
+                continue;
+            };
             // Recorded relative to the repo dir.
-            .filter_map(|entry| {
-                fs::canonicalize(self.repo_dir().join(OsStr::from_bytes(&entry.path))).ok()
-            })
-            .collect())
+            if let Ok(root) = fs::canonicalize(repo_dir.join(path)) {
+                roots.push(root);
+            }
+        }
+        Ok(roots)
     }
 }
 
@@ -220,7 +215,7 @@ mod tests {
         fx.jj(&main, &["workspace", "add", "../forgotten"]);
         fs::remove_dir_all(fx.path().join("deleted")).unwrap();
         fx.jj(&main, &["workspace", "forget", "forgotten"]);
-        let repo = JjRepo::discover(&main).unwrap();
+        let repo = JjRepo::discover(&main).unwrap().open().unwrap();
 
         let roots = |names: &[&str]| -> Vec<PathBuf> {
             let names = names.iter().map(|name| (*name).to_owned()).collect();
@@ -235,8 +230,13 @@ mod tests {
             roots(&["default", "live", "deleted"]),
             [canonical("main"), canonical("live")],
         );
-        // Only the workspaces the view names count, the main one included.
-        assert_eq!(roots(&["live", "forgotten"]), [canonical("live")]);
+        // Only the workspaces the view names count, the main one included;
+        // a forgotten workspace stays recorded, so the view is the filter.
+        assert_eq!(roots(&["live"]), [canonical("live")]);
+        assert_eq!(
+            roots(&["live", "forgotten"]),
+            [canonical("forgotten"), canonical("live")],
+        );
 
         // A recorded root now holding another repo's workspace is not ours.
         fx.init_repo("other");
