@@ -10,10 +10,11 @@
 //! to the merged "after" value by compare-and-swap. The "before" depends
 //! on who else writes the git repo:
 //!
-//! - Git repo inside `.jj`: only jj writes there, so "before" is what the
-//!   repo actually holds and any difference from the merged view is
-//!   staleness. [`heal`] runs the same pass on watch start.
-//! - Colocated `.git` or an external git repo: the user may have moved
+//! - Git repo inside `.jj` with no worktree: only jj writes there, so
+//!   "before" is what the repo actually holds and any difference from the
+//!   merged view is staleness. [`heal`] runs the same pass on watch start.
+//! - Colocated `.git`, external git repo, or a git worktree (a colocated
+//!   secondary workspace): the user may have moved
 //!   refs there that jj has not imported yet, so "before" is the merged
 //!   view of the heads before the publication, and a ref moved by the
 //!   user fails its swap and stays for jj to import.
@@ -231,6 +232,7 @@ fn swap(repo: &OpenRepo, before: &GitRefs, after: &GitRefs) -> Result<()> {
     use gix::refs::transaction::{Change, LogChange, PreviousValue, RefEdit, RefLog};
 
     let git = repo.git_backend().git_repo();
+    let heads = head_names(&git)?;
     let names: BTreeSet<&GitRefName> = [before, after]
         .into_iter()
         .flat_map(|refs| refs.keys().map(GitRefNameBuf::as_ref))
@@ -273,10 +275,10 @@ fn swap(repo: &OpenRepo, before: &GitRefs, after: &GitRefs) -> Result<()> {
             name: full_name,
             deref: false,
         };
-        // Each ref moves in its own transaction, with HEAD: one ref the
-        // user raced must not abort the rest of the mirror, nor leave HEAD
-        // moved for nothing.
-        let moved = unpin_head(&git, name).and_then(|mut edits| {
+        // Each ref moves in its own transaction, with the HEADs: one ref the
+        // user raced must not abort the rest of the mirror, nor leave a
+        // HEAD moved for nothing.
+        let moved = unpin_heads(&git, &heads, name).and_then(|mut edits| {
             edits.push(edit);
             git.edit_references(edits).map_err(|err| eyre!("{err}"))
         });
@@ -292,53 +294,75 @@ fn swap(repo: &OpenRepo, before: &GitRefs, after: &GitRefs) -> Result<()> {
 /// deletes it first: it must not resolve, or HEAD would be born on it.
 const UNBORN_HEAD: &str = "refs/jj/root";
 
-/// The edits moving HEAD off `name` without changing what it resolves
-/// to, when HEAD is symbolic to `name`, as jj's export does before moving
-/// a ref: a branch moved under HEAD leaves git's index and worktree
-/// behind, and jj's next import would read the jump as a checkout. HEAD
+/// The HEADs of the git repo: the main one, then each linked worktree's,
+/// addressed from the common repo so that one transaction covers them.
+fn head_names(git: &gix::Repository) -> Result<Vec<gix::refs::FullName>> {
+    let main = gix::refs::FullName::try_from("HEAD").expect("valid ref name");
+    let worktrees = git.worktrees()?.into_iter().filter_map(|worktree| {
+        gix::refs::FullName::try_from(format!("worktrees/{}/HEAD", worktree.id())).ok()
+    });
+    Ok(std::iter::once(main).chain(worktrees).collect())
+}
+
+/// The edits moving each of `heads` symbolic to `name` off it without
+/// changing what it resolves to, as jj's export does before moving a
+/// ref: a branch moved under a HEAD leaves git's index and worktree
+/// behind, and jj's next import would read the jump as a checkout. A HEAD
 /// is detached at its commit, or parked on [`UNBORN_HEAD`] when `name`
 /// does not exist (a fresh colocated repo, before its branch is created
-/// here). Empty when HEAD is detached or on another ref.
-fn unpin_head(
+/// here). Empty when no HEAD is symbolic to `name`.
+fn unpin_heads(
     git: &gix::Repository,
+    heads: &[gix::refs::FullName],
     name: &GitRefName,
 ) -> Result<Vec<gix::refs::transaction::RefEdit>> {
     use gix::refs::transaction::{Change, LogChange, PreviousValue, RefEdit, RefLog};
 
-    let Some(mut head) = git.try_find_reference("HEAD")? else {
-        return Ok(vec![]);
-    };
-    let stored = head.target().into_owned();
-    if stored.try_name().map(gix::refs::FullNameRef::as_bstr) != Some(name.as_str().into()) {
-        return Ok(vec![]);
-    }
+    let placeholder: gix::refs::FullName = UNBORN_HEAD.try_into().expect("valid ref name");
+    // Looked up once, at the first HEAD on `name`.
+    let mut name_exists = None;
     let mut edits = Vec::new();
-    let new = if git.try_find_reference(name.as_str())?.is_some() {
-        let commit = head
-            .peel_to_commit()
-            .map_err(|err| eyre!("cannot resolve HEAD: {err}"))?;
-        gix::refs::Target::Object(commit.id)
-    } else {
-        let placeholder: gix::refs::FullName = UNBORN_HEAD.try_into().expect("valid ref name");
+    for head_name in heads {
+        // An unreadable HEAD is skipped, as jj's export does.
+        let Ok(Some(mut head)) = git.try_find_reference(head_name.as_ref()) else {
+            continue;
+        };
+        let stored = head.target().into_owned();
+        if stored.try_name().map(gix::refs::FullNameRef::as_bstr) != Some(name.as_str().into()) {
+            continue;
+        }
+        let exists = match name_exists {
+            Some(exists) => exists,
+            None => *name_exists.insert(git.try_find_reference(name.as_str())?.is_some()),
+        };
+        let new = if exists {
+            let commit = head
+                .peel_to_commit()
+                .map_err(|err| eyre!("cannot resolve {head_name}: {err}"))?;
+            gix::refs::Target::Object(commit.id)
+        } else {
+            gix::refs::Target::Symbolic(placeholder.clone())
+        };
+        edits.push(RefEdit {
+            change: Change::Update {
+                log: LogChange::default(),
+                expected: PreviousValue::MustExistAndMatch(stored),
+                new,
+            },
+            name: head_name.clone(),
+            deref: false,
+        });
+    }
+    if name_exists == Some(false) {
         edits.push(RefEdit {
             change: Change::Delete {
                 expected: PreviousValue::Any,
                 log: RefLog::AndReference,
             },
-            name: placeholder.clone(),
+            name: placeholder,
             deref: false,
         });
-        gix::refs::Target::Symbolic(placeholder)
-    };
-    edits.push(RefEdit {
-        change: Change::Update {
-            log: LogChange::default(),
-            expected: PreviousValue::MustExistAndMatch(stored),
-            new,
-        },
-        name: "HEAD".try_into().expect("valid ref name"),
-        deref: false,
-    });
+    }
     Ok(edits)
 }
 
