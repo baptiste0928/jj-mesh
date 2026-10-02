@@ -524,6 +524,45 @@ async fn mirror_detaches_head_before_moving_its_branch() {
     );
 }
 
+/// [`mirror_detaches_head_before_moving_its_branch`], in the git worktree
+/// of a colocated secondary workspace: each worktree has its own HEAD.
+#[tokio::test]
+async fn mirror_detaches_worktree_head_before_moving_its_branch() {
+    let fx = Fixture::new();
+    let dir_a = fx.path().join("a");
+    fx.jj(fx.path(), &["git", "init", "--colocate", "a"]);
+    fx.jj(&dir_a, &["describe", "-m", "base"]);
+    fx.jj(&dir_a, &["bookmark", "create", "main", "-r", "@"]);
+    fx.jj(&dir_a, &["new", "-m", "export"]);
+    fork(&dir_a, &fx.path().join("b"));
+    let dir_b = fx.path().join("b");
+    fx.jj(&dir_b, &["workspace", "add", "--colocate", "../child"]);
+    let child_git = fx.path().join("child").join(".git");
+
+    // The user checks the branch out in the child's worktree.
+    git(&child_git, &["symbolic-ref", "HEAD", "refs/heads/main"]);
+    let checked_out = git_rev(&dir_b, "refs/heads/main");
+
+    fs::write(dir_a.join("file.txt"), "moved\n").unwrap();
+    fx.jj(&dir_a, &["commit", "-m", "advance"]);
+    fx.jj(&dir_a, &["bookmark", "set", "main", "-r", "@-"]);
+    fx.jj(&dir_a, &["new", "-m", "trigger export"]);
+
+    let (ra, rb) = (open(&dir_a), open(&dir_b));
+    let wants = ra.op_heads().await.unwrap();
+    sync_once(&rb, &ra, &wants).await;
+
+    assert_eq!(
+        git_rev(&dir_b, "refs/heads/main"),
+        git_rev(&dir_a, "refs/heads/main")
+    );
+    assert_eq!(git_rev_at(&child_git, "HEAD"), checked_out);
+    assert!(
+        !git_ok(&child_git, &["symbolic-ref", "-q", "HEAD"]),
+        "the worktree HEAD must be detached"
+    );
+}
+
 /// A fresh colocated repo has an unborn HEAD symbolic to `main`, and its
 /// directory is empty. When the mirror creates `main`, HEAD must stay
 /// unborn: otherwise jj's next import reads a checkout of `main`, and
