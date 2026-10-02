@@ -29,15 +29,21 @@ const MAX_RULES_BYTES: u64 = 1024 * 1024;
 /// Gitignore evaluation state for one working copy.
 pub(super) struct Rules {
     root: PathBuf,
+    /// The repo's `info/exclude`, applied at the root like jj: it lives in
+    /// the git directory, shared by every workspace of the repo.
+    exclude: PathBuf,
     /// The user's global gitignore, lowest precedence.
     global: Gitignore,
     per_dir: HashMap<PathBuf, Option<Gitignore>>,
 }
 
 impl Rules {
-    pub(super) fn new(root: &Path) -> Self {
+    /// The rules of the working copy at `root`, in a repo whose git
+    /// directory is `git_dir`.
+    pub(super) fn new(root: &Path, git_dir: &Path) -> Self {
         Rules {
             root: root.to_owned(),
+            exclude: git_dir.join("info").join("exclude"),
             global: Gitignore::global().0,
             per_dir: HashMap::new(),
         }
@@ -74,10 +80,10 @@ impl Rules {
 
     /// The matcher for one directory's own rule files.
     fn matcher(&mut self, dir: &Path) -> Option<&Gitignore> {
-        let is_root = dir == self.root;
+        let exclude = (dir == self.root).then_some(self.exclude.as_path());
         self.per_dir
             .entry(dir.to_owned())
-            .or_insert_with(|| build_matcher(dir, is_root))
+            .or_insert_with(|| build_matcher(dir, exclude))
             .as_ref()
     }
 
@@ -87,21 +93,18 @@ impl Rules {
     }
 }
 
-/// Builds the matcher for one directory: its `.gitignore`, plus
-/// `.git/info/exclude` at the root of colocated repos. `None` when the
-/// directory has no rules at all, which keeps the cache cheap.
-fn build_matcher(dir: &Path, is_root: bool) -> Option<Gitignore> {
+/// Builds the matcher for one directory: its `.gitignore`, plus `exclude`
+/// at the root. `None` when the directory has no rules at all, which
+/// keeps the cache cheap.
+fn build_matcher(dir: &Path, exclude: Option<&Path>) -> Option<Gitignore> {
     let mut builder = GitignoreBuilder::new(dir);
     let mut any = false;
     // Lowest precedence first: within one matcher the last matching rule
     // wins, and git ranks a directory's own `.gitignore` above
-    // `.git/info/exclude`.
-    let files = [
-        is_root.then(|| dir.join(".git").join("info").join("exclude")),
-        Some(dir.join(GITIGNORE)),
-    ];
-    for rules in files.into_iter().flatten() {
-        let Some(text) = read_rules(&rules) else {
+    // `info/exclude`.
+    let gitignore = dir.join(GITIGNORE);
+    for rules in exclude.into_iter().chain([gitignore.as_path()]) {
+        let Some(text) = read_rules(rules) else {
             continue;
         };
         for line in text.lines() {
