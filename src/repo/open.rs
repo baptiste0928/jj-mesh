@@ -41,6 +41,7 @@ use jj_lib::{
     repo::RepoLoader,
     revset::{GENERATION_RANGE_FULL, PARENTS_RANGE_FULL, ResolvedExpression},
     settings::UserSettings,
+    workspace_store::WorkspaceStore,
 };
 use pollster::FutureExt as _;
 use tracing::warn;
@@ -97,6 +98,16 @@ impl OpenRepo {
             repo.root().display(),
         );
         Ok(OpenRepo { repo, loader })
+    }
+
+    /// The validated repo on disk.
+    pub(super) fn jj(&self) -> &JjRepo {
+        &self.repo
+    }
+
+    /// The store recording this machine's workspace roots.
+    pub(super) fn workspace_store(&self) -> &dyn WorkspaceStore {
+        self.loader.workspace_store().as_ref()
     }
 
     /// The id of the root operation, common to all repos.

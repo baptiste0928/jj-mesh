@@ -257,7 +257,7 @@ impl RepoTask {
         let mut claims = self.claims.clone();
         let mut workspaces = Workspaces::default();
         let current = claims.borrow_and_update().clone();
-        self.track_workspaces(&jj, &ctx, &heads, &synced, &current, &mut workspaces)
+        self.track_workspaces(&ctx, &heads, &synced, &current, &mut workspaces)
             .await;
         self.set_state(RepoState::Watching {
             op_heads: heads.len(),
@@ -330,7 +330,7 @@ impl RepoTask {
             }
             if rescan {
                 let current = claims.borrow_and_update().clone();
-                self.track_workspaces(&jj, &ctx, &heads, &synced, &current, &mut workspaces)
+                self.track_workspaces(&ctx, &heads, &synced, &current, &mut workspaces)
                     .await;
             }
 
@@ -375,7 +375,6 @@ impl RepoTask {
     /// workspaces found on disk.
     async fn track_workspaces(
         &self,
-        jj: &JjRepo,
         ctx: &Arc<RepoContext>,
         heads: &[OperationId],
         synced: &watch::Sender<Option<OperationId>>,
@@ -387,7 +386,7 @@ impl RepoTask {
         }
         let mut held = claims.ours.clone();
         held.extend(workspaces.sent.iter().flatten().cloned());
-        let scan = match find_workspaces(jj, &ctx.repo, heads, claims, held).await {
+        let scan = match find_workspaces(&ctx.repo, heads, claims, held).await {
             Ok(scan) => scan,
             Err(err) => return warn!("cannot list workspaces: {err:#}"),
         };
@@ -673,13 +672,12 @@ impl Scan {
 /// so far. Runs on a blocking thread: decodes a view per head, and two per
 /// freshness check.
 async fn find_workspaces(
-    jj: &JjRepo,
     repo: &Arc<OpenRepo>,
     heads: &[OperationId],
     claims: &RepoClaims,
     held: BTreeSet<String>,
 ) -> Result<Scan> {
-    let (jj, repo, heads, claims) = (jj.clone(), repo.clone(), heads.to_vec(), claims.clone());
+    let (repo, heads, claims) = (repo.clone(), heads.to_vec(), claims.clone());
     crate::spawn_blocking(move || {
         let names = repo.workspace_names(&heads).block_on()?;
         let single = single_head(&heads);
@@ -691,7 +689,7 @@ async fn find_workspaces(
 
         let mut claimed: BTreeSet<String> = held.intersection(&names).cloned().collect();
         let mut found = Vec::new();
-        for (name, workspace) in jj.workspaces(&names)? {
+        for (name, workspace) in repo.workspaces(&names)? {
             let state = match claims.others.get(&name) {
                 Some(machines) if claimed.contains(&name) => WorkspaceState::Contested {
                     machines: machines.clone(),
