@@ -173,7 +173,7 @@ impl WorkspaceTask {
     /// Builds the working-copy watcher, degrading to `None` instead of
     /// failing: `None` means no snapshots for this workspace, nothing else.
     async fn watch_tree(&self, root: &Path) -> Option<TreeWatcher> {
-        match TreeWatcher::new(root).await {
+        match TreeWatcher::new(root, self.ctx.repo.git_repo_path()).await {
             Ok(tree) => Some(tree),
             Err(err) => {
                 warn!("cannot watch working copy files, auto-snapshot disabled: {err:#}");

@@ -82,20 +82,21 @@ pub struct TreeWatcher {
 
 impl TreeWatcher {
     /// Starts watching the working copy rooted at `root` (a canonical
-    /// path; event paths are matched against it by prefix).
+    /// path; event paths are matched against it by prefix), in a repo
+    /// whose git directory is `git_dir`.
     ///
     /// The initial walk plus one watch registration per directory is
     /// seconds of blocking syscalls on a large tree, so it runs on a
     /// blocking thread.
-    pub async fn new(root: &Path) -> Result<Self> {
-        let root = root.to_owned();
-        crate::spawn_blocking(move || Self::build(&root))
+    pub async fn new(root: &Path, git_dir: &Path) -> Result<Self> {
+        let (root, git_dir) = (root.to_owned(), git_dir.to_owned());
+        crate::spawn_blocking(move || Self::build(&root, &git_dir))
             .await
             .wrap_err("working copy watch task failed")?
     }
 
     /// Builds the watcher and its initial watched set. Blocking.
-    fn build(root: &Path) -> Result<Self> {
+    fn build(root: &Path, git_dir: &Path) -> Result<Self> {
         let (tx, signals) = mpsc::channel(SIGNAL_QUEUE);
         let overflowed = Arc::new(AtomicBool::new(false));
         let full = overflowed.clone();
@@ -118,7 +119,7 @@ impl TreeWatcher {
             signals,
             overflowed,
             watched: BTreeSet::new(),
-            rules: Arc::new(Mutex::new(Rules::new(root))),
+            rules: Arc::new(Mutex::new(Rules::new(root, git_dir))),
             stale: false,
             pending: false,
         };
@@ -425,7 +426,12 @@ mod tests {
     /// writes that set the tree up before the watch, which would trip
     /// the negative assertions that follow.
     async fn watch(root: &Path) -> TreeWatcher {
-        let mut watch = tokio::time::timeout(WAIT, TreeWatcher::new(root))
+        watch_in(root, &root.join(".git")).await
+    }
+
+    /// [`watch`], in a repo whose git directory is `git_dir`.
+    async fn watch_in(root: &Path, git_dir: &Path) -> TreeWatcher {
+        let mut watch = tokio::time::timeout(WAIT, TreeWatcher::new(root, git_dir))
             .await
             .expect("building the watcher must not hang")
             .unwrap();
@@ -515,7 +521,7 @@ mod tests {
         assert_changed(&mut watch).await;
     }
 
-    /// git ranks a directory's own `.gitignore` above `.git/info/exclude`;
+    /// git ranks a directory's own `.gitignore` above `info/exclude`;
     /// so must the watcher, or it filters out edits jj tracks.
     #[tokio::test]
     async fn gitignore_outranks_git_exclude() {
@@ -530,6 +536,25 @@ mod tests {
         assert_quiet(&mut watch).await;
 
         fs::write(root.join("important.log"), "x").unwrap();
+        assert_changed(&mut watch).await;
+    }
+
+    /// `info/exclude` comes from the repo's git directory, wherever it
+    /// lives: a git worktree or a non-colocated repo has none in the
+    /// working copy.
+    #[tokio::test]
+    async fn git_exclude_comes_from_the_git_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = workdir(&tmp);
+        let git_dir = tmp.path().join("git");
+        fs::create_dir_all(git_dir.join("info")).unwrap();
+        fs::write(git_dir.join("info/exclude"), "*.log\n").unwrap();
+        let mut watch = watch_in(&root, &git_dir).await;
+
+        fs::write(root.join("boring.log"), "x").unwrap();
+        assert_quiet(&mut watch).await;
+
+        fs::write(root.join("file.txt"), "x").unwrap();
         assert_changed(&mut watch).await;
     }
 
