@@ -139,7 +139,7 @@ pub struct ControlServer {
 impl ControlServer {
     /// Binds the control socket, also acting as the single-daemon guard.
     pub fn bind(dir: &ConfigDir) -> Result<Self> {
-        let path = dir.socket_path();
+        let path = dir.socket_path().to_owned();
 
         let lock_path = path.with_extension("lock");
         let lock = File::create(&lock_path)

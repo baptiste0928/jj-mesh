@@ -63,7 +63,7 @@ impl ControlClient {
         };
         // Daemons predating the build file are caught by the decode hint
         // in `recv`; builds without a known commit cannot be compared.
-        let build = fs::read_to_string(build_path(&path)).unwrap_or_default();
+        let build = fs::read_to_string(build_path(path)).unwrap_or_default();
         let known = |build: &str| !build.is_empty() && !build.starts_with("unknown");
         if known(&build) && known(BUILD) && build != BUILD {
             bail!(
