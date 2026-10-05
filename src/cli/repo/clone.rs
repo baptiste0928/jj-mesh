@@ -6,13 +6,13 @@
 //! working copy on trunk. A failed clone removes the directory it created.
 
 use std::{
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     time::Duration,
 };
 
 use clap::{Args, ValueHint};
 use clap_complete::ArgValueCandidates;
-use color_eyre::eyre::{Report, Result, WrapErr as _, bail, ensure};
+use color_eyre::eyre::{OptionExt as _, Report, Result, WrapErr as _, bail, ensure};
 use indicatif::{HumanBytes, ProgressBar, ProgressStyle};
 
 use super::jj;
@@ -24,14 +24,14 @@ use crate::{
 
 /// Clone a repo from another machine
 ///
-/// The repo must have been added to the mesh with `jj-mesh repo add`. The
+/// The repo must have been added to the mesh with `jj-mesh add`. The
 /// clone follows jj's `git.colocate` setting unless `--colocate` or
 /// `--no-colocate` is given.
 #[derive(Debug, Args)]
 pub struct CloneArgs {
-    /// Name of the repo in the mesh
+    /// Name of the repo in the mesh (asked when omitted)
     #[arg(add = ArgValueCandidates::new(complete::clonable_repos))]
-    name: String,
+    name: Option<String>,
 
     /// Directory to create the repo in (defaults to the repo name)
     ///
@@ -58,9 +58,6 @@ pub struct CloneArgs {
 
 /// Runs the `repo clone` command.
 pub fn run(args: CloneArgs, dir: &ConfigDir) -> Result<()> {
-    let name = args.name;
-    let path = args.path.unwrap_or_else(|| PathBuf::from(&name));
-
     // Best-effort pre-checks, so an obviously doomed clone fails before
     // anything is created on disk: the daemon must be up (it is only
     // contacted once the local repo exists), and the stored state must
@@ -68,6 +65,14 @@ pub fn run(args: CloneArgs, dir: &ConfigDir) -> Result<()> {
     // registering).
     control::ensure_daemon_blocking(dir)?;
     let state = MeshState::load(dir)?;
+    let name = match args.name {
+        Some(name) => name,
+        None => pick(&state)?,
+    };
+    let path = match args.path {
+        Some(path) => path,
+        None => default_path(&name)?,
+    };
     state.validate_new_repo(&name, &path)?;
     ensure!(
         !path.exists(),
@@ -116,6 +121,33 @@ pub fn run(args: CloneArgs, dir: &ConfigDir) -> Result<()> {
         ui::good(format_args!("Cloned `{name}` in {}", path.display())),
     );
     Ok(())
+}
+
+/// Asks which of the mesh repos not on this machine to clone.
+fn pick(state: &MeshState) -> Result<String> {
+    let available: Vec<&str> = state.clonable_repo_names().collect();
+    ensure!(
+        !available.is_empty(),
+        "no repo to clone: add one with `jj-mesh add` on another machine",
+    );
+    let name = ui::select("Repo to clone", &available)?
+        .ok_or_eyre("the name of the repo to clone is required")?;
+    Ok((*name).to_owned())
+}
+
+/// The directory named after the repo. Names come from peers, so one that
+/// is not a plain directory name (`..`, separators) must not pick where the
+/// clone is written.
+fn default_path(name: &str) -> Result<PathBuf> {
+    let path = PathBuf::from(name);
+    ensure!(
+        matches!(
+            path.components().collect::<Vec<_>>()[..],
+            [Component::Normal(_)]
+        ),
+        "`{name}` is not a directory name: pass the directory to clone into",
+    );
+    Ok(path)
 }
 
 /// Names the workspace, then asks the daemon to pull and register the

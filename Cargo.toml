@@ -13,6 +13,7 @@ clap_complete = { version = "4.6.9", features = ["unstable-dynamic"] }
 color-eyre = "0.6.5"
 console = "0.16.4"
 data-encoding = "2.11.1"
+dialoguer = { version = "0.12.0", default-features = false }
 etcetera = "0.11.0"
 fail = "0.5.1"
 futures = { version = "0.3.34", default-features = false, features = ["std"] }
@@ -37,6 +38,7 @@ tokio = { version = "1.53.1", features = ["io-util", "net", "process", "rt", "si
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 zstd = "0.13.3"
+shell-words = "1.1.1"
 
 [features]
 test-util = []

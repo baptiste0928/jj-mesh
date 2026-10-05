@@ -15,7 +15,7 @@ use crate::{
 /// Add a repo to the mesh
 ///
 /// The repo will be made available for other machines to clone with
-/// `jj-mesh repo clone`, and any changes will be synced across the mesh.
+/// `jj-mesh clone`, and any changes will be synced across the mesh.
 /// Every workspace of the repo on this machine is kept up to date; run from
 /// a secondary workspace, this adds the repo it belongs to.
 #[derive(Debug, Args)]
@@ -87,6 +87,10 @@ pub fn run(args: AddArgs, dir: &ConfigDir) -> Result<()> {
             "Added repo `{name}` at {}",
             repo.root().display()
         ))
+    );
+    println!(
+        "Clone it on another machine with `jj-mesh clone {}`.",
+        shell_words::quote(&name),
     );
     Ok(())
 }

@@ -8,8 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Added `jj-mesh setup` command to setup a new machine** in a single step. It setups the service
+  and pairs the machine with the mesh.
 - Recent daemon logs can be viewed with the new `jj-mesh logs` command. Existing logs have been
   made less noisy.
+- New `jj-mesh clone` and `jj-mesh add` top-level aliases for `jj-mesh repo clone` and
+  `jj-mesh repo add`. Clone now asks which repo to clone when no name is given.
 
 ### Changed
 - **Auto-snapshot and update-stale now run on secondary workspaces**, which are listed in

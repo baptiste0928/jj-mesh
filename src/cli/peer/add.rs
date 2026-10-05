@@ -23,33 +23,36 @@ const TICKET_TIMEOUT: Duration = Duration::from_secs(45);
 
 /// Pair with another machine, adding it to the mesh
 ///
-/// Run this command on one machine to print a pairing ticket, then run it again
-/// with the ticket on the other machine. Each ticket can only be used once.
+/// Run this command on a machine of the mesh to print a pairing ticket, then
+/// run `jj-mesh setup` with the ticket on the other machine. Each ticket can
+/// only be used once.
 ///
 /// When a machine gets added to the mesh, it gets access to all synced
 /// repositories and can sync from any of the machines already in the mesh.
 #[derive(Debug, Args)]
 pub struct AddArgs {
-    /// Pairing ticket printed by `jj-mesh peer add` on the other machine
+    /// Pairing ticket printed on the other machine
     ///
     /// If omitted, a ticket will be generated. The ticket can be used once,
     /// and expires after a few minutes.
-    ticket: Option<String>,
+    ticket: Option<PairTicket>,
 }
 
 /// Runs the `peer add` command.
 pub fn run(args: AddArgs, dir: &ConfigDir) -> Result<()> {
-    control::block_on(pair(args.ticket, dir))
+    pair(dir, args.ticket)
 }
 
-/// Dispatches to the hosting or joining side of the pairing.
-async fn pair(ticket: Option<String>, dir: &ConfigDir) -> Result<()> {
-    let mut client = ControlClient::connect_required(dir).await?;
+/// Joins with `ticket`, or hosts a pairing and prints its ticket.
+pub fn pair(dir: &ConfigDir, ticket: Option<PairTicket>) -> Result<()> {
+    control::block_on(async {
+        let mut client = ControlClient::connect_required(dir).await?;
 
-    match ticket {
-        Some(ticket) => join(&mut client, ticket).await,
-        None => host(&mut client).await,
-    }
+        match ticket {
+            Some(ticket) => join(&mut client, &ticket).await,
+            None => host(&mut client).await,
+        }
+    })
 }
 
 /// Asks the daemon for a fresh pairing ticket and prints it. The daemon
@@ -60,9 +63,10 @@ async fn host(client: &mut ControlClient) -> Result<()> {
     match client.recv(Some(TICKET_TIMEOUT)).await? {
         Response::PairTicket(ticket) => {
             println!("Run this on the other machine to pair:\n");
+            // `setup` joins from fresh and paired machines alike.
             println!(
                 "    {}\n",
-                ui::heading(format_args!("jj-mesh peer add {ticket}"))
+                ui::heading(format_args!("jj-mesh setup {ticket}"))
             );
             println!(
                 "{}",
@@ -79,11 +83,9 @@ async fn host(client: &mut ControlClient) -> Result<()> {
 }
 
 /// Joins a pairing hosted by another machine, waiting for the outcome.
-async fn join(client: &mut ControlClient, ticket: String) -> Result<()> {
-    // Parse locally first, for fast feedback on a mangled paste.
-    let _: PairTicket = ticket.parse()?;
-
+async fn join(client: &mut ControlClient, ticket: &PairTicket) -> Result<()> {
     println!("Connecting to the pairing host...");
+    let ticket = ticket.to_string();
     client.send(&Request::PairJoin { ticket }).await?;
 
     match client.recv(None).await? {

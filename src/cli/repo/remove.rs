@@ -1,10 +1,8 @@
 //! `jj-mesh repo remove`: retire a repo from the whole mesh.
 
-use std::io::{BufRead as _, IsTerminal as _};
-
 use clap::Args;
 use clap_complete::ArgValueCandidates;
-use color_eyre::eyre::{Result, bail};
+use color_eyre::eyre::{Result, bail, eyre};
 
 use crate::{
     cli::{complete, ui},
@@ -53,17 +51,11 @@ pub fn run(args: RemoveArgs, dir: &ConfigDir) -> Result<()> {
     Ok(())
 }
 
-/// Asks the user to confirm the mesh-wide removal. The prompt goes to
-/// stderr, so it stays visible when stdout is redirected.
+/// Asks the user to confirm the mesh-wide removal.
 fn confirm(name: &str) -> Result<bool> {
-    if !std::io::stdin().is_terminal() {
-        bail!("pass --yes to confirm removal of `{name}`");
-    }
-
-    eprint!("Remove `{name}` from every machine on the mesh? [y/N] ");
-    let mut answer = String::new();
-    std::io::stdin().lock().read_line(&mut answer)?;
-
-    let answer = answer.trim();
-    Ok(answer.eq_ignore_ascii_case("y") || answer.eq_ignore_ascii_case("yes"))
+    ui::confirm(
+        &format!("Remove `{name}` from every machine on the mesh?"),
+        false,
+    )?
+    .ok_or_else(|| eyre!("pass --yes to confirm removal of `{name}`"))
 }

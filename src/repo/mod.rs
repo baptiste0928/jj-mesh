@@ -26,8 +26,7 @@ use color_eyre::eyre::{Result, WrapErr as _, ensure};
 
 pub use self::{
     jj::{
-        jj_bin, jj_output, jj_peer_warning, jj_version_warning, local_jj_version, repo_present,
-        run_jj,
+        jj_bin, jj_output, jj_peer_warning, jj_version, jj_version_warning, repo_present, run_jj,
     },
     open::OpenRepo,
     workspace::{Checkout, Workspace},

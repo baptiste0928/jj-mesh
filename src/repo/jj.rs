@@ -1,11 +1,11 @@
 //! Invoking the user's jj binary.
 //!
 //! [`run_jj`] and [`jj_output`] run one command against a repo,
-//! [`local_jj_version`] detects the binary's version, and
+//! [`jj_version`] detects a binary's version, and
 //! [`jj_version_warning`] and [`jj_peer_warning`] word the warnings when
 //! the local or a peer's version falls outside the supported series.
 
-use std::path::Path;
+use std::{ffi::OsStr, path::Path};
 
 use color_eyre::eyre::{Result, WrapErr as _, ensure, eyre};
 use tokio::io::{AsyncRead, AsyncReadExt as _};
@@ -116,12 +116,12 @@ pub fn repo_present(root: &Path) -> bool {
     }
 }
 
-/// The version of the [`jj_bin`] binary (`X.Y.Z`), or `None` when jj is
-/// not runnable or its output is unrecognized. This is a heuristic: the
+/// The version of the jj binary `bin` (`X.Y.Z`), or `None` when it is not
+/// runnable or its output is unrecognized. This is a heuristic: the
 /// daemon cannot know which jj binary actually writes the repos, so the
 /// answer is only ever used to warn, never to refuse.
-pub fn local_jj_version() -> Option<String> {
-    let output = std::process::Command::new(jj_bin())
+pub fn jj_version(bin: &OsStr) -> Option<String> {
+    let output = std::process::Command::new(bin)
         .arg("--version")
         .output()
         .ok()

@@ -32,10 +32,8 @@ pub(super) fn mesh_repos() -> Vec<CompletionCandidate> {
 /// The mesh repos not registered on this machine, i.e. the clonable ones
 /// (`repo clone`).
 pub(super) fn clonable_repos() -> Vec<CompletionCandidate> {
-    let state = state();
-    state
-        .mesh_repo_names()
-        .filter(|name| !state.repos.contains_key(*name))
+    state()
+        .clonable_repo_names()
         .map(CompletionCandidate::new)
         .collect()
 }

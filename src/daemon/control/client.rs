@@ -19,6 +19,11 @@ use crate::{
 /// Hint for a daemon of another build.
 const RESTART_HINT: &str = "restart it with `jj-mesh service restart`";
 
+/// Environment variable that, when set to a non-empty value, lets the CLI
+/// talk to a daemon of another build, for testing builds known to be
+/// compatible.
+const IGNORE_BUILD_VAR: &str = "JJ_MESH_IGNORE_BUILD";
+
 /// Error of every command that needs the daemon when none is running.
 ///
 /// The CLI entry point recognizes this type and reports it as a plain
@@ -31,12 +36,19 @@ impl std::fmt::Display for DaemonNotRunning {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "The jj-mesh daemon is not running. Install it with `jj-mesh service install`."
+            "The jj-mesh daemon is not running. Set it up with `jj-mesh setup`."
         )
     }
 }
 
 impl std::error::Error for DaemonNotRunning {}
+
+/// Whether two builds are known to differ: builds without a known commit
+/// cannot be compared.
+fn builds_differ(daemon: &str, cli: &str) -> bool {
+    let known = |build: &str| !build.is_empty() && !build.starts_with("unknown");
+    known(daemon) && known(cli) && daemon != cli
+}
 
 /// Client side of the control socket.
 #[derive(Debug)]
@@ -73,9 +85,8 @@ impl ControlClient {
             .ok_or_else(|| {
                 eyre!("the daemon did not send its build, it likely runs an older jj-mesh: {RESTART_HINT}")
             })?;
-        // Builds without a known commit cannot be compared.
-        let known = |build: &str| !build.is_empty() && !build.starts_with("unknown");
-        if known(&build) && known(BUILD) && build != BUILD {
+        let ignore = std::env::var_os(IGNORE_BUILD_VAR).is_some_and(|value| !value.is_empty());
+        if !ignore && builds_differ(&build, BUILD) {
             bail!(
                 "the daemon runs jj-mesh build {build} while this command is build {BUILD}: \
                  {RESTART_HINT}"
@@ -199,6 +210,9 @@ mod tests {
     async fn refuses_daemon_of_another_build() {
         if BUILD.starts_with("unknown") {
             return; // Built without a commit: nothing to compare.
+        }
+        if std::env::var_os(IGNORE_BUILD_VAR).is_some_and(|value| !value.is_empty()) {
+            return; // The check is disabled for this shell.
         }
         let (_tmp, dir, listener) = fake_daemon();
         let daemon = tokio::spawn(async move {

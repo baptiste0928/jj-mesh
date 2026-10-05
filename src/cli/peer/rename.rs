@@ -22,7 +22,14 @@ pub struct RenameArgs {
 /// Runs the `peer rename` command.
 pub fn run(args: RenameArgs, dir: &ConfigDir) -> Result<()> {
     let RenameArgs { name } = args;
-    let request = Request::RenameMachine { name: name.clone() };
+    rename(dir, &name)
+}
+
+/// Renames this machine through the daemon.
+pub fn rename(dir: &ConfigDir, name: &str) -> Result<()> {
+    let request = Request::RenameMachine {
+        name: name.to_owned(),
+    };
     let response = control::request_blocking(dir, &request, control::MUTATE_WAIT)?;
     let Response::MachineRenamed = response else {
         bail!("unexpected response from the daemon: {response:?}");

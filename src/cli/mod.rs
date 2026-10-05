@@ -7,6 +7,8 @@ mod repo;
 mod run_daemon;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod service;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod setup;
 mod status;
 mod ui;
 
@@ -26,10 +28,10 @@ use crate::config::{ConfigDir, MeshState};
 /// machines, with no central server.
 ///
 /// Getting started:
-///   1. Install the background service:  jj-mesh service install
-///   2. Pair with another machine:       jj-mesh peer add
-///   3. Put a repo on the mesh:          jj-mesh repo add <PATH>
-///   4. Clone it on the other machine:   jj-mesh repo clone <NAME>
+///   1. Set up and get a pairing ticket:  jj-mesh setup
+///   2. Pair the other machine:           jj-mesh setup <TICKET>
+///   3. Put a repo on the mesh:           jj-mesh add <PATH>
+///   4. Clone it on the other machine:    jj-mesh clone <NAME>
 ///
 /// Use `jj-mesh status` to inspect peers, repos, and synchronization status.
 #[derive(Debug, Parser)]
@@ -47,6 +49,12 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    Setup(setup::SetupArgs),
+    #[command(about = "Clone a repo from another machine (alias for `repo clone`)")]
+    Clone(repo::CloneArgs),
+    #[command(about = "Add a repo to the mesh (alias for `repo add`)")]
+    Add(repo::AddArgs),
     Repo(repo::RepoArgs),
     Peer(peer::PeerArgs),
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -70,6 +78,10 @@ pub fn run() -> Result<()> {
     let dir = ConfigDir::new(cli.config_dir)?;
 
     match cli.command {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        Command::Setup(args) => setup::run(args, &dir),
+        Command::Clone(args) => repo::clone(args, &dir),
+        Command::Add(args) => repo::add(args, &dir),
         Command::Repo(args) => repo::run(args, &dir),
         Command::Peer(args) => peer::run(args, &dir),
         #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -96,4 +108,16 @@ pub fn report_error(err: &color_eyre::Report) {
 /// repos.
 fn machine_name(dir: &ConfigDir) -> Result<String> {
     Ok(MeshState::load(dir)?.machine.name)
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::CommandFactory as _;
+
+    use super::Cli;
+
+    #[test]
+    fn cli_is_well_formed() {
+        Cli::command().debug_assert();
+    }
 }

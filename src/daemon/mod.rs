@@ -101,7 +101,7 @@ impl Daemon {
         // The local jj version is a warning signal, never a gate: the
         // binary on the daemon's PATH is only a proxy for whichever jj
         // actually writes the repos.
-        let jj_version = crate::spawn_blocking(repo::local_jj_version)
+        let jj_version = crate::spawn_blocking(|| repo::jj_version(&repo::jj_bin()))
             .await
             .unwrap_or(None);
         if let Some(warning) = repo::jj_version_warning(jj_version.as_deref()) {

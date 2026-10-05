@@ -39,12 +39,8 @@ You can install `jj-mesh` with `cargo`, Rust's package manager (which you can in
 $ cargo install --git https://github.com/baptiste0928/jj-mesh.git --locked
 ```
 
-Once installed, you'll need to create a user service to start the daemon in the background. We
-provide a command to do that for you, with `systemd` on Linux and `launchd` on macOS.
-
-```sh
-$ jj-mesh service install
-```
+The daemon runs in the background as a user service, with `systemd` on Linux and `launchd` on
+macOS. `jj-mesh setup` installs it for you (see [Usage](#usage)).
 
 ### With Nix and Home Manager
 
@@ -71,19 +67,20 @@ Then enable the service in your Home Manager configuration:
 
 ## Usage
 
-Start by pairing your machines together. After setting up the daemon, run `jj-mesh peer add` on one
-machine to print a one-time pairing ticket, then redeem it on the other machine:
+Start by setting up your machines and pairing them together. Run `jj-mesh setup` on the first
+machine to start the daemon and print a one-time pairing ticket, then pass the ticket to
+`jj-mesh setup` on the other machine:
 
 ```sh
 # On the first machine
-$ jj-mesh peer add
+$ jj-mesh setup
 
 # Redeem the ticket on the second machine
-$ jj-mesh peer add jjmesh-pair-...
+$ jj-mesh setup jjmesh-pair-...
 ```
 
 If the connection is established, you'll see the machine show up in `jj-mesh status`. You can add
-more machines by running `jj-mesh peer add` again.
+more machines by running `jj-mesh peer add` on a paired machine to get a new ticket.
 
 > [!IMPORTANT]
 > `jj-mesh` is meant to be used **across personal machines you control** only. Once a machine gets
@@ -98,10 +95,10 @@ start syncing:
 
 ```sh
 # On the first machine, inside the repo
-$ jj-mesh repo add
+$ jj-mesh add
 
 # On the other machine
-$ jj-mesh repo clone <name>
+$ jj-mesh clone <name>
 ```
 
 From there, the daemon will keep both copies in sync. Use `jj-mesh status` to check the status,

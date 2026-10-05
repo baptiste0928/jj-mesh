@@ -7,6 +7,7 @@ mod rename;
 use clap::{Args, Subcommand};
 use color_eyre::eyre::Result;
 
+pub(super) use self::{add::pair, rename::rename};
 use crate::config::ConfigDir;
 
 /// Manage the machines of the mesh

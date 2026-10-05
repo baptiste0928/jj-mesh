@@ -9,7 +9,9 @@
 //! it.
 //!
 //! Definitions are rendered from a [`Spec`] by the platform module, which
-//! also drives the service manager (`systemctl --user`, `launchctl`).
+//! also drives the service manager (`systemctl --user`, `launchctl`). The
+//! programs a spec runs are found with [`which`], since the service's own
+//! PATH is minimal.
 
 #[cfg(target_os = "macos")]
 #[path = "launchd.rs"]
@@ -19,8 +21,10 @@ mod platform;
 mod platform;
 
 use std::{
+    ffi::OsStr,
     fs,
     io::ErrorKind,
+    os::unix::fs::PermissionsExt as _,
     path::{Path, PathBuf},
     process::{Command, Output},
 };
@@ -140,6 +144,24 @@ impl Service {
     }
 }
 
+/// Resolves `bin` to the executable the shell would run, without following
+/// symlinks so a path such as `~/.nix-profile/bin/jj` survives updates. A
+/// bare name is looked up in the absolute entries of `path` (a `PATH`
+/// value): relative ones depend on the current directory.
+pub fn which(bin: &Path, path: &OsStr) -> Option<PathBuf> {
+    let executable = |path: &Path| {
+        path.metadata()
+            .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+    };
+    if bin.components().count() > 1 {
+        return executable(bin).then(|| bin.to_owned());
+    }
+    std::env::split_paths(path)
+        .filter(|dir| dir.is_absolute())
+        .map(|dir| dir.join(bin))
+        .find(|path| executable(path))
+}
+
 /// Removes a definition file.
 fn remove(path: &Path) -> Result<()> {
     fs::remove_file(path).wrap_err_with(|| format!("cannot remove {}", path.display()))
@@ -163,4 +185,48 @@ fn output(program: &str, args: &[&str]) -> Result<Output> {
         .args(args)
         .output()
         .wrap_err_with(|| format!("cannot run {program}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn finds_programs_like_the_shell() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = |name: &str| {
+            let dir = tmp.path().join(name);
+            std::fs::create_dir(&dir).unwrap();
+            dir
+        };
+        let (plain, exec, linked) = (dir("plain"), dir("exec"), dir("linked"));
+        std::fs::write(plain.join("jj"), "").unwrap();
+        std::fs::write(exec.join("jj"), "").unwrap();
+        std::fs::set_permissions(exec.join("jj"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        symlink(exec.join("jj"), linked.join("jj")).unwrap();
+        std::fs::create_dir(dir("folder").join("jj")).unwrap();
+        let path = |dirs: &[&Path]| std::env::join_paths(dirs).unwrap();
+        let jj = Path::new("jj");
+
+        // Non-executables and directories are skipped.
+        let folder = tmp.path().join("folder");
+        assert_eq!(
+            which(jj, &path(&[&plain, &folder, &exec])),
+            Some(exec.join("jj"))
+        );
+        // Symlinks are kept as-is.
+        assert_eq!(which(jj, &path(&[&linked, &exec])), Some(linked.join("jj")));
+        // Relative entries are skipped, even when they resolve.
+        let cwd = std::env::current_dir().unwrap();
+        let up: PathBuf = cwd.components().skip(1).map(|_| "..").collect();
+        let relative = up.join(exec.strip_prefix("/").unwrap());
+        assert!(relative.join("jj").is_file());
+        assert_eq!(which(jj, &path(&[&relative])), None);
+        assert_eq!(which(jj, &path(&[])), None);
+        // A path is checked, not looked up.
+        assert_eq!(which(&exec.join("jj"), &path(&[])), Some(exec.join("jj")));
+        assert_eq!(which(&plain.join("jj"), &path(&[&exec])), None);
+    }
 }

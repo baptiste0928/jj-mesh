@@ -59,27 +59,31 @@ pub fn run(_args: StatusArgs, dir: &ConfigDir) -> Result<()> {
     } else {
         println!("{}", ui::heading("repos:"));
         let width = ui::name_width(status.repos.iter().map(|r| r.name.as_str()));
-        let paths: Vec<String> = status
-            .repos
-            .iter()
-            .map(|r| ui::display_path(&r.path))
-            .collect();
-        let path_width = ui::name_width(paths.iter().map(String::as_str));
-        for (repo, path) in status.repos.iter().zip(&paths) {
-            println!(
-                "  {:width$}  {}  {}",
-                repo.name,
-                ui::dim(format_args!("{path:path_width$}")),
-                watch_summary(&repo.watch),
+        for repo in &status.repos {
+            // The root workspace line shows the repo path; local workspaces
+            // are unknown until the repo is watched.
+            let listed = repo.workspaces.iter().any(
+                |w| matches!(&w.place, WorkspacePlace::Local { path, .. } if *path == repo.path),
             );
-            // A single workspace is the repo itself.
-            if repo.workspaces.len() > 1 {
-                let names: Vec<String> =
-                    repo.workspaces.iter().map(|w| sanitize(&w.name)).collect();
-                let width = ui::name_width(names.iter().map(String::as_str));
-                for (workspace, name) in repo.workspaces.iter().zip(&names) {
-                    println!("    {name:width$}  {}", place_summary(&workspace.place));
-                }
+            let path = if listed {
+                String::new()
+            } else {
+                format!("{}  ", ui::dim(ui::display_path(&repo.path)))
+            };
+            println!(
+                "  {:width$}  {path}{}",
+                repo.name,
+                watch_summary(&repo.watch)
+            );
+            // `@` marks workspace names, as in `jj log`.
+            let names: Vec<String> = repo
+                .workspaces
+                .iter()
+                .map(|w| format!("{}@", sanitize(&w.name)))
+                .collect();
+            let width = ui::name_width(names.iter().map(String::as_str));
+            for (workspace, name) in repo.workspaces.iter().zip(&names) {
+                println!("    {name:width$}  {}", place_summary(&workspace.place));
             }
         }
     }

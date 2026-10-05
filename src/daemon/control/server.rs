@@ -101,12 +101,7 @@ impl ControlContext {
                 })
             })
             .collect();
-        // Mesh repos not registered here are clonable.
-        let available = state
-            .mesh_repo_names()
-            .filter(|name| !state.repos.contains_key(*name))
-            .map(str::to_owned)
-            .collect();
+        let available = state.clonable_repo_names().map(str::to_owned).collect();
 
         Status {
             name: state.machine.name,

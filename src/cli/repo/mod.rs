@@ -10,6 +10,10 @@ use std::path::Path;
 use clap::{Args, Subcommand};
 use color_eyre::eyre::{Result, WrapErr as _, ensure};
 
+pub(super) use self::{
+    add::{AddArgs, run as add},
+    clone::{CloneArgs, run as clone},
+};
 use crate::config::ConfigDir;
 
 /// Manage the repos synchronized on the mesh

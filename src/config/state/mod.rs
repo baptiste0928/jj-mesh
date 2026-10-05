@@ -199,6 +199,13 @@ impl MeshState {
             .map(|(name, _)| name.as_str())
     }
 
+    /// The mesh repos not registered on this machine, i.e. the clonable
+    /// ones.
+    pub fn clonable_repo_names(&self) -> impl Iterator<Item = &str> {
+        self.mesh_repo_names()
+            .filter(|name| !self.repos.contains_key(*name))
+    }
+
     /// Checks that registering `name` with this id agrees with the mesh: a
     /// name the mesh already knows may only be registered with its id (that
     /// is what a clone does), since anything else forks the name into two
