@@ -17,6 +17,8 @@ pub mod config;
 pub mod daemon;
 pub mod net;
 pub mod repo;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) mod service;
 pub(crate) mod watch;
 
 /// [`tokio::task::spawn_blocking`] in the caller's tracing span, so the

@@ -5,6 +5,7 @@ mod logs;
 mod peer;
 mod repo;
 mod run_daemon;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 mod service;
 mod status;
 mod ui;
@@ -48,6 +49,7 @@ pub struct Cli {
 enum Command {
     Repo(repo::RepoArgs),
     Peer(peer::PeerArgs),
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     Service(service::ServiceArgs),
     Status(status::StatusArgs),
     Logs(logs::LogsArgs),
@@ -70,6 +72,7 @@ pub fn run() -> Result<()> {
     match cli.command {
         Command::Repo(args) => repo::run(args, &dir),
         Command::Peer(args) => peer::run(args, &dir),
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         Command::Service(args) => service::run(args, &dir),
         Command::Status(args) => status::run(args, &dir),
         Command::Logs(args) => logs::run(&args, &dir),

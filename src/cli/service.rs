@@ -1,31 +1,21 @@
 //! `jj-mesh service`: manage the daemon as a user service.
 
 use std::{
-    ffi::OsString,
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
 
 use clap::{Args, Subcommand};
-use color_eyre::eyre::{Result, WrapErr as _, bail, ensure};
-use service_manager::{
-    RestartPolicy, ServiceInstallCtx, ServiceLabel, ServiceLevel, ServiceManager, ServiceStartCtx,
-    ServiceStatus, ServiceStatusCtx, ServiceStopCtx, ServiceUninstallCtx,
-};
+use color_eyre::eyre::{OptionExt as _, Result, WrapErr as _, bail, ensure, eyre};
 
 use super::ui;
-use crate::config::{ConfigDir, ServiceState};
+use crate::{
+    config::ConfigDir,
+    service::{Service, Spec, Status},
+};
 
-/// Label of the service installed by `service install`.
-const DEFAULT_LABEL: &str = "jj-mesh";
-
-/// Seconds the service manager waits before restarting a failed daemon.
-const FAILURE_RESTART_DELAY_SECS: u32 = 5;
-
-/// How long `restart` waits for the service to leave or reach the running
-/// state. Stopping is asynchronous on launchd, and starting reports
-/// success as soon as the process forks, so both transitions are verified
-/// by polling rather than trusted.
+/// How long `restart` waits for the service to reach the running state:
+/// launchd restarts asynchronously.
 const RESTART_WAIT: Duration = Duration::from_secs(10);
 
 /// Delay after a verified start before re-checking that the service is
@@ -74,267 +64,113 @@ enum ServiceCommand {
 
 /// Runs the `service` command.
 pub fn run(args: ServiceArgs, dir: &ConfigDir) -> Result<()> {
-    let mut manager =
-        <dyn ServiceManager>::native().wrap_err("no supported service manager on this system")?;
-    manager
-        .set_level(ServiceLevel::User)
-        .wrap_err("user services are not supported on this system")?;
-
-    // The recorded label lets start/stop/restart drive an externally
-    // installed service even when its label differs from ours (Home
-    // Manager prefixes launchd agents on macOS).
-    let state = ServiceState::load(dir)?;
-    let label: ServiceLabel = state
-        .as_ref()
-        .map_or(DEFAULT_LABEL, |state| state.label.as_str())
-        .parse()?;
-
     match args.command {
-        ServiceCommand::Install { program, jj_bin } => {
-            ensure_ours(state.as_ref(), &label)?;
-            install(&*manager, label, dir, program, jj_bin.as_deref())
-        }
+        ServiceCommand::Install { program, jj_bin } => install(dir, program, jj_bin.as_deref())?,
         ServiceCommand::Uninstall => {
-            ensure_ours(state.as_ref(), &label)?;
-            uninstall(&*manager, label, dir)
+            let service = installed()?;
+            ensure_ours(&service)?;
+            service.uninstall()?;
+            println!("{}", ui::good("Stopped the service"));
+            println!(
+                "{}",
+                ui::good(format_args!("Removed {}", service.path().display()))
+            );
         }
         ServiceCommand::Start => {
-            manager
-                .start(ServiceStartCtx { label })
-                .wrap_err("cannot start the service")?;
+            installed()?.start().wrap_err("cannot start the service")?;
             println!("{}", ui::good("jj-mesh daemon service started"));
-            Ok(())
         }
         ServiceCommand::Stop => {
-            manager
-                .stop(ServiceStopCtx { label })
-                .wrap_err("cannot stop the service")?;
+            installed()?.stop().wrap_err("cannot stop the service")?;
             println!("{}", ui::good("jj-mesh daemon service stopped"));
-            Ok(())
         }
-        ServiceCommand::Restart => restart(&*manager, &label),
-    }
-}
-
-/// Refuses to install or uninstall a service this command does not own:
-/// either the state file records another installer, or an unrecorded
-/// service definition is a symlink (how Home Manager and other nix-based
-/// managers install theirs).
-fn ensure_ours(state: Option<&ServiceState>, label: &ServiceLabel) -> Result<()> {
-    if let Some(state) = state {
-        ensure!(
-            state.installer == ServiceState::CLI,
-            "the service is managed by {}: update that configuration instead",
-            state.installer,
-        );
-    } else {
-        let file = service_file(label)?;
-        ensure!(
-            !file.is_symlink(),
-            "{} is a symlink, so an external program probably manages \
-             the service: refusing to replace it",
-            file.display(),
-        );
+        ServiceCommand::Restart => {
+            restart(&installed()?)?;
+            println!("{}", ui::good("jj-mesh daemon service restarted"));
+        }
     }
     Ok(())
 }
 
-/// Installs the service and starts it.
-fn install(
-    manager: &dyn ServiceManager,
-    label: ServiceLabel,
-    dir: &ConfigDir,
-    program: Option<PathBuf>,
-    jj_bin: Option<&Path>,
-) -> Result<()> {
+/// The installed service.
+fn installed() -> Result<Service> {
+    Service::find()?.ok_or_eyre("the service is not installed: run `jj-mesh service install`")
+}
+
+/// Refuses to replace or remove a service another program manages.
+fn ensure_ours(service: &Service) -> Result<()> {
+    ensure!(
+        !service.is_external(),
+        "{} is managed by another program (such as Home Manager): \
+         update that configuration instead",
+        service.path().display(),
+    );
+    Ok(())
+}
+
+/// Installs the service and (re)starts it.
+fn install(dir: &ConfigDir, program: Option<PathBuf>, jj_bin: Option<&Path>) -> Result<()> {
+    if let Some(service) = Service::find()? {
+        ensure_ours(&service)?;
+    }
+    let service = Service::ours()?;
+
     let program = match program {
         Some(program) => program,
         None => std::env::current_exe().wrap_err("cannot resolve the jj-mesh binary path")?,
     };
-    validate_service_path("the program path", &program)?;
-
-    let mut environment = vec![("RUST_LOG".to_owned(), "jj_mesh=info".to_owned())];
-    if let Some(jj_bin) = jj_bin {
-        // Environment values are written into the service definition just
-        // as unescaped as the paths, so they get the same restrictions.
-        validate_service_path("the jj binary path", jj_bin)?;
-        environment.push(("JJ_BIN".to_owned(), jj_bin.to_string_lossy().into_owned()));
-    }
-
+    let mut command = vec![service_path("the program path", &program)?];
     // A custom config directory is baked into the service (useful for side
     // setups); the default is resolved by the daemon at startup.
-    let mut args = Vec::new();
     if dir.is_custom() {
-        validate_service_path("the config directory", dir.path())?;
-        args.push(OsString::from("--config-dir"));
-        args.push(dir.path().into());
+        command.push("--config-dir".to_owned());
+        command.push(service_path("the config directory", dir.path())?);
     }
-    args.push(OsString::from("run-daemon"));
+    command.push("run-daemon".to_owned());
 
-    manager
-        .install(ServiceInstallCtx {
-            label: label.clone(),
-            program,
-            args,
-            contents: None,
-            username: None,
-            working_directory: None,
-            environment: Some(environment),
-            autostart: true,
-            restart_policy: RestartPolicy::OnFailure {
-                delay_secs: Some(FAILURE_RESTART_DELAY_SECS),
-                max_retries: None,
-                reset_after_secs: None,
-            },
-        })
+    let mut env = vec![("RUST_LOG".to_owned(), "jj_mesh=info".to_owned())];
+    if let Some(jj_bin) = jj_bin {
+        // Absolute rather than resolved: `jj` would resolve to `./jj`.
+        ensure!(jj_bin.is_absolute(), "the jj binary path must be absolute");
+        env.push((
+            "JJ_BIN".to_owned(),
+            service_path("the jj binary path", jj_bin)?,
+        ));
+    }
+
+    service
+        .install(&Spec { command, env })
         .wrap_err("cannot install the service")?;
-
-    // A reinstall rewrites the unit file, but systemd keeps serving the
-    // cached one (with a possibly stale ExecStart) until told to reload;
-    // `service-manager` never does. Best effort: a failure only means the
-    // cache heals on the next reboot or manual reload.
-    #[cfg(target_os = "linux")]
-    let _ = std::process::Command::new("systemctl")
-        .args(["--user", "daemon-reload"])
-        .status();
-
-    println!("Created {}", service_file(&label)?.display());
-    ServiceState::record_cli(dir, &label.to_string())?;
-
-    manager
-        .start(ServiceStartCtx { label })
-        .wrap_err("installed the service, but cannot start it")?;
-
+    println!("Created {}", service.path().display());
     println!("{}", ui::good("Service enabled and started"));
-
     Ok(())
 }
 
-/// Stops the service if running, then removes it.
-fn uninstall(manager: &dyn ServiceManager, label: ServiceLabel, dir: &ConfigDir) -> Result<()> {
-    stop_quietly(manager, &label);
+/// Restarts the service, verifying it comes up and stays up.
+fn restart(service: &Service) -> Result<()> {
+    service.restart().wrap_err("cannot restart the service")?;
 
-    let file = service_file(&label)?;
-    manager
-        .uninstall(ServiceUninstallCtx { label })
-        .wrap_err("cannot uninstall the service")?;
-    ServiceState::clear(dir)?;
-
-    println!("{}", ui::good("Stopped the service"));
-    println!("{}", ui::good(format_args!("Removed {}", file.display())));
-    Ok(())
-}
-
-/// Stops and starts the service, verifying both transitions by polling
-/// (see [`RESTART_WAIT`]).
-fn restart(manager: &dyn ServiceManager, label: &ServiceLabel) -> Result<()> {
-    stop_quietly(manager, label);
-    wait_status(manager, label, "stop", |status| {
-        status != &ServiceStatus::Running
-    })?;
-
-    manager
-        .start(ServiceStartCtx {
-            label: label.clone(),
-        })
-        .wrap_err("cannot start the service")?;
-    wait_status(manager, label, "start", |status| {
-        status == &ServiceStatus::Running
-    })?;
-    std::thread::sleep(RESTART_SETTLE);
-    let status = manager
-        .status(ServiceStatusCtx {
-            label: label.clone(),
-        })
-        .wrap_err("cannot query the service status")?;
-    ensure!(
-        status == ServiceStatus::Running,
-        "the service started but died (status: {status:?}); check its logs",
-    );
-
-    println!("{}", ui::good("jj-mesh daemon service restarted"));
-    Ok(())
-}
-
-/// Stops the service, ignoring failures: stopping a service that is not
-/// running errors harmlessly, and the callers verify the state they need
-/// afterwards.
-fn stop_quietly(manager: &dyn ServiceManager, label: &ServiceLabel) {
-    let _ = manager.stop(ServiceStopCtx {
-        label: label.clone(),
-    });
-}
-
-/// Polls the service status until `reached` accepts it, bounded by
-/// [`RESTART_WAIT`]; `what` names the awaited transition in errors.
-fn wait_status(
-    manager: &dyn ServiceManager,
-    label: &ServiceLabel,
-    what: &str,
-    reached: impl Fn(&ServiceStatus) -> bool,
-) -> Result<()> {
     let deadline = Instant::now() + RESTART_WAIT;
-    loop {
-        let status = manager
-            .status(ServiceStatusCtx {
-                label: label.clone(),
-            })
-            .wrap_err("cannot query the service status")?;
-        if reached(&status) {
-            return Ok(());
-        }
+    while service.status()? != Status::Running {
         if Instant::now() >= deadline {
-            bail!("the service did not {what} (status: {status:?})");
+            bail!("the service did not start; check its logs");
         }
         std::thread::sleep(Duration::from_millis(200));
     }
-}
-
-/// Checks that a path can be embedded in a service definition.
-///
-/// `service-manager` writes systemd units without any quoting or escaping,
-/// so a path with whitespace silently corrupts `ExecStart`, control
-/// characters (newlines) could inject arbitrary unit directives, `%` is
-/// rewritten by systemd's specifier expansion, and the XML metacharacters
-/// would break the launchd plist. systemd also refuses non-absolute paths
-/// outside its fixed `/usr` search path.
-fn validate_service_path(what: &str, path: &Path) -> Result<()> {
-    ensure!(path.is_absolute(), "{what} must be absolute: {path:?}");
-
-    let text = path.as_os_str().to_string_lossy();
+    std::thread::sleep(RESTART_SETTLE);
     ensure!(
-        !text
-            .chars()
-            .any(|c| c.is_whitespace() || c.is_control() || "%<>&\"'".contains(c)),
-        "{what} must not contain whitespace, control characters or any of \
-         `%<>&\"'`, as it is written unescaped into the service definition: {path:?}",
+        service.status()? == Status::Running,
+        "the service started but died; check its logs",
     );
-
     Ok(())
 }
 
-/// Path of the service definition file, where `service-manager` puts user
-/// services on each platform.
-#[cfg_attr(
-    not(any(target_os = "linux", target_os = "macos")),
-    allow(unused_variables, reason = "no service file on other platforms")
-)]
-fn service_file(label: &ServiceLabel) -> Result<PathBuf> {
-    #[cfg(target_os = "linux")]
-    {
-        Ok(service_manager::systemd_user_dir_path()?
-            .join(format!("{}.service", label.to_script_name())))
-    }
-    #[cfg(target_os = "macos")]
-    {
-        Ok(etcetera::home_dir()
-            .wrap_err("cannot determine the home directory")?
-            .join("Library")
-            .join("LaunchAgents")
-            .join(format!("{label}.plist")))
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    {
-        bail!("unsupported platform for user services");
-    }
+/// A path as written into the service definition: absolute, since the
+/// daemon runs from another directory, and UTF-8.
+fn service_path(what: &str, path: &Path) -> Result<String> {
+    let path = std::path::absolute(path)
+        .wrap_err_with(|| format!("cannot resolve {what} {}", path.display()))?;
+    path.into_os_string()
+        .into_string()
+        .map_err(|path| eyre!("{what} is not valid UTF-8: {}", Path::new(&path).display()))
 }

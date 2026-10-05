@@ -24,6 +24,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Peers changes were sometimes rejected after a restart when the local machine did not
   notice the old connection drop (e.g. while suspended).
 - Shallow and partial git clones are now explicitely refused.
+- The daemon installed on macOS now logs to `~/Library/Logs/jj-mesh.log`.
 
 ## [0.2.0] - 2026-09-06
 

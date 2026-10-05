@@ -80,11 +80,6 @@ impl ConfigDir {
         self.path.join("mesh.json")
     }
 
-    /// Path of the service installation record (`service.toml`).
-    pub fn service_state_file(&self) -> PathBuf {
-        self.path.join("service.toml")
-    }
-
     /// Path of the daemon control socket.
     ///
     /// Usually `$XDG_RUNTIME_DIR/jj-mesh.sock`; kept inside custom config

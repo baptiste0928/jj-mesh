@@ -6,14 +6,10 @@
 //! - `mesh.json`: the mesh state (paired peers and registered repos), owned
 //!   and written by the daemon only; the CLI mutates it through the control
 //!   socket
-//! - `service.toml`: records which program installed the daemon service
-//!   and under which label, written by `jj-mesh service install` or by an
-//!   external manager like the Home Manager module
 
 mod key;
 mod name;
 mod resolve;
-mod service;
 mod state;
 
 pub use key::MachineKey;
@@ -21,7 +17,6 @@ pub use key::MachineKey;
 pub(crate) use name::MAX_NAME_LEN;
 pub(crate) use name::{sanitize, sanitize_bounded, validate_name};
 pub use resolve::ConfigDir;
-pub use service::ServiceState;
 pub use state::{
     MAX_MACHINE_WORKSPACES, MAX_MESH_PEERS, MAX_MESH_REPOS, MAX_MESH_WORKSPACES, Machine,
     Membership, MeshRepo, MeshRepoStatus, MeshState, Peer, PeerStatus, Repo, RepoClaims, RepoId,

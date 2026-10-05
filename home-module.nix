@@ -9,7 +9,6 @@ self:
 }:
 let
   cfg = config.services.jj-mesh;
-  tomlFormat = pkgs.formats.toml { };
 
   environment = {
     RUST_LOG = "jj_mesh=info";
@@ -45,12 +44,6 @@ in
 
   config = lib.mkIf cfg.enable {
     home.packages = [ cfg.package ];
-
-    # Record that the service is managed by home-manager
-    xdg.configFile."jj-mesh/service.toml".source = tomlFormat.generate "jj-mesh-service.toml" {
-      installer = "home-manager";
-      label = if pkgs.stdenv.isDarwin then "org.nix-community.home.jj-mesh" else "jj-mesh";
-    };
 
     systemd.user.services.jj-mesh = lib.mkIf pkgs.stdenv.isLinux {
       Unit = {
