@@ -46,6 +46,11 @@ impl Fixture {
         Fixture { tmp, config }
     }
 
+    /// Replaces the user-level jj config.
+    pub fn set_user_config(&self, text: &str) {
+        fs::write(&self.config, text).unwrap();
+    }
+
     /// The fixture's scratch directory.
     pub fn path(&self) -> &Path {
         self.tmp.path()

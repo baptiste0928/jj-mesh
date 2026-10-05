@@ -35,7 +35,7 @@ use self::{
     store::MeshStore,
 };
 use crate::{
-    config::{ConfigDir, MachineKey, Membership, MeshState, Settings},
+    config::{ConfigDir, MachineKey, Membership, MeshState},
     net::{EndpointOptions, bind_endpoint, pair, sync},
     repo,
 };
@@ -104,17 +104,6 @@ impl Daemon {
             warn!("{warning}");
         }
 
-        // Settings are loaded once here: edits to config.toml apply on
-        // the next daemon restart. A broken file must not keep the daemon
-        // down: fall back to the defaults.
-        if let Err(err) = Settings::write_template(dir) {
-            warn!("cannot write the config.toml template: {err:#}");
-        }
-        let settings = Arc::new(Settings::load(dir).unwrap_or_else(|err| {
-            warn!("cannot load config.toml, using defaults: {err:#}");
-            Settings::default()
-        }));
-
         let hub = Arc::new(SyncHub::new());
         let (gossip_tx, gossip_rx) = mpsc::channel(GOSSIP_QUEUE);
         let peers = Arc::new(PeerSet::new(
@@ -124,7 +113,7 @@ impl Daemon {
             gossip_tx,
         ));
         let (claim_tx, claim_rx) = mpsc::unbounded_channel();
-        let repos = Arc::new(RepoSet::new(hub.clone(), settings, claim_tx));
+        let repos = Arc::new(RepoSet::new(hub.clone(), claim_tx));
         let store = Arc::new(MeshStore::new(
             dir.clone(),
             key.endpoint_id(),

@@ -3,7 +3,8 @@
 //! [`RepoSet`] keeps one watch task per registered repo (see the `task`
 //! submodule), spawning and aborting them as repos are registered and
 //! removed. Each repo task runs one task per local workspace, keeping its
-//! working copy fresh (see the `workspace` submodule).
+//! working copy fresh (see the `workspace` submodule) with the settings
+//! it reads from jj config (see the `settings` submodule).
 //!
 //! Repo tasks decide which workspaces this machine claims (see
 //! [`crate::config::WorkspaceClaims`]), which round-trip through the store:
@@ -14,6 +15,7 @@
 //!       └───── store ◄─ClaimUpdate──┘
 //! ```
 
+mod settings;
 mod task;
 #[cfg(test)]
 mod tests;
@@ -30,10 +32,10 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{Notify, mpsc, watch};
 use tracing::debug;
 
-use self::task::spawn_repo;
+use self::{settings::Settings, task::spawn_repo};
 use super::{control, hub::SyncHub};
 use crate::{
-    config::{MeshState, RepoClaims, RepoId, Settings},
+    config::{MeshState, RepoClaims, RepoId},
     net::sync::{RepoHealth, RepoHealthState},
 };
 
@@ -45,9 +47,8 @@ pub struct RepoSet {
     repos: Mutex<BTreeMap<String, RepoHandle>>,
     /// Pinged on every repo state change, driving the status broadcast.
     changed: Arc<Notify>,
-    /// Daemon settings, loaded once at start and shared with every repo
-    /// task.
-    settings: Arc<Settings>,
+    /// Settings for every workspace instead of their jj config (tests).
+    settings: Option<Settings>,
     /// Where repo tasks send the claims to persist.
     claim: mpsc::UnboundedSender<ClaimUpdate>,
 }
@@ -115,17 +116,26 @@ enum RepoState {
 }
 
 impl RepoSet {
-    pub fn new(
-        hub: Arc<SyncHub>,
-        settings: Arc<Settings>,
-        claim: mpsc::UnboundedSender<ClaimUpdate>,
-    ) -> Self {
+    pub fn new(hub: Arc<SyncHub>, claim: mpsc::UnboundedSender<ClaimUpdate>) -> Self {
         RepoSet {
             hub,
             repos: Mutex::new(BTreeMap::new()),
             changed: Arc::new(Notify::new()),
-            settings,
+            settings: None,
             claim,
+        }
+    }
+
+    /// A repo set whose workspaces all use `settings`.
+    #[cfg(test)]
+    fn with_settings(
+        hub: Arc<SyncHub>,
+        settings: Settings,
+        claim: mpsc::UnboundedSender<ClaimUpdate>,
+    ) -> Self {
+        RepoSet {
+            settings: Some(settings),
+            ..Self::new(hub, claim)
         }
     }
 

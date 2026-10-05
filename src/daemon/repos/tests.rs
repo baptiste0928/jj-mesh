@@ -7,7 +7,7 @@ use std::{
 
 use tokio::sync::mpsc;
 
-use super::{ClaimUpdate, RepoSet};
+use super::{ClaimUpdate, RepoSet, Settings};
 use crate::{
     config::{MeshState, Repo, RepoId, WorkspaceClaims},
     daemon::{
@@ -18,25 +18,39 @@ use crate::{
     testing::Fixture,
 };
 
-/// A repo set with the given `config.toml` contents, and the claims its
-/// repo tasks send.
-fn claiming_repo_set(config: &str) -> (RepoSet, mpsc::UnboundedReceiver<ClaimUpdate>) {
-    let settings = Arc::new(toml::from_str(config).unwrap());
+/// A repo set with the given settings, and the claims its repo tasks
+/// send.
+fn claiming_repo_set(settings: Settings) -> (RepoSet, mpsc::UnboundedReceiver<ClaimUpdate>) {
     let (claim, claims) = mpsc::unbounded_channel();
     (
-        RepoSet::new(Arc::new(SyncHub::new()), settings, claim),
+        RepoSet::with_settings(Arc::new(SyncHub::new()), settings, claim),
         claims,
     )
 }
 
 /// Settings with auto-snapshot and update-stale disabled: hermetic (the
 /// daemon spawns no jj, which would read the user's real config).
-const QUIET: &str = "snapshot-interval = 0\nupdate-stale = false";
+const QUIET: Settings = Settings {
+    snapshot_interval: None,
+    update_stale: false,
+};
 
-/// A repo set with the given `config.toml` contents, synced to `state`
-/// and recording the claims its repo tasks make like the daemon's store.
-fn start(config: &str, state: MeshState) -> Arc<RepoSet> {
-    let (set, mut claims) = claiming_repo_set(config);
+/// Settings with only update-stale enabled.
+const UPDATE_STALE: Settings = Settings {
+    snapshot_interval: None,
+    update_stale: true,
+};
+
+/// Settings with only auto-snapshot enabled, every second.
+const SNAPSHOT: Settings = Settings {
+    snapshot_interval: Some(Duration::from_secs(1)),
+    update_stale: false,
+};
+
+/// A repo set with the given settings, synced to `state` and recording
+/// the claims its repo tasks make like the daemon's store.
+fn start(settings: Settings, state: MeshState) -> Arc<RepoSet> {
+    let (set, mut claims) = claiming_repo_set(settings);
     let set = Arc::new(set);
     set.sync(&state);
     let weak = Arc::downgrade(&set);
@@ -230,10 +244,7 @@ async fn auto_snapshots_working_copy_edits() {
     let fx = Fixture::new();
     let dir = fx.init_repo("a");
 
-    let set = start(
-        "snapshot-interval = 1\nupdate-stale = false",
-        state_with("a", &dir),
-    );
+    let set = start(SNAPSHOT, state_with("a", &dir));
     wait_watch(&set, |w| {
         matches!(
             w,
@@ -266,12 +277,25 @@ async fn updates_stale_working_copy() {
         "the working copy must start stale for this test to mean anything",
     );
 
-    let _set = start(
-        "snapshot-interval = 0\nupdate-stale = true",
-        state_with("a", &dir),
-    );
+    let _set = start(UPDATE_STALE, state_with("a", &dir));
 
     eventually("working copy still stale", || fx.jj_ok(&dir, &["status"])).await;
+}
+
+/// With update-stale disabled, a stale working copy is left alone.
+#[tokio::test]
+async fn leaves_stale_working_copy_when_disabled() {
+    let fx = Fixture::new();
+    let dir = fx.init_repo("a");
+    let child = stale_child(&fx, &dir);
+    let mut state = state_with("a", &dir);
+    claim(&mut state, &["default", "child"]);
+
+    let set = start(QUIET, state);
+
+    wait_for(&set, |s| local_state(s, "child").is_some()).await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(!fx.jj_ok(&child, &["status"]), "working copy was updated");
 }
 
 /// An op head without a commit index (published by a fetch whose index
@@ -391,10 +415,7 @@ async fn tracks_and_snapshots_secondary_workspaces() {
     let fx = Fixture::new();
     let dir = fx.init_repo("a");
 
-    let set = start(
-        "snapshot-interval = 1\nupdate-stale = false",
-        state_with("a", &dir),
-    );
+    let set = start(SNAPSHOT, state_with("a", &dir));
     wait_for(&set, |s| workspace_names(s) == ["default"]).await;
 
     fx.jj(&dir, &["workspace", "add", "../child"]);
@@ -429,7 +450,7 @@ async fn updates_stale_secondary_workspace() {
 
     let mut state = state_with("a", &dir);
     claim(&mut state, &["default", "child"]);
-    let _set = start("snapshot-interval = 0\nupdate-stale = true", state);
+    let _set = start(UPDATE_STALE, state);
 
     eventually("working copy still stale", || fx.jj_ok(&child, &["status"])).await;
 }
@@ -474,7 +495,7 @@ async fn claims_fresh_workspaces() {
     let dir = fx.init_repo("a");
     fx.jj(&dir, &["workspace", "add", "../child"]);
 
-    let (set, mut claims) = claiming_repo_set("snapshot-interval = 0\nupdate-stale = false");
+    let (set, mut claims) = claiming_repo_set(QUIET);
     set.sync(&state_with("a", &dir));
 
     let update = tokio::time::timeout(Duration::from_secs(10), claims.recv())
@@ -493,10 +514,7 @@ async fn leaves_stale_unclaimed_workspaces_alone() {
     let dir = fx.init_repo("a");
     let child = stale_child(&fx, &dir);
 
-    let set = start(
-        "snapshot-interval = 0\nupdate-stale = true",
-        state_with("a", &dir),
-    );
+    let set = start(UPDATE_STALE, state_with("a", &dir));
 
     wait_for(&set, |s| {
         local_state(s, "child") == Some(WorkspaceState::Stale)
@@ -535,7 +553,7 @@ async fn leaves_contested_workspaces_alone() {
         },
     );
 
-    let set = start("snapshot-interval = 0\nupdate-stale = true", state);
+    let set = start(UPDATE_STALE, state);
 
     wait_for(&set, |s| {
         matches!(

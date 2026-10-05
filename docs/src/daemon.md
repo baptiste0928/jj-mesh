@@ -44,6 +44,6 @@ Beyond replicating history, the daemon keeps working copies fresh:
 - **Auto-update-stale** refreshes a workspace that a synced operation left
   stale, sparing the user a manual `jj workspace update-stale`.
 
-Both are configurable, globally and per repo, and run through the user's jj
-binary, so they take the working-copy lock like any jj command and respect the
-user's jj configuration.
+Both are configured in the `[jj-mesh]` table of the user's jj config, per user,
+repo or workspace. They run through the user's jj binary, so they take the
+working-copy lock like any jj command and respect the rest of the jj config.

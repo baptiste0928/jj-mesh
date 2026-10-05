@@ -80,11 +80,6 @@ impl ConfigDir {
         self.path.join("mesh.json")
     }
 
-    /// Path of the daemon settings file (`config.toml`).
-    pub fn settings_file(&self) -> PathBuf {
-        self.path.join("config.toml")
-    }
-
     /// Path of the service installation record (`service.toml`).
     pub fn service_state_file(&self) -> PathBuf {
         self.path.join("service.toml")

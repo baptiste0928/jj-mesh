@@ -47,11 +47,11 @@ use tokio::sync::{Notify, mpsc, watch};
 use tracing::{Instrument as _, debug, info, info_span, warn};
 
 use super::{
-    ClaimUpdate, RepoHandle, RepoSet, RepoState, WorkspaceState, sleep_until,
+    ClaimUpdate, RepoHandle, RepoSet, RepoState, Settings, WorkspaceState, sleep_until,
     workspace::{RepoContext, WorkspaceHandle, may_be_stale, spawn_workspace},
 };
 use crate::{
-    config::{Repo, RepoClaims, RepoId, Settings, validate_name},
+    config::{Repo, RepoClaims, RepoId, validate_name},
     daemon::{
         backoff::Backoff,
         control::{WorkspacePlace, WorkspaceStatus},
@@ -131,7 +131,7 @@ pub(super) fn spawn_repo(
             hub: set.hub.clone(),
             announcements,
             changed: set.changed.clone(),
-            settings: set.settings.clone(),
+            settings: set.settings,
             claims: claims_rx,
             claim: set.claim.clone(),
         })
@@ -157,8 +157,8 @@ struct RepoTask {
     announcements: Arc<Inbox>,
     /// The repo set's change notifier, pinged on every state change.
     changed: Arc<Notify>,
-    /// Daemon settings, fixed for the daemon's lifetime.
-    settings: Arc<Settings>,
+    /// Settings for every workspace instead of their jj config (tests).
+    settings: Option<Settings>,
     /// The claims on the repo's workspaces.
     claims: watch::Receiver<RepoClaims>,
     claim: mpsc::UnboundedSender<ClaimUpdate>,
@@ -252,10 +252,7 @@ impl RepoTask {
 
         // The op-heads watch above is already live, so any operation the
         // workspace tasks create is picked up like any other.
-        let ctx = Arc::new(RepoContext::new(
-            repo.clone(),
-            self.settings.for_repo(&self.name),
-        ));
+        let ctx = Arc::new(RepoContext::new(repo.clone(), self.settings));
         let (synced, _) = watch::channel(None);
         let mut claims = self.claims.clone();
         let mut workspaces = Workspaces::default();

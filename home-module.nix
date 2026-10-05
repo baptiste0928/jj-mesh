@@ -11,10 +11,6 @@ let
   cfg = config.services.jj-mesh;
   tomlFormat = pkgs.formats.toml { };
 
-  # config.toml is only managed when settings are given
-  manageSettings = cfg.settings != { };
-  settingsFile = tomlFormat.generate "jj-mesh-config.toml" cfg.settings;
-
   environment = {
     RUST_LOG = "jj_mesh=info";
     JJ_BIN = lib.getExe cfg.jjPackage;
@@ -45,30 +41,10 @@ in
         so the daemon runs the same jj as the user.
       '';
     };
-
-    settings = lib.mkOption {
-      type = tomlFormat.type;
-      default = { };
-      example = lib.literalExpression ''
-        {
-          snapshot-interval = 30;
-          repos.work.update-stale = false;
-        }
-      '';
-      description = ''
-        Daemon settings written to
-        {file}`$XDG_CONFIG_HOME/jj-mesh/config.toml`. When empty, the file
-        is left unmanaged and can be edited by hand.
-      '';
-    };
   };
 
   config = lib.mkIf cfg.enable {
     home.packages = [ cfg.package ];
-
-    xdg.configFile."jj-mesh/config.toml" = lib.mkIf manageSettings {
-      source = settingsFile;
-    };
 
     # Record that the service is managed by home-manager
     xdg.configFile."jj-mesh/service.toml".source = tomlFormat.generate "jj-mesh-service.toml" {
@@ -80,10 +56,6 @@ in
       Unit = {
         Description = "jj-mesh sync daemon";
         After = [ "network.target" ];
-      }
-      // lib.optionalAttrs manageSettings {
-        # Restarts when the managed settings change
-        X-Restart-Triggers = [ (toString settingsFile) ];
       };
       Service = {
         ExecStart = "${lib.getExe cfg.package} run-daemon";
@@ -106,12 +78,7 @@ in
         ProcessType = "Background";
         StandardOutPath = "${config.home.homeDirectory}/Library/Logs/jj-mesh.log";
         StandardErrorPath = "${config.home.homeDirectory}/Library/Logs/jj-mesh.log";
-        EnvironmentVariables =
-          environment
-          // lib.optionalAttrs manageSettings {
-            # Reference the settings store path to reload when settings change
-            JJ_MESH_HM_SETTINGS = toString settingsFile;
-          };
+        EnvironmentVariables = environment;
       };
     };
   };

@@ -65,11 +65,7 @@ Then enable the service in your Home Manager configuration:
 {
   imports = [ inputs.jj-mesh.homeModules.default ];
 
-  services.jj-mesh = {
-    enable = true;
-    # Optional, to manage config.toml declaratively:
-    settings = { };
-  };
+  services.jj-mesh.enable = true;
 }
 ```
 
@@ -111,8 +107,17 @@ $ jj-mesh repo clone <name>
 From there, the daemon will keep both copies in sync. Use `jj-mesh status` to check the status,
 and `jj-mesh help` to list available commands.
 
-You can configure the daemon in `~/.config/jj-mesh/config.toml` to **disable or adjust auto-snapshots**
-or disable updating stale working copies. A template file to edit is written on first start.
+You can **disable or adjust auto-snapshots** or disable updating stale working copies in the
+`[jj-mesh]` table of your [jj config](https://docs.jj-vcs.dev/latest/config/), per user, repo or
+workspace. Restart the daemon with `jj-mesh service restart` to apply changes.
+
+```toml
+[jj-mesh]
+# Interval between automatic snapshots of the working copy, in seconds (0 disables them).
+snapshot-interval = 20
+# Update the working copy after syncing if stale.
+update-stale = true
+```
 
 ## How it works
 

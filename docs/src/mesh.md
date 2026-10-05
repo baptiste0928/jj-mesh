@@ -73,8 +73,8 @@ normal membership propagation.
 
 ## Storage
 
-Each machine stores everything mesh-related in its config directory
-(`~/.config/jj-mesh`), split in three files by ownership:
+Each machine stores its mesh state in its config directory
+(`~/.config/jj-mesh`), split in two files by ownership:
 
 - **The identity key**, in its own file, only ever read by the daemon.
 - **`mesh.json`**, this machine's copy of the mesh state, in two parts: what
@@ -83,9 +83,8 @@ Each machine stores everything mesh-related in its config directory
   what is strictly local (the repos registered here, with their paths). Only the daemon writes it: the CLI mutates it
   through the daemon's control socket, and reads it directly only for
   pre-checks and completion, treating what it sees as advisory.
-- **The user configuration**, the only hand-edited file, holding local
-  settings such as the working copy automation (see [Daemon](daemon.md)).
-  The daemon reads it once at start: edits apply on the next restart.
+
+User settings live in the jj config instead (see [Daemon](daemon.md)).
 
 ## Security
 

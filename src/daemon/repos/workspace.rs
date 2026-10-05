@@ -6,6 +6,8 @@
 //! through [`Synced`]. A task whose working copy watch dies stops, and the
 //! repo task's next workspace scan respawns it.
 //!
+//! The task reads its [`Settings`] from jj config once on start.
+//!
 //! When auto-snapshotting is enabled, the task watches the working copy
 //! files and snapshots them on the cadence [`Snapshotting`] sets. The
 //! snapshot runs through the jj binary and produces a regular operation,
@@ -37,9 +39,8 @@ use pollster::FutureExt as _;
 use tokio::sync::{Mutex, watch};
 use tracing::{Instrument as _, debug, info, info_span, warn};
 
-use super::sleep_until;
+use super::{Settings, sleep_until};
 use crate::{
-    config::RepoSettings,
     repo::{OpenRepo, Workspace, run_jj},
     watch::TreeWatcher,
 };
@@ -55,14 +56,15 @@ pub(super) type Synced = watch::Receiver<Option<OperationId>>;
 /// What the workspace tasks of one repo share.
 pub(super) struct RepoContext {
     pub repo: Arc<OpenRepo>,
-    settings: RepoSettings,
+    /// Settings for every workspace instead of their jj config (tests).
+    settings: Option<Settings>,
     /// Serializes the jj runs of all workspaces: concurrent ones would
     /// each write an operation on the same head, diverging the op log.
     jj: Mutex<()>,
 }
 
 impl RepoContext {
-    pub fn new(repo: Arc<OpenRepo>, settings: RepoSettings) -> Self {
+    pub fn new(repo: Arc<OpenRepo>, settings: Option<Settings>) -> Self {
         RepoContext {
             repo,
             settings,
@@ -123,22 +125,33 @@ impl WorkspaceTask {
     /// Keeps the working copy fresh until the repo watch ends or the
     /// working copy watch fails.
     async fn run(mut self, head: Option<OperationId>) {
-        if let Err(err) = self.keep_fresh(head).await {
+        let settings = match self.ctx.settings {
+            Some(settings) => settings,
+            None => Settings::load(self.workspace.root())
+                .await
+                .unwrap_or_else(|err| {
+                    warn!("cannot read settings, using defaults: {err:#}");
+                    Settings::default()
+                }),
+        };
+        if let Err(err) = self.keep_fresh(settings, head).await {
             warn!("working copy watch failed: {err:#}");
         }
     }
 
     /// Runs the auto-snapshot and update-stale loop. Errors when the
     /// working copy watch dies.
-    async fn keep_fresh(&mut self, head: Option<OperationId>) -> Result<()> {
-        let interval = self.ctx.settings.snapshot_interval;
+    async fn keep_fresh(&mut self, settings: Settings, head: Option<OperationId>) -> Result<()> {
+        let interval = settings.snapshot_interval;
         let mut snap = Snapshotting::default();
         let mut tree = match interval {
             Some(_) => self.watch_tree(self.workspace.root()).await,
             None => None,
         };
 
-        if let Some(head) = &head {
+        if settings.update_stale
+            && let Some(head) = &head
+        {
             self.update_stale(head, &mut tree).await?;
         }
         // Edits made while the watch was down produce no event, so the
@@ -153,7 +166,8 @@ impl WorkspaceTask {
                         return Ok(());
                     };
                     let head = self.synced.borrow_and_update().clone();
-                    if let Some(head) = head
+                    if settings.update_stale
+                        && let Some(head) = head
                         && self.update_stale(&head, &mut tree).await?
                     {
                         // update-stale snapshots the working copy itself,
@@ -182,16 +196,13 @@ impl WorkspaceTask {
         }
     }
 
-    /// Runs `jj workspace update-stale` when enabled and the working copy
-    /// may be stale at `head`; returns whether it ran.
+    /// Runs `jj workspace update-stale` when the working copy may be stale
+    /// at `head`; returns whether it ran.
     async fn update_stale(
         &self,
         head: &OperationId,
         tree: &mut Option<TreeWatcher>,
     ) -> Result<bool> {
-        if !self.ctx.settings.update_stale {
-            return Ok(false);
-        }
         // Blocking: reads the checkout file and two views.
         let stale = {
             let (workspace, repo, head) =

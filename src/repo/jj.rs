@@ -1,21 +1,23 @@
 //! Invoking the user's jj binary.
 //!
-//! [`run_jj`] runs one command against a repo, [`local_jj_version`]
-//! detects the binary's version, and [`jj_version_warning`] and
-//! [`jj_peer_warning`] word the warnings when the local or a peer's
-//! version falls outside the supported series.
+//! [`run_jj`] and [`jj_output`] run one command against a repo,
+//! [`local_jj_version`] detects the binary's version, and
+//! [`jj_version_warning`] and [`jj_peer_warning`] word the warnings when
+//! the local or a peer's version falls outside the supported series.
 
 use std::path::Path;
 
 use color_eyre::eyre::{Result, WrapErr as _, ensure, eyre};
+use tokio::io::{AsyncRead, AsyncReadExt as _};
 
 use super::SUPPORTED_JJ_MINORS;
 
-/// Cap on the child's diagnostics kept in memory. jj reports one line
-/// per file it refuses to snapshot, so on a hostile or merely enormous
-/// working copy its stderr is neither small nor ours to trust; the tail
-/// past the cap is dropped, and only the start ever reaches a log.
-const MAX_JJ_STDERR: u64 = 64 * 1024;
+/// Cap on each of the child's output streams kept in memory. jj reports
+/// one line per file it refuses to snapshot, so on a hostile or merely
+/// enormous working copy its stderr is neither small nor ours to trust;
+/// the tail past the cap is dropped, and only the start ever reaches a
+/// log.
+const MAX_JJ_OUTPUT: u64 = 64 * 1024;
 
 /// The jj binary to invoke: `$JJ_BIN` when set and non-empty, otherwise
 /// `jj` from PATH. Resolved on every call so a daemon inherits its
@@ -31,16 +33,25 @@ pub fn jj_bin() -> std::ffi::OsString {
 /// locks, which jj-mesh must not reimplement. The child is killed when
 /// `timeout` fires.
 pub async fn run_jj(root: &Path, args: &[&str], timeout: std::time::Duration) -> Result<()> {
+    timed_jj(root, args, timeout).await.map(drop)
+}
+
+/// [`run_jj`], returning the command's stdout (capped).
+pub async fn jj_output(root: &Path, args: &[&str], timeout: std::time::Duration) -> Result<String> {
+    let stdout = timed_jj(root, args, timeout).await?;
+    String::from_utf8(stdout).wrap_err_with(|| format!("jj {} output is not UTF-8", args.join(" ")))
+}
+
+/// [`spawn_jj`], killed when `timeout` fires.
+async fn timed_jj(root: &Path, args: &[&str], timeout: std::time::Duration) -> Result<Vec<u8>> {
     tokio::time::timeout(timeout, spawn_jj(root, args))
         .await
         .map_err(|_| eyre!("jj {} timed out", args.join(" ")))?
 }
 
 /// Spawns one jj command and waits for it, failing with its (bounded,
-/// sanitized) diagnostics.
-async fn spawn_jj(root: &Path, args: &[&str]) -> Result<()> {
-    use tokio::io::AsyncReadExt as _;
-
+/// sanitized) diagnostics. Returns its stdout.
+async fn spawn_jj(root: &Path, args: &[&str]) -> Result<Vec<u8>> {
     let mut child = tokio::process::Command::new(jj_bin())
         // jj resolves the current directory even when given a repo, so
         // it must be one that exists: the daemon's own cwd is whatever
@@ -50,7 +61,7 @@ async fn spawn_jj(root: &Path, args: &[&str]) -> Result<()> {
         .arg(root)
         .args(args)
         .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true)
         .spawn()
@@ -61,17 +72,10 @@ async fn spawn_jj(root: &Path, args: &[&str]) -> Result<()> {
             )
         })?;
 
-    let mut stderr = Vec::new();
-    if let Some(pipe) = child.stderr.take() {
-        // A full pipe would block the child forever, so it is drained
-        // even past the cap; only the head is kept.
-        let mut pipe = pipe;
-        let mut head = (&mut pipe).take(MAX_JJ_STDERR);
-        head.read_to_end(&mut stderr).await.ok();
-        tokio::io::copy(&mut pipe, &mut tokio::io::sink())
-            .await
-            .ok();
-    }
+    let (stdout, stderr) = tokio::join!(
+        read_capped(child.stdout.take()),
+        read_capped(child.stderr.take()),
+    );
     let status = child.wait().await.wrap_err("cannot wait for jj")?;
 
     ensure!(
@@ -82,7 +86,24 @@ async fn spawn_jj(root: &Path, args: &[&str]) -> Result<()> {
         // control characters and capped before they can reach a log.
         crate::config::sanitize_bounded(String::from_utf8_lossy(&stderr).trim()),
     );
-    Ok(())
+    Ok(stdout)
+}
+
+/// Reads the first [`MAX_JJ_OUTPUT`] bytes of a child's pipe. A full pipe
+/// would block the child forever, so the rest is drained and dropped.
+async fn read_capped(pipe: Option<impl AsyncRead + Unpin>) -> Vec<u8> {
+    let mut head = Vec::new();
+    if let Some(mut pipe) = pipe {
+        (&mut pipe)
+            .take(MAX_JJ_OUTPUT)
+            .read_to_end(&mut head)
+            .await
+            .ok();
+        tokio::io::copy(&mut pipe, &mut tokio::io::sink())
+            .await
+            .ok();
+    }
+    head
 }
 
 /// Whether a jj repo exists at `root` (its `.jj` marker is present).
