@@ -22,7 +22,7 @@ use std::{
 
 use color_eyre::eyre::{Result, eyre};
 use iroh::Endpoint;
-use tokio::sync::{Semaphore, mpsc};
+use tokio::sync::{Semaphore, mpsc, watch};
 use tracing::{debug, info, warn};
 
 pub use self::logs::LogBuffer;
@@ -88,8 +88,12 @@ impl Daemon {
         let state = MeshState::load(dir)?;
 
         // Binding the control socket first doubles as the single-daemon
-        // guard.
+        // guard. It is served right away so clients reaching a starting
+        // daemon get its build, then wait for `ctx`.
         let server = ControlServer::bind(dir)?;
+        let (ctx_tx, ctx_rx) = watch::channel(None);
+        let mut tasks = tokio::task::JoinSet::new();
+        tasks.spawn(async move { server.serve(ctx_rx).await });
 
         let endpoint = bind_endpoint(&key, alpns(), options).await?;
         info!(endpoint = %key.endpoint_id(), "daemon started");
@@ -128,7 +132,7 @@ impl Daemon {
             store.clone(),
         ));
 
-        let ctx = Arc::new(ControlContext {
+        ctx_tx.send_replace(Some(Arc::new(ControlContext {
             endpoint: endpoint.clone(),
             started: SystemTime::now(),
             peers: peers.clone(),
@@ -138,10 +142,8 @@ impl Daemon {
             pairing: pairing.clone(),
             logs,
             jj_version: jj_version.clone(),
-        });
+        })));
 
-        let mut tasks = tokio::task::JoinSet::new();
-        tasks.spawn(async move { server.serve(ctx).await });
         tasks.spawn(accept_loop(endpoint.clone(), peers, pairing));
         tasks.spawn(membership_loop(gossip_rx, store.clone()));
         tasks.spawn(claim_loop(claim_rx, store.clone()));

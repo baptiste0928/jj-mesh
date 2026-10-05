@@ -14,15 +14,15 @@ use iroh::Endpoint;
 use tokio::{
     io::{AsyncRead, AsyncReadExt as _},
     net::{UnixListener, UnixStream},
-    sync::broadcast::error::RecvError,
+    sync::{broadcast::error::RecvError, watch},
 };
 use tracing::{debug, info, warn};
 
 use super::{
     clone,
     protocol::{
-        BUILD, CLIENT_TIMEOUT, ConflictStatus, LogsStart, MAX_MESSAGE_SIZE, PeerReport, Request,
-        Response, Status, build_path,
+        BUILD, CLIENT_TIMEOUT, ConflictStatus, LogsStart, MAX_BUILD_SIZE, MAX_MESSAGE_SIZE,
+        PeerReport, Request, Response, Status,
     },
 };
 use crate::{
@@ -162,10 +162,6 @@ impl ControlServer {
         let listener = UnixListener::bind(&tmp)
             .wrap_err_with(|| format!("cannot bind control socket {}", tmp.display()))?;
         fs::set_permissions(&tmp, std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
-        // Published before the socket: a client that can connect always
-        // finds the build of the daemon it reached.
-        let build = build_path(&path);
-        fs::write(&build, BUILD).wrap_err_with(|| format!("cannot write {}", build.display()))?;
         fs::rename(&tmp, &path)
             .wrap_err_with(|| format!("cannot move control socket to {}", path.display()))?;
 
@@ -176,8 +172,9 @@ impl ControlServer {
         })
     }
 
-    /// Serves control requests forever.
-    pub async fn serve(self, ctx: Arc<ControlContext>) -> ! {
+    /// Serves control requests forever. Clients are greeted right away,
+    /// and their requests wait until the daemon publishes its `ctx`.
+    pub async fn serve(self, ctx: watch::Receiver<Option<Arc<ControlContext>>>) -> ! {
         let mut backoff = Backoff::new(ACCEPT_ERROR_BACKOFF, ACCEPT_ERROR_BACKOFF_MAX);
 
         loop {
@@ -200,12 +197,17 @@ impl ControlServer {
 impl Drop for ControlServer {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.path);
-        let _ = fs::remove_file(build_path(&self.path));
     }
 }
 
 /// Answers one client connection.
-async fn handle_client(mut stream: UnixStream, ctx: Arc<ControlContext>) {
+async fn handle_client(
+    mut stream: UnixStream,
+    mut ctx: watch::Receiver<Option<Arc<ControlContext>>>,
+) {
+    if let Err(err) = write_message(&mut stream, &BUILD, MAX_BUILD_SIZE).await {
+        return debug!("control client error: {err}");
+    }
     let request =
         match tokio::time::timeout(CLIENT_TIMEOUT, read_message(&mut stream, MAX_MESSAGE_SIZE))
             .await
@@ -214,6 +216,11 @@ async fn handle_client(mut stream: UnixStream, ctx: Arc<ControlContext>) {
             Ok(Err(err)) => return debug!("control client error: {err}"),
             Err(_) => return debug!("control client timed out"),
         };
+    let ctx = match ctx.wait_for(Option::is_some).await {
+        Ok(ctx) => ctx.clone().expect("waited for the context"),
+        // The daemon failed to start.
+        Err(_) => return,
+    };
 
     // PairJoin, CloneRepo and Logs own their stream (client-cancel
     // handling, and streaming for the clone and logs); the rest return a

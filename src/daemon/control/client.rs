@@ -2,18 +2,22 @@
 //! blocking helpers CLI commands use, which have no tokio runtime of their
 //! own.
 
-use std::{fs, future::Future, io, time::Duration};
+use std::{future::Future, io, time::Duration};
 
 use color_eyre::eyre::{Report, Result, WrapErr as _, bail, eyre};
 use tokio::net::UnixStream;
 
 use super::protocol::{
-    BUILD, CLIENT_TIMEOUT, CloneProgress, MAX_MESSAGE_SIZE, Request, Response, Status, build_path,
+    BUILD, CLIENT_TIMEOUT, CloneProgress, MAX_BUILD_SIZE, MAX_MESSAGE_SIZE, Request, Response,
+    Status,
 };
 use crate::{
     config::ConfigDir,
     net::wire::{read_message, write_message},
 };
+
+/// Hint for a daemon of another build.
+const RESTART_HINT: &str = "restart it with `jj-mesh service restart`";
 
 /// Error of every command that needs the daemon when none is running.
 ///
@@ -47,7 +51,7 @@ impl ControlClient {
     pub async fn connect(dir: &ConfigDir) -> Result<Option<Self>> {
         let path = dir.socket_path();
 
-        let stream = match UnixStream::connect(&path).await {
+        let mut stream = match UnixStream::connect(path).await {
             Ok(stream) => stream,
             Err(err)
                 if matches!(
@@ -61,14 +65,20 @@ impl ControlClient {
                 return Err(err).wrap_err_with(|| format!("cannot connect to {}", path.display()));
             }
         };
-        // Daemons predating the build file are caught by the decode hint
-        // in `recv`; builds without a known commit cannot be compared.
-        let build = fs::read_to_string(build_path(path)).unwrap_or_default();
+        let greeting = read_message::<String>(&mut stream, MAX_BUILD_SIZE);
+        let build = tokio::time::timeout(CLIENT_TIMEOUT, greeting)
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .ok_or_else(|| {
+                eyre!("the daemon did not send its build, it likely runs an older jj-mesh: {RESTART_HINT}")
+            })?;
+        // Builds without a known commit cannot be compared.
         let known = |build: &str| !build.is_empty() && !build.starts_with("unknown");
         if known(&build) && known(BUILD) && build != BUILD {
             bail!(
                 "the daemon runs jj-mesh build {build} while this command is build {BUILD}: \
-                 restart it with `jj-mesh service restart`"
+                 {RESTART_HINT}"
             );
         }
         Ok(Some(ControlClient { stream }))
@@ -99,10 +109,9 @@ impl ControlClient {
                 .map_err(|_| eyre!("the daemon did not answer"))?,
             None => read.await,
         };
-        response.wrap_err(
-            "cannot read the daemon's answer: if it runs another build of jj-mesh, \
-             restart it with `jj-mesh service restart`",
-        )
+        response.wrap_err_with(|| {
+            format!("cannot read the daemon's answer: if it runs another build, {RESTART_HINT}")
+        })
     }
 }
 
@@ -167,4 +176,68 @@ pub fn request_streaming_blocking(
             }
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use tokio::{net::UnixListener, sync::watch};
+
+    use super::*;
+    use crate::daemon::control::server::ControlServer;
+
+    /// A config dir with a fake daemon socket.
+    fn fake_daemon() -> (tempfile::TempDir, ConfigDir, UnixListener) {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = ConfigDir::new(Some(tmp.path().to_owned())).unwrap();
+        let listener = UnixListener::bind(dir.socket_path()).unwrap();
+        (tmp, dir, listener)
+    }
+
+    /// A CLI reaching a daemon of another build is told to restart it,
+    /// before any exchange that would fail to decode.
+    #[tokio::test]
+    async fn refuses_daemon_of_another_build() {
+        if BUILD.starts_with("unknown") {
+            return; // Built without a commit: nothing to compare.
+        }
+        let (_tmp, dir, listener) = fake_daemon();
+        let daemon = tokio::spawn(async move {
+            for build in ["0000dead", BUILD] {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                write_message(&mut stream, &build, MAX_BUILD_SIZE)
+                    .await
+                    .unwrap();
+            }
+        });
+
+        let err = ControlClient::connect(&dir).await.unwrap_err();
+        assert!(err.to_string().contains("0000dead"), "{err}");
+        assert!(err.to_string().contains("service restart"), "{err}");
+        assert!(ControlClient::connect(&dir).await.unwrap().is_some());
+        daemon.await.unwrap();
+    }
+
+    /// A starting daemon greets clients before it can serve requests.
+    #[tokio::test]
+    async fn connects_to_starting_daemon() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = ConfigDir::new(Some(tmp.path().to_owned())).unwrap();
+        let server = ControlServer::bind(&dir).unwrap();
+        let (_ctx, ctx_rx) = watch::channel(None);
+        let daemon = tokio::spawn(server.serve(ctx_rx));
+
+        assert!(ControlClient::connect(&dir).await.unwrap().is_some());
+        daemon.abort();
+    }
+
+    /// Daemons predating the greeting send nothing first.
+    #[tokio::test]
+    async fn refuses_daemon_without_greeting() {
+        let (_tmp, dir, listener) = fake_daemon();
+        let daemon = tokio::spawn(async move { listener.accept().await.unwrap() });
+
+        let err = ControlClient::connect(&dir).await.unwrap_err();
+        assert!(err.to_string().contains("service restart"), "{err}");
+        drop(daemon.await.unwrap());
+    }
 }

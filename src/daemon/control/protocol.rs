@@ -341,14 +341,12 @@ pub enum WatchStatus {
     Indexing,
 }
 
-/// The build (commit) this binary was made from, published by the daemon
-/// beside its socket and compared by the CLI before any exchange: the
+/// The build (commit) this binary was made from, sent by the daemon first
+/// on every connection and compared by the CLI before any exchange: the
 /// messages above only stay decodable across builds when the variants
 /// were appended, and a mismatch is reported as such instead of as a
-/// decode error.
+/// decode error. This greeting must never change shape.
 pub(super) const BUILD: &str = env!("JJ_MESH_COMMIT");
 
-/// Where the daemon publishes its [`BUILD`], beside the control socket.
-pub(super) fn build_path(socket: &std::path::Path) -> PathBuf {
-    socket.with_extension("build")
-}
+/// Size bound of the [`BUILD`] greeting.
+pub(super) const MAX_BUILD_SIZE: u32 = 256;
