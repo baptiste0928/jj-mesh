@@ -137,7 +137,7 @@ async fn conflicting_id_is_surfaced_and_never_synced() {
     // A matching announcement resumes sync and resolves the conflict.
     hub.route(peer, announce("a", &id, 2, vec![vec![2; 64]]));
     assert_eq!(inbox.drain().len(), 1);
-    assert!(hub.conflicts().is_empty());
+    assert_eq!(hub.conflicts(), []);
 }
 
 #[tokio::test]
@@ -249,7 +249,7 @@ async fn retraction_releases_peer_state() {
     );
     assert_eq!(hub.conflicts().len(), 1);
     hub.route(peer, announce("a", &RepoId::generate(), 2, vec![]));
-    assert!(hub.conflicts().is_empty());
+    assert_eq!(hub.conflicts(), []);
 
     // A stale pre-retraction announcement stays rejected...
     hub.route(peer, announce("a", &id, 1, vec![vec![1; 64]]));
@@ -266,7 +266,7 @@ async fn retraction_releases_peer_state() {
     );
     hub.route(peer, announce("b", &RepoId::generate(), 5, vec![]));
     hub.register_repo("b".to_owned(), RepoId::generate());
-    assert!(hub.conflicts().is_empty());
+    assert_eq!(hub.conflicts(), []);
 }
 
 #[tokio::test]

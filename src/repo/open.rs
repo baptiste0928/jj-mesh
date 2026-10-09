@@ -689,7 +689,7 @@ mod tests {
         );
 
         let missing = ra.ancestors_until(&a_heads, &b_heads).await.unwrap();
-        assert!(!missing.is_empty());
+        assert_ne!(missing, []);
         let mut writes = rb.raw_write_batch();
         for (id, op) in &missing {
             let view = ra.read_view_bytes(&op.view_id).unwrap();

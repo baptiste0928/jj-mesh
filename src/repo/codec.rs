@@ -259,7 +259,7 @@ mod tests {
         let repo = JjRepo::discover(&dir).unwrap().open().unwrap();
         let heads = repo.op_heads().await.unwrap();
         let ops = repo.ancestors_until(&heads, &[]).await.unwrap();
-        assert!(!ops.is_empty());
+        assert_ne!(ops, []);
 
         for (id, op) in &ops {
             let meta = parse_operation(&repo.read_operation_bytes(id).unwrap()).unwrap();
@@ -363,7 +363,7 @@ mod tests {
         for byte in 1..=7u8 {
             assert!(ids.contains(&vec![byte; 20]), "missing id {byte}");
         }
-        assert!(meta.head_ids.is_empty());
+        assert_eq!(meta.head_ids, []);
     }
 
     /// Shapes jj's own view reader panics or errors on must be rejected at

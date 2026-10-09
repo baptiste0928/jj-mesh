@@ -8,10 +8,10 @@ license = "ISC"
 
 [dependencies]
 chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
-clap = { version = "4.6.6", features = ["derive", "wrap_help"] }
-clap_complete = { version = "4.6.9", features = ["unstable-dynamic"] }
+clap = { version = "4.6.7", features = ["derive", "wrap_help"] }
+clap_complete = { version = "4.6.11", features = ["unstable-dynamic"] }
 color-eyre = "0.6.5"
-console = "0.16.4"
+console = "0.16.6"
 data-encoding = "2.11.1"
 dialoguer = { version = "0.12.0", default-features = false }
 etcetera = "0.11.0"
@@ -22,22 +22,22 @@ gix = { version = "0.88.0", default-features = false }
 gix-pack = "0.75.0"
 indicatif = "0.18.6"
 ignore = "0.4"
-iroh = "1.1.0"
+iroh = "1.3.0"
 jj-lib = "0.46.0" # Exact pin since jj's on-disk formats are internal and may change between releases
 mimalloc = "0.1.52"
 notify = "8.2.0"
 pollster = "1.0.1"
 postcard = { version = "1.1.3", features = ["use-std"] }
 prost = "0.14.4"
-rand = "0.10.2"
+rand = "0.10.3"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 subtle = { version = "2.6.1", default-features = false }
 tempfile = "3.27.0"
-tokio = { version = "1.53.1", features = ["io-util", "net", "process", "rt", "signal", "sync", "time"] }
+tokio = { version = "1.53.2", features = ["io-util", "net", "process", "rt", "signal", "sync", "time"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
-zstd = "0.13.3"
+zstd = "0.14.1"
 shell-words = "1.1.1"
 
 [features]
@@ -47,4 +47,4 @@ failpoints = ["fail/failpoints"]
 [dev-dependencies]
 fail = "0.5.1"
 jj-mesh = { path = ".", features = ["test-util", "failpoints"] }
-tokio = { version = "1.53.1", features = ["macros"] }
+tokio = { version = "1.53.2", features = ["macros"] }
