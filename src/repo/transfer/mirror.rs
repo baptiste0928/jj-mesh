@@ -1,6 +1,13 @@
 //! The git ref mirror: before op heads get published, moves the git
 //! repo's refs to what jj's merged view of the new heads carries, so
-//! jj's next import finds nothing to undo (see the sync docs).
+//! jj's next import finds nothing to undo.
+//!
+//! jj records the git refs in its view and, on import, treats any ref that
+//! differs from that record as a move the user made in git. A sync leaving
+//! the git repo stale is therefore undone at the next import, and the undo
+//! spreads to every peer: after a clone's first pull, it deletes every
+//! bookmark mesh-wide. A colocated repo imports at every jj command, a
+//! non-colocated one when the user enables colocation.
 //!
 //! The merge replays jj's own view merge on the git refs, with jj's code:
 //! the op heads fold pairwise, each pair three-way merged against its

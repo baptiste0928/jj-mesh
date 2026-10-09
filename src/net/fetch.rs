@@ -1,19 +1,17 @@
 //! The fetch protocol, run on one bidirectional stream opened by the
 //! fetching side:
 //!
-//! 1. fetcher: [`FetchRequest`] (wanted op heads + have samples)
-//! 2. server:  [`OpFrame::Begin`] with the phase's exact frame counts (for
-//!    progress display; the delta is collected before streaming anyway),
-//!    then [`OpFrame`]s, views before the ops referencing them, ops in
-//!    parents-first order, terminated by [`OpFrame::Done`]
-//! 3. fetcher: [`GitRequest`] (commits referenced by the new views that are
-//!    missing locally, plus have samples, and the transfer format)
-//! 4. server:  [`GitFrame`]s terminated by [`GitFrame::Done`]: raw git
-//!    objects in the loose format, or chunks of one git packfile in the
-//!    pack format
-//!
-//! The fetcher then applies everything locally in crash-safe order; nothing
-//! is written before the peer's data is fully validated per object.
+//! ```text
+//! fetcher                                     server
+//!    |  FetchRequest { wants, haves }           |
+//!    |----------------------------------------->|
+//!    |  OpFrame: Begin, (View | Op)*, Done      |
+//!    |<-----------------------------------------|
+//!    |  GitRequest { wants, haves, format }     |
+//!    |----------------------------------------->|
+//!    |  GitFrame: (Object* | Pack chunk*), Done |
+//!    |<-----------------------------------------|
+//! ```
 //!
 //! Op, view and loose git object payloads travel zstd-compressed (see
 //! [`compress_payload`]); QUIC does not compress, and proto bytes and git
@@ -104,9 +102,9 @@ pub struct FetchRequest {
 /// Server-to-fetcher frame of the op phase.
 ///
 /// Views and ops travel as the raw proto bytes stored in the server's op
-/// store, under their stored ids (see the sync docs for why re-encoding
-/// them is impossible). The receiver validates the bytes structurally
-/// (`repo`'s codec) before storing them.
+/// store, under their stored ids (see [`crate::repo::transfer`] for why
+/// re-encoding them is impossible). The receiver validates the bytes
+/// structurally (`repo`'s codec) before storing them.
 ///
 /// The proto bytes travel zstd-compressed; compression is a wire concern
 /// and the stored bytes stay verbatim.

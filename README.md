@@ -15,7 +15,7 @@ but works across machines:
 - Since the [op log](https://docs.jj-vcs.dev/latest/operation-log/) is synced, concurrent operations
   get merged automatically and everything is recoverable.
 
-![Screenshot of `jj-mesh status`](./docs/screenshot.png)
+![Screenshot of `jj-mesh status`](./.github/screenshot.png)
 
 `jj-mesh` is made to sync across your personal machines. You can for example use it to run a coding
 agent on a server and inspect its edits locally, or keep your work-in-progress changes in sync
@@ -131,8 +131,6 @@ without waiting for the next `jj` command to be run.
 
 Most of it works thanks to the operation log. Concurrent operations get merged automatically by
 `jj`, which avoids many conflicts that occur when using regular `git`-only sync.
-
-Check out [`docs/`](./docs/src) for more information about the internals.
 
 ## Security and privacy
 

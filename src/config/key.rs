@@ -1,10 +1,7 @@
 //! Machine identity key file (`machine.key`).
 //!
-//! This private key is used by iroh to identify the machine in the p2p network
-//! and must not be shared across machines. The public part is the
-//! [`EndpointId`], which is used to connect to other peers.
-//!
-//! The key is stored base64-encoded.
+//! This private key is the machine's iroh identity and must not be shared
+//! across machines.
 
 use std::{
     fs,

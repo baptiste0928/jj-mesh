@@ -1,11 +1,5 @@
 //! Server side of a fetch: streaming the op-log delta, then the git object
-//! closure the fetcher lacks. Read-only on the repo throughout.
-//!
-//! Every phase runs the same pipeline ([`serve_phase`]): a blocking
-//! producer task walks the repo and streams frames through a bounded
-//! channel, while the async side relays them to the wire and closes the
-//! phase with `Done`, or with an `Error` frame carrying the producer's
-//! failure.
+//! closure the fetcher lacks. Every phase runs through [`serve_phase`].
 
 use std::{
     collections::{HashMap, HashSet},

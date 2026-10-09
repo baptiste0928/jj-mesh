@@ -22,6 +22,9 @@ use super::open::OpenRepo;
 /// always holds durable, complete content, so an interrupted batch can
 /// be retried with the existing objects skipped.
 ///
+/// An existing object is never overwritten: for a content-addressed store
+/// the first write wins.
+///
 /// Nothing is readable under its final id until [`Self::persist`];
 /// dropping the batch instead discards the staged files.
 pub struct RawWriteBatch<'a> {
@@ -53,10 +56,9 @@ impl<'a> RawWriteBatch<'a> {
         self.stage(&self.repo.op_store_dir().join("views"), id, bytes)
     }
 
-    /// Stages one object file, leaving any existing object untouched
-    /// (the first write wins, see the `open` module invariants). The temp file
-    /// is closed right away so a large batch does not hold thousands of
-    /// open descriptors.
+    /// Stages one object file, leaving any existing object untouched. The
+    /// temp file is closed right away so a large batch does not hold
+    /// thousands of open descriptors.
     fn stage(&mut self, dir: &Path, id: &impl ObjectId, bytes: &[u8]) -> Result<()> {
         let path = dir.join(id.hex());
         if path.exists() {

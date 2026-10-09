@@ -1,45 +1,35 @@
 //! The op and git object transfer engine: serving fetches and fetching.
 //!
 //! Both sides run over any `AsyncRead`/`AsyncWrite` pair (QUIC streams in
-//! production, in-memory duplexes in tests) and exchange the frame types
-//! defined in [`crate::net::fetch`]:
+//! production, in-memory duplexes in tests) and exchange the frames of
+//! [`crate::net::fetch`].
 //!
-//! ```text
-//! fetcher                                     server
-//!    |  FetchRequest { wants, haves }           |
-//!    |----------------------------------------->|
-//!    |  OpFrame: Begin, (View | Op)*, Done      |
-//!    |<-----------------------------------------|
-//!    |  GitRequest { wants, haves, format }     |
-//!    |----------------------------------------->|
-//!    |  GitFrame: (Object* | Pack chunk*), Done |
-//!    |<-----------------------------------------|
-//!    |  stage + index + publish (local only)    |
-//! ```
+//! Ops and views travel as raw stored bytes and keep their sender-side ids.
+//! jj computes these ids by hashing its in-memory structures at write time,
+//! and objects written by older jj versions do not survive a decode and
+//! re-encode with identical ids: replicating decoded objects would silently
+//! fork ids across the mesh.
 //!
-//! Ops and views travel as raw stored bytes and keep their sender-side ids
-//! (see the sync docs for why re-hashing them is impossible).
-//! Peer-supplied data is authenticated but untrusted: op and view bytes are
-//! validated structurally before anything is written, git objects are
-//! hash-verified before writing (loose frames against their claimed id,
-//! packed objects while indexing the pack), and replicated bytes can never
-//! replace already-stored objects (loose writes skip existing ids; pack ids
-//! are content hashes).
+//! Peer-supplied data is authenticated but untrusted. The engine guarantees,
+//! and changes here must preserve, that:
+//! - nothing synced becomes visible before it is validated: op and view
+//!   bytes structurally, git objects by hash (loose frames against their
+//!   claimed id, packed objects while indexing the pack);
+//! - replicated bytes never replace stored objects (loose writes skip
+//!   existing ids; pack ids are content hashes);
+//! - no op head is published before the ops and views it exposes are
+//!   readable;
+//! - a peer cannot unlist a local head without supplying a valid op history
+//!   that supersedes it;
+//! - an interrupted sync is safe to retry.
 //!
 //! The engine splits along its two sides and the apply step:
 //! - [`serve`] answers a fetch (read-only): the op-log delta, then the git
 //!   object closure the fetcher lacks, loose or as one packfile (see
 //!   [`crate::net::fetch::GitTransferFormat`]).
-//! - [`fetch`] pulls and validates that delta, then orchestrates the
-//!   local write in the crash-safe order: git objects already landed
-//!   during the transfer, [`apply`]'s stage step imports the new head
-//!   commits (keep refs and change-id extras) and persists views and ops
-//!   (parents first), the commit index is built for the incoming heads,
-//!   and [`apply`]'s publish step runs the git ref mirror and the op head
-//!   publication.
-//! - [`mirror`] keeps the git repo's refs in line with the synced views,
-//!   before each publication and, through [`mirror::heal`], when the
-//!   daemon starts watching a repo.
+//! - [`fetch`] pulls and validates that delta, then writes it through
+//!   [`apply`], in crash-safe order.
+//! - [`mirror`] keeps the git repo's refs in line with the synced views.
 //!
 //! Bulk store and git work runs on blocking threads (see the `open` module
 //! docs).

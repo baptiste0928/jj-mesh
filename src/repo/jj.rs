@@ -1,9 +1,4 @@
 //! Invoking the user's jj binary.
-//!
-//! [`run_jj`] and [`jj_output`] run one command against a repo,
-//! [`jj_version`] detects a binary's version, and
-//! [`jj_version_warning`] and [`jj_peer_warning`] word the warnings when
-//! the local or a peer's version falls outside the supported series.
 
 use std::{ffi::OsStr, path::Path};
 

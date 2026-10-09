@@ -1,10 +1,9 @@
 //! Owner of the daemon's authoritative mesh state.
 //!
 //! Every mutation, whether driven by the control socket or by membership
-//! gossip, funnels through [`MeshStore::update`]: persist to `mesh.json`,
-//! commit in memory, align the live peer and repo sets, and broadcast the
-//! membership when it changed. Owning the sets and the hub is what makes
-//! that guarantee structural rather than a convention on callers.
+//! gossip, funnels through [`MeshStore::update`]. Owning the peer and repo
+//! sets and the hub is what makes that guarantee structural rather than a
+//! convention on callers.
 
 use std::sync::{Arc, Mutex};
 

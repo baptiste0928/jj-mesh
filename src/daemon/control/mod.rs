@@ -4,20 +4,16 @@
 //! length-prefixed postcard messages (`net::wire` framing), one request
 //! per connection. Most get a single response; a clone streams progress,
 //! logs stream events, and joining a pairing keeps its connection open so
-//! the daemon notices a cancelling client. The
-//! daemon publishes its build beside the socket, and the CLI refuses to
-//! talk to another build: a daemon left running across an upgrade is a
-//! common state, and its answers may not decode.
+//! the daemon notices a cancelling client. The daemon greets each
+//! connection with its build, and the CLI refuses to talk to another
+//! build: a daemon left running across an upgrade is a common state, and
+//! its answers may not decode.
 //!
-//! The daemon is the only holder of the machine-key endpoint and the only
-//! writer of the mesh state, so live peer state, pairing and every
-//! user-driven mesh mutation go through here. Gossip-driven mutations
-//! reach the same store from the daemon's membership loop.
-//!
-//! Split along that line: [`protocol`] is the request/response vocabulary
-//! the CLI and daemon share, [`server`] serves it (with the streaming
-//! clone handler in [`clone`]), and [`client`] is what the CLI dials. The
-//! CLI depends on `protocol` and `client`, never on `server`.
+//! Live peer state, pairing and every user-driven mesh mutation go through
+//! here. [`protocol`] is the request/response vocabulary the CLI and daemon
+//! share, [`server`] serves it (with the streaming clone handler in
+//! [`clone`]), and [`client`] is what the CLI dials. The CLI depends on
+//! `protocol` and `client`, never on `server`.
 
 mod client;
 mod clone;

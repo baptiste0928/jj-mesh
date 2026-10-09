@@ -1,8 +1,5 @@
 //! `jj-mesh setup`: get this machine onto the mesh.
 //!
-//! Steps already done are skipped, except pairing, so setup can be run
-//! again to pair another machine:
-//!
 //! ```text
 //! check jj ─▶ start the daemon ─▶ name the machine ─▶ pair
 //!             (install or start    (only before the   (print a ticket,

@@ -1,12 +1,9 @@
 //! Daemon-side pairing.
 //!
 //! The daemon owns the machine-key endpoint, so all pairing runs through
-//! it, driven by control-socket requests. The pairing ALPN is always
-//! served; what gates pairing is the *ticket*: hosting issues a one-time
-//! ticket valid for [`PAIR_TICKET_TTL`], at most one is valid at a time
-//! (hosting again revokes the previous one), and redeeming it is atomic:
-//! the ticket is consumed under its lock before the peer is registered, so
-//! a revoked, expired or already-used ticket can never pair.
+//! it, driven by control-socket requests. Hosting issues a one-time ticket
+//! valid for [`PAIR_TICKET_TTL`], and at most one is valid at a time
+//! (hosting again revokes the previous one).
 
 use std::{
     sync::{Arc, Mutex},
