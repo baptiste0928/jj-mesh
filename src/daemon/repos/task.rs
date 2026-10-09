@@ -5,9 +5,7 @@
 //! command atomically swaps head marker files there, so a change event
 //! means new operations to announce. The task publishes its head set
 //! through the sync hub (on change and on watch start) and fetches
-//! operations peers announce; serving peer fetches is dispatched by the
-//! hub directly (never through this task's loop, which may itself be
-//! fetching).
+//! operations peers announce.
 //!
 //! Change detection compares the head set against the last one seen, which
 //! also absorbs event bursts and spurious wakeups; the task's own head
@@ -26,11 +24,6 @@
 //!
 //! A claim is released only when its name leaves the view, so a workspace
 //! briefly gone from disk (an unmounted disk) keeps it.
-//!
-//! On watch start the task also rebuilds the commit index for op heads
-//! that lack one (a fetch whose build failed, a repo synced by an older
-//! jj-mesh), showing the repo as indexing meanwhile: without it the
-//! user's next jj command would pay for the rebuild.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -220,15 +213,14 @@ impl RepoTask {
     /// Watches the repo's op heads until it stops: `Ok(())` when the store
     /// configuration changed underneath it (the caller reopens cleanly),
     /// an error when something failed. Announces local changes through the
-    /// hub and fetches announced changes from peers; serving peer fetches
-    /// is dispatched by the hub.
+    /// hub and fetches announced changes from peers.
     ///
     /// The head reads here are cheap single-shot store calls (one readdir),
     /// safe from async context; see the [`crate::repo::OpenRepo`] docs.
     async fn watch(&self) -> Result<()> {
         let (jj, repo, fingerprint) = self.open().await?;
-        // Fetch serving is dispatched by the hub, never by this loop: a
-        // fetch below may block on the very peer being served.
+        // Fetch serving is dispatched by the hub (see `hub::serve`), never
+        // by this loop: a fetch below may block on the very peer being served.
         self.hub.repo_opened(&self.name, &self.id, repo.clone());
 
         // Watch before the first read: changes racing the setup produce at
@@ -721,8 +713,12 @@ async fn find_workspaces(
     .wrap_err("workspace search task failed")?
 }
 
-/// The op head, when single: working copies are only caught up on then
-/// (see the `workspace` module docs on divergence).
+/// The op head, when single: working copies are only caught up on then.
+/// Any jj command reconciles divergent op heads by writing a merge
+/// operation, so daemons catching up on both ends of a divergence would
+/// ping-pong fresh merges at each other. Divergence is left to the next
+/// actual jj activity (a user command, an auto-snapshot), whose merge then
+/// syncs as a single head.
 fn single_head(heads: &[OperationId]) -> Option<OperationId> {
     match heads {
         [head] => Some(head.clone()),

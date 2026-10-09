@@ -1,6 +1,5 @@
 //! The control-socket vocabulary: the request/response types the CLI and
-//! daemon exchange, and the timing budgets that bound the exchange. Shared
-//! by [`super::server`] and [`super::client`], and re-exported for the CLI.
+//! daemon exchange, and the timing budgets that bound the exchange.
 
 use std::{
     path::PathBuf,

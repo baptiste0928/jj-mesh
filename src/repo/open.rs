@@ -3,16 +3,11 @@
 //! [`OpenRepo`] wraps a [`RepoLoader`] and exposes op-head enumeration, op
 //! DAG walking, op/view transfer primitives and the git backend. It never
 //! loads a full repo; the commit index is built only by the explicit
-//! builds (see [`OpenRepo::build_commit_indexes`]): syncs run one before
-//! publishing an op head, and the repo watch heals heads that lack one.
-//! The git ref mirror reads the built indexes to merge divergent views.
+//! builds (see [`OpenRepo::build_commit_indexes`]).
 //!
 //! Invariants:
 //! - Ops and views replicate as raw stored bytes under the sender's ids
-//!   (see the sync docs for why re-encoding them is impossible). Raw
-//!   writes are atomic and never overwrite an existing object: for a
-//!   content-addressed store the first write wins. They are staged and
-//!   persisted in batches (see [`RawWriteBatch`] in `super::write`).
+//!   (see [`super::transfer`]), written through [`RawWriteBatch`].
 //! - The root operation is never transferred; it is identical in every repo.
 //!
 //! jj's store traits are async in signature only: every call does blocking

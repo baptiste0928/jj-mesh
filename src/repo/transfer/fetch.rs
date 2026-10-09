@@ -1,7 +1,6 @@
 //! Fetcher side of a fetch: requesting the op-log delta, validating it,
 //! pulling the git objects it references, then staging it, indexing the
-//! incoming heads and publishing them (see [`super`] for the crash-safe
-//! apply order).
+//! incoming heads and publishing them (see [`super::apply`]).
 
 use std::{collections::HashSet, sync::Arc, time::Duration};
 

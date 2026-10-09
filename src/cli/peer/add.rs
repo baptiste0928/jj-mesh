@@ -1,9 +1,4 @@
 //! `jj-mesh peer add`: register another machine as a peer.
-//!
-//! Pairing always runs through the daemon, which owns the machine-key
-//! endpoint: the CLI drives it over the control socket. Hosting only asks
-//! the daemon for a ticket and exits; the daemon completes the pairing on
-//! its own once the other machine redeems the ticket.
 
 use std::time::Duration;
 

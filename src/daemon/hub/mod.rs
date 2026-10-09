@@ -2,37 +2,18 @@
 //!
 //! Peer tasks and repo tasks do not know each other; the hub sits between
 //! them and makes announcements genuinely latest-wins in both directions:
-//!
-//! - Outbound, each connected peer has one sender task draining a per-repo
-//!   coalescing [`Outbox`]: publishes overwrite the pending entry for their
-//!   repo, sends are sequential per peer, and a (re)connecting peer's
-//!   outbox is seeded with every published repo (anti-entropy replay).
-//! - Inbound, announcements land in a per-peer slot on the repo's
-//!   [`Inbox`], newer sequence numbers overwriting older ones, so reordered
-//!   streams and slow repo tasks can never make stale state win.
+//! a per-peer coalescing [`Outbox`] outbound, and per-peer slots on the
+//! repo's [`Inbox`], ordered by sequence number, inbound.
 //!
 //! ```text
 //! peer task --route()---> Inbox (per repo) ---drain()--> repo task
 //! peer task <--sender---- Outbox (per peer) <-publish()- repo task
 //! ```
 //!
-//! Repos are identified by name. An announcement whose name matches a
-//! registered repo but whose id differs means two unrelated repos contest
-//! the name: it is never synced (that would merge unrelated histories) and
-//! the conflict is surfaced through the status. Announcements for names not
-//! registered here are remembered for `clone` (see [`orphans`]).
-//! Disconnecting a peer closes its connection through the hub: revocation
-//! must sever announcements even when it races connection setup.
-//!
-//! The hub also carries the machine's latest membership and status report,
-//! since it owns the outboxes: both are published here on every change and
-//! replayed (before any announcement) to every connecting peer. It holds
-//! the latest report of each connected peer as well. And it serves inbound
-//! fetches for the repos it has open (see [`serve`]).
-//!
-//! Peers are identified by endpoint id; the hub also holds their current
-//! paired names (see [`SyncHub::peer_name`]), so both sides log peers the
-//! way the user knows them.
+//! Owning the outboxes, the hub also carries the membership and status
+//! reports to peers, remembers announcements for unregistered repos (see
+//! [`orphans`]), serves inbound fetches (see [`serve`]), and holds the
+//! peers' paired names (see [`SyncHub::peer_name`]).
 
 mod inbox;
 mod orphans;
@@ -322,7 +303,7 @@ impl SyncHub {
     }
 
     /// Marks a peer connected: spawns its sender task and seeds the outbox
-    /// with the membership and every published repo, so a (re)connecting
+    /// with the membership, the status report and every published repo, so a (re)connecting
     /// peer learns state it missed while away. Resets per-peer state (see
     /// [`HubState::forget_peer`]): the connection may replace one whose
     /// loss went unnoticed.

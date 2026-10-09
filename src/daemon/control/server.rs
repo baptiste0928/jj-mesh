@@ -1,6 +1,5 @@
 //! Server side of the control socket: the listener, the per-connection
-//! request handlers, and the daemon context they act on. The clone
-//! handler, which streams progress, lives in [`super::clone`].
+//! request handlers, and the daemon context they act on.
 
 use std::{
     fs::{self, File, TryLockError},

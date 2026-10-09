@@ -1,5 +1,10 @@
 //! Sync protocol, multiplexed over the persistent peer connection.
 //!
+//! The protocol is pull-based: announcements advertise op heads, and a
+//! machine missing some fetches them. The receiver thus controls exactly
+//! what enters its repo (validation lives on one side), and delivery needs
+//! no guarantees: the latest announcement always suffices.
+//!
 //! One-shot uni streams carry a [`UniMessage`]: op-head announcements,
 //! membership gossip and daemon status reports. All are idempotent
 //! latest-wins state, re-sent on every change and on peer (re)connect, so a

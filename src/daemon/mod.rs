@@ -1,10 +1,17 @@
 //! Long-running sync daemon.
 //!
-//! Maintains persistent connections to every paired peer (allowlisted at
-//! accept), watches every registered repo for op head changes and announces
-//! them to peers, and serves live state on the control socket. The daemon
-//! owns the mesh state (`mesh.json`): every mutation arrives through the
-//! control socket or the membership gossip, and is persisted here.
+//! ```text
+//! control socket ─┐               ┌─► PeerSet ─ peer tasks ◄──► peer daemons
+//! gossip, claims ─┴─► MeshStore ──┤                │
+//!                     (mesh.json) │             SyncHub
+//!                                 │                │
+//!                                 └─► RepoSet ─ repo tasks ◄──► jj repos
+//! ```
+//!
+//! `MeshStore` owns the mesh state, and every mutation aligns the `PeerSet`
+//! (one connection task per peer) and the `RepoSet` (one watch task per
+//! repo) with it. Peer and repo tasks never talk directly: the `SyncHub`
+//! routes announcements and fetches between them.
 
 mod backoff;
 pub mod control;

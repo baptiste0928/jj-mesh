@@ -4,9 +4,8 @@
 //! every directory, ignored build trees included: tens of thousands of
 //! watches and a constant event stream to discard. Instead the tree is
 //! walked with gitignore semantics and only non-ignored directories get a
-//! watch, one non-recursive watch each. The same rules filter events for
-//! ignored files inside watched directories, so the walk and the event
-//! path can never disagree.
+//! watch, one non-recursive watch each. The same rules (see [`rules`])
+//! filter events for ignored files inside watched directories.
 //!
 //! This is a change signal for snapshot scheduling, not an exact tracker:
 //! a spurious signal only costs a no-op snapshot, and a missed one is
@@ -17,8 +16,7 @@
 //! - a directory that appears non-ignored, however it appeared (created,
 //!   renamed in, unignored), starts being watched;
 //! - the watcher's own cost stays bounded whatever the tree contains:
-//!   rule files are read defensively, the event queue is bounded, and the
-//!   walks rebuilding the watched set are coalesced and run off-thread.
+//!   the event queue is bounded, and the walks rebuilding the watched set are coalesced and run off-thread.
 
 mod rules;
 

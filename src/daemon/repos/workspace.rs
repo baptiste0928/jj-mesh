@@ -6,26 +6,13 @@
 //! through [`Synced`]. A task whose working copy watch dies stops, and the
 //! repo task's next workspace scan respawns it.
 //!
-//! The task reads its [`Settings`] from jj config once on start.
-//!
 //! When auto-snapshotting is enabled, the task watches the working copy
-//! files and snapshots them on the cadence [`Snapshotting`] sets. The
-//! snapshot runs through the jj binary and produces a regular operation,
-//! which the repo task's op-heads watch then picks up and announces like
-//! any local change.
+//! files and snapshots them on the cadence [`Snapshotting`] sets.
 //!
 //! Syncing operations from peers can leave the working copy stale (updated
 //! by an operation the working copy never saw). When enabled, `jj workspace
-//! update-stale` runs after every sync that applied operations, and once on
-//! task start for staleness accrued while the daemon was down, but only
-//! while the op head is single and the head moved the working-copy commit
-//! since the working copy's last update: the command snapshots the whole
-//! working copy before checking anything, so it must not run on syncs that
-//! cannot have made it stale. Any jj command reconciles divergent op heads
-//! by writing a merge operation, so daemons doing this on both ends of a
-//! divergence would ping-pong fresh merge operations at each other.
-//! Divergence is left to the next actual jj activity (a user command, an
-//! auto-snapshot), whose merge then syncs as a single head.
+//! update-stale` runs after syncs that applied operations, while the op head
+//! is single.
 
 use std::{
     path::Path,
@@ -197,7 +184,9 @@ impl WorkspaceTask {
     }
 
     /// Runs `jj workspace update-stale` when the working copy may be stale
-    /// at `head`; returns whether it ran.
+    /// at `head`; returns whether it ran. The command snapshots the whole
+    /// working copy before checking anything, so it must not run on syncs
+    /// that cannot have made it stale.
     async fn update_stale(
         &self,
         head: &OperationId,

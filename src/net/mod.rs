@@ -1,7 +1,4 @@
 //! Peer-to-peer networking over iroh.
-//!
-//! Hosts the endpoint construction, the message framing, and the pairing
-//! and sync protocols.
 
 mod endpoint;
 pub(crate) mod fetch;

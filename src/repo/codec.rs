@@ -1,11 +1,10 @@
 //! Structural validation of replicated op store bytes.
 //!
-//! Ops and views replicate as the raw proto bytes stored on the sender
-//! (see [`crate::net::fetch::OpFrame`]). This module decodes them with jj's
-//! own proto schema and extracts what sync validation needs: the op DAG
-//! shape and every commit id the object references, including legacy proto
-//! forms still present in repos written by older jj versions. The bytes
-//! themselves are stored verbatim, so fields this build does not know
+//! Replicated op and view bytes are decoded with jj's own proto schema to
+//! extract what sync validation needs: the op DAG shape and every commit id
+//! the object references, including legacy proto forms still present in
+//! repos written by older jj versions. The bytes themselves are stored
+//! verbatim, so fields this build does not know
 //! about survive replication untouched.
 //!
 //! Parsing must reject every shape jj's own readers reject (or panic on).
