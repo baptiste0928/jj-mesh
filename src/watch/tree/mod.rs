@@ -391,8 +391,11 @@ mod tests {
     use std::{os::unix::fs::symlink, time::Duration};
 
     use super::*;
+    use crate::testing::{
+        self,
+        watch::{QUIET, drain},
+    };
 
-    const QUIET: Duration = Duration::from_millis(300);
     const WAIT: Duration = Duration::from_secs(5);
 
     async fn assert_changed(watch: &mut TreeWatcher) {
@@ -400,14 +403,6 @@ mod tests {
             .await
             .expect("no change detected")
             .unwrap();
-    }
-
-    /// Consumes queued signals until the watcher stays quiet, so earlier
-    /// activity cannot leak into a negative assertion.
-    async fn drain(watch: &mut TreeWatcher) {
-        while let Ok(changed) = tokio::time::timeout(QUIET, watch.changed()).await {
-            changed.unwrap();
-        }
     }
 
     async fn assert_quiet(watch: &mut TreeWatcher) {
@@ -422,21 +417,8 @@ mod tests {
         root.canonicalize().unwrap()
     }
 
-    /// Starts a watch and settles it: FSEvents may still deliver the
-    /// writes that set the tree up before the watch, which would trip
-    /// the negative assertions that follow.
     async fn watch(root: &Path) -> TreeWatcher {
-        watch_in(root, &root.join(".git")).await
-    }
-
-    /// [`watch`], in a repo whose git directory is `git_dir`.
-    async fn watch_in(root: &Path, git_dir: &Path) -> TreeWatcher {
-        let mut watch = tokio::time::timeout(WAIT, TreeWatcher::new(root, git_dir))
-            .await
-            .expect("building the watcher must not hang")
-            .unwrap();
-        drain(&mut watch).await;
-        watch
+        testing::watch::tree(root, &root.join(".git")).await
     }
 
     #[tokio::test]
@@ -549,7 +531,7 @@ mod tests {
         let git_dir = tmp.path().join("git");
         fs::create_dir_all(git_dir.join("info")).unwrap();
         fs::write(git_dir.join("info/exclude"), "*.log\n").unwrap();
-        let mut watch = watch_in(&root, &git_dir).await;
+        let mut watch = testing::watch::tree(&root, &git_dir).await;
 
         fs::write(root.join("boring.log"), "x").unwrap();
         assert_quiet(&mut watch).await;

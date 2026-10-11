@@ -1,5 +1,6 @@
 //! Test fixtures: runs the `jj` binary against temporary repos, syncs two
-//! local repos over in-memory streams, and queries git.
+//! local repos over in-memory streams, queries git, and starts settled
+//! filesystem watchers.
 //!
 //! Available to this crate's unit tests and, through the `test-util`
 //! feature, to the integration tests.
@@ -316,4 +317,47 @@ fn git_command(git_dir: &Path, args: &[&str]) -> Command {
         .arg(git_dir)
         .args(args);
     cmd
+}
+
+/// Settled filesystem watchers.
+///
+/// Watchers must be settled before asserting: FSEvents may still deliver
+/// writes made before the watch started, such as the creation of the
+/// watched directory itself.
+#[cfg(test)]
+pub(crate) mod watch {
+    use std::{path::Path, time::Duration};
+
+    use crate::watch::{DirWatcher, TreeWatcher};
+
+    /// Quiet window after which a watcher counts as settled.
+    pub(crate) const QUIET: Duration = Duration::from_millis(300);
+
+    /// Starts a [`DirWatcher`] and settles it.
+    pub(crate) async fn dir(dir: &Path, debounce: Duration, debounce_max: Duration) -> DirWatcher {
+        #[expect(clippy::disallowed_methods, reason = "settled below")]
+        let mut watch = DirWatcher::new(dir, debounce, debounce_max).unwrap();
+        while watch.changed_or_idle(QUIET).await.unwrap() {}
+        watch
+    }
+
+    /// Starts a [`TreeWatcher`] and settles it.
+    pub(crate) async fn tree(root: &Path, git_dir: &Path) -> TreeWatcher {
+        #[expect(clippy::disallowed_methods, reason = "settled below")]
+        let build = TreeWatcher::new(root, git_dir);
+        let mut watch = tokio::time::timeout(Duration::from_secs(5), build)
+            .await
+            .expect("building the watcher must not hang")
+            .unwrap();
+        drain(&mut watch).await;
+        watch
+    }
+
+    /// Consumes queued changes until the watcher stays quiet, so earlier
+    /// activity cannot leak into a negative assertion.
+    pub(crate) async fn drain(watch: &mut TreeWatcher) {
+        while let Ok(changed) = tokio::time::timeout(QUIET, watch.changed()).await {
+            changed.unwrap();
+        }
+    }
 }

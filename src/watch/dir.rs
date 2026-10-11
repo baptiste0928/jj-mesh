@@ -124,14 +124,19 @@ mod tests {
     use std::fs;
 
     use super::*;
+    use crate::testing;
 
     const DEBOUNCE: Duration = Duration::from_millis(50);
     const DEBOUNCE_MAX: Duration = Duration::from_millis(500);
 
+    async fn watch(dir: &Path) -> DirWatcher {
+        testing::watch::dir(dir, DEBOUNCE, DEBOUNCE_MAX).await
+    }
+
     #[tokio::test]
     async fn reports_changes() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut watch = DirWatcher::new(tmp.path(), DEBOUNCE, DEBOUNCE_MAX).unwrap();
+        let mut watch = watch(tmp.path()).await;
 
         fs::write(tmp.path().join("file"), "x").unwrap();
 
@@ -144,23 +149,11 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("watched");
         fs::create_dir(&dir).unwrap();
-        let mut watch = DirWatcher::new(&dir, DEBOUNCE, DEBOUNCE_MAX).unwrap();
+        let mut watch = watch(&dir).await;
 
         fs::remove_dir(&dir).unwrap();
 
         let outcome = watch.changed_or_idle(Duration::from_secs(5)).await;
         assert!(outcome.is_err(), "removal must surface as a watch error");
-    }
-
-    #[tokio::test]
-    async fn idle_elapses_without_events() {
-        let tmp = tempfile::tempdir().unwrap();
-        let mut watch = DirWatcher::new(tmp.path(), DEBOUNCE, DEBOUNCE_MAX).unwrap();
-
-        let changed = watch
-            .changed_or_idle(Duration::from_millis(50))
-            .await
-            .unwrap();
-        assert!(!changed);
     }
 }

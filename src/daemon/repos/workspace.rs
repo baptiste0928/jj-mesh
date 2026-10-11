@@ -187,6 +187,7 @@ impl WorkspaceTask {
     /// Builds the working-copy watcher, degrading to `None` instead of
     /// failing: `None` means no snapshots for this workspace, nothing else.
     async fn watch_tree(&self, root: &Path) -> Option<TreeWatcher> {
+        #[expect(clippy::disallowed_methods, reason = "spurious wakeups are harmless")]
         match TreeWatcher::new(root, self.ctx.repo.git_repo_path()).await {
             Ok(tree) => Some(tree),
             Err(err) => {

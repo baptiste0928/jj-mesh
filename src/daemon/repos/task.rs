@@ -234,6 +234,7 @@ impl RepoTask {
         // Watch before the first read: changes racing the setup produce at
         // worst a no-change wakeup.
         let heads_dir = jj.op_heads_dir();
+        #[expect(clippy::disallowed_methods, reason = "spurious wakeups are harmless")]
         let mut watch = DirWatcher::new(&heads_dir, DEBOUNCE, DEBOUNCE_MAX)?;
         let mut heads = sorted_heads(&repo).await?;
         let mut last_change = None;

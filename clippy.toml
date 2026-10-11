@@ -1,3 +1,5 @@
 disallowed-methods = [
     { path = "tokio::task::spawn_blocking", reason = "use `crate::spawn_blocking`, which keeps the tracing span" },
+    { path = "jj_mesh::watch::DirWatcher::new", reason = "in tests, use `crate::testing::watch::dir`, which settles the watch" },
+    { path = "jj_mesh::watch::TreeWatcher::new", reason = "in tests, use `crate::testing::watch::tree`, which settles the watch" },
 ]
