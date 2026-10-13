@@ -21,19 +21,10 @@ pub(super) fn registered_repos() -> Vec<CompletionCandidate> {
     state().repos.keys().map(CompletionCandidate::new).collect()
 }
 
-/// The repo names in use on the mesh (`repo remove`).
+/// The repo names in use on the mesh (`repo clone`, `repo remove`).
 pub(super) fn mesh_repos() -> Vec<CompletionCandidate> {
     state()
         .mesh_repo_names()
-        .map(CompletionCandidate::new)
-        .collect()
-}
-
-/// The mesh repos not registered on this machine, i.e. the clonable ones
-/// (`repo clone`).
-pub(super) fn clonable_repos() -> Vec<CompletionCandidate> {
-    state()
-        .clonable_repo_names()
         .map(CompletionCandidate::new)
         .collect()
 }

@@ -34,6 +34,7 @@ use crate::config::{ConfigDir, MeshState};
 ///   4. Clone it on the other machine:    jj-mesh clone <NAME>
 ///
 /// Use `jj-mesh status` to inspect peers, repos, and synchronization status.
+#[allow(rustdoc::bare_urls, rustdoc::invalid_html_tags)]
 #[derive(Debug, Parser)]
 #[command(name = "jj-mesh", version, verbatim_doc_comment)]
 pub struct Cli {

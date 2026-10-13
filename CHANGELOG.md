@@ -14,6 +14,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   made less noisy.
 - New `jj-mesh clone` and `jj-mesh add` top-level aliases for `jj-mesh repo clone` and
   `jj-mesh repo add`. Clone now asks which repo to clone when no name is given.
+- Cloning a repo already on the current machine adds a new workspace to it, so a repo can be cloned
+  several times.
 
 ### Changed
 - **`jj` 0.46 is required.** Older versions are no longer supported.

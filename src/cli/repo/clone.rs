@@ -4,6 +4,9 @@
 //! daemon to pull the mesh repo's full state from a peer and register it, lets
 //! jj merge the fresh workspace into the replicated history, and starts the
 //! working copy on trunk. A failed clone removes the directory it created.
+//!
+//! A repo already registered here gets a new workspace instead, which the
+//! daemon syncs like the others.
 
 use std::{
     path::{Component, Path, PathBuf},
@@ -18,7 +21,7 @@ use indicatif::{HumanBytes, ProgressBar, ProgressStyle};
 use super::jj;
 use crate::{
     cli::{complete, ui},
-    config::{ConfigDir, MeshState},
+    config::{ConfigDir, MeshState, validate_name},
     daemon::control::{self, CloneProgress, Request, Response, TransferPhase},
 };
 
@@ -26,11 +29,12 @@ use crate::{
 ///
 /// The repo must have been added to the mesh with `jj-mesh add`. The
 /// clone follows jj's `git.colocate` setting unless `--colocate` or
-/// `--no-colocate` is given.
+/// `--no-colocate` is given. Cloning a repo already on this machine adds a
+/// workspace to it instead.
 #[derive(Debug, Args)]
 pub struct CloneArgs {
     /// Name of the repo in the mesh (asked when omitted)
-    #[arg(add = ArgValueCandidates::new(complete::clonable_repos))]
+    #[arg(add = ArgValueCandidates::new(complete::mesh_repos))]
     name: Option<String>,
 
     /// Directory to create the repo in (defaults to the repo name)
@@ -58,12 +62,6 @@ pub struct CloneArgs {
 
 /// Runs the `repo clone` command.
 pub fn run(args: CloneArgs, dir: &ConfigDir) -> Result<()> {
-    // Best-effort pre-checks, so an obviously doomed clone fails before
-    // anything is created on disk: the daemon must be up (it is only
-    // contacted once the local repo exists), and the stored state must
-    // accept the repo (the daemon re-validates authoritatively before
-    // registering).
-    control::ensure_daemon_blocking(dir)?;
     let state = MeshState::load(dir)?;
     let name = match args.name {
         Some(name) => name,
@@ -73,22 +71,48 @@ pub fn run(args: CloneArgs, dir: &ConfigDir) -> Result<()> {
         Some(path) => path,
         None => default_path(&name)?,
     };
-    state.validate_new_repo(&name, &path)?;
+    let colocate: &[&str] = match (args.colocate, args.no_colocate) {
+        (true, _) => &["--colocate"],
+        (_, true) => &["--no-colocate"],
+        _ => &[],
+    };
+
+    if let Some(repo) = state.repos.get(&name) {
+        let workspace = match args.workspace {
+            Some(workspace) => workspace,
+            None => extra_workspace_name(&state.machine.name, &path)?,
+        };
+        add_workspace(&name, &repo.path, &path, &workspace, colocate)
+    } else {
+        let workspace = args.workspace.unwrap_or_else(|| state.machine.name.clone());
+        clone(dir, &state, &name, &path, &workspace, colocate)
+    }
+}
+
+/// Clones the mesh repo `name` in `path`.
+fn clone(
+    dir: &ConfigDir,
+    state: &MeshState,
+    name: &str,
+    path: &Path,
+    workspace: &str,
+    colocate: &[&str],
+) -> Result<()> {
+    // Best-effort pre-checks, so an obviously doomed clone fails before
+    // anything is created on disk: the daemon must be up (it is only
+    // contacted once the local repo exists), and the stored state must
+    // accept the repo (the daemon re-validates authoritatively before
+    // registering).
+    control::ensure_daemon_blocking(dir)?;
+    state.validate_new_repo(name, path)?;
     ensure!(
         !path.exists(),
         "{} already exists (clone creates the directory)",
         path.display(),
     );
 
-    let workspace = args.workspace.unwrap_or(state.machine.name);
-
     // Fresh repo with a machine-unique workspace name, using the user's
     // own jj (their config applies to the repo from the start).
-    let colocate: &[&str] = match (args.colocate, args.no_colocate) {
-        (true, _) => &["--colocate"],
-        (_, true) => &["--no-colocate"],
-        _ => &[],
-    };
     let path_arg = path.to_string_lossy();
     jj(
         None,
@@ -97,8 +121,8 @@ pub fn run(args: CloneArgs, dir: &ConfigDir) -> Result<()> {
 
     // The directory exists from here on: a failed pull removes it again so
     // a retry starts clean.
-    if let Err(err) = pull(dir, &name, &path, &workspace) {
-        return Err(clean_failed_clone(dir, &name, &path, err));
+    if let Err(err) = pull(dir, name, path, workspace) {
+        return Err(clean_failed_clone(dir, name, path, err));
     }
 
     // Any jj command merges the fresh workspace into the pulled history;
@@ -107,10 +131,10 @@ pub fn run(args: CloneArgs, dir: &ConfigDir) -> Result<()> {
     // the pulled history, which leaves the fresh working copy stale:
     // recover it rather than fail a clone that already succeeded, and keep
     // its recovered position instead of jumping to trunk.
-    match jj(Some(&path), &["status"]) {
-        Ok(()) => start_on_trunk(&path),
+    match jj(Some(path), &["status"]) {
+        Ok(()) => start_on_trunk(path),
         Err(err) => {
-            if jj(Some(&path), &["workspace", "update-stale"]).is_err() {
+            if jj(Some(path), &["workspace", "update-stale"]).is_err() {
                 return Err(err);
             }
         }
@@ -123,9 +147,60 @@ pub fn run(args: CloneArgs, dir: &ConfigDir) -> Result<()> {
     Ok(())
 }
 
-/// Asks which of the mesh repos not on this machine to clone.
+/// Adds a workspace of `name`, registered here at `repo`, in `path`.
+fn add_workspace(
+    name: &str,
+    repo: &Path,
+    path: &Path,
+    workspace: &str,
+    colocate: &[&str],
+) -> Result<()> {
+    ensure!(
+        !path.exists(),
+        "{} already exists: `{name}` is already cloned in {}, pass the directory of a new workspace",
+        path.display(),
+        repo.display(),
+    );
+    // The daemon would leave a workspace with an invalid name unsynced.
+    validate_name("workspace", workspace)?;
+
+    // jj runs from the repo, resolving relative paths from there.
+    let path =
+        std::path::absolute(path).wrap_err_with(|| format!("cannot resolve {}", path.display()))?;
+    let path_arg = path.to_string_lossy();
+    jj(
+        Some(repo),
+        &[
+            &["workspace", "add", "--name", workspace],
+            colocate,
+            &["--", &path_arg],
+        ]
+        .concat(),
+    )?;
+
+    println!(
+        "{}",
+        ui::good(format_args!(
+            "`{name}` is already cloned in {}, added workspace `{workspace}` in {}",
+            repo.display(),
+            path.display(),
+        )),
+    );
+    Ok(())
+}
+
+/// The default name of another workspace of a local repo: the machine name
+/// and the workspace directory name.
+fn extra_workspace_name(machine: &str, path: &Path) -> Result<String> {
+    let dir_name = path
+        .file_name()
+        .ok_or_eyre("cannot derive a workspace name, use --workspace")?;
+    Ok(format!("{machine}-{}", dir_name.to_string_lossy()))
+}
+
+/// Asks which of the mesh repos to clone.
 fn pick(state: &MeshState) -> Result<String> {
-    let available: Vec<&str> = state.clonable_repo_names().collect();
+    let available: Vec<&str> = state.mesh_repo_names().collect();
     ensure!(
         !available.is_empty(),
         "no repo to clone: add one with `jj-mesh add` on another machine",
