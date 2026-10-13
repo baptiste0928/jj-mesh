@@ -17,7 +17,10 @@ use iroh::endpoint::{Connection, RecvStream};
 use serde::{Deserialize, Serialize};
 
 use super::wire::{read_message, write_message};
-use crate::config::{MAX_MESH_PEERS, MAX_MESH_REPOS, MAX_MESH_WORKSPACES, Membership, RepoId};
+use crate::config::{
+    MAX_MESH_CLAIMED_REPOS, MAX_MESH_PEERS, MAX_MESH_REPOS, MAX_MESH_WORKSPACES, Membership,
+    RepoId, WorkspaceClaims,
+};
 
 /// ALPN of the sync protocol. Bumped whenever the wire format changes, so
 /// mismatched daemons refuse each other instead of mis-decoding.
@@ -25,10 +28,10 @@ pub const ALPN: &[u8] = b"jj-mesh/sync/2";
 
 /// Cap on uni-stream messages. Sized for the largest legitimate message, a
 /// full membership (peer records are ~100 bytes, repo records and
-/// workspace claims ~100), with headroom; the peer, while authenticated, is
-/// not trusted with our memory, and every byte here is decoded before we
-/// can check anything.
-const MAX_UNI_SIZE: u32 = 320 * 1024;
+/// workspace claims ~100, empty repo claims ~35), with headroom; the peer,
+/// while authenticated, is not trusted with our memory, and every byte
+/// here is decoded before we can check anything.
+const MAX_UNI_SIZE: u32 = 384 * 1024;
 
 /// A message carried by a one-shot uni stream.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -107,22 +110,22 @@ pub async fn send_uni(conn: &Connection, message: &UniMessage) -> Result<()> {
 /// the flood off the queue.
 pub async fn recv_uni(stream: &mut RecvStream) -> Result<UniMessage> {
     let message: UniMessage = read_message(stream, MAX_UNI_SIZE).await?;
+    check_bounds(&message)?;
+    Ok(message)
+}
 
-    match &message {
+/// Rejects messages carrying more entries than the mesh caps allow.
+fn check_bounds(message: &UniMessage) -> Result<()> {
+    match message {
         UniMessage::Membership(membership) => {
             // Claimed repos are counted apart from names: an empty claim
             // costs no name but still takes wire space.
-            let (repos, names) = membership
-                .claims
-                .values()
-                .fold((0, 0), |(repos, names), c| {
-                    (repos + c.repos.len(), names + c.count())
-                });
+            let (names, repos) = WorkspaceClaims::tally(membership.claims.values());
             ensure!(
                 membership.peers.len() <= MAX_MESH_PEERS
                     && membership.repos.len() <= MAX_MESH_REPOS
                     && membership.claims.len() <= MAX_MESH_PEERS
-                    && repos <= MAX_MESH_WORKSPACES
+                    && repos <= MAX_MESH_CLAIMED_REPOS
                     && names <= MAX_MESH_WORKSPACES,
                 "membership too large",
             );
@@ -132,8 +135,7 @@ pub async fn recv_uni(stream: &mut RecvStream) -> Result<UniMessage> {
         }
         UniMessage::Announce(_) => {}
     }
-
-    Ok(message)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -141,8 +143,8 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet};
 
     use crate::config::{
-        MAX_MESH_PEERS, MAX_MESH_REPOS, MAX_MESH_WORKSPACES, MAX_NAME_LEN, Membership, MeshRepo,
-        Peer, RepoId, WorkspaceClaims,
+        MAX_MESH_CLAIMED_REPOS, MAX_MESH_PEERS, MAX_MESH_REPOS, MAX_MESH_WORKSPACES, MAX_NAME_LEN,
+        Membership, MeshRepo, Peer, RepoId, WorkspaceClaims,
     };
 
     /// A membership carrying the largest state we accept must stay inside
@@ -178,16 +180,18 @@ mod tests {
             .collect();
 
         // Every machine holding a record, the mesh-wide names spread one
-        // per repo (the costliest layout).
+        // per repo and the remaining repos claimed empty (the costliest
+        // layout).
         let claims = peers
             .keys()
             .map(|endpoint| {
-                let repos = (0..MAX_MESH_WORKSPACES / MAX_MESH_PEERS)
-                    .map(|n| {
-                        let name = format!("{n:0>64}");
-                        (RepoId::generate(), BTreeSet::from([name]))
-                    })
-                    .collect();
+                let named = (0..MAX_MESH_WORKSPACES / MAX_MESH_PEERS).map(|n| {
+                    let name = format!("{n:0>64}");
+                    (RepoId::generate(), BTreeSet::from([name]))
+                });
+                let empty = (0..(MAX_MESH_CLAIMED_REPOS - MAX_MESH_WORKSPACES) / MAX_MESH_PEERS)
+                    .map(|_| (RepoId::generate(), BTreeSet::new()));
+                let repos = named.chain(empty).collect();
                 let claims = WorkspaceClaims {
                     version: u64::from(u32::MAX),
                     repos,
@@ -201,7 +205,9 @@ mod tests {
             repos,
             claims,
         };
-        let encoded = postcard::to_stdvec(&super::UniMessage::Membership(membership)).unwrap();
+        let message = super::UniMessage::Membership(membership);
+        super::check_bounds(&message).unwrap();
+        let encoded = postcard::to_stdvec(&message).unwrap();
         assert!(
             encoded.len() <= super::MAX_UNI_SIZE as usize,
             "a full membership is {} bytes, over the {} byte cap",
@@ -226,7 +232,9 @@ mod tests {
                 .collect(),
         };
 
-        let encoded = postcard::to_stdvec(&super::UniMessage::Status(report)).unwrap();
+        let message = super::UniMessage::Status(report);
+        super::check_bounds(&message).unwrap();
+        let encoded = postcard::to_stdvec(&message).unwrap();
         assert!(
             encoded.len() <= super::MAX_UNI_SIZE as usize,
             "a full status report is {} bytes, over the {} byte cap",

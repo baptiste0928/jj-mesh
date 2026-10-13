@@ -25,19 +25,22 @@ use iroh::EndpointId;
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
-use self::{
-    claims::MAX_OTHER_WORKSPACES,
-    membership::{
-        MAX_OTHER_PEERS, MAX_RECORD_VERSION, Register as _, bumped_version, should_adopt,
-    },
-};
 pub use self::{
-    claims::{MAX_MACHINE_WORKSPACES, MAX_MESH_WORKSPACES, RepoClaims, WorkspaceClaims},
+    claims::{
+        MAX_MACHINE_WORKSPACES, MAX_MESH_CLAIMED_REPOS, MAX_MESH_WORKSPACES, RepoClaims,
+        WorkspaceClaims,
+    },
     machine::Machine,
     membership::{
         MAX_MESH_PEERS, MAX_MESH_REPOS, Membership, MeshRepo, MeshRepoStatus, Peer, PeerStatus,
     },
     repo::{Repo, RepoId},
+};
+use self::{
+    claims::{MAX_OTHER_REPOS, MAX_OTHER_WORKSPACES},
+    membership::{
+        MAX_OTHER_PEERS, MAX_RECORD_VERSION, Register as _, bumped_version, should_adopt,
+    },
 };
 use super::{ConfigDir, validate_name};
 
@@ -455,9 +458,9 @@ impl MeshState {
     }
 
     /// Merges the gossiped workspace claims: only alive peers' are kept,
-    /// and new or grown records stop being adopted at the cap.
+    /// and new or grown records stop being adopted at the caps.
     fn merge_claims(&mut self, remote: &Membership, local: &EndpointId) {
-        let mut others: usize = self.peer_claims.values().map(WorkspaceClaims::count).sum();
+        let (mut names, mut repos) = WorkspaceClaims::tally(self.peer_claims.values());
         for (endpoint, record) in &remote.claims {
             if record.version >= MAX_RECORD_VERSION {
                 continue;
@@ -473,11 +476,14 @@ impl MeshState {
             {
                 continue;
             }
-            let adopted = others - held.map_or(0, WorkspaceClaims::count) + record.count();
-            if adopted > MAX_OTHER_WORKSPACES {
+            let (held_names, held_repos) = WorkspaceClaims::tally(held);
+            let (record_names, record_repos) = WorkspaceClaims::tally([record]);
+            let adopted_names = names - held_names + record_names;
+            let adopted_repos = repos - held_repos + record_repos;
+            if adopted_names > MAX_OTHER_WORKSPACES || adopted_repos > MAX_OTHER_REPOS {
                 continue;
             }
-            others = adopted;
+            (names, repos) = (adopted_names, adopted_repos);
             self.peer_claims.insert(*endpoint, record.clone());
         }
         self.prune_claims();

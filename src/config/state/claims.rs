@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use super::{
     RepoId,
-    membership::{MAX_RECORD_VERSION, Register, next_version},
+    membership::{MAX_MESH_REPOS, MAX_RECORD_VERSION, Register, next_version},
 };
 use crate::config::validate_name;
 
@@ -27,7 +27,18 @@ pub const MAX_MESH_WORKSPACES: usize = 1024;
 /// Cap on the other machines' claims, leaving room for our own.
 pub(super) const MAX_OTHER_WORKSPACES: usize = MAX_MESH_WORKSPACES - MAX_MACHINE_WORKSPACES;
 
-/// The workspaces one machine claims, by repo.
+/// Cap on the repos one machine claims: it may hold every mesh repo.
+pub(super) const MAX_MACHINE_REPOS: usize = MAX_MESH_REPOS;
+
+/// Cap on the repos claimed across the mesh, a repo counting once per
+/// claiming machine.
+pub const MAX_MESH_CLAIMED_REPOS: usize = 4096;
+
+/// Cap on the other machines' claimed repos, leaving room for our own.
+pub(super) const MAX_OTHER_REPOS: usize = MAX_MESH_CLAIMED_REPOS - MAX_MACHINE_REPOS;
+
+/// The workspaces one machine claims, by repo. An empty set claims the
+/// repo without any workspace.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkspaceClaims {
@@ -53,17 +64,34 @@ impl WorkspaceClaims {
         self.repos.values().map(BTreeSet::len).sum()
     }
 
-    /// Whether the record only holds non-empty claims on valid names,
-    /// within the per-machine cap. Empty claims would cost nothing against
-    /// the cap while growing the gossiped membership.
+    /// Claimed workspaces and repos, summed over `records`.
+    pub fn tally<'a>(records: impl IntoIterator<Item = &'a Self>) -> (usize, usize) {
+        records.into_iter().fold((0, 0), |(names, repos), record| {
+            (names + record.count(), repos + record.repos.len())
+        })
+    }
+
+    /// Claims on `n` fresh repos, without workspaces.
+    #[cfg(test)]
+    pub(super) fn holding(n: usize) -> Self {
+        WorkspaceClaims {
+            version: 1,
+            repos: (0..n)
+                .map(|_| (RepoId::generate(), BTreeSet::new()))
+                .collect(),
+        }
+    }
+
+    /// Whether the record only claims valid names, within the per-machine
+    /// caps.
     pub(super) fn is_valid(&self) -> bool {
-        self.count() <= MAX_MACHINE_WORKSPACES
-            && self.repos.values().all(|names| {
-                !names.is_empty()
-                    && names
-                        .iter()
-                        .all(|name| validate_name("workspace", name).is_ok())
-            })
+        self.repos.len() <= MAX_MACHINE_REPOS
+            && self.count() <= MAX_MACHINE_WORKSPACES
+            && self
+                .repos
+                .values()
+                .flatten()
+                .all(|name| validate_name("workspace", name).is_ok())
     }
 
     /// Replaces the claims on one repo, bumping the version on change.
@@ -152,12 +180,9 @@ mod tests {
     }
 
     #[test]
-    fn empty_claims_are_invalid() {
-        let claims = WorkspaceClaims {
-            version: 1,
-            repos: BTreeMap::from([(RepoId::generate(), BTreeSet::new())]),
-        };
-        assert!(!claims.is_valid());
+    fn caps_claimed_repos() {
+        assert!(WorkspaceClaims::holding(MAX_MACHINE_REPOS).is_valid());
+        assert!(!WorkspaceClaims::holding(MAX_MACHINE_REPOS + 1).is_valid());
     }
 
     #[test]
