@@ -13,18 +13,7 @@ fn announce(name: &str, id: &RepoId, seq: u64, heads: Vec<Vec<u8>>) -> Announce 
 
 /// A connection between two local endpoints, which must outlive it.
 async fn connection() -> (Connection, [iroh::Endpoint; 2]) {
-    let lookup = iroh::address_lookup::MemoryLookup::new();
-    let options = crate::net::EndpointOptions::LocalTest { lookup };
-    let bind = async || {
-        let dir = tempfile::tempdir().unwrap();
-        let config = crate::config::ConfigDir::new(Some(dir.path().to_owned())).unwrap();
-        let key = crate::config::MachineKey::from_config(&config).unwrap();
-        crate::net::bind_endpoint(&key, vec![sync::ALPN.to_vec()], &options)
-            .await
-            .unwrap()
-    };
-    let (dialer, server) = (bind().await, bind().await);
-
+    let [dialer, server] = crate::testing::local_endpoints(sync::ALPN).await;
     let (conn, _) = tokio::join!(dialer.connect(server.id(), sync::ALPN), async {
         server.accept().await.unwrap().await.unwrap()
     });

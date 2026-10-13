@@ -16,7 +16,7 @@ use tokio::sync::Semaphore;
 use tracing::{debug, info, warn};
 
 use super::{control::PAIR_TICKET_TTL, store::MeshStore};
-use crate::net::pair;
+use crate::net::{hello, pair};
 
 /// How long to wait for a relay connection when issuing a ticket.
 const ONLINE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -96,6 +96,12 @@ impl Pairing {
             conn.close(0u32.into(), b"busy");
             return;
         };
+        // Kept at debug: anyone can attempt pairing. The joiner is told.
+        match hello::accept(&conn).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => return debug!(%error, "refusing pairing connection"),
+            Err(err) => return debug!("bad pairing hello: {err:#}"),
+        }
 
         let Some(ticket) = self.issued_ticket() else {
             debug!("refusing pairing connection: no valid ticket");

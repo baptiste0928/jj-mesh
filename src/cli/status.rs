@@ -238,6 +238,14 @@ fn connection_summary(connection: &ConnectionStatus) -> String {
         ConnectionStatus::Connecting { .. } => {
             format!("{} (retrying)", ui::bad("offline"))
         }
+        ConnectionStatus::Incompatible {
+            peer,
+            retry_in_secs,
+        } => format!(
+            "{} {peer} (retry in {})",
+            ui::bad("incompatible:"),
+            ui::format_duration(*retry_in_secs)
+        ),
         ConnectionStatus::Backoff { retry_in_secs, .. } => format!(
             "{} (retry in {})",
             ui::bad("offline"),

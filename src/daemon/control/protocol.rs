@@ -10,7 +10,9 @@ use iroh::EndpointId;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    daemon::repos::WorkspaceState, net::sync::StatusReport, repo::transfer::TransferProgress,
+    daemon::repos::WorkspaceState,
+    net::{hello::Incompatible, sync::StatusReport},
+    repo::transfer::TransferProgress,
 };
 
 /// Maximum accepted size of a control message.
@@ -264,6 +266,14 @@ pub enum ConnectionStatus {
         retry_in_secs: u64,
         /// Why the last attempt failed.
         error: String,
+    },
+    /// The peer speaks another protocol version; redialed in case it
+    /// updates.
+    Incompatible {
+        /// The peer's hello.
+        peer: Incompatible,
+        /// Seconds until the next attempt.
+        retry_in_secs: u64,
     },
 }
 

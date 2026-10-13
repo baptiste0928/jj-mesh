@@ -69,7 +69,8 @@ const STATUS_DEBOUNCE: Duration = Duration::from_secs(1);
 /// The ALPNs the daemon serves. The pairing ALPN is always among them:
 /// pairing is gated by the one-time ticket, not by ALPN exposure, and
 /// unknown endpoints can complete handshakes on the sync ALPN anyway
-/// (they are refused post-handshake by the peer allowlist).
+/// (they are refused post-handshake by the peer allowlist). Replaced ALPNs
+/// stay served with their hello alone (see [`crate::net::hello`]).
 fn alpns() -> Vec<Vec<u8>> {
     vec![sync::ALPN.to_vec(), pair::ALPN.to_vec()]
 }
@@ -218,9 +219,9 @@ async fn accept_loop(endpoint: Endpoint, peers: Arc<PeerSet>, pairing: Arc<Pairi
         let pairing = pairing.clone();
         tokio::spawn(async move {
             // The permit is captured by the task and released when it
-            // ends, covering the whole handshake.
+            // ends, covering the whole handshake (and the sync hello).
             match tokio::time::timeout(HANDSHAKE_TIMEOUT, connecting).await {
-                Ok(Ok(conn)) if conn.alpn() == sync::ALPN => peers.route_inbound(conn),
+                Ok(Ok(conn)) if conn.alpn() == sync::ALPN => peers.route_inbound(conn).await,
                 Ok(Ok(conn)) if conn.alpn() == pair::ALPN => {
                     // The exchange outlives the handshake phase; release
                     // the permit and let pairing bound its own work.

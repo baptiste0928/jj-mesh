@@ -22,9 +22,8 @@ use crate::config::{
     RepoId, WorkspaceClaims,
 };
 
-/// ALPN of the sync protocol. Bumped whenever the wire format changes, so
-/// mismatched daemons refuse each other instead of mis-decoding.
-pub const ALPN: &[u8] = b"jj-mesh/sync/2";
+/// ALPN of the sync protocol, opening with a [`super::hello`].
+pub const ALPN: &[u8] = b"jj-mesh/sync/3";
 
 /// Cap on uni-stream messages. Sized for the largest legitimate message, a
 /// full membership (peer records are ~100 bytes, repo records and

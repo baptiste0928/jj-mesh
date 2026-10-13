@@ -6,8 +6,8 @@
 //! allowlist. Endpoint identities themselves are authenticated by iroh's QUIC
 //! handshake, so the exchange only has to carry the human names.
 //!
-//! Flow, over a single bidirectional stream:
-//! 1. joiner -> host: [`Message::Hello`] with the ticket secret and the
+//! Flow, after the [`super::hello`], over a single bidirectional stream:
+//! 1. joiner -> host: [`Message::Join`] with the ticket secret and the
 //!    joiner's name
 //! 2. host -> joiner: [`Message::Welcome`] with the host's name, or
 //!    [`Message::Reject`]
@@ -33,11 +33,14 @@ use iroh::{
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq as _;
 
-use super::wire::{read_message, write_message};
+use super::{
+    hello,
+    wire::{read_message, write_message},
+};
 use crate::config::{MeshState, sanitize_bounded};
 
 /// ALPN of the pairing protocol.
-pub const ALPN: &[u8] = b"jj-mesh/pair/0";
+pub const ALPN: &[u8] = b"jj-mesh/pair/1";
 
 /// Prefix of the ticket serialization.
 const TICKET_PREFIX: &str = "jjmesh-pair-";
@@ -46,7 +49,7 @@ const TICKET_PREFIX: &str = "jjmesh-pair-";
 const MAX_MESSAGE_SIZE: u32 = 4096;
 
 /// Host-side budget for a connection to open its stream and present its
-/// `Hello`. This pre-secret phase is the only part an attacker without the
+/// `Join`. This pre-secret phase is the only part an attacker without the
 /// ticket can stretch, and one stalled connection occupies one of the few
 /// exchange slots, so it gets a much shorter deadline than the exchange.
 const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
@@ -160,7 +163,7 @@ pub enum Outcome {
 #[derive(Debug, Serialize, Deserialize)]
 enum Message {
     /// Joiner's opening request, proving ticket possession.
-    Hello { secret: PairSecret, name: String },
+    Join { secret: PairSecret, name: String },
     /// Host's acceptance, announcing its own name.
     Welcome { name: String },
     /// Joiner's confirmation that it accepts the pairing.
@@ -185,11 +188,11 @@ pub async fn pair_with(
 ) -> Result<Outcome> {
     let opening = tokio::time::timeout(HELLO_TIMEOUT, async {
         let (send, mut recv) = conn.accept_bi().await.ok()?;
-        let hello = read_message(&mut recv, MAX_MESSAGE_SIZE).await;
-        Some((send, recv, hello))
+        let join = read_message(&mut recv, MAX_MESSAGE_SIZE).await;
+        Some((send, recv, join))
     })
     .await;
-    let (mut send, mut recv, hello) = match opening {
+    let (mut send, mut recv, join) = match opening {
         Ok(Some(opened)) => opened,
         Ok(None) => return Ok(Outcome::Dismissed),
         Err(_timeout) => {
@@ -200,8 +203,8 @@ pub async fn pair_with(
 
     // Joiners that don't speak the protocol or hold the wrong secret are
     // dismissed without stopping the host.
-    let hello = match hello {
-        Ok(Message::Hello {
+    let announced = match join {
+        Ok(Message::Join {
             secret: proof,
             name,
         }) if ticket.secret.verify(&proof) => name,
@@ -218,7 +221,7 @@ pub async fn pair_with(
     };
 
     let endpoint = conn.remote_id();
-    let name = resolve_peer_name(conn, &mut send, hello, &endpoint, state).await?;
+    let name = resolve_peer_name(conn, &mut send, announced, &endpoint, state).await?;
 
     let welcome = Message::Welcome {
         name: state.machine.name.clone(),
@@ -248,7 +251,7 @@ pub async fn pair_with(
 /// answers the joiner's opening stream with a rejection, so it sees a
 /// readable reason instead of a transport error.
 pub async fn reject_attempt(conn: &Connection, reason: &str) {
-    // The joiner's Hello is left unread but its stream is kept open until
+    // The joiner's Join is left unread but its stream is kept open until
     // the linger, so the joiner's write cannot fail before it reads the
     // rejection.
     match tokio::time::timeout(HELLO_TIMEOUT, conn.accept_bi()).await {
@@ -281,13 +284,14 @@ pub async fn join(
         .connect(ticket.addr.clone(), ALPN)
         .await
         .wrap_err("cannot connect to the pairing host")?;
+    hello::dial(&conn).await?.wrap_err("cannot pair")?;
     let (mut send, mut recv) = conn.open_bi().await?;
 
-    let hello = Message::Hello {
+    let join = Message::Join {
         secret: ticket.secret.clone(),
         name: state.machine.name.clone(),
     };
-    write_message(&mut send, &hello, MAX_MESSAGE_SIZE).await?;
+    write_message(&mut send, &join, MAX_MESSAGE_SIZE).await?;
 
     let host_endpoint = conn.remote_id();
     let name = match read_message(&mut recv, MAX_MESSAGE_SIZE).await? {

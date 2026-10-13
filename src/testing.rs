@@ -1,6 +1,6 @@
 //! Test fixtures: runs the `jj` binary against temporary repos, syncs two
-//! local repos over in-memory streams, queries git, and starts settled
-//! filesystem watchers.
+//! local repos over in-memory streams, binds local endpoints, queries git,
+//! and starts settled filesystem watchers.
 //!
 //! Available to this crate's unit tests and, through the `test-util`
 //! feature, to the integration tests.
@@ -31,6 +31,21 @@ use crate::{
 
 /// Network deadline of test fetches, large enough to never fire.
 const NET_TIMEOUT: Duration = Duration::from_mins(1);
+
+/// Two endpoints serving `alpn` that dial each other over localhost only.
+pub async fn local_endpoints(alpn: &[u8]) -> [iroh::Endpoint; 2] {
+    let lookup = iroh::address_lookup::MemoryLookup::new();
+    let options = crate::net::EndpointOptions::LocalTest { lookup };
+    let bind = async || {
+        let dir = tempfile::tempdir().unwrap();
+        let config = crate::config::ConfigDir::new(Some(dir.path().to_owned())).unwrap();
+        let key = crate::config::MachineKey::from_config(&config).unwrap();
+        crate::net::bind_endpoint(&key, vec![alpn.to_vec()], &options)
+            .await
+            .unwrap()
+    };
+    [bind().await, bind().await]
+}
 
 /// A tempdir with a hermetic jj setup: empty jj and git configs, identity
 /// from env.

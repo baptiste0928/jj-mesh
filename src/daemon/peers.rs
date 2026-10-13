@@ -8,6 +8,7 @@
 
 use std::{
     collections::BTreeMap,
+    mem,
     sync::{Arc, Mutex},
     time::{Duration, Instant, SystemTime},
 };
@@ -17,12 +18,16 @@ use iroh::{
     endpoint::{Connection, ConnectionError, RecvStream, SendStream},
 };
 use tokio::sync::{Semaphore, mpsc};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use super::{backoff::Backoff, control, hub::SyncHub};
 use crate::{
     config::{Membership, MeshState},
-    net::{fetch, sync, wire},
+    net::{
+        fetch,
+        hello::{self, Incompatible},
+        sync, wire,
+    },
 };
 
 /// Maximum uni streams (announcements, status, membership) handled
@@ -89,8 +94,15 @@ enum PeerState {
     },
     Backoff {
         until: Instant,
-        error: String,
+        failure: Failure,
     },
+}
+
+/// Why a connection attempt failed.
+#[derive(Debug)]
+enum Failure {
+    Error(String),
+    Incompatible(Incompatible),
 }
 
 impl PeerSet {
@@ -161,16 +173,31 @@ impl PeerSet {
         }
     }
 
-    /// Hands an accepted connection to the matching peer task, refusing
-    /// endpoints that are not paired.
-    pub fn route_inbound(&self, conn: Connection) {
+    /// Hands an accepted connection to the matching peer task after the
+    /// hello, refusing endpoints that are not paired.
+    pub async fn route_inbound(&self, conn: Connection) {
         let id = conn.remote_id();
-        let peers = self.peers.lock().unwrap();
-
-        let Some(handle) = peers.get(&id) else {
+        if !self.peers.lock().unwrap().contains_key(&id) {
             // Kept at debug: reachable by any endpoint that learns our id,
             // so logging louder would allow log flooding.
             debug!("refusing connection from unpaired endpoint {id}");
+            conn.close(0u32.into(), b"unauthorized");
+            return;
+        }
+
+        // Kept at debug: the peer task logs its own dial failing the same
+        // way.
+        match hello::accept(&conn).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                return debug!(peer = %self.hub.peer_name(&id), %error, "refusing connection");
+            }
+            Err(err) => return debug!(peer = %self.hub.peer_name(&id), "bad hello: {err:#}"),
+        }
+
+        let peers = self.peers.lock().unwrap();
+        // The peer may have been removed during the hello.
+        let Some(handle) = peers.get(&id) else {
             conn.close(0u32.into(), b"unauthorized");
             return;
         };
@@ -192,10 +219,22 @@ impl PeerSet {
                     PeerState::Connecting { failures } => control::ConnectionStatus::Connecting {
                         failures: *failures,
                     },
-                    PeerState::Backoff { until, error } => control::ConnectionStatus::Backoff {
-                        retry_in_secs: until.saturating_duration_since(Instant::now()).as_secs(),
-                        error: error.clone(),
-                    },
+                    PeerState::Backoff { until, failure } => {
+                        let retry_in_secs =
+                            until.saturating_duration_since(Instant::now()).as_secs();
+                        match failure {
+                            Failure::Error(error) => control::ConnectionStatus::Backoff {
+                                retry_in_secs,
+                                error: error.clone(),
+                            },
+                            Failure::Incompatible(peer) => {
+                                control::ConnectionStatus::Incompatible {
+                                    peer: peer.clone(),
+                                    retry_in_secs,
+                                }
+                            }
+                        }
+                    }
                     PeerState::Connected { conn, since } => control::ConnectionStatus::Connected {
                         path: selected_path(conn),
                         since_secs: since.elapsed().unwrap_or_default().as_secs(),
@@ -282,21 +321,21 @@ async fn run_peer(mut task: PeerTask) {
     // Consecutive attempts that failed to yield a stable connection.
     let mut failures = 0u32;
     // Why the last attempt failed, to be waited out before the next one.
-    let mut failure: Option<String> = None;
-    // Whether the current outage was logged: a sleeping or offline peer
-    // fails every retry.
-    let mut unreachable = false;
+    let mut failure: Option<Failure> = None;
+    // The kind of failure logged in the current outage: a sleeping or
+    // offline peer fails every retry.
+    let mut logged = None;
 
     loop {
         // Wait out the backoff, adopting an inbound connection if one
         // arrives in the meantime.
         let mut adopted = None;
-        if let Some(error) = failure.take() {
+        if let Some(failure) = failure.take() {
             failures += 1;
             let delay = backoff.next_delay();
             task.set_state(PeerState::Backoff {
                 until: Instant::now() + delay,
-                error,
+                failure,
             });
             tokio::select! {
                 () = tokio::time::sleep(delay) => {}
@@ -311,16 +350,24 @@ async fn run_peer(mut task: PeerTask) {
         let (conn, outbound) = match established {
             Ok(established) => established,
             Err(error) => {
-                if !unreachable {
-                    info!(peer = %task.name(), %error, "cannot reach peer, retrying");
-                    unreachable = true;
+                let kind = mem::discriminant(&error);
+                if logged != Some(kind) {
+                    match &error {
+                        Failure::Error(error) => {
+                            info!(peer = %task.name(), %error, "cannot reach peer, retrying");
+                        }
+                        Failure::Incompatible(error) => {
+                            warn!(peer = %task.name(), %error, "incompatible peer, retrying");
+                        }
+                    }
+                    logged = Some(kind);
                 }
                 failure = Some(error);
                 continue;
             }
         };
 
-        unreachable = false;
+        logged = None;
         let held = Instant::now();
         info!(peer = %task.name(), outbound, "peer connected");
         let reason = task.connected(conn, outbound).await;
@@ -334,7 +381,9 @@ async fn run_peer(mut task: PeerTask) {
             backoff.reset();
             failures = 0;
         } else {
-            failure = Some("connection dropped right after connecting".to_owned());
+            failure = Some(Failure::Error(
+                "connection dropped right after connecting".to_owned(),
+            ));
         }
     }
 }
@@ -347,7 +396,7 @@ impl PeerTask {
     /// adopts whichever lands first. First-wins on both sides could adopt
     /// mirrored connections that the other side just abandoned, redialing
     /// in a loop.
-    async fn establish(&mut self, failures: u32) -> Result<(Connection, bool), String> {
+    async fn establish(&mut self, failures: u32) -> Result<(Connection, bool), Failure> {
         self.set_state(PeerState::Connecting { failures });
 
         if self.local_id < self.peer_id {
@@ -487,14 +536,19 @@ impl PeerTask {
     }
 }
 
-/// Dials the peer on the sync ALPN within [`DIAL_TIMEOUT`], returning why it
-/// failed otherwise.
-async fn dial(endpoint: &Endpoint, peer: EndpointId, hub: &SyncHub) -> Result<Connection, String> {
-    let error = match tokio::time::timeout(DIAL_TIMEOUT, endpoint.connect(peer, sync::ALPN)).await {
-        Ok(Ok(conn)) => return Ok(conn),
+/// Dials the peer on the sync ALPN and runs the hello within
+/// [`DIAL_TIMEOUT`], returning why it failed otherwise.
+async fn dial(endpoint: &Endpoint, peer: EndpointId, hub: &SyncHub) -> Result<Connection, Failure> {
+    let dialed = tokio::time::timeout(DIAL_TIMEOUT, async {
+        let conn = endpoint.connect(peer, sync::ALPN).await?;
+        Ok::<_, color_eyre::Report>(hello::dial(&conn).await?.map(|()| conn))
+    });
+    let error = match dialed.await {
+        Ok(Ok(Ok(conn))) => return Ok(conn),
+        Ok(Ok(Err(incompatible))) => return Err(Failure::Incompatible(incompatible)),
         Ok(Err(err)) => format!("{err:#}"),
         Err(_) => format!("no answer within {}s", DIAL_TIMEOUT.as_secs()),
     };
     debug!(peer = %hub.peer_name(&peer), "dial failed: {error}");
-    Err(error)
+    Err(Failure::Error(error))
 }
