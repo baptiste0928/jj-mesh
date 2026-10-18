@@ -51,6 +51,7 @@ in
         After = [ "network.target" ];
       };
       Service = {
+        Type = "exec";
         ExecStart = "${lib.getExe cfg.package} run-daemon";
         Restart = "on-failure";
         RestartSec = 5;
