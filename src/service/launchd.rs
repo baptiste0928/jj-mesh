@@ -23,6 +23,11 @@ pub(super) fn path(label: &str) -> Result<PathBuf> {
         .join(format!("{label}.plist")))
 }
 
+/// The paths to the system-configured user services.
+pub(super) fn system_paths(_label: &str) -> Vec<PathBuf> {
+    Vec::new()
+}
+
 /// The agent plist for `spec`. `KeepAlive` restarts the daemon only when
 /// it fails, like systemd's `Restart=on-failure`.
 pub(super) fn render(service: &Service, spec: &Spec) -> Result<String> {
