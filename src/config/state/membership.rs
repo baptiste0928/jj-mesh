@@ -12,7 +12,7 @@ use color_eyre::eyre::{Result, ensure};
 use iroh::EndpointId;
 use serde::{Deserialize, Serialize};
 
-use super::{RepoId, WorkspaceClaims};
+use super::{ObjectHash, RepoId, WorkspaceClaims};
 
 /// Cap on machines tracked in the mesh state, tombstones included. A
 /// personal mesh is a handful of machines; the cap keeps a peer from
@@ -163,12 +163,18 @@ pub struct MeshRepo {
 }
 
 impl MeshRepo {
-    /// The repo's mesh id while the name is in use; `None` for a tombstone.
-    pub fn id(&self) -> Option<&RepoId> {
+    /// The repo's mesh id and git object hash while the name is in use;
+    /// `None` for a tombstone.
+    pub fn present(&self) -> Option<(&RepoId, ObjectHash)> {
         match &self.status {
-            MeshRepoStatus::Present { id } => Some(id),
+            MeshRepoStatus::Present { id, object_hash } => Some((id, *object_hash)),
             MeshRepoStatus::Removed => None,
         }
+    }
+
+    /// The repo's mesh id while the name is in use; `None` for a tombstone.
+    pub fn id(&self) -> Option<&RepoId> {
+        self.present().map(|(id, _)| id)
     }
 }
 
@@ -178,10 +184,14 @@ impl Register for MeshRepo {
     }
 
     /// Higher version first, removal beating presence on ties, then the
-    /// smaller id.
+    /// smaller id and object hash.
     fn outranks(&self, other: &Self) -> bool {
-        fn rank(repo: &MeshRepo) -> (u64, bool, cmp::Reverse<Option<&RepoId>>) {
-            (repo.version, repo.id().is_none(), cmp::Reverse(repo.id()))
+        fn rank(repo: &MeshRepo) -> (u64, bool, cmp::Reverse<Option<(&RepoId, ObjectHash)>>) {
+            (
+                repo.version,
+                repo.id().is_none(),
+                cmp::Reverse(repo.present()),
+            )
         }
         rank(self) > rank(other)
     }
@@ -191,6 +201,10 @@ impl Register for MeshRepo {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MeshRepoStatus {
-    Present { id: RepoId },
+    Present {
+        id: RepoId,
+        #[serde(default)]
+        object_hash: ObjectHash,
+    },
     Removed,
 }

@@ -30,7 +30,7 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
-use color_eyre::eyre::{Result, eyre};
+use color_eyre::eyre::{Result, WrapErr as _, eyre};
 use iroh::Endpoint;
 use tokio::sync::{Semaphore, mpsc, watch};
 use tracing::{debug, info, warn};
@@ -42,7 +42,7 @@ use self::{
     pairing::Pairing,
     peers::PeerSet,
     replicas::Replicas,
-    repos::{ClaimUpdate, RepoSet},
+    repos::{RepoSet, RepoUpdate},
     store::MeshStore,
 };
 use crate::{
@@ -128,8 +128,8 @@ impl Daemon {
             hub.clone(),
             gossip_tx,
         ));
-        let (claim_tx, claim_rx) = mpsc::unbounded_channel();
-        let repos = Arc::new(RepoSet::new(hub.clone(), claim_tx));
+        let (update_tx, update_rx) = mpsc::unbounded_channel();
+        let repos = Arc::new(RepoSet::new(hub.clone(), update_tx));
         let replicas = Arc::new(Replicas::default());
         let store = Arc::new(MeshStore::new(
             dir.clone(),
@@ -160,7 +160,7 @@ impl Daemon {
 
         tasks.spawn(accept_loop(endpoint.clone(), peers, pairing));
         tasks.spawn(membership_loop(gossip_rx, store.clone()));
-        tasks.spawn(claim_loop(claim_rx, store.clone()));
+        tasks.spawn(update_loop(update_rx, store.clone()));
         tasks.spawn(replicas::run(
             dir.clone(),
             store.clone(),
@@ -280,14 +280,25 @@ async fn membership_loop(mut gossip: mpsc::Receiver<(String, Membership)>, store
     }
 }
 
-/// Persists the workspace claims repo tasks make; the store then gossips
-/// them and feeds them back to the repo tasks.
-async fn claim_loop(mut claims: mpsc::UnboundedReceiver<ClaimUpdate>, store: Arc<MeshStore>) {
-    while let Some(ClaimUpdate { repo, names }) = claims.recv().await {
-        if let Err(err) = store.update(|state| state.set_claims(&repo, names)) {
+/// Persists the changes repo tasks make (workspace claims, object hash
+/// corrections); the store then gossips them and feeds the claims back to
+/// the repo tasks.
+async fn update_loop(mut updates: mpsc::UnboundedReceiver<RepoUpdate>, store: Arc<MeshStore>) {
+    while let Some(update) = updates.recv().await {
+        let (repo, result) = match update {
+            RepoUpdate::Claims { repo, names } => {
+                let result = store.update(|state| state.set_claims(&repo, names));
+                (repo, result.wrap_err("cannot claim workspaces"))
+            }
+            RepoUpdate::ObjectHash { repo, object_hash } => {
+                let result = store.update(|state| state.set_object_hash(&repo, object_hash));
+                (repo, result.wrap_err("cannot record the object hash"))
+            }
+        };
+        if let Err(err) = result {
             let snapshot = store.snapshot();
             let repo = snapshot.repo_name(&repo).unwrap_or("(removed)");
-            warn!(%repo, "cannot claim workspaces: {err:#}");
+            warn!(%repo, "{err:#}");
         }
     }
 }

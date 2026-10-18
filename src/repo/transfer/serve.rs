@@ -19,7 +19,7 @@ use tokio::{
 };
 use tracing::debug;
 
-use super::{is_virtual_root, pack, to_gix_id};
+use super::{pack, to_gix_id};
 use crate::{
     net::{
         fetch::{
@@ -370,7 +370,7 @@ pub(super) fn walk_git_closure(
     let git = repo.git_backend().git_repo();
     // The trees of each change's versions the fetcher holds or received.
     let mut versions: HashMap<Vec<u8>, Vec<gix::ObjectId>> = HashMap::new();
-    for have in haves.iter().filter(|have| !is_virtual_root(have)) {
+    for have in haves.iter().filter(|have| !repo.is_root_commit(have)) {
         // Haves we lack cannot serve as bases.
         if let Ok(have) = Commit::read(&git, to_gix_id(have)?)
             && let Some(change) = have.change
@@ -385,7 +385,7 @@ pub(super) fn walk_git_closure(
     // fetcher's missing-commit check relies on when retrying.
     let mut seen: HashSet<gix::ObjectId> = HashSet::new();
     // jj's virtual root commit is in the index, not in git.
-    for commit in commits.iter().filter(|commit| !is_virtual_root(commit)) {
+    for commit in commits.iter().filter(|commit| !repo.is_root_commit(commit)) {
         let id = to_gix_id(commit)?;
         let commit = Commit::read(&git, id)?;
         let mut bases = Vec::with_capacity(MAX_BASES);

@@ -17,8 +17,8 @@ use color_eyre::eyre::Result;
 use jj_lib::{object_id::ObjectId as _, op_store::OperationId};
 use tokio::io::{AsyncRead, AsyncWrite};
 
-pub use crate::{net::fetch::GitTransferFormat, repo::transfer::FetchOutcome};
 use crate::{
+    config::ObjectHash,
     net::{
         fetch::{FetchRequest, MAX_OP_FRAME_SIZE},
         wire::read_message,
@@ -28,6 +28,7 @@ use crate::{
         transfer::{FetchOptions, ProgressSink, RepoIdent, fetch, mirror, serve},
     },
 };
+pub use crate::{net::fetch::GitTransferFormat, repo::transfer::FetchOutcome};
 
 /// Network deadline of test fetches, large enough to never fire.
 const NET_TIMEOUT: Duration = Duration::from_mins(1);
@@ -124,8 +125,17 @@ impl Fixture {
 
     /// Creates a jj repo named `name` with an initial described commit.
     pub fn init_repo(&self, name: &str) -> PathBuf {
+        self.init_repo_hashed(name, ObjectHash::Sha1)
+    }
+
+    /// [`Self::init_repo`] with the git object hash `hash`.
+    pub fn init_repo_hashed(&self, name: &str, hash: ObjectHash) -> PathBuf {
         let dir = self.tmp.path().join(name);
-        self.jj(self.tmp.path(), &["git", "init", name]);
+        let hash = hash.to_string();
+        self.jj(
+            self.tmp.path(),
+            &["git", "init", "--object-hash", &hash, name],
+        );
         self.jj(&dir, &["describe", "-m", "base"]);
         dir
     }
@@ -220,9 +230,7 @@ pub async fn try_sync(
         let request: FetchRequest = read_message(&mut server_rx, MAX_OP_FRAME_SIZE)
             .await
             .unwrap();
-        serve(&server, request, &mut server_tx, &mut server_rx)
-            .await
-            .unwrap();
+        serve(&server, request, &mut server_tx, &mut server_rx).await
     });
 
     let outcome = fetch_from(
@@ -234,7 +242,12 @@ pub async fn try_sync(
         ProgressSink::default(),
     )
     .await;
-    serve_task.await.unwrap();
+    // A failed fetch drops its stream, which ends the serve.
+    drop((client_rx, client_tx));
+    let serve_result = serve_task.await.unwrap();
+    if outcome.is_ok() {
+        serve_result.unwrap();
+    }
     outcome
 }
 

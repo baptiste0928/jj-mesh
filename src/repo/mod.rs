@@ -27,6 +27,8 @@ use color_eyre::eyre::{Result, WrapErr as _, ensure};
 use jj_lib::{git_backend::GitBackend, repo::ReadonlyRepo, signing_factory::signer_from_settings};
 use pollster::FutureExt as _;
 
+use crate::config::ObjectHash;
+
 pub use self::{
     jj::{
         jj_bin, jj_output, jj_peer_warning, jj_version, jj_version_warning, repo_present, run_jj,
@@ -85,10 +87,10 @@ impl JjRepo {
     }
 
     /// Creates a bare repo at `root`, which must not exist: the stores of a
-    /// main workspace, holding only the root operation. Built through
-    /// jj_lib, as the jj CLI needs a working copy. The git store uses SHA-1
-    /// object ids, jj's default.
-    pub fn init_bare(root: &Path) -> Result<Self> {
+    /// main workspace, holding only the root operation, and a git store
+    /// using `object_hash`. Built through jj_lib, as the jj CLI needs a
+    /// working copy.
+    pub fn init_bare(root: &Path, object_hash: ObjectHash) -> Result<Self> {
         let repo_dir = root.join(".jj").join("repo");
         fs::create_dir_all(&repo_dir)
             .wrap_err_with(|| format!("cannot create {}", repo_dir.display()))?;
@@ -97,8 +99,7 @@ impl JjRepo {
             settings,
             &repo_dir,
             &|settings, store_path| {
-                let backend =
-                    GitBackend::init_internal(settings, store_path, gix::hash::Kind::Sha1)?;
+                let backend = GitBackend::init_internal(settings, store_path, object_hash.kind())?;
                 Ok(Box::new(backend))
             },
             signer_from_settings(settings)?,

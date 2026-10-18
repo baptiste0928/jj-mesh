@@ -40,7 +40,7 @@ use super::{
     store::MeshStore,
 };
 use crate::{
-    config::{ConfigDir, MeshState, Repo, RepoId, create_private},
+    config::{ConfigDir, MeshRepo, MeshState, ObjectHash, Repo, RepoId, create_private},
     repo::JjRepo,
 };
 
@@ -202,12 +202,16 @@ impl Task {
         let Ok((id, sources)) = self.hub.clone_sources(name) else {
             return;
         };
-        if state.mesh_repo_id(name) != Some(&id) {
+        let Some((mesh_id, object_hash)) = state.mesh_repos.get(name).and_then(MeshRepo::present)
+        else {
+            return;
+        };
+        if *mesh_id != id {
             return debug!(repo = %name, "peers announce another repo under this name");
         }
 
         info!(repo = %name, "replicating repo");
-        match self.pull(name, &id, sources).await {
+        match self.pull(name, &id, object_hash, sources).await {
             Ok(()) => {
                 self.retries.remove(name);
             }
@@ -224,14 +228,20 @@ impl Task {
 
     /// Pulls into `<id>.tmp`, then moves the complete repo to `<id>` and
     /// registers it. A failure leaves directories the next sweep deletes.
-    async fn pull(&self, name: &str, id: &RepoId, sources: Vec<CloneSource>) -> Result<()> {
+    async fn pull(
+        &self,
+        name: &str,
+        id: &RepoId,
+        object_hash: ObjectHash,
+        sources: Vec<CloneSource>,
+    ) -> Result<()> {
         let path = self.root.join(id.to_string());
         let partial = self.root.join(format!("{id}.tmp"));
         {
             let (root, partial) = (self.root.clone(), partial.clone());
             crate::spawn_blocking(move || -> Result<()> {
                 create_private(&root)?;
-                JjRepo::init_bare(&partial)?;
+                JjRepo::init_bare(&partial, object_hash)?;
                 Ok(())
             })
             .await

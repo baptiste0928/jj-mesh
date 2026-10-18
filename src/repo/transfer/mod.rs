@@ -51,7 +51,7 @@ pub use serve::serve;
 
 use super::{
     codec::{OpMeta, ViewMeta},
-    open::{is_virtual_root, to_gix_id},
+    open::to_gix_id,
 };
 use crate::{config::RepoId, net::fetch::GitTransferFormat};
 

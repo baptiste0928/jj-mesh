@@ -173,6 +173,7 @@ mod tests {
                         version: u64::from(u32::MAX),
                         status: crate::config::MeshRepoStatus::Present {
                             id: RepoId::generate(),
+                            object_hash: crate::config::ObjectHash::Sha256,
                         },
                     },
                 )

@@ -315,10 +315,13 @@ async fn pair_join(stream: &mut UnixStream, ctx: &ControlContext, ticket: &str) 
 /// daemon is the authority, and registering an invalid path would only
 /// surface later as a watch failure. Storing the discovered main workspace
 /// root (canonicalized) also keeps two spellings of one repo, or two of its
-/// workspaces, from registering twice.
+/// workspaces, from registering twice. Its git object hash goes to the mesh
+/// record, so clones and replicas use the same.
 async fn add_repo(ctx: &ControlContext, name: String, path: PathBuf) -> Result<Response> {
-    let root = crate::spawn_blocking(move || -> Result<PathBuf> {
-        Ok(JjRepo::discover(&path)?.root().to_owned())
+    let (root, object_hash) = crate::spawn_blocking(move || -> Result<_> {
+        let repo = JjRepo::discover(&path)?;
+        let object_hash = repo.open()?.object_hash()?;
+        Ok((repo.root().to_owned(), object_hash))
     })
     .await
     .wrap_err("repo validation task failed")??;
@@ -331,6 +334,7 @@ async fn add_repo(ctx: &ControlContext, name: String, path: PathBuf) -> Result<R
                 path: root,
                 bare: false,
             },
+            object_hash,
         )
     })?;
     Ok(Response::RepoAdded)

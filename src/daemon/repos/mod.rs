@@ -7,12 +7,13 @@
 //! it reads from jj config (see the `settings` submodule).
 //!
 //! Repo tasks decide which workspaces this machine claims (see
-//! [`crate::config::WorkspaceClaims`]), which round-trip through the store:
+//! [`crate::config::WorkspaceClaims`]), which round-trip through the store,
+//! and correct the git object hash the mesh records for their repo:
 //!
 //! ```text
 //! RepoSet::sync ──RepoClaims──► repo task ──► workspace tasks
 //!       ▲                           │
-//!       └───── store ◄─ClaimUpdate──┘
+//!       └───── store ◄─RepoUpdate───┘
 //! ```
 
 mod settings;
@@ -35,7 +36,7 @@ use tracing::debug;
 use self::{settings::Settings, task::spawn_repo};
 use super::{control, hub::SyncHub};
 use crate::{
-    config::{MeshState, RepoClaims, RepoId},
+    config::{MeshRepo, MeshState, ObjectHash, RepoClaims, RepoId},
     net::sync::{RepoHealth, RepoHealthState},
 };
 
@@ -49,8 +50,8 @@ pub struct RepoSet {
     changed: Arc<Notify>,
     /// Settings for every workspace instead of their jj config (tests).
     settings: Option<Settings>,
-    /// Where repo tasks send the claims to persist.
-    claim: mpsc::UnboundedSender<ClaimUpdate>,
+    /// Where repo tasks send the changes to persist.
+    updates: mpsc::UnboundedSender<RepoUpdate>,
 }
 
 /// Whether this machine keeps a local workspace fresh (see the `task`
@@ -70,11 +71,20 @@ pub enum WorkspaceState {
     Unclaimable,
 }
 
-/// The workspaces of a repo this machine claims, to persist.
+/// A repo task's change to the mesh state, to persist.
 #[derive(Debug)]
-pub struct ClaimUpdate {
-    pub repo: RepoId,
-    pub names: BTreeSet<String>,
+pub enum RepoUpdate {
+    /// The workspaces of the repo this machine claims.
+    Claims {
+        repo: RepoId,
+        names: BTreeSet<String>,
+    },
+    /// The repo's git object hash, as its stores report it, when the mesh
+    /// records another.
+    ObjectHash {
+        repo: RepoId,
+        object_hash: ObjectHash,
+    },
 }
 
 /// Book-keeping for one repo task.
@@ -116,13 +126,13 @@ enum RepoState {
 }
 
 impl RepoSet {
-    pub fn new(hub: Arc<SyncHub>, claim: mpsc::UnboundedSender<ClaimUpdate>) -> Self {
+    pub fn new(hub: Arc<SyncHub>, updates: mpsc::UnboundedSender<RepoUpdate>) -> Self {
         RepoSet {
             hub,
             repos: Mutex::new(BTreeMap::new()),
             changed: Arc::new(Notify::new()),
             settings: None,
-            claim,
+            updates,
         }
     }
 
@@ -131,11 +141,11 @@ impl RepoSet {
     fn with_settings(
         hub: Arc<SyncHub>,
         settings: Settings,
-        claim: mpsc::UnboundedSender<ClaimUpdate>,
+        updates: mpsc::UnboundedSender<RepoUpdate>,
     ) -> Self {
         RepoSet {
             settings: Some(settings),
-            ..Self::new(hub, claim)
+            ..Self::new(hub, updates)
         }
     }
 
@@ -174,7 +184,12 @@ impl RepoSet {
                 }
             } else {
                 debug!(repo = %name, "managing repo");
-                let handle = spawn_repo(self, name.clone(), repo, claims);
+                let recorded = state
+                    .mesh_repos
+                    .get(name)
+                    .and_then(MeshRepo::present)
+                    .map(|(_, object_hash)| object_hash);
+                let handle = spawn_repo(self, name.clone(), repo, claims, recorded);
                 repos.insert(name.clone(), handle);
             }
         }

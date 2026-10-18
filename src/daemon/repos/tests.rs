@@ -7,7 +7,7 @@ use std::{
 
 use tokio::sync::mpsc;
 
-use super::{ClaimUpdate, RepoSet, Settings};
+use super::{RepoSet, RepoUpdate, Settings};
 use crate::{
     config::{MeshState, Repo, RepoId, WorkspaceClaims},
     daemon::{
@@ -20,7 +20,7 @@ use crate::{
 
 /// A repo set with the given settings, and the claims its repo tasks
 /// send.
-fn claiming_repo_set(settings: Settings) -> (RepoSet, mpsc::UnboundedReceiver<ClaimUpdate>) {
+fn claiming_repo_set(settings: Settings) -> (RepoSet, mpsc::UnboundedReceiver<RepoUpdate>) {
     let (claim, claims) = mpsc::unbounded_channel();
     (
         RepoSet::with_settings(Arc::new(SyncHub::new()), settings, claim),
@@ -60,7 +60,10 @@ fn start(settings: Settings, state: MeshState) -> Arc<RepoSet> {
             let Some(set) = weak.upgrade() else {
                 return;
             };
-            state.set_claims(&update.repo, update.names).unwrap();
+            let RepoUpdate::Claims { repo, names } = update else {
+                continue;
+            };
+            state.set_claims(&repo, names).unwrap();
             set.sync(&state);
         }
     });
@@ -504,7 +507,10 @@ async fn claims_fresh_workspaces() {
         .unwrap()
         .unwrap();
     let expected: BTreeSet<String> = ["child", "default"].map(str::to_owned).into();
-    assert_eq!(update.names, expected);
+    assert!(
+        matches!(&update, RepoUpdate::Claims { names, .. } if *names == expected),
+        "{update:?}",
+    );
 }
 
 /// A workspace found stale is not claimed: it may be a forgotten one that

@@ -15,7 +15,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 
 use super::{
     FetchOptions, FetchOutcome, OpBatch, ProgressSink, RepoIdent, StoredOp, StoredView,
-    TransferPhase, TransferProgress, apply, is_virtual_root, pack, to_gix_id,
+    TransferPhase, TransferProgress, apply, pack, to_gix_id,
 };
 use crate::{
     config::sanitize,
@@ -87,41 +87,13 @@ pub async fn fetch(
     .await?;
     let ops_received = batch.ops.len();
 
-    // Everything the new views (and op predecessor records) reference and
-    // the local git store lacks is requested from the peer. The haves are
-    // our view heads (the server ignores those it lacks), then what the
-    // views reference and we hold: the peer knows those, and the new
-    // commits build on them.
-    let referenced = referenced_commits(&batch);
     let (missing, git_haves) = {
         let repo = repo.clone();
         let local_heads = local_heads.clone();
-        crate::spawn_blocking(move || -> Result<_> {
-            let git = repo.git_backend().git_repo();
-            let mut git_haves: Vec<CommitId> = Vec::new();
-            for head in &local_heads {
-                let op = repo.read_operation(head).block_on()?;
-                let view = repo.read_view(&op.view_id).block_on()?;
-                git_haves.extend(view.head_ids.iter().cloned());
-            }
-            let mut missing: Vec<CommitId> = Vec::new();
-            for id in referenced {
-                if is_virtual_root(&id) {
-                    continue;
-                }
-                if git.has_object(to_gix_id(&id)?) {
-                    git_haves.push(id);
-                } else {
-                    missing.push(id);
-                }
-            }
-            let mut unique = HashSet::new();
-            git_haves.retain(|id| unique.insert(id.clone()));
-            git_haves.truncate(MAX_GIT_HAVES);
-            Ok((missing, git_haves))
-        })
-        .await
-        .wrap_err("git check task failed")??
+        let referenced = referenced_commits(&batch);
+        crate::spawn_blocking(move || git_wants(&repo, &local_heads, referenced))
+            .await
+            .wrap_err("git check task failed")??
     };
     // A pack of nothing is not a valid transfer; an empty want set falls
     // back to the loose exchange, which the server answers with `Done`.
@@ -402,6 +374,51 @@ fn ensure_batch_reachable(wants: &[OperationId], batch: &OpBatch) -> Result<()> 
         batch.ops.len() - reachable.len(),
     );
     Ok(())
+}
+
+/// The commits to request from the peer and the haves to send it, from
+/// the `referenced` commits of the new views (and op predecessor records):
+/// those the local git store lacks are requested. The haves are our view
+/// heads at `local_heads` (the server ignores those it lacks), then what
+/// the views reference and we hold: the peer knows those, and the new
+/// commits build on them. Blocking.
+fn git_wants(
+    repo: &OpenRepo,
+    local_heads: &[OperationId],
+    referenced: Vec<CommitId>,
+) -> Result<(Vec<CommitId>, Vec<CommitId>)> {
+    let git = repo.git_backend().git_repo();
+    // Repos of different object hashes cannot share commits; the ids alone
+    // tell, before anything is requested.
+    let hash = git.object_hash();
+    ensure!(
+        referenced
+            .iter()
+            .all(|id| id.as_bytes().len() == hash.len_in_bytes()),
+        "the peer's repo uses another git object hash than this one ({hash}); \
+         repos of different hashes cannot sync",
+    );
+    let mut git_haves: Vec<CommitId> = Vec::new();
+    for head in local_heads {
+        let op = repo.read_operation(head).block_on()?;
+        let view = repo.read_view(&op.view_id).block_on()?;
+        git_haves.extend(view.head_ids.iter().cloned());
+    }
+    let mut missing: Vec<CommitId> = Vec::new();
+    for id in referenced {
+        if repo.is_root_commit(&id) {
+            continue;
+        }
+        if git.has_object(to_gix_id(&id)?) {
+            git_haves.push(id);
+        } else {
+            missing.push(id);
+        }
+    }
+    let mut unique = HashSet::new();
+    git_haves.retain(|id| unique.insert(id.clone()));
+    git_haves.truncate(MAX_GIT_HAVES);
+    Ok((missing, git_haves))
 }
 
 /// Every commit id the batch references: view heads, all ref targets

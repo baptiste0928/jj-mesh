@@ -40,11 +40,11 @@ use tokio::sync::{Notify, mpsc, watch};
 use tracing::{Instrument as _, debug, info, info_span, warn};
 
 use super::{
-    ClaimUpdate, RepoHandle, RepoSet, RepoState, Settings, WorkspaceState,
+    RepoHandle, RepoSet, RepoState, RepoUpdate, Settings, WorkspaceState,
     workspace::{RepoContext, WorkspaceHandle, may_be_stale, spawn_workspace},
 };
 use crate::{
-    config::{Repo, RepoClaims, RepoId, validate_name},
+    config::{ObjectHash, Repo, RepoClaims, RepoId, validate_name},
     daemon::{
         backoff::Backoff,
         control::{WorkspacePlace, WorkspaceStatus},
@@ -106,6 +106,7 @@ pub(super) fn spawn_repo(
     name: String,
     repo: &Repo,
     claims: RepoClaims,
+    recorded_hash: Option<ObjectHash>,
 ) -> RepoHandle {
     let state = Arc::new(Mutex::new(RepoState::Opening));
     let announcements = set.hub.register_repo(name.clone(), repo.id.clone());
@@ -123,7 +124,8 @@ pub(super) fn spawn_repo(
             changed: set.changed.clone(),
             settings: set.settings,
             claims: claims_rx,
-            claim: set.claim.clone(),
+            recorded_hash,
+            updates: set.updates.clone(),
         })
         .instrument(span),
     );
@@ -151,7 +153,9 @@ struct RepoTask {
     settings: Option<Settings>,
     /// The claims on the repo's workspaces.
     claims: watch::Receiver<RepoClaims>,
-    claim: mpsc::UnboundedSender<ClaimUpdate>,
+    /// The git object hash the mesh recorded for the repo at spawn.
+    recorded_hash: Option<ObjectHash>,
+    updates: mpsc::UnboundedSender<RepoUpdate>,
 }
 
 /// Opens and watches one repo forever: reopening immediately when the
@@ -219,6 +223,7 @@ impl RepoTask {
         // Fetch serving is dispatched by the hub (see `hub::serve`), never
         // by this loop: a fetch below may block on the very peer being served.
         self.hub.repo_opened(&self.name, &self.id, repo.clone());
+        self.correct_object_hash(&repo);
 
         // Watch before the first read: changes racing the setup produce at
         // worst a no-change wakeup.
@@ -382,7 +387,7 @@ impl RepoTask {
         };
 
         if scan.claimed != claims.ours && workspaces.sent.as_ref() != Some(&scan.claimed) {
-            let _ = self.claim.send(ClaimUpdate {
+            let _ = self.updates.send(RepoUpdate::Claims {
                 repo: self.id.clone(),
                 names: scan.claimed.clone(),
             });
@@ -571,6 +576,26 @@ impl RepoTask {
             Ok(Ok(())) => {}
             Ok(Err(err)) => warn!("git ref repair failed: {err:#}"),
             Err(err) => warn!("git ref repair task failed: {err}"),
+        }
+    }
+
+    /// Reports the repo's git object hash when the mesh records another:
+    /// records written before the hash was gossiped read as SHA-1.
+    fn correct_object_hash(&self, repo: &OpenRepo) {
+        match repo.object_hash() {
+            Ok(object_hash)
+                if self
+                    .recorded_hash
+                    .is_some_and(|recorded| recorded != object_hash) =>
+            {
+                info!(%object_hash, "correcting the object hash the mesh records");
+                let _ = self.updates.send(RepoUpdate::ObjectHash {
+                    repo: self.id.clone(),
+                    object_hash,
+                });
+            }
+            Ok(_) => {}
+            Err(err) => warn!("cannot read the object hash: {err:#}"),
         }
     }
 

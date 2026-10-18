@@ -24,7 +24,7 @@ use pollster::FutureExt as _;
 use super::jj;
 use crate::{
     cli::{complete, ui},
-    config::{ConfigDir, MeshState, validate_name},
+    config::{ConfigDir, MeshRepo, MeshState, ObjectHash, validate_name},
     daemon::control::{self, CloneProgress, Request, Response, TransferPhase},
     repo::{Identity, JjRepo},
 };
@@ -131,11 +131,23 @@ fn clone(
     );
 
     // Fresh repo with a machine-unique workspace name, using the user's
-    // own jj (their config applies to the repo from the start).
+    // own jj (their config applies to the repo from the start), but the
+    // mesh repo's object hash, which their config must not override.
+    let object_hash = state
+        .mesh_repos
+        .get(name)
+        .and_then(MeshRepo::present)
+        .map_or_else(ObjectHash::default, |(_, object_hash)| object_hash)
+        .to_string();
     let path_arg = path.to_string_lossy();
     jj(
         None,
-        &[&["git", "init"], colocate, &["--", &path_arg]].concat(),
+        &[
+            &["git", "init", "--object-hash", &object_hash],
+            colocate,
+            &["--", &path_arg],
+        ]
+        .concat(),
     )?;
 
     // The directory exists from here on: a failed pull removes it again so

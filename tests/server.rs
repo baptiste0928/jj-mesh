@@ -4,13 +4,15 @@ mod harness;
 
 use harness::{TestMesh, descriptions, wait_converged, wait_until};
 use jj_mesh::{
+    config::ObjectHash,
     daemon::control::{Request, Response, Status},
     repo::{Identity, JjRepo},
 };
 
 /// A server announces its role, replicates every mesh repo, the ones added
-/// before server mode and after, keeps them in sync, refuses to forget
-/// them, and deletes them once removed from the mesh.
+/// before server mode and after, whatever their object hash, keeps them in
+/// sync, refuses to forget them, and deletes them once removed from the
+/// mesh.
 #[tokio::test]
 async fn server_replicates_every_repo() {
     let mesh = TestMesh::new();
@@ -23,7 +25,8 @@ async fn server_replicates_every_repo() {
     assert!(server.status().await.server);
     a.wait("machine-b as server", |s| is_server(s, "machine-b"))
         .await;
-    let late = mesh.jj.init_repo("late");
+    // A SHA-256 repo gets a SHA-256 replica.
+    let late = mesh.jj.init_repo_hashed("late", ObjectHash::Sha256);
     a.add_repo("late", &late).await;
 
     let early_replica = server.wait_repo("early").await;

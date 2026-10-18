@@ -42,6 +42,7 @@ use pollster::FutureExt as _;
 use tracing::warn;
 
 use super::{JjRepo, write::RawWriteBatch};
+use crate::config::ObjectHash;
 
 /// A repo opened through jj_lib, ready for sync operations.
 ///
@@ -525,7 +526,7 @@ impl OpenRepo {
     /// Ensures a jj-written commit carries the `change-id` git header (see
     /// [`Self::self_check`]).
     fn check_change_id_header(&self, id: &CommitId) -> Result<()> {
-        if is_virtual_root(id) {
+        if self.is_root_commit(id) {
             return Ok(());
         }
 
@@ -546,6 +547,16 @@ impl OpenRepo {
             id.hex(),
         );
         Ok(())
+    }
+
+    /// Whether `id` is jj's virtual root commit, never a real git object.
+    pub(super) fn is_root_commit(&self, id: &CommitId) -> bool {
+        id == self.loader.store().root_commit_id()
+    }
+
+    /// The git object hash of the repo.
+    pub fn object_hash(&self) -> Result<ObjectHash> {
+        ObjectHash::try_from(self.git_backend().git_repo().object_hash()).map_err(|err| eyre!(err))
     }
 
     pub fn git_backend(&self) -> &GitBackend {
@@ -581,11 +592,6 @@ impl OpenRepo {
             Err(err) => err.kind() == std::io::ErrorKind::NotFound,
         }
     }
-}
-
-/// jj's virtual root commit is never a real git object.
-pub(super) fn is_virtual_root(id: &CommitId) -> bool {
-    id.as_bytes().iter().all(|byte| *byte == 0)
 }
 
 /// Converts a jj commit id into a gix object id.

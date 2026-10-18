@@ -18,7 +18,7 @@ etcetera = "0.11.0"
 fail = "0.5.1"
 futures = { version = "0.3.34", default-features = false, features = ["std"] }
 gethostname = "1.1.0"
-gix = { version = "0.88.0", default-features = false }
+gix = { version = "0.88.0", default-features = false, features = ["sha1", "sha256"] }
 gix-pack = "0.75.0"
 indicatif = "0.18.6"
 ignore = "0.4"

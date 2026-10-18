@@ -13,6 +13,7 @@ use jj_lib::object_id::ObjectId as _;
 
 use super::*;
 use crate::{
+    config::ObjectHash,
     net::{
         fetch::{
             FetchRequest, GitFrame, GitRequest, MAX_GIT_FRAME_SIZE, MAX_OP_FRAME_SIZE, OpFrame,
@@ -68,7 +69,7 @@ async fn fetch_into_bare_repo_supersedes_the_root() {
     let fx = Fixture::new();
     let a = fx.init_repo("a");
     fx.commit_file(&a, "file.txt", "content");
-    let bare = crate::repo::JjRepo::init_bare(&fx.path().join("bare")).unwrap();
+    let bare = crate::repo::JjRepo::init_bare(&fx.path().join("bare"), ObjectHash::Sha1).unwrap();
     let (ra, rb) = (open(&a), Arc::new(bare.open().unwrap()));
     assert!(!bare.has_workspaces().unwrap());
     assert_eq!(
@@ -80,6 +81,27 @@ async fn fetch_into_bare_repo_supersedes_the_root() {
     sync_once(&rb, &ra, &wants).await;
     assert_eq!(rb.op_heads().await.unwrap(), wants);
     assert_heads_indexed(&rb).await;
+}
+
+/// Repos of different git object hashes refuse to sync, before any git
+/// object is requested.
+#[tokio::test]
+async fn fetch_refuses_another_object_hash() {
+    let fx = Fixture::new();
+    let a = fx.init_repo_hashed("a", ObjectHash::Sha256);
+    fx.commit_file(&a, "file.txt", "content");
+    let bare = crate::repo::JjRepo::init_bare(&fx.path().join("bare"), ObjectHash::Sha1).unwrap();
+    let (ra, rb) = (open(&a), Arc::new(bare.open().unwrap()));
+
+    let wants = ra.op_heads().await.unwrap();
+    let err = try_sync(&rb, &ra, &wants, GitTransferFormat::Pack)
+        .await
+        .unwrap_err();
+    assert!(format!("{err:#}").contains("object hash"), "{err:#}");
+    assert_eq!(
+        rb.op_heads().await.unwrap(),
+        [rb.root_operation_id().clone()]
+    );
 }
 
 /// Stored but unpublished heads are fetched again; published ones are not.
