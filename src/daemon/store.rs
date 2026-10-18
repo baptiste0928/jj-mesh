@@ -11,7 +11,7 @@ use color_eyre::eyre::Result;
 use iroh::EndpointId;
 use tracing::info;
 
-use super::{hub::SyncHub, peers::PeerSet, repos::RepoSet};
+use super::{hub::SyncHub, peers::PeerSet, replicas::Replicas, repos::RepoSet};
 use crate::{
     config::{ConfigDir, Membership, MeshState},
     net::pair,
@@ -26,6 +26,7 @@ pub struct MeshStore {
     state: Mutex<MeshState>,
     peers: Arc<PeerSet>,
     repos: Arc<RepoSet>,
+    replicas: Arc<Replicas>,
     hub: Arc<SyncHub>,
 }
 
@@ -39,11 +40,13 @@ impl MeshStore {
         state: MeshState,
         peers: Arc<PeerSet>,
         repos: Arc<RepoSet>,
+        replicas: Arc<Replicas>,
         hub: Arc<SyncHub>,
     ) -> Self {
         hub.publish_membership(state.membership(local));
         peers.sync(&state);
         repos.sync(&state);
+        replicas.sync();
 
         MeshStore {
             dir,
@@ -51,6 +54,7 @@ impl MeshStore {
             state: Mutex::new(state),
             peers,
             repos,
+            replicas,
             hub,
         }
     }
@@ -95,7 +99,7 @@ impl MeshStore {
     }
 
     /// Mutates the state: persists the change to `mesh.json`, aligns the
-    /// peer and repo sets with it, and broadcasts the membership if it
+    /// peer and repo sets and the replicas with it, and broadcasts the membership if it
     /// changed. Nothing is committed (in memory or on disk) when the
     /// mutation or the save fails, and a mutation that changes nothing
     /// writes nothing, which is what stops gossip from echoing forever.
@@ -116,6 +120,7 @@ impl MeshStore {
 
         self.peers.sync(&state);
         self.repos.sync(&state);
+        self.replicas.sync();
         if membership_changed {
             self.hub.publish_membership(state.membership(self.local));
         }

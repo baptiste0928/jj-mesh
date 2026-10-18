@@ -146,14 +146,20 @@ fn parents_of(
 }
 
 /// The local heads that are ancestors of `want`, walking parent links of
-/// validated ops.
+/// validated ops. The root operation, the only head of a fresh bare repo,
+/// is an ancestor of every op.
 fn superseded_by(
     repo: &OpenRepo,
     batch: &HashMap<&OperationId, &OpMeta>,
     want: &OperationId,
     local_heads: &[OperationId],
 ) -> Vec<OperationId> {
-    let mut superseded = Vec::new();
+    let root = repo.root_operation_id();
+    let mut superseded: Vec<OperationId> = local_heads
+        .iter()
+        .filter(|head| *head == root)
+        .cloned()
+        .collect();
     let mut visited: HashSet<OperationId> = HashSet::new();
     let mut stack = vec![want.clone()];
     let mut budget = SUPERSEDE_WALK_BUDGET;
@@ -171,7 +177,7 @@ fn superseded_by(
             continue;
         }
         for parent in parents_of(repo, batch, &id) {
-            if parent != *repo.root_operation_id() && !visited.contains(&parent) {
+            if parent != *root && !visited.contains(&parent) {
                 visited.insert(parent.clone());
                 stack.push(parent);
             }

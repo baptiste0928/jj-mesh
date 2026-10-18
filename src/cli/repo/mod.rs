@@ -45,8 +45,8 @@ pub fn run(args: RepoArgs, dir: &ConfigDir) -> Result<()> {
     }
 }
 
-/// Runs a jj command, surfacing its stderr on failure.
-fn jj(dir: Option<&Path>, args: &[&str]) -> Result<()> {
+/// Runs a jj command, surfacing its stderr on failure. Returns its stdout.
+fn jj(dir: Option<&Path>, args: &[&str]) -> Result<String> {
     let mut command = std::process::Command::new(crate::repo::jj_bin());
     if let Some(dir) = dir {
         command.current_dir(dir);
@@ -65,5 +65,5 @@ fn jj(dir: Option<&Path>, args: &[&str]) -> Result<()> {
         args.join(" "),
         stderr.join("\n"),
     );
-    Ok(())
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }

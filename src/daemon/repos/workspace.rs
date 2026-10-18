@@ -26,8 +26,9 @@ use pollster::FutureExt as _;
 use tokio::sync::{Mutex, watch};
 use tracing::{Instrument as _, debug, info, info_span, warn};
 
-use super::{Settings, sleep_until};
+use super::Settings;
 use crate::{
+    daemon::sleep_until,
     repo::{OpenRepo, Workspace, run_jj},
     watch::TreeWatcher,
 };

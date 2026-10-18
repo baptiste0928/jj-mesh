@@ -3,15 +3,17 @@
 //! ```text
 //! control socket ─┐               ┌─► PeerSet ─ peer tasks ◄──► peer daemons
 //! gossip, claims ─┴─► MeshStore ──┤                │
-//!                     (mesh.json) │             SyncHub
-//!                                 │                │
-//!                                 └─► RepoSet ─ repo tasks ◄──► jj repos
+//!                     (mesh.json) │             SyncHub ─ orphans ───────────┐
+//!                                 │                │                         │
+//!                                 ├─► RepoSet ─ repo tasks ◄──► jj repos     │
+//!                                 └─► Replicas ─ replica task ◄──────────────┘
 //! ```
 //!
 //! `MeshStore` owns the mesh state, and every mutation aligns the `PeerSet`
 //! (one connection task per peer) and the `RepoSet` (one watch task per
-//! repo) with it. Peer and repo tasks never talk directly: the `SyncHub`
-//! routes announcements and fetches between them.
+//! repo) with it, and wakes the replica task of server mode. Peer and repo
+//! tasks never talk directly: the `SyncHub` routes announcements and
+//! fetches between them.
 
 mod backoff;
 pub mod control;
@@ -19,12 +21,13 @@ mod hub;
 mod logs;
 mod pairing;
 mod peers;
+mod replicas;
 mod repos;
 mod store;
 
 use std::{
     sync::Arc,
-    time::{Duration, SystemTime},
+    time::{Duration, Instant, SystemTime},
 };
 
 use color_eyre::eyre::{Result, eyre};
@@ -38,6 +41,7 @@ use self::{
     hub::SyncHub,
     pairing::Pairing,
     peers::PeerSet,
+    replicas::Replicas,
     repos::{ClaimUpdate, RepoSet},
     store::MeshStore,
 };
@@ -126,12 +130,14 @@ impl Daemon {
         ));
         let (claim_tx, claim_rx) = mpsc::unbounded_channel();
         let repos = Arc::new(RepoSet::new(hub.clone(), claim_tx));
+        let replicas = Arc::new(Replicas::default());
         let store = Arc::new(MeshStore::new(
             dir.clone(),
             key.endpoint_id(),
             state,
             peers.clone(),
             repos.clone(),
+            replicas.clone(),
             hub.clone(),
         ));
         let pairing = Arc::new(Pairing::new(
@@ -155,6 +161,12 @@ impl Daemon {
         tasks.spawn(accept_loop(endpoint.clone(), peers, pairing));
         tasks.spawn(membership_loop(gossip_rx, store.clone()));
         tasks.spawn(claim_loop(claim_rx, store.clone()));
+        tasks.spawn(replicas::run(
+            dir.clone(),
+            store.clone(),
+            hub.clone(),
+            replicas,
+        ));
         tasks.spawn(status_loop(repos, hub, jj_version));
         tasks.spawn(gossip_loop(store));
 
@@ -287,6 +299,15 @@ async fn gossip_loop(store: Arc<MeshStore>) {
     loop {
         tokio::time::sleep(GOSSIP_INTERVAL).await;
         store.republish_membership();
+    }
+}
+
+/// Sleeps until `deadline`, or never when it is `None`, so an optional
+/// deadline can sit in a `select!` uniformly.
+async fn sleep_until(deadline: Option<Instant>) {
+    match deadline {
+        Some(at) => tokio::time::sleep_until(at.into()).await,
+        None => std::future::pending().await,
     }
 }
 

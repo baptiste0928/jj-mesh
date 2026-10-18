@@ -8,6 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Machines can be set in "server mode"** and keep a copy of every mesh repo, without having a
+  workspace for each. Enable it with `jj-mesh setup --server`.
 - **Added `jj-mesh setup` command to setup a new machine** in a single step. It setups the service
   and pairs the machine with the mesh.
 - Recent daemon logs can be viewed with the new `jj-mesh logs` command. Existing logs have been

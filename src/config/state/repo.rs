@@ -12,8 +12,12 @@ pub struct Repo {
     /// Mesh-wide identifier of the repo.
     pub id: RepoId,
     /// Local repository root (the directory containing `.jj`), stored
-    /// canonicalized by `MeshState::add_repo`.
+    /// canonicalized on registration.
     pub path: PathBuf,
+    /// Whether it is a bare replica made by server mode, in
+    /// [`crate::config::ConfigDir::replicas_dir`].
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub bare: bool,
 }
 
 /// Mesh-wide identifier of a repo, shared by all machines syncing it.

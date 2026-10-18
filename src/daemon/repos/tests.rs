@@ -133,6 +133,7 @@ fn state_with(name: &str, path: &Path) -> MeshState {
         Repo {
             id: RepoId::generate(),
             path: path.to_owned(),
+            bare: false,
         },
     );
     state

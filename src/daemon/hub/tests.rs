@@ -1,6 +1,8 @@
-use super::orphans::MAX_ORPHAN_REPOS_PER_PEER;
 use super::*;
-use crate::net::sync::{self, UniMessage};
+use crate::{
+    config::MAX_MESH_REPOS,
+    net::sync::{self, UniMessage},
+};
 
 fn announce(name: &str, id: &RepoId, seq: u64, heads: Vec<Vec<u8>>) -> Announce {
     Announce {
@@ -33,6 +35,12 @@ async fn routes_to_registered_repo() {
     assert_eq!(drained.len(), 1);
     assert_eq!(drained[0].peer, peer);
     assert_eq!(drained[0].heads, vec![vec![1; 64]]);
+    assert!(inbox.drain().is_empty());
+
+    // Malformed announcements are dropped.
+    hub.route(peer, announce("a", &id, 2, vec![vec![1; MAX_HEAD_LEN + 1]]));
+    let heads = vec![vec![1; 64]; MAX_MESH_REPOS + 1];
+    hub.route(peer, announce("a", &id, 3, heads));
     assert!(inbox.drain().is_empty());
 }
 
@@ -170,7 +178,7 @@ async fn orphans_are_bounded_per_peer() {
     let flooder = iroh::SecretKey::generate().public();
     let honest = iroh::SecretKey::generate().public();
 
-    for n in 0..MAX_ORPHAN_REPOS_PER_PEER {
+    for n in 0..MAX_MESH_REPOS {
         hub.route(
             flooder,
             announce(

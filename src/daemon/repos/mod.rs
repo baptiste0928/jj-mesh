@@ -258,12 +258,3 @@ impl RepoSet {
             .collect()
     }
 }
-
-/// Sleeps until `deadline`, or never when it is `None`, so an optional
-/// deadline can sit in a `select!` uniformly.
-async fn sleep_until(deadline: Option<Instant>) {
-    match deadline {
-        Some(at) => tokio::time::sleep_until(at.into()).await,
-        None => std::future::pending().await,
-    }
-}

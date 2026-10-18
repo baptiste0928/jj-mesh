@@ -28,6 +28,7 @@ use std::{
 };
 
 use iroh::{EndpointId, endpoint::Connection};
+use tokio::sync::Notify;
 use tracing::{debug, warn};
 
 pub use self::inbox::{Inbox, PeerAnnounce};
@@ -43,10 +44,21 @@ use crate::{
     repo::OpenRepo,
 };
 
+/// Cap on head ids accepted in one announcement; legitimate divergence is
+/// a few heads, anything more is a hostile or broken peer.
+const MAX_ANNOUNCED_HEADS: usize = 64;
+
+/// Cap on the length of an announced head id: jj's op ids are 64 bytes.
+/// Repo tasks check the exact length against their store.
+const MAX_HEAD_LEN: usize = 64;
+
 /// The router between peer connections and repo tasks.
 #[derive(Debug, Default)]
 pub struct SyncHub {
     state: Mutex<HubState>,
+    /// Pinged when an orphan announcement is remembered (see
+    /// [`SyncHub::orphans_changed`]).
+    orphaned: Notify,
 }
 
 #[derive(Debug, Default)]
@@ -235,6 +247,7 @@ impl SyncHub {
                 },
             );
         }
+        self.orphaned.notify_one();
 
         if entry.published.is_some() {
             state.announce_seq += 1;
@@ -376,6 +389,15 @@ impl SyncHub {
             debug!(%peer, "dropping announcement with an invalid repo name");
             return;
         }
+        // Bounds what an announcement holds, kept as an orphan or in an
+        // inbox.
+        if announce.heads.len() > MAX_ANNOUNCED_HEADS
+            || announce.heads.iter().any(|head| head.len() > MAX_HEAD_LEN)
+        {
+            let peer = self.peer_name(&peer);
+            debug!(%peer, "dropping malformed announcement");
+            return;
+        }
         let retraction = announce.heads.is_empty();
 
         let mut guard = self.state.lock().unwrap();
@@ -393,7 +415,9 @@ impl SyncHub {
                     heads: announce.heads,
                 },
             );
-            if !remembered {
+            if remembered {
+                self.orphaned.notify_one();
+            } else {
                 let peer = peer_name(&state.names, &peer);
                 debug!(%peer, "dropping announcement: too many unregistered repos");
             }

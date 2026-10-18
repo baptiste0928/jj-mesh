@@ -61,6 +61,27 @@ async fn fast_forward_sync_transfers_ops_and_git_objects() {
     assert_eq!(rb.op_heads().await.unwrap(), wants);
 }
 
+/// A bare repo starts at the root operation, which the first fetch
+/// supersedes like any local head.
+#[tokio::test]
+async fn fetch_into_bare_repo_supersedes_the_root() {
+    let fx = Fixture::new();
+    let a = fx.init_repo("a");
+    fx.commit_file(&a, "file.txt", "content");
+    let bare = crate::repo::JjRepo::init_bare(&fx.path().join("bare")).unwrap();
+    let (ra, rb) = (open(&a), Arc::new(bare.open().unwrap()));
+    assert!(!bare.has_workspaces().unwrap());
+    assert_eq!(
+        rb.op_heads().await.unwrap(),
+        [rb.root_operation_id().clone()]
+    );
+
+    let wants = ra.op_heads().await.unwrap();
+    sync_once(&rb, &ra, &wants).await;
+    assert_eq!(rb.op_heads().await.unwrap(), wants);
+    assert_heads_indexed(&rb).await;
+}
+
 /// Stored but unpublished heads are fetched again; published ones are not.
 #[tokio::test]
 async fn stored_but_unpublished_heads_are_missing() {

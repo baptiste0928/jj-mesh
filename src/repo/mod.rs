@@ -6,7 +6,8 @@
 //!
 //! [`JjRepo`] is a validated repo on disk, [`StoreFingerprint`] its
 //! captured store configuration, and [`Workspace`] one of its working
-//! copies. The `jj` module invokes the user's jj binary, `open` opens the
+//! copies. A bare repo (see [`JjRepo::init_bare`]) has the main workspace
+//! layout without a working copy. The `jj` module invokes the user's jj binary, `open` opens the
 //! stores through jj_lib (with raw batched writes in `write`), `codec`
 //! validates replicated bytes, and `transfer` moves them between peers.
 
@@ -23,13 +24,15 @@ use std::{
 };
 
 use color_eyre::eyre::{Result, WrapErr as _, ensure};
+use jj_lib::{git_backend::GitBackend, repo::ReadonlyRepo, signing_factory::signer_from_settings};
+use pollster::FutureExt as _;
 
 pub use self::{
     jj::{
         jj_bin, jj_output, jj_peer_warning, jj_version, jj_version_warning, repo_present, run_jj,
     },
     open::OpenRepo,
-    workspace::{Checkout, Workspace},
+    workspace::{Checkout, Identity, Workspace},
 };
 
 /// The jj release series this build accepts, as minors of `0.<minor>.<patch>`
@@ -71,13 +74,43 @@ impl JjRepo {
         Workspace::discover(path)?.repo()
     }
 
-    /// The repo whose main workspace is rooted at `root`, validated.
-    fn at(root: &Path) -> Result<Self> {
+    /// The repo whose main workspace is rooted at `root`, validated. Unlike
+    /// [`Self::discover`], never looks in the parents.
+    pub fn at(root: &Path) -> Result<Self> {
         let repo = JjRepo {
             root: root.to_owned(),
         };
         repo.validate()?;
         Ok(repo)
+    }
+
+    /// Creates a bare repo at `root`, which must not exist: the stores of a
+    /// main workspace, holding only the root operation. Built through
+    /// jj_lib, as the jj CLI needs a working copy. The git store uses SHA-1
+    /// object ids, jj's default.
+    pub fn init_bare(root: &Path) -> Result<Self> {
+        let repo_dir = root.join(".jj").join("repo");
+        fs::create_dir_all(&repo_dir)
+            .wrap_err_with(|| format!("cannot create {}", repo_dir.display()))?;
+        let settings = open::settings()?;
+        ReadonlyRepo::init(
+            settings,
+            &repo_dir,
+            &|settings, store_path| {
+                let backend =
+                    GitBackend::init_internal(settings, store_path, gix::hash::Kind::Sha1)?;
+                Ok(Box::new(backend))
+            },
+            signer_from_settings(settings)?,
+            ReadonlyRepo::default_workspace_store_initializer(),
+            ReadonlyRepo::default_op_store_initializer(),
+            ReadonlyRepo::default_op_heads_store_initializer(),
+            ReadonlyRepo::default_index_store_initializer(),
+            ReadonlyRepo::default_submodule_store_initializer(),
+        )
+        .block_on()
+        .wrap_err_with(|| format!("cannot create a repo in {}", root.display()))?;
+        Self::at(root)
     }
 
     /// The main workspace root (the directory containing `.jj/repo`).

@@ -16,8 +16,17 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use color_eyre::eyre::{Result, WrapErr as _, eyre};
-use jj_lib::{op_store::OperationId, protos};
+use color_eyre::eyre::{Result, WrapErr as _, ensure, eyre};
+use jj_lib::{
+    config::{ConfigLayer, ConfigSource, StackedConfig},
+    default_backend_factories::{default_backend_factories, default_working_copy_factory},
+    op_store::OperationId,
+    protos,
+    ref_name::{WorkspaceName, WorkspaceNameBuf},
+    repo::RepoLoader,
+    settings::UserSettings,
+};
+use pollster::FutureExt as _;
 use prost::Message as _;
 
 use super::{JjRepo, OpenRepo};
@@ -28,6 +37,14 @@ pub struct Workspace {
     root: PathBuf,
     /// The repo storage directory it uses, canonical.
     repo_dir: PathBuf,
+}
+
+/// The user a workspace is added for: jj records it on the operation and
+/// the working-copy commit.
+#[derive(Debug, Clone, Default)]
+pub struct Identity {
+    pub name: String,
+    pub email: String,
 }
 
 /// What a working copy was last updated to: its workspace, and the
@@ -133,6 +150,72 @@ impl JjRepo {
     /// The main workspace.
     pub fn workspace(&self) -> Result<Workspace> {
         Workspace::at(self.root())
+    }
+
+    /// Whether a workspace on disk uses the repo: a root its workspace store
+    /// records still points back to it. Decided from local data only,
+    /// unlike [`OpenRepo::workspaces`]: operations synced from peers must
+    /// not decide what jj-mesh deletes.
+    pub fn has_workspaces(&self) -> Result<bool> {
+        let index = self.repo_dir().join("workspace_store").join("index");
+        let bytes = match fs::read(&index) {
+            Ok(bytes) => bytes,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(err) => {
+                return Err(err).wrap_err_with(|| format!("cannot read {}", index.display()));
+            }
+        };
+        let store = protos::simple_workspace_store::Workspaces::decode(&*bytes)
+            .wrap_err_with(|| format!("cannot decode {}", index.display()))?;
+        let repo_dir = fs::canonicalize(self.repo_dir())
+            .wrap_err_with(|| format!("cannot resolve {}", self.repo_dir().display()))?;
+        Ok(store.workspaces.iter().any(|workspace| {
+            // Recorded relative to the repo dir.
+            let root = self.repo_dir().join(OsStr::from_bytes(&workspace.path));
+            fs::canonicalize(root)
+                .ok()
+                .and_then(|root| Workspace::at(&root).ok())
+                .is_some_and(|found| found.repo_dir == repo_dir)
+        }))
+    }
+
+    /// Adds a workspace named `name` at `root`, which must not exist, like
+    /// `jj workspace add`: the jj CLI cannot run in a bare repo, which has
+    /// no workspace to run in.
+    pub fn add_workspace(&self, root: &Path, name: &str, user: &Identity) -> Result<()> {
+        let mut layer = ConfigLayer::empty(ConfigSource::User);
+        layer.set_value("user.name", user.name.as_str())?;
+        layer.set_value("user.email", user.email.as_str())?;
+        let hostname = gethostname::gethostname().to_string_lossy().into_owned();
+        layer.set_value("operation.hostname", hostname)?;
+        let username = std::env::var("USER").unwrap_or_default();
+        layer.set_value("operation.username", username)?;
+        let mut config = StackedConfig::with_defaults();
+        config.add_layer(layer);
+        let settings = UserSettings::from_config_and_home_dir(config, None)?;
+
+        let repo_dir = self.repo_dir();
+        let repo =
+            RepoLoader::init_from_file_system(&settings, &repo_dir, &default_backend_factories())?
+                .load_at_head()
+                .block_on()?;
+        let names = repo.view().wc_commit_ids();
+        ensure!(
+            !names.contains_key(WorkspaceName::new(name)),
+            "the workspace `{name}` already exists",
+        );
+
+        fs::create_dir_all(root).wrap_err_with(|| format!("cannot create {}", root.display()))?;
+        jj_lib::workspace::Workspace::init_workspace_with_existing_repo(
+            root,
+            &repo_dir,
+            &repo,
+            &*default_working_copy_factory(),
+            WorkspaceNameBuf::from(name),
+        )
+        .block_on()
+        .wrap_err_with(|| format!("cannot add a workspace in {}", root.display()))?;
+        Ok(())
     }
 }
 

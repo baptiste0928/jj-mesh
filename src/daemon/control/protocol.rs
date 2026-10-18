@@ -28,11 +28,6 @@ pub const MUTATE_WAIT: Duration = Duration::from_secs(10);
 /// CLI tells the user; the daemon enforces it.
 pub const PAIR_TICKET_TTL: Duration = Duration::from_mins(3);
 
-/// Deadline for the network-facing work of a clone's initial repo pull
-/// (it may transfer an entire repository); the pull's local apply and
-/// index work runs unbounded.
-pub(super) const CLONE_PULL_NET_TIMEOUT: Duration = Duration::from_mins(30);
-
 /// Cadence at which the daemon re-sends the latest clone progress. Sent
 /// unconditionally, changed or not: the frames double as the liveness
 /// signal behind [`CLONE_IDLE_WAIT`].
@@ -41,8 +36,7 @@ pub(super) const CLONE_PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
 /// Time budget the CLI grants between clone frames, not the whole exchange:
 /// the daemon heartbeats progress every [`CLONE_PROGRESS_INTERVAL`] while
 /// the clone runs, so a silent daemon is a dead one. The transfer's
-/// network phases stay bounded by the daemon's own
-/// [`CLONE_PULL_NET_TIMEOUT`].
+/// network phases stay bounded by the daemon's own pull deadline.
 pub const CLONE_IDLE_WAIT: Duration = Duration::from_secs(30);
 
 /// A request from the CLI to the daemon.

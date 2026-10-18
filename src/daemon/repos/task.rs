@@ -40,7 +40,7 @@ use tokio::sync::{Notify, mpsc, watch};
 use tracing::{Instrument as _, debug, info, info_span, warn};
 
 use super::{
-    ClaimUpdate, RepoHandle, RepoSet, RepoState, Settings, WorkspaceState, sleep_until,
+    ClaimUpdate, RepoHandle, RepoSet, RepoState, Settings, WorkspaceState,
     workspace::{RepoContext, WorkspaceHandle, may_be_stale, spawn_workspace},
 };
 use crate::{
@@ -49,6 +49,7 @@ use crate::{
         backoff::Backoff,
         control::{WorkspacePlace, WorkspaceStatus},
         hub::{Inbox, PeerAnnounce, SyncHub},
+        sleep_until,
     },
     net::fetch::GitTransferFormat,
     repo::{JjRepo, OpenRepo, StoreFingerprint, Workspace, repo_present, transfer},
@@ -81,10 +82,6 @@ const LIVENESS_INTERVAL: Duration = Duration::from_mins(1);
 /// their length is not ours to trust, and they are cloned into every
 /// status response.
 const MAX_ERROR_LEN: usize = 256;
-
-/// Cap on head ids accepted in one announcement; legitimate divergence is
-/// a few heads, anything more is a hostile or broken peer.
-const MAX_ANNOUNCED_HEADS: usize = 64;
 
 /// Deadline for the network-facing work of one fetch from a peer: a
 /// stalled or hostile server must not pin the repo task forever
@@ -458,9 +455,7 @@ impl RepoTask {
     ) -> Result<Handled> {
         let peer = self.hub.peer_name(&announce.peer);
         let id_len = repo.root_operation_id().as_bytes().len();
-        if announce.heads.len() > MAX_ANNOUNCED_HEADS
-            || announce.heads.iter().any(|head| head.len() != id_len)
-        {
+        if announce.heads.iter().any(|head| head.len() != id_len) {
             debug!(%peer, "ignoring malformed announcement");
             return Ok(Handled::Idle);
         }

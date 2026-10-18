@@ -6,7 +6,9 @@
 //! working copy on trunk. A failed clone removes the directory it created.
 //!
 //! A repo already registered here gets a new workspace instead, which the
-//! daemon syncs like the others.
+//! daemon syncs like the others. On a server, the workspace of a replica
+//! is added through jj_lib (see [`JjRepo::add_workspace`]), since the jj CLI
+//! needs a workspace to run in.
 
 use std::{
     path::{Component, Path, PathBuf},
@@ -17,12 +19,14 @@ use clap::{Args, ValueHint};
 use clap_complete::ArgValueCandidates;
 use color_eyre::eyre::{OptionExt as _, Report, Result, WrapErr as _, bail, ensure};
 use indicatif::{HumanBytes, ProgressBar, ProgressStyle};
+use pollster::FutureExt as _;
 
 use super::jj;
 use crate::{
     cli::{complete, ui},
     config::{ConfigDir, MeshState, validate_name},
     daemon::control::{self, CloneProgress, Request, Response, TransferPhase},
+    repo::{Identity, JjRepo},
 };
 
 /// Clone a repo from another machine
@@ -77,15 +81,30 @@ pub fn run(args: CloneArgs, dir: &ConfigDir) -> Result<()> {
         _ => &[],
     };
 
-    if let Some(repo) = state.repos.get(&name) {
-        let workspace = match args.workspace {
-            Some(workspace) => workspace,
-            None => extra_workspace_name(&state.machine.name, &path)?,
-        };
-        add_workspace(&name, &repo.path, &path, &workspace, colocate)
-    } else {
-        let workspace = args.workspace.unwrap_or_else(|| state.machine.name.clone());
-        clone(dir, &state, &name, &path, &workspace, colocate)
+    match state.repos.get(&name) {
+        Some(repo) if repo.bare => {
+            ensure!(
+                colocate.is_empty(),
+                "`{name}` is a server replica, whose git store cannot be colocated",
+            );
+            let replica = JjRepo::at(&repo.path)?;
+            let workspace = match args.workspace {
+                Some(workspace) => workspace,
+                None => replica_workspace_name(&replica, &state.machine.name, &path)?,
+            };
+            add_replica_workspace(&name, &replica, &path, &workspace)
+        }
+        Some(repo) => {
+            let workspace = match args.workspace {
+                Some(workspace) => workspace,
+                None => extra_workspace_name(&state.machine.name, &path)?,
+            };
+            add_workspace(&name, &repo.path, &path, &workspace, colocate)
+        }
+        None => {
+            let workspace = args.workspace.unwrap_or_else(|| state.machine.name.clone());
+            clone(dir, &state, &name, &path, &workspace, colocate)
+        }
     }
 }
 
@@ -132,7 +151,7 @@ fn clone(
     // recover it rather than fail a clone that already succeeded, and keep
     // its recovered position instead of jumping to trunk.
     match jj(Some(path), &["status"]) {
-        Ok(()) => start_on_trunk(path),
+        Ok(_) => start_on_trunk(path),
         Err(err) => {
             if jj(Some(path), &["workspace", "update-stale"]).is_err() {
                 return Err(err);
@@ -187,6 +206,50 @@ fn add_workspace(
         )),
     );
     Ok(())
+}
+
+/// Adds a workspace of the server replica of `name` in `path`, then starts
+/// its working copy on trunk.
+fn add_replica_workspace(name: &str, replica: &JjRepo, path: &Path, workspace: &str) -> Result<()> {
+    ensure!(
+        !path.exists(),
+        "{} already exists (clone creates the directory)",
+        path.display(),
+    );
+    validate_name("workspace", workspace)?;
+
+    // jj_lib records the identity the user's jj config holds.
+    let config = |key| {
+        jj(None, &["config", "get", key])
+            .map_or_else(|_| String::new(), |value| value.trim().to_owned())
+    };
+    let user = Identity {
+        name: config("user.name"),
+        email: config("user.email"),
+    };
+    replica.add_workspace(path, workspace, &user)?;
+    start_on_trunk(path);
+
+    println!(
+        "{}",
+        ui::good(format_args!(
+            "Added workspace `{workspace}` of the server replica of `{name}` in {}",
+            path.display(),
+        )),
+    );
+    Ok(())
+}
+
+/// The default name of a workspace of a server replica: the machine name,
+/// or the [`extra_workspace_name`] once a workspace holds it.
+fn replica_workspace_name(replica: &JjRepo, machine: &str, path: &Path) -> Result<String> {
+    let repo = replica.open()?;
+    let heads = repo.op_heads().block_on()?;
+    if repo.workspace_names(&heads).block_on()?.contains(machine) {
+        extra_workspace_name(machine, path)
+    } else {
+        Ok(machine.to_owned())
+    }
 }
 
 /// The default name of another workspace of a local repo: the machine name

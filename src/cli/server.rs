@@ -12,7 +12,8 @@ use crate::{
 /// Manage server mode
 ///
 /// A server keeps a copy of every mesh repo, without a working copy, so the
-/// whole mesh stays available from it.
+/// whole mesh stays available from it. `jj-mesh clone` on a server adds a
+/// workspace to its copy.
 #[derive(Debug, Args)]
 pub struct ServerArgs {
     #[command(subcommand)]
@@ -23,7 +24,7 @@ pub struct ServerArgs {
 enum ServerCommand {
     /// Replicate every mesh repo on this machine
     Enable,
-    /// Stop replicating the mesh repos
+    /// Stop replicating the mesh repos, deleting the replicas no workspace uses
     Disable,
 }
 

@@ -309,13 +309,9 @@ impl MeshState {
     /// it in the mesh-wide repo list, superseding any tombstone. The path
     /// is stored canonicalized, whatever the caller sent, so path
     /// comparisons never have to resolve stored entries again.
-    pub fn add_repo(&mut self, name: String, mut repo: Repo) -> Result<()> {
-        repo.path = canonical_path(&repo.path);
-        self.validate_new_repo(&name, &repo.path)?;
+    pub fn add_repo(&mut self, name: String, repo: Repo) -> Result<()> {
+        let repo = self.check_new_repo(&name, repo)?;
         self.ensure_mesh_id(&name, &repo.id)?;
-        if let Some(existing) = self.repo_name(&repo.id) {
-            bail!("repo {} is already registered as `{existing}`", repo.id);
-        }
         ensure!(
             self.mesh_repos.contains_key(&name) || self.mesh_repos.len() < MAX_MESH_REPOS,
             "the mesh already has {MAX_MESH_REPOS} repos",
@@ -336,9 +332,35 @@ impl MeshState {
         Ok(())
     }
 
+    /// Registers a clone of the mesh repo `name`, which the mesh must still
+    /// list under the repo's id. Unlike [`Self::add_repo`], the mesh record
+    /// is left alone: a clone finishing after a removal must not undo it.
+    pub fn add_clone(&mut self, name: String, repo: Repo) -> Result<()> {
+        let repo = self.check_new_repo(&name, repo)?;
+        ensure!(
+            self.mesh_repo_id(&name) == Some(&repo.id),
+            "`{name}` is no longer in the mesh",
+        );
+        self.repos.insert(name, repo);
+
+        Ok(())
+    }
+
+    /// Checks that `repo` can be registered under `name`, canonicalizing
+    /// its path.
+    fn check_new_repo(&self, name: &str, mut repo: Repo) -> Result<Repo> {
+        repo.path = canonical_path(&repo.path);
+        self.validate_new_repo(name, &repo.path)?;
+        if let Some(existing) = self.repo_name(&repo.id) {
+            bail!("repo {} is already registered as `{existing}`", repo.id);
+        }
+        Ok(repo)
+    }
+
     /// Retires a repo name from the mesh: tombstones the mesh record and
     /// unregisters the repo here. The tombstone propagates the removal, so
-    /// every machine stops syncing the repo; none of them touch its files.
+    /// every machine stops syncing the repo; only servers delete their
+    /// replica, unless a workspace uses it.
     /// Returns whether the repo was registered on this machine.
     pub fn remove_repo(&mut self, name: &str) -> Result<bool> {
         match (self.mesh_repos.get(name), self.repos.contains_key(name)) {
@@ -365,10 +387,26 @@ impl MeshState {
     /// mesh record is untouched: the other machines keep syncing the repo
     /// among themselves, and it stays clonable here (that is also the only
     /// way back in, since re-adding it would fork the name).
+    ///
+    /// Bare replicas cannot be forgotten: server mode would replicate them
+    /// again.
     pub fn forget_repo(&mut self, name: &str) -> Result<Repo> {
-        match self.unregister_repo(name) {
-            Some(repo) => Ok(repo),
+        match self.repos.get(name) {
             None => bail!("no repo named `{name}` is registered on this machine"),
+            Some(repo) if repo.bare => {
+                bail!(
+                    "`{name}` is a server replica; disable server mode or remove it from the mesh"
+                )
+            }
+            Some(_) => Ok(self.unregister_repo(name).expect("registered")),
+        }
+    }
+
+    /// Unregisters a bare replica (server mode is off and no workspace uses
+    /// it); other repos are left alone.
+    pub fn drop_replica(&mut self, name: &str) {
+        if self.repos.get(name).is_some_and(|repo| repo.bare) {
+            self.unregister_repo(name);
         }
     }
 
@@ -552,6 +590,7 @@ mod tests {
                 Repo {
                     id: RepoId::generate(),
                     path: tmp.path().join("project"),
+                    bare: false,
                 },
             )
             .unwrap();
@@ -888,6 +927,7 @@ mod tests {
                 Repo {
                     id: RepoId::generate(),
                     path: "/p".into(),
+                    bare: false,
                 },
             )
             .unwrap_err();
@@ -900,6 +940,7 @@ mod tests {
         let repo = |id: &RepoId| Repo {
             id: id.clone(),
             path: "/p".into(),
+            bare: false,
         };
 
         let first = RepoId::generate();
@@ -932,6 +973,7 @@ mod tests {
                 Repo {
                     id: id.clone(),
                     path: "/p".into(),
+                    bare: false,
                 },
             )
             .unwrap();
@@ -952,6 +994,7 @@ mod tests {
                 Repo {
                     id: RepoId::generate(),
                     path: repo.path,
+                    bare: false,
                 },
             )
             .unwrap_err();
@@ -970,6 +1013,7 @@ mod tests {
                 Repo {
                     id: id.clone(),
                     path: "/p".into(),
+                    bare: false,
                 },
             )
             .unwrap();
@@ -1010,6 +1054,7 @@ mod tests {
                 Repo {
                     id: RepoId::generate(),
                     path: real,
+                    bare: false,
                 },
             )
             .unwrap();
@@ -1029,6 +1074,7 @@ mod tests {
                 Repo {
                     id: id.clone(),
                     path: "/a".into(),
+                    bare: false,
                 },
             )
             .unwrap();
@@ -1038,7 +1084,8 @@ mod tests {
                     "b".to_owned(),
                     Repo {
                         id,
-                        path: "/b".into()
+                        path: "/b".into(),
+                        bare: false,
                     }
                 )
                 .is_err()
@@ -1105,6 +1152,7 @@ mod tests {
                 Repo {
                     id: id.clone(),
                     path: "/tmp/proj".into(),
+                    bare: false,
                 },
             )
             .unwrap();
@@ -1145,6 +1193,7 @@ mod tests {
                 Repo {
                     id: id.clone(),
                     path: "/tmp/proj".into(),
+                    bare: false,
                 },
             )
             .unwrap();

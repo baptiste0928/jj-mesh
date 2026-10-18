@@ -329,6 +329,7 @@ async fn add_repo(ctx: &ControlContext, name: String, path: PathBuf) -> Result<R
             Repo {
                 id: RepoId::generate(),
                 path: root,
+                bare: false,
             },
         )
     })?;

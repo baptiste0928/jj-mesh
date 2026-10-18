@@ -1,27 +1,17 @@
 //! The clone handler: pull a mesh repo from an announcing peer, register
 //! it, and stream progress frames to the client while the pull runs.
 
-use std::{path::Path, sync::Arc, time::Duration};
+use std::path::Path;
 
-use color_eyre::eyre::{Result, WrapErr as _, bail, eyre};
+use color_eyre::eyre::{Result, bail};
 use tokio::net::UnixStream;
-use tracing::{info, warn};
+use tracing::info;
 
 use super::{
-    protocol::{CLONE_PROGRESS_INTERVAL, CLONE_PULL_NET_TIMEOUT, CloneProgress, Response},
+    protocol::{CLONE_PROGRESS_INTERVAL, CloneProgress, Response},
     server::{ControlContext, client_gone, respond},
 };
-use crate::{
-    config::{Repo, RepoId},
-    daemon::hub::CloneSource,
-    net::fetch::GitTransferFormat,
-    repo::{JjRepo, transfer},
-};
-
-/// Budget for opening the pull stream on an established connection: a
-/// peer that never grants stream credit must not stall the clone (the
-/// progress heartbeat would mask the hang from the CLI).
-const OPEN_STREAM_TIMEOUT: Duration = Duration::from_secs(30);
+use crate::{config::Repo, repo::transfer};
 
 /// Pulls the mesh repo named `name` into the freshly initialized repo at
 /// `path`, streaming progress frames while the pull runs. Stops the pull
@@ -96,87 +86,25 @@ async fn clone_pull_and_register(
         }
     }
 
-    let (ops, git_objects) = clone_pull(ctx, name, &repo_id, sources, path, progress).await?;
+    // The progress publishes latest-wins into the watch; the connection
+    // task samples and forwards it on its heartbeat.
+    let sink = |peer: &str, transfer| {
+        progress.send_replace(CloneProgress {
+            peer: peer.to_owned(),
+            transfer,
+        });
+    };
+    let (ops, git_objects) = ctx.hub.pull(name, &repo_id, sources, path, &sink).await?;
 
     ctx.store.update(|state| {
-        state.add_repo(
+        state.add_clone(
             name.to_owned(),
             Repo {
                 id: repo_id.clone(),
                 path: path.to_owned(),
+                bare: false,
             },
         )
     })?;
     Ok(Response::Cloned { ops, git_objects })
-}
-
-async fn clone_pull(
-    ctx: &ControlContext,
-    name: &str,
-    repo_id: &RepoId,
-    sources: Vec<CloneSource>,
-    path: &Path,
-    progress: &tokio::sync::watch::Sender<CloneProgress>,
-) -> Result<(u64, u64)> {
-    use jj_lib::op_store::OperationId;
-
-    let repo_path = path.to_owned();
-    let repo = crate::spawn_blocking(move || -> Result<_> {
-        Ok(Arc::new(JjRepo::discover(&repo_path)?.open()?))
-    })
-    .await
-    .wrap_err("repo open task failed")??;
-
-    let mut last_error = eyre!("no usable source peer");
-    for CloneSource { peer, heads } in sources {
-        let wants: Vec<OperationId> = heads.into_iter().map(OperationId::new).collect();
-        let Some(conn) = ctx.hub.connection(&peer) else {
-            continue;
-        };
-
-        // The transfer sink publishes latest-wins into the watch; the
-        // connection task samples and forwards it on its heartbeat. Reset
-        // to zeroed counters before dialing, so a fallback to this source
-        // is visible and a stalled dial still heartbeats fresh state.
-        let peer_name = ctx.hub.peer_name(&peer);
-        let sink = |transfer: transfer::TransferProgress| {
-            progress.send_replace(CloneProgress {
-                peer: peer_name.clone(),
-                transfer,
-            });
-        };
-        sink(transfer::TransferProgress::start(
-            transfer::TransferPhase::Ops,
-        ));
-
-        let pull = async {
-            let (mut send, mut recv) = tokio::time::timeout(OPEN_STREAM_TIMEOUT, conn.open_bi())
-                .await
-                .map_err(|_| eyre!("timed out opening the pull stream"))??;
-            // A clone pulls a whole history: the pack format reuses the
-            // server's on-disk deltas and lands as one pack file here,
-            // instead of writing every object loose.
-            let outcome = transfer::fetch(
-                &repo,
-                transfer::RepoIdent { name, id: repo_id },
-                &wants,
-                transfer::FetchOptions {
-                    format: GitTransferFormat::Pack,
-                    net_timeout: CLONE_PULL_NET_TIMEOUT,
-                },
-                &mut send,
-                &mut recv,
-                transfer::ProgressSink::new(&sink),
-            )
-            .await?;
-            let _ = send.finish();
-            Ok::<_, color_eyre::Report>(outcome)
-        };
-        match pull.await {
-            Err(err) => last_error = err.wrap_err(format!("pull from {peer} failed")),
-            Ok(outcome) => return Ok((outcome.ops as u64, outcome.git_objects as u64)),
-        }
-        warn!("clone pull attempt failed: {last_error:#}");
-    }
-    Err(last_error)
 }

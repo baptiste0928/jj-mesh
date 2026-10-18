@@ -271,6 +271,18 @@ impl Machine {
         .await;
     }
 
+    /// Waits until the repo `name` is registered on this machine, returning
+    /// its path.
+    pub async fn wait_repo(&self, name: &str) -> PathBuf {
+        poll(async || {
+            let status = self.status().await;
+            let repo = status.repos.into_iter().find(|repo| repo.name == name);
+            repo.map(|repo| repo.path)
+                .ok_or_else(|| format!("{}: timed out waiting for {name}", self.name))
+        })
+        .await
+    }
+
     /// Waits until the mesh repo `name` is clonable on this machine.
     pub async fn wait_available(&self, name: &str) {
         self.wait(&format!("{name} available"), |s| {
@@ -352,6 +364,18 @@ pub async fn wait_converged(a: &Path, b: &Path) {
                 a.display(),
                 b.display(),
             ))
+        }
+    })
+    .await;
+}
+
+/// Polls `pred` until it holds, panicking after [`WAIT_TIMEOUT`].
+pub async fn wait_until(what: &str, pred: impl Fn() -> bool) {
+    poll(async || {
+        if pred() {
+            Ok(())
+        } else {
+            Err(format!("timed out waiting for {what}"))
         }
     })
     .await;
