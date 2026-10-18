@@ -136,7 +136,7 @@ fn installed() -> Result<Service> {
 fn ensure_ours(service: &Service) -> Result<()> {
     ensure!(
         !service.is_external(),
-        "{} is managed by another program (such as Home Manager). \
+        "{} is managed by another program (such as Home Manager or NixOS). \
          Update that configuration instead",
         service.path().display(),
     );

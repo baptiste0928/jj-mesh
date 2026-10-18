@@ -42,11 +42,11 @@ $ cargo install --git https://github.com/baptiste0928/jj-mesh.git --locked
 The daemon runs in the background as a user service, with `systemd` on Linux and `launchd` on
 macOS. `jj-mesh setup` installs it for you (see [Usage](#usage)).
 
-### With Nix and Home Manager
+### With Nix
 
-For [Nix](https://nixos.org/) and [Home Manager](https://github.com/nix-community/home-manager) users,
-this repository contains a flake exposing a Home Manager module which installs `jj-mesh` and runs the
-daemon as a user service.
+For [Nix](https://nixos.org/) users, this repository contains a flake exposing a
+[Home Manager](https://github.com/nix-community/home-manager) module and a NixOS module, both of which
+install `jj-mesh` and run the daemon as a user service.
 
 Add the flake as an input:
 
@@ -62,6 +62,20 @@ Then enable the service in your Home Manager configuration:
   imports = [ inputs.jj-mesh.homeModules.default ];
 
   services.jj-mesh.enable = true;
+}
+```
+
+Or in your NixOS configuration:
+
+```nix
+{ inputs, ... }:
+{
+  imports = [ inputs.jj-mesh.nixosModules.default ];
+
+  services.jj-mesh = {
+    enable = true;
+    users = [ "alice" ];
+  };
 }
 ```
 

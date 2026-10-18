@@ -4,9 +4,9 @@
 //! A [`Service`] is identified by its definition file (unit or plist),
 //! looked up under the labels in the platform's `LABELS`. `jj-mesh service
 //! install` writes a regular file under the first one; external managers
-//! (Home Manager) use another label or install a symlink. The CLI still
-//! starts and stops an external service, but refuses to replace or remove
-//! it.
+//! (Home Manager, NixOS) use another label, install a symlink or install
+//! it system-wide. The CLI still starts and stops an external service, but
+//! refuses to replace or remove it.
 //!
 //! Definitions are rendered from a [`Spec`] by the platform module, which
 //! also drives the service manager (`systemctl --user`, `launchctl`). The
@@ -56,9 +56,19 @@ pub struct Service {
 impl Service {
     /// The installed service: the last label whose definition exists, so
     /// a leftover install of ours never hides an external manager's.
+    /// System-wide definitions (NixOS) come last, since the service
+    /// manager also prefers the user's own.
     pub fn find() -> Result<Option<Self>> {
-        for label in platform::LABELS.iter().rev() {
-            let service = Self::new(label)?;
+        let labels = || platform::LABELS.iter().rev();
+        let user = labels()
+            .map(|label| Self::new(label))
+            .collect::<Result<Vec<_>>>()?;
+        let system = labels().flat_map(|label| {
+            platform::system_paths(label)
+                .into_iter()
+                .map(|path| Service { label, path })
+        });
+        for service in user.into_iter().chain(system) {
             match fs::symlink_metadata(&service.path) {
                 Ok(_) => return Ok(Some(service)),
                 Err(err) if err.kind() == ErrorKind::NotFound => {}
@@ -89,10 +99,13 @@ impl Service {
     }
 
     /// Whether another program manages the service: it has another label
-    /// than ours, or its definition is a symlink (as installed by Home
-    /// Manager and other nix-based managers).
+    /// than ours, its definition is installed system-wide (NixOS), or it is
+    /// a symlink (as installed by Home Manager and other nix-based
+    /// managers).
     pub fn is_external(&self) -> bool {
-        self.label != platform::LABELS[0] || self.path.is_symlink()
+        self.label != platform::LABELS[0]
+            || platform::path(self.label).map_or(true, |path| path != self.path)
+            || self.path.is_symlink()
     }
 
     /// Writes the definition, then enables and (re)starts the service.

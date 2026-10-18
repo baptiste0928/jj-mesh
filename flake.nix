@@ -41,6 +41,11 @@
         default = jj-mesh;
       };
 
+      nixosModules = rec {
+        jj-mesh = import ./nixos-module.nix self;
+        default = jj-mesh;
+      };
+
       packages = forEachSystem (
         system:
         let

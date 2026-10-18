@@ -22,6 +22,11 @@ pub(super) fn path(label: &str) -> Result<PathBuf> {
         .join(unit(label)))
 }
 
+/// The paths to the system-configured user services.
+pub(super) fn system_paths(label: &str) -> Vec<PathBuf> {
+    vec![PathBuf::from("/etc/systemd/user").join(unit(label))]
+}
+
 /// The unit file for `spec`. `Type=exec` makes `systemctl start` fail when
 /// the program cannot run.
 #[allow(clippy::unnecessary_wraps, reason = "same signature as on launchd")]
