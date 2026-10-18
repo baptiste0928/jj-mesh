@@ -91,6 +91,12 @@ pub enum Request {
     /// the gossip. Answered with [`Response::ServerSet`] or
     /// [`Response::Error`].
     SetServer { enabled: bool },
+    /// Hold back the daemon from keeping the workspace named `workspace`
+    /// of the registered repo `repo` fresh, so the CLI can create it and
+    /// write its settings first. Answered with [`Response::WorkspaceHeld`]
+    /// or [`Response::Error`]; the hold lasts until the client
+    /// disconnects.
+    HoldWorkspace { repo: String, workspace: String },
 }
 
 /// A daemon answer to a [`Request`].
@@ -144,6 +150,8 @@ pub enum Response {
     LogsSkipped(u64),
     /// Server mode is switched in the mesh state.
     ServerSet,
+    /// The workspace is held until the client disconnects.
+    WorkspaceHeld,
 }
 
 /// Header of a [`Request::Logs`] stream.

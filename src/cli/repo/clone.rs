@@ -9,6 +9,10 @@
 //! daemon syncs like the others. On a server, the workspace of a replica
 //! is added through jj_lib (see [`JjRepo::add_workspace`]), since the jj CLI
 //! needs a workspace to run in.
+//!
+//! Settings flags go to the repo config of a fresh clone or of a replica
+//! without workspaces, and to the workspace config otherwise (see the
+//! `settings` module).
 
 use std::{
     path::{Component, Path, PathBuf},
@@ -21,11 +25,14 @@ use color_eyre::eyre::{OptionExt as _, Report, Result, WrapErr as _, bail, ensur
 use indicatif::{HumanBytes, ProgressBar, ProgressStyle};
 use pollster::FutureExt as _;
 
-use super::jj;
+use super::{
+    jj,
+    settings::{Scope, SettingsArgs},
+};
 use crate::{
     cli::{complete, ui},
     config::{ConfigDir, MeshRepo, MeshState, ObjectHash, validate_name},
-    daemon::control::{self, CloneProgress, Request, Response, TransferPhase},
+    daemon::control::{self, CloneProgress, Request, Response, TransferPhase, WorkspaceHold},
     repo::{Identity, JjRepo},
 };
 
@@ -62,6 +69,9 @@ pub struct CloneArgs {
     /// Keep the git store inside `.jj`, hidden from git tools
     #[arg(long)]
     no_colocate: bool,
+
+    #[command(flatten)]
+    settings: SettingsArgs,
 }
 
 /// Runs the `repo clone` command.
@@ -80,6 +90,7 @@ pub fn run(args: CloneArgs, dir: &ConfigDir) -> Result<()> {
         (_, true) => &["--no-colocate"],
         _ => &[],
     };
+    let settings = &args.settings;
 
     match state.repos.get(&name) {
         Some(repo) if repo.bare => {
@@ -92,18 +103,20 @@ pub fn run(args: CloneArgs, dir: &ConfigDir) -> Result<()> {
                 Some(workspace) => workspace,
                 None => replica_workspace_name(&replica, &state.machine.name, &path)?,
             };
-            add_replica_workspace(&name, &replica, &path, &workspace)
+            add_replica_workspace(dir, &name, &replica, &path, &workspace, settings)
         }
         Some(repo) => {
             let workspace = match args.workspace {
                 Some(workspace) => workspace,
                 None => extra_workspace_name(&state.machine.name, &path)?,
             };
-            add_workspace(&name, &repo.path, &path, &workspace, colocate)
+            add_workspace(
+                dir, &name, &repo.path, &path, &workspace, colocate, settings,
+            )
         }
         None => {
             let workspace = args.workspace.unwrap_or_else(|| state.machine.name.clone());
-            clone(dir, &state, &name, &path, &workspace, colocate)
+            clone(dir, &state, &name, &path, &workspace, colocate, settings)
         }
     }
 }
@@ -116,6 +129,7 @@ fn clone(
     path: &Path,
     workspace: &str,
     colocate: &[&str],
+    settings: &SettingsArgs,
 ) -> Result<()> {
     // Best-effort pre-checks, so an obviously doomed clone fails before
     // anything is created on disk: the daemon must be up (it is only
@@ -151,8 +165,12 @@ fn clone(
     )?;
 
     // The directory exists from here on: a failed pull removes it again so
-    // a retry starts clean.
-    if let Err(err) = pull(dir, name, path, workspace) {
+    // a retry starts clean. Settings are written before the daemon
+    // registers the repo.
+    if let Err(err) = settings
+        .write(path, Scope::Repo)
+        .and_then(|()| pull(dir, name, path, workspace))
+    {
         return Err(clean_failed_clone(dir, name, path, err));
     }
 
@@ -180,11 +198,13 @@ fn clone(
 
 /// Adds a workspace of `name`, registered here at `repo`, in `path`.
 fn add_workspace(
+    dir: &ConfigDir,
     name: &str,
     repo: &Path,
     path: &Path,
     workspace: &str,
     colocate: &[&str],
+    settings: &SettingsArgs,
 ) -> Result<()> {
     ensure!(
         !path.exists(),
@@ -199,15 +219,18 @@ fn add_workspace(
     let path =
         std::path::absolute(path).wrap_err_with(|| format!("cannot resolve {}", path.display()))?;
     let path_arg = path.to_string_lossy();
-    jj(
-        Some(repo),
-        &[
-            &["workspace", "add", "--name", workspace],
-            colocate,
-            &["--", &path_arg],
-        ]
-        .concat(),
-    )?;
+    create_workspace(dir, name, workspace, &path, settings, || {
+        jj(
+            Some(repo),
+            &[
+                &["workspace", "add", "--name", workspace],
+                colocate,
+                &["--", &path_arg],
+            ]
+            .concat(),
+        )
+        .map(drop)
+    })?;
 
     println!(
         "{}",
@@ -222,7 +245,14 @@ fn add_workspace(
 
 /// Adds a workspace of the server replica of `name` in `path`, then starts
 /// its working copy on trunk.
-fn add_replica_workspace(name: &str, replica: &JjRepo, path: &Path, workspace: &str) -> Result<()> {
+fn add_replica_workspace(
+    dir: &ConfigDir,
+    name: &str,
+    replica: &JjRepo,
+    path: &Path,
+    workspace: &str,
+    settings: &SettingsArgs,
+) -> Result<()> {
     ensure!(
         !path.exists(),
         "{} already exists (clone creates the directory)",
@@ -239,7 +269,16 @@ fn add_replica_workspace(name: &str, replica: &JjRepo, path: &Path, workspace: &
         name: config("user.name"),
         email: config("user.email"),
     };
-    replica.add_workspace(path, workspace, &user)?;
+    if replica.has_workspaces()? {
+        create_workspace(dir, name, workspace, path, settings, || {
+            replica.add_workspace(path, workspace, &user)
+        })?;
+    } else {
+        // The first workspace: the settings go to the repo config, where
+        // the next ones also find them.
+        settings.write(replica.root(), Scope::Repo)?;
+        replica.add_workspace(path, workspace, &user)?;
+    }
     start_on_trunk(path);
 
     println!(
@@ -249,6 +288,36 @@ fn add_replica_workspace(name: &str, replica: &JjRepo, path: &Path, workspace: &
             path.display(),
         )),
     );
+    Ok(())
+}
+
+/// Runs `create`, which adds the workspace `workspace` of the registered
+/// repo `repo` at `root`, then writes `settings` to its workspace config.
+/// The daemon holds the workspace meanwhile, so it never starts without
+/// them.
+fn create_workspace(
+    dir: &ConfigDir,
+    repo: &str,
+    workspace: &str,
+    root: &Path,
+    settings: &SettingsArgs,
+    create: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    if settings.is_empty() {
+        return create();
+    }
+    let hold = WorkspaceHold::take(dir, repo, workspace)?;
+    create()?;
+    settings
+        .write(root, Scope::Workspace)
+        .wrap_err("the workspace is created, but its settings could not be written")?;
+    if !hold.is_held() {
+        eprintln!(
+            "{} the daemon restarted while the workspace was created and may run it with \
+             other settings: restart it with `jj-mesh service restart`",
+            ui::warn("warning:").for_stderr(),
+        );
+    }
     Ok(())
 }
 

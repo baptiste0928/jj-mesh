@@ -217,9 +217,10 @@ async fn handle_client(
         Err(_) => return,
     };
 
-    // PairJoin, CloneRepo and Logs own their stream (client-cancel
-    // handling, and streaming for the clone and logs); the rest return a
-    // single response and share one error conversion.
+    // PairJoin, CloneRepo, Logs and HoldWorkspace own their stream
+    // (client-cancel handling, streaming for the clone and logs, and the
+    // hold lasting as long as the connection); the rest return a single
+    // response and share one error conversion.
     let served = match request {
         Request::Status => reply(&mut stream, Ok(Response::Status(ctx.status()))).await,
         Request::PairHost => reply(&mut stream, pair_host(&ctx).await).await,
@@ -236,6 +237,9 @@ async fn handle_client(
         Request::RenameMachine { name } => reply(&mut stream, rename_machine(&ctx, &name)).await,
         Request::Logs { follow } => stream_logs(&mut stream, &ctx, follow).await,
         Request::SetServer { enabled } => reply(&mut stream, set_server(&ctx, enabled)).await,
+        Request::HoldWorkspace { repo, workspace } => {
+            hold_workspace(&mut stream, &ctx, &repo, &workspace).await
+        }
     };
 
     if let Err(err) = served {
@@ -378,6 +382,23 @@ fn set_server(ctx: &ControlContext, enabled: bool) -> Result<Response> {
     ctx.store.update(|state| state.set_server(enabled))?;
     info!(enabled, "server mode switched");
     Ok(Response::ServerSet)
+}
+
+/// Holds back the workspace task of `workspace` in `repo` until the client
+/// disconnects, which also covers a creator that crashed.
+async fn hold_workspace(
+    stream: &mut UnixStream,
+    ctx: &ControlContext,
+    repo: &str,
+    workspace: &str,
+) -> Result<()> {
+    let _hold = match ctx.repos.hold(repo, workspace) {
+        Ok(hold) => hold,
+        Err(err) => return reply(stream, Err(err)).await,
+    };
+    respond(stream, &Response::WorkspaceHeld).await?;
+    client_gone(stream).await;
+    Ok(())
 }
 
 /// Streams the buffered daemon events, then the new ones when following,

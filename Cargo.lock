@@ -2901,7 +2901,6 @@ dependencies = [
 name = "jj-mesh"
 version = "0.2.0"
 dependencies = [
- "chrono",
  "clap",
  "clap_complete",
  "color-eyre",
@@ -2917,6 +2916,7 @@ dependencies = [
  "ignore",
  "indicatif",
  "iroh",
+ "jiff",
  "jj-lib",
  "jj-mesh",
  "mimalloc",

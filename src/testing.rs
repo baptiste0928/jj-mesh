@@ -103,15 +103,19 @@ impl Fixture {
     /// The hermetic jj invocation shared by all runners.
     fn jj_command(&self, dir: &Path, args: &[&str]) -> Command {
         let mut cmd = Command::new(crate::repo::jj_bin());
-        Self::git_env(&mut cmd)
-            .current_dir(dir)
+        self.env(&mut cmd).current_dir(dir).args(args);
+        cmd
+    }
+
+    /// Sets the hermetic jj and git environment on `cmd`, for commands
+    /// running jj themselves.
+    pub fn env<'a>(&self, cmd: &'a mut Command) -> &'a mut Command {
+        Self::git_env(cmd)
             .env("JJ_CONFIG", &self.config)
             .env("JJ_USER", "Test User")
             .env("JJ_EMAIL", "test@example.com")
             .env("JJ_OP_HOSTNAME", "test-host")
             .env("JJ_OP_USERNAME", "test-user")
-            .args(args);
-        cmd
     }
 
     pub fn git_env(cmd: &mut Command) -> &mut Command {

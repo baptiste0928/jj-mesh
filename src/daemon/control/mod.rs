@@ -3,8 +3,9 @@
 //! The CLI talks to the running daemon over a unix socket with
 //! length-prefixed postcard messages (`net::wire` framing), one request
 //! per connection. Most get a single response; a clone streams progress,
-//! logs stream events, and joining a pairing keeps its connection open so
-//! the daemon notices a cancelling client. The daemon greets each
+//! logs stream events, joining a pairing keeps its connection open so
+//! the daemon notices a cancelling client, and a workspace hold lasts as
+//! long as its connection. The daemon greets each
 //! connection with its build, and the CLI refuses to talk to another
 //! build: a daemon left running across an upgrade is a common state, and
 //! its answers may not decode.
@@ -21,8 +22,8 @@ mod protocol;
 mod server;
 
 pub use client::{
-    ControlClient, DaemonNotRunning, block_on, ensure_daemon_blocking, query_status_blocking,
-    request_blocking, request_streaming_blocking,
+    ControlClient, DaemonNotRunning, WorkspaceHold, block_on, ensure_daemon_blocking,
+    query_status_blocking, request_blocking, request_streaming_blocking,
 };
 pub use protocol::*;
 pub(super) use server::{ControlContext, ControlServer};

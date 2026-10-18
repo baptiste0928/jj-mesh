@@ -2,9 +2,9 @@
 
 use std::io;
 
-use chrono::{DateTime, Local};
 use clap::Args;
 use color_eyre::eyre::{Result, bail};
+use jiff::Zoned;
 
 use super::ui;
 use crate::{
@@ -119,7 +119,10 @@ fn is_eof(err: &color_eyre::Report) -> bool {
 
 /// Prints one event: time, message, then its fields.
 fn print_entry(entry: &LogEntry) {
-    let time = DateTime::<Local>::from(entry.time).format("%b %d %H:%M:%S");
+    let time = Zoned::try_from(entry.time).map_or_else(
+        |_| "?".to_owned(),
+        |time| time.strftime("%b %d %H:%M:%S").to_string(),
+    );
     let message = sanitize(&entry.message);
     let message = match entry.level {
         LogLevel::Info => message,

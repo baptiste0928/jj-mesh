@@ -4,7 +4,7 @@
 //! submodule), spawning and aborting them as repos are registered and
 //! removed. Each repo task runs one task per local workspace, keeping its
 //! working copy fresh (see the `workspace` submodule) with the settings
-//! it reads from jj config (see the `settings` submodule).
+//! it reads from jj config (see [`Settings`]).
 //!
 //! Repo tasks decide which workspaces this machine claims (see
 //! [`crate::config::WorkspaceClaims`]), which round-trip through the store,
@@ -15,8 +15,10 @@
 //!       ▲                           │
 //!       └───── store ◄─RepoUpdate───┘
 //! ```
+//!
+//! A workspace being created is held (see [`RepoSet::hold`]): its task
+//! starts once the creator has written its settings, never before.
 
-mod settings;
 mod task;
 #[cfg(test)]
 mod tests;
@@ -29,14 +31,15 @@ use std::{
     time::{Instant, SystemTime},
 };
 
+use color_eyre::eyre::{Result, ensure};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Notify, mpsc, watch};
 use tracing::debug;
 
-use self::{settings::Settings, task::spawn_repo};
+use self::task::spawn_repo;
 use super::{control, hub::SyncHub};
 use crate::{
-    config::{MeshRepo, MeshState, ObjectHash, RepoClaims, RepoId},
+    config::{MeshRepo, MeshState, ObjectHash, RepoClaims, RepoId, Settings},
     net::sync::{RepoHealth, RepoHealthState},
 };
 
@@ -52,6 +55,27 @@ pub struct RepoSet {
     settings: Option<Settings>,
     /// Where repo tasks send the changes to persist.
     updates: mpsc::UnboundedSender<RepoUpdate>,
+    /// The workspaces being created, as `(repo, workspace)` names.
+    holds: watch::Sender<Holds>,
+}
+
+/// Workspaces whose task waits, as `(repo, workspace)` names.
+type Holds = BTreeSet<(String, String)>;
+
+/// Holds back a workspace task until dropped (see [`RepoSet::hold`]).
+#[derive(Debug)]
+pub struct WorkspaceHold {
+    holds: watch::Sender<Holds>,
+    key: (String, String),
+}
+
+impl Drop for WorkspaceHold {
+    fn drop(&mut self) {
+        // Wakes every repo task, which rescans and starts the workspace.
+        self.holds.send_modify(|holds| {
+            holds.remove(&self.key);
+        });
+    }
 }
 
 /// Whether this machine keeps a local workspace fresh (see the `task`
@@ -133,6 +157,7 @@ impl RepoSet {
             changed: Arc::new(Notify::new()),
             settings: None,
             updates,
+            holds: watch::Sender::default(),
         }
     }
 
@@ -155,6 +180,28 @@ impl RepoSet {
     /// never loses, state.
     pub async fn changed(&self) {
         self.changed.notified().await;
+    }
+
+    /// Holds back the task of the workspace named `workspace` of `repo`
+    /// until the returned guard drops, so a workspace being created starts
+    /// with the settings its creator writes.
+    pub fn hold(&self, repo: &str, workspace: &str) -> Result<WorkspaceHold> {
+        ensure!(
+            self.repos.lock().unwrap().contains_key(repo),
+            "`{repo}` is not registered on this machine",
+        );
+        let key = (repo.to_owned(), workspace.to_owned());
+        let added = self
+            .holds
+            .send_if_modified(|holds| holds.insert(key.clone()));
+        ensure!(
+            added,
+            "the workspace `{workspace}` of `{repo}` is already being created",
+        );
+        Ok(WorkspaceHold {
+            holds: self.holds.clone(),
+            key,
+        })
     }
 
     /// Aligns the managed repos with the mesh state: spawns tasks for new

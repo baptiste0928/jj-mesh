@@ -4,6 +4,7 @@ mod add;
 mod clone;
 mod forget;
 mod remove;
+mod settings;
 
 use std::path::Path;
 

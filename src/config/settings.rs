@@ -3,7 +3,8 @@
 //! Settings live in the `[jj-mesh]` table and resolve like any jj setting
 //! (user, then repo, then workspace config), so each workspace task reads
 //! its own through the jj binary when it starts. Every key is optional and
-//! defaults in code.
+//! defaults in code. `jj-mesh add` and `clone` write the
+//! [`SNAPSHOT_INTERVAL`] given on their command line.
 //!
 //! Parsing is strict (unknown keys are errors): a typoed key silently
 //! doing nothing is worse than a load failure, which the workspace task
@@ -11,13 +12,19 @@
 
 use std::{path::Path, time::Duration};
 
-use color_eyre::eyre::{Result, WrapErr as _, eyre};
+use color_eyre::eyre::{Result, WrapErr as _, ensure, eyre};
+use jiff::SignedDuration;
 use serde::Deserialize;
 
 use crate::repo::jj_output;
 
 /// The jj config table holding the settings.
 const TABLE: &str = "jj-mesh";
+
+/// The jj config key of the wait between an edit and its automatic
+/// snapshot: seconds, or a duration with units (see [`parse_interval`]);
+/// 0 disables auto-snapshot.
+pub const SNAPSHOT_INTERVAL: &str = "jj-mesh.snapshot-interval";
 
 /// Default seconds between an edit and its automatic snapshot.
 const DEFAULT_SNAPSHOT_INTERVAL: u64 = 20;
@@ -27,7 +34,7 @@ const DEFAULT_UPDATE_STALE: bool = true;
 
 /// Ceiling on the snapshot interval, so arithmetic on deadlines can never
 /// overflow. A day is already indistinguishable from disabled.
-const MAX_SNAPSHOT_INTERVAL: u64 = 24 * 60 * 60;
+pub const MAX_SNAPSHOT_INTERVAL: u64 = 24 * 60 * 60;
 
 /// Budget for reading the config.
 const LOAD_TIMEOUT: Duration = Duration::from_secs(30);
@@ -57,8 +64,52 @@ pub struct Settings {
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
 struct Table {
-    snapshot_interval: Option<u64>,
+    snapshot_interval: Option<Interval>,
     update_stale: Option<bool>,
+}
+
+/// A configured snapshot interval, in seconds.
+#[derive(Debug, Deserialize)]
+#[serde(try_from = "RawInterval")]
+struct Interval(u64);
+
+/// The forms a snapshot interval is written in.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum RawInterval {
+    Secs(u64),
+    Text(String),
+}
+
+impl TryFrom<RawInterval> for Interval {
+    type Error = String;
+
+    fn try_from(raw: RawInterval) -> Result<Self, Self::Error> {
+        match raw {
+            RawInterval::Secs(secs) => Ok(Interval(secs)),
+            RawInterval::Text(text) => parse_interval(&text)
+                .map(Interval)
+                .map_err(|err| format!("{err:#}")),
+        }
+    }
+}
+
+/// Parses a snapshot interval into whole seconds: bare seconds, or a
+/// duration with units (`30s`, `5m`, `1h30m`) of which only zero is below
+/// a second.
+pub fn parse_interval(text: &str) -> Result<u64> {
+    if let Ok(secs) = text.parse() {
+        return Ok(secs);
+    }
+    let interval: SignedDuration = text
+        .parse()
+        .map_err(|_| eyre!("invalid duration `{text}`, expected e.g. `30s`, `5m` or `1h30m`"))?;
+    let interval = Duration::try_from(interval).wrap_err("the interval cannot be negative")?;
+    ensure!(
+        interval.is_zero() || interval.as_secs() > 0,
+        "the interval must be at least a second, or 0 to disable",
+    );
+    Ok(interval.as_secs())
 }
 
 impl Settings {
@@ -99,7 +150,7 @@ impl From<Table> for Settings {
     fn from(table: Table) -> Self {
         let interval = table
             .snapshot_interval
-            .unwrap_or(DEFAULT_SNAPSHOT_INTERVAL)
+            .map_or(DEFAULT_SNAPSHOT_INTERVAL, |Interval(secs)| secs)
             .min(MAX_SNAPSHOT_INTERVAL);
 
         Settings {
@@ -126,10 +177,26 @@ mod tests {
 
     #[test]
     fn parses_keys() {
-        let settings =
-            Settings::parse("jj-mesh.snapshot-interval\t0\njj-mesh.update-stale\tfalse\n").unwrap();
+        let output = format!("{SNAPSHOT_INTERVAL}\t0\njj-mesh.update-stale\tfalse\n");
+        let settings = Settings::parse(&output).unwrap();
         assert_eq!(settings.snapshot_interval, None);
         assert!(!settings.update_stale);
+    }
+
+    #[test]
+    fn parses_intervals_with_units() {
+        let interval = |text: &str| {
+            let output = format!("{SNAPSHOT_INTERVAL}\t{}", serde_json::json!(text));
+            Settings::parse(&output).map(|settings| settings.snapshot_interval)
+        };
+        assert_eq!(interval("5m").unwrap(), Some(Duration::from_mins(5)));
+        assert_eq!(interval("1h 30m").unwrap(), Some(Duration::from_mins(90)));
+        assert_eq!(interval("1.5s").unwrap(), Some(Duration::from_secs(1)));
+        assert_eq!(interval("0s").unwrap(), None);
+        assert_eq!(interval("007").unwrap(), Some(Duration::from_secs(7)));
+        for bad in ["500ms", "-5m", "soon"] {
+            assert!(interval(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]
@@ -146,7 +213,6 @@ mod tests {
     fn invalid_entries_are_rejected() {
         assert!(Settings::parse("jj-mesh.snapshot-intervall\t20").is_err());
         assert!(Settings::parse("jj-mesh.repos.a.update-stale\ttrue").is_err());
-        assert!(Settings::parse("jj-mesh.snapshot-interval\t\"20\"").is_err());
         assert!(Settings::parse("other.snapshot-interval\t20").is_err());
     }
 
@@ -160,7 +226,7 @@ mod tests {
         let dir = fx.init_repo("a");
         fx.jj(
             &dir,
-            &["config", "set", "--repo", "jj-mesh.snapshot-interval", "5"],
+            &["config", "set", "--repo", "jj-mesh.snapshot-interval", "5m"],
         );
         fx.jj(&dir, &["workspace", "add", "../child"]);
         let child = fx.path().join("child");
@@ -177,7 +243,7 @@ mod tests {
         let load = |dir: &std::path::Path| Settings::parse(&fx.jj_output(dir, &LIST_ARGS)).unwrap();
 
         let settings = load(&dir);
-        assert_eq!(settings.snapshot_interval, Some(Duration::from_secs(5)));
+        assert_eq!(settings.snapshot_interval, Some(Duration::from_mins(5)));
         assert!(!settings.update_stale);
 
         let settings = load(&child);

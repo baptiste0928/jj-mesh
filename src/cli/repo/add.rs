@@ -5,9 +5,10 @@ use std::path::PathBuf;
 use clap::{Args, ValueHint};
 use color_eyre::eyre::{Result, bail, eyre};
 
+use super::settings::{Scope, SettingsArgs};
 use crate::{
-    cli::{machine_name, ui},
-    config::ConfigDir,
+    cli::ui,
+    config::{ConfigDir, MeshState},
     daemon::control::{self, Request, Response},
     repo::Workspace,
 };
@@ -34,6 +35,9 @@ pub struct AddArgs {
     /// the current head of each machine is displayed in `jj log`.
     #[arg(long)]
     workspace: Option<String>,
+
+    #[command(flatten)]
+    settings: SettingsArgs,
 }
 
 /// Runs the `repo add` command.
@@ -60,17 +64,26 @@ pub fn run(args: AddArgs, dir: &ConfigDir) -> Result<()> {
             .into_owned(),
     };
 
+    // Best-effort pre-checks, so a doomed add fails before the rename and
+    // settings below change the repo (the daemon re-validates).
+    control::ensure_daemon_blocking(dir)?;
+    let state = MeshState::load(dir)?;
+    state.validate_new_repo(&name, repo.root())?;
+
     // A main workspace still on jj's `default` name gets the machine name,
     // so workspace names stay unique across the mesh; a deliberately named
     // workspace is kept as-is.
     let rename = match args.workspace {
         Some(name) => Some(name),
-        None if repo.workspace()?.name()? == "default" => Some(machine_name(dir)?),
+        None if repo.workspace()?.name()? == "default" => Some(state.machine.name),
         None => None,
     };
     if let Some(rename) = &rename {
         super::jj(Some(repo.root()), &["workspace", "rename", rename])?;
     }
+
+    // Written before registration: the daemon reads them once.
+    args.settings.write(repo.root(), Scope::Repo)?;
 
     let request = Request::AddRepo {
         name: name.clone(),

@@ -2,7 +2,7 @@
 //! blocking helpers CLI commands use, which have no tokio runtime of their
 //! own.
 
-use std::{future::Future, io, time::Duration};
+use std::{future::Future, io, io::Read as _, time::Duration};
 
 use color_eyre::eyre::{Report, Result, WrapErr as _, bail, eyre};
 use tokio::net::UnixStream;
@@ -163,6 +163,45 @@ pub fn ensure_daemon_blocking(dir: &ConfigDir) -> Result<()> {
 /// success variant. Progress frames, if any, are dropped.
 pub fn request_blocking(dir: &ConfigDir, request: &Request, limit: Duration) -> Result<Response> {
     request_streaming_blocking(dir, request, limit, |_| {})
+}
+
+/// A workspace the daemon holds back from keeping fresh, until dropped
+/// (see [`Request::HoldWorkspace`]).
+#[derive(Debug)]
+pub struct WorkspaceHold(std::os::unix::net::UnixStream);
+
+impl WorkspaceHold {
+    /// Holds the workspace `workspace` of `repo`. Errors with
+    /// [`DaemonNotRunning`] when no daemon is running. Blocking.
+    pub fn take(dir: &ConfigDir, repo: &str, workspace: &str) -> Result<Self> {
+        block_on(async {
+            let mut client = ControlClient::connect_required(dir).await?;
+            client
+                .send(&Request::HoldWorkspace {
+                    repo: repo.to_owned(),
+                    workspace: workspace.to_owned(),
+                })
+                .await?;
+            match client.recv(Some(CLIENT_TIMEOUT)).await? {
+                Response::WorkspaceHeld => {}
+                Response::Error(message) => bail!("{message}"),
+                other => bail!("unexpected response from the daemon: {other:?}"),
+            }
+            // Outlives this runtime: the hold lasts until the caller drops it.
+            Ok(WorkspaceHold(client.stream.into_std()?))
+        })
+    }
+
+    /// Whether the daemon still holds the workspace: one that restarted
+    /// meanwhile closed the connection and forgot the hold.
+    pub fn is_held(&self) -> bool {
+        // The daemon never writes after the confirmation, and the stream
+        // is non-blocking: only a closed connection makes a read return.
+        matches!(
+            (&self.0).read(&mut [0]),
+            Err(err) if err.kind() == io::ErrorKind::WouldBlock
+        )
+    }
 }
 
 /// Like [`request_blocking`], for requests answered by a progress stream:

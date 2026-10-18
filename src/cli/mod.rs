@@ -18,7 +18,7 @@ use std::path::PathBuf;
 use clap::{CommandFactory as _, Parser, Subcommand, ValueHint};
 use color_eyre::eyre::Result;
 
-use crate::config::{ConfigDir, MeshState};
+use crate::config::ConfigDir;
 
 /// Peer-to-peer synchronization of jj repositories
 ///
@@ -106,12 +106,6 @@ pub fn report_error(err: &color_eyre::Report) {
         format!("Error: {err:#}")
     };
     eprintln!("{}", ui::bad(message).for_stderr());
-}
-
-/// This machine's name in the mesh, the default workspace name in synced
-/// repos.
-fn machine_name(dir: &ConfigDir) -> Result<String> {
-    Ok(MeshState::load(dir)?.machine.name)
 }
 
 #[cfg(test)]

@@ -23,7 +23,8 @@
 //!   workspaces in its store).
 //!
 //! A claim is released only when its name leaves the view, so a workspace
-//! briefly gone from disk (an unmounted disk) keeps it.
+//! briefly gone from disk (an unmounted disk) keeps it. A held workspace
+//! (see [`RepoSet::hold`]) gets its task once released.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -40,7 +41,7 @@ use tokio::sync::{Notify, mpsc, watch};
 use tracing::{Instrument as _, debug, info, info_span, warn};
 
 use super::{
-    RepoHandle, RepoSet, RepoState, RepoUpdate, Settings, WorkspaceState,
+    Holds, RepoHandle, RepoSet, RepoState, RepoUpdate, Settings, WorkspaceState,
     workspace::{RepoContext, WorkspaceHandle, may_be_stale, spawn_workspace},
 };
 use crate::{
@@ -124,6 +125,7 @@ pub(super) fn spawn_repo(
             changed: set.changed.clone(),
             settings: set.settings,
             claims: claims_rx,
+            holds: set.holds.subscribe(),
             recorded_hash,
             updates: set.updates.clone(),
         })
@@ -153,6 +155,8 @@ struct RepoTask {
     settings: Option<Settings>,
     /// The claims on the repo's workspaces.
     claims: watch::Receiver<RepoClaims>,
+    /// The workspaces of every repo being created.
+    holds: watch::Receiver<Holds>,
     /// The git object hash the mesh recorded for the repo at spawn.
     recorded_hash: Option<ObjectHash>,
     updates: mpsc::UnboundedSender<RepoUpdate>,
@@ -250,6 +254,7 @@ impl RepoTask {
         let ctx = Arc::new(RepoContext::new(repo.clone(), self.settings));
         let (synced, _) = watch::channel(None);
         let mut claims = self.claims.clone();
+        let mut holds = self.holds.clone();
         let mut workspaces = Workspaces::default();
         let current = claims.borrow_and_update().clone();
         self.track_workspaces(&ctx, &heads, &synced, &current, &mut workspaces)
@@ -280,6 +285,7 @@ impl RepoTask {
                 }
                 () = self.announcements.changed() => {}
                 Ok(()) = claims.changed() => rescan = true,
+                Ok(()) = holds.changed() => rescan = true,
                 () = sleep_until(retry_at) => {}
             }
 
@@ -408,8 +414,17 @@ impl RepoTask {
             keep
         });
         workspaces.listed = scan.listed();
+        // Read after the scan: a workspace it found was created after its
+        // hold was taken.
+        let creating: BTreeSet<String> = self
+            .holds
+            .borrow()
+            .iter()
+            .filter(|(repo, _)| *repo == self.name)
+            .map(|(_, workspace)| workspace.clone())
+            .collect();
         for found in scan.found {
-            if !automated(&found) {
+            if !automated(&found) || creating.contains(&found.name) {
                 continue;
             }
             let root = found.workspace.root().to_owned();
