@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use super::wire::{read_message, write_message};
 
 /// Version of every jj-mesh protocol past the hello.
-pub const PROTOCOL: u32 = 3;
+pub const PROTOCOL: u32 = 4;
 
 /// Budget for the whole exchange. Acceptors run it before knowing whether
 /// the peer is welcome, so it is kept short.

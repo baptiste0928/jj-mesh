@@ -240,7 +240,10 @@ impl MeshState {
             endpoint,
             Peer {
                 version,
-                status: PeerStatus::Alive { name },
+                status: PeerStatus::Alive {
+                    name,
+                    server: false,
+                },
             },
         );
 
@@ -251,6 +254,12 @@ impl MeshState {
     /// through the gossip.
     pub fn rename_machine(&mut self, name: String) -> Result<()> {
         self.machine.rename(name)
+    }
+
+    /// Switches server mode on this machine; the bumped version propagates
+    /// the role through the gossip.
+    pub fn set_server(&mut self, server: bool) -> Result<()> {
+        self.machine.set_server(server)
     }
 
     /// Tombstones an alive peer, resolved by name or full endpoint id.
@@ -423,7 +432,7 @@ impl MeshState {
                 self.machine.observe(record);
                 continue;
             }
-            if let PeerStatus::Alive { name } = &record.status
+            if let PeerStatus::Alive { name, .. } = &record.status
                 && validate_name("peer", name).is_err()
             {
                 continue;
@@ -514,6 +523,7 @@ mod tests {
         fn new(name: &str, version: u64) -> Self {
             Machine {
                 name: name.to_owned(),
+                server: false,
                 version,
             }
         }
@@ -602,6 +612,7 @@ mod tests {
             version,
             status: PeerStatus::Alive {
                 name: name.to_owned(),
+                server: false,
             },
         };
         let removed = |version| Peer {
@@ -651,6 +662,7 @@ mod tests {
             version,
             status: PeerStatus::Alive {
                 name: name.to_owned(),
+                server: false,
             },
         };
         let about_us = |record: Peer| Membership {
@@ -674,14 +686,23 @@ mod tests {
         assert_eq!(state.machine, Machine::new("desk", 6));
         assert!(alive(6, "desk").outranks(&alive(5, "stale")));
 
+        // ...as is one with another role.
+        state.set_server(true).unwrap();
+        assert_eq!(state.machine.version, 7);
+        state.merge_membership(&about_us(alive(7, "desk")), &local);
+        assert_eq!(state.machine.version, 8);
+        assert!(state.membership(local).peers[&local].is_server());
+        state.set_server(false).unwrap();
+        assert_eq!(state.machine, Machine::new("desk", 9));
+
         // ...and a tombstone is matched, not outranked: the removed machine
         // cannot undo its removal.
         let removed = Peer {
-            version: 8,
+            version: 10,
             status: PeerStatus::Removed,
         };
         state.merge_membership(&about_us(removed.clone()), &local);
-        assert_eq!(state.machine, Machine::new("desk", 8));
+        assert_eq!(state.machine, Machine::new("desk", 10));
         assert!(!state.membership(local).peers[&local].outranks(&removed));
 
         // Records about ourselves never land in the peer map.
@@ -725,6 +746,7 @@ mod tests {
                             version: 1,
                             status: PeerStatus::Alive {
                                 name: "flood".to_owned(),
+                                server: false,
                             },
                         },
                     )

@@ -8,13 +8,18 @@ use super::{
     validate_name,
 };
 
-/// The record this machine gossips about itself: the name it announces,
-/// versioned like a [`Peer`] so a rename outranks every copy the mesh
-/// holds. Named after the short hostname until renamed.
+/// The record this machine gossips about itself: the name it announces and
+/// whether it runs in server mode, versioned like a [`Peer`] so a change
+/// outranks every copy the mesh holds. Named after the short hostname until
+/// renamed.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Machine {
     pub name: String,
+    /// Whether this machine replicates every mesh repo (see
+    /// `daemon::replicas`).
+    #[serde(default)]
+    pub server: bool,
     pub version: u64,
 }
 
@@ -30,20 +35,32 @@ impl Machine {
         Ok(())
     }
 
+    /// Switches server mode; the bumped version propagates it through the
+    /// gossip.
+    pub(super) fn set_server(&mut self, server: bool) -> Result<()> {
+        if server != self.server {
+            self.version = next_version(self.version, "this machine")?;
+            self.server = server;
+        }
+        Ok(())
+    }
+
     /// The record gossiped for this machine.
     pub(super) fn record(&self) -> Peer {
         Peer {
             version: self.version,
             status: PeerStatus::Alive {
                 name: self.name.clone(),
+                server: self.server,
             },
         }
     }
 
     /// Absorbs a copy of our record gossiped back by a peer. Peers bump
     /// their copies on their own (removal, re-pairing), so our version
-    /// tracks the highest seen. Our name is the authority: a copy under
-    /// another name is outranked outright, so the mesh converges on ours.
+    /// tracks the highest seen. Our record is the authority: a copy with
+    /// another name or role is outranked outright, so the mesh converges on
+    /// ours.
     /// A tombstone is only matched, not outranked here; a later rename
     /// still bumps past it (an accepted risk: renaming is as trusted as
     /// the machines themselves).
@@ -52,8 +69,10 @@ impl Machine {
     /// park us on the ceiling, where renames fail and every machine
     /// discards our record.
     pub(super) fn observe(&mut self, copy: &Peer) {
-        let outranking = match copy.name() {
-            Some(name) if name != self.name => copy.version + 1,
+        let outranking = match &copy.status {
+            PeerStatus::Alive { name, server } if *name != self.name || *server != self.server => {
+                copy.version + 1
+            }
             _ => copy.version,
         };
         self.version = self.version.max(outranking).min(MAX_RECORD_VERSION - 1);
@@ -64,6 +83,7 @@ impl Default for Machine {
     fn default() -> Self {
         Machine {
             name: short_hostname(),
+            server: false,
             version: 0,
         }
     }

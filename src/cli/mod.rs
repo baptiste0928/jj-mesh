@@ -5,6 +5,7 @@ mod logs;
 mod peer;
 mod repo;
 mod run_daemon;
+mod server;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod service;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -58,6 +59,7 @@ enum Command {
     Add(repo::AddArgs),
     Repo(repo::RepoArgs),
     Peer(peer::PeerArgs),
+    Server(server::ServerArgs),
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     Service(service::ServiceArgs),
     Status(status::StatusArgs),
@@ -85,6 +87,7 @@ pub fn run() -> Result<()> {
         Command::Add(args) => repo::add(args, &dir),
         Command::Repo(args) => repo::run(args, &dir),
         Command::Peer(args) => peer::run(args, &dir),
+        Command::Server(args) => server::run(&args, &dir),
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         Command::Service(args) => service::run(args, &dir),
         Command::Status(args) => status::run(args, &dir),

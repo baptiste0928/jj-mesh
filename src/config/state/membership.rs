@@ -108,9 +108,14 @@ impl Peer {
     /// tombstone.
     pub fn name(&self) -> Option<&str> {
         match &self.status {
-            PeerStatus::Alive { name } => Some(name),
+            PeerStatus::Alive { name, .. } => Some(name),
             PeerStatus::Removed => None,
         }
+    }
+
+    /// Whether the machine is alive and runs in server mode.
+    pub fn is_server(&self) -> bool {
+        matches!(self.status, PeerStatus::Alive { server: true, .. })
     }
 }
 
@@ -120,13 +125,15 @@ impl Register for Peer {
     }
 
     /// Higher version first, removal beating alive on ties, then the smaller
-    /// name (so equal-version renames converge instead of ping-ponging).
+    /// name and the server role (so equal-version changes converge instead
+    /// of ping-ponging).
     fn outranks(&self, other: &Self) -> bool {
-        fn rank(peer: &Peer) -> (u64, bool, cmp::Reverse<&str>) {
+        fn rank(peer: &Peer) -> (u64, bool, cmp::Reverse<&str>, bool) {
             (
                 peer.version,
                 peer.name().is_none(),
                 cmp::Reverse(peer.name().unwrap_or("")),
+                peer.is_server(),
             )
         }
         rank(self) > rank(other)
@@ -137,7 +144,12 @@ impl Register for Peer {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PeerStatus {
-    Alive { name: String },
+    Alive {
+        name: String,
+        /// Whether it replicates every mesh repo.
+        #[serde(default)]
+        server: bool,
+    },
     Removed,
 }
 

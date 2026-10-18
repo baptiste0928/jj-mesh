@@ -22,7 +22,7 @@ use tracing::{debug, info, warn};
 
 use super::{backoff::Backoff, control, hub::SyncHub};
 use crate::{
-    config::{Membership, MeshState},
+    config::{Membership, MeshState, Peer},
     net::{
         fetch,
         hello::{self, Incompatible},
@@ -208,8 +208,9 @@ impl PeerSet {
         }
     }
 
-    /// Snapshots the state of every peer for the control socket.
-    pub fn statuses(&self) -> Vec<control::PeerStatus> {
+    /// Snapshots the state of every peer for the control socket, with
+    /// their roles from `state`.
+    pub fn statuses(&self, state: &MeshState) -> Vec<control::PeerStatus> {
         let peers = self.peers.lock().unwrap();
 
         peers
@@ -244,6 +245,7 @@ impl PeerSet {
                 control::PeerStatus {
                     name: self.hub.peer_name(id),
                     endpoint: *id,
+                    server: state.peers.get(id).is_some_and(Peer::is_server),
                     connection,
                 }
             })

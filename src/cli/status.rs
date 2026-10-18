@@ -33,7 +33,12 @@ pub fn run(_args: StatusArgs, dir: &ConfigDir) -> Result<()> {
         ui::good("running"),
         ui::format_duration(status.uptime_secs)
     );
-    println!("machine: {}", sanitize(&status.name));
+    let role = if status.server {
+        format!(" {}", ui::dim("[server]"))
+    } else {
+        String::new()
+    };
+    println!("machine: {}{role}", sanitize(&status.name));
     if let Some(warning) = crate::repo::jj_version_warning(status.jj_version.as_deref()) {
         println!("{} {warning}", ui::warn("warning:"));
     }
@@ -45,8 +50,13 @@ pub fn run(_args: StatusArgs, dir: &ConfigDir) -> Result<()> {
         println!("{}", ui::heading("peers:"));
         let width = ui::name_width(status.peers.iter().map(|p| p.name.as_str()));
         for peer in &status.peers {
+            let role = if peer.server {
+                format!("{}  ", ui::dim("(server)"))
+            } else {
+                String::new()
+            };
             println!(
-                "  {:width$}  {}",
+                "  {:width$}  {role}{}",
                 peer.name,
                 connection_summary(&peer.connection)
             );

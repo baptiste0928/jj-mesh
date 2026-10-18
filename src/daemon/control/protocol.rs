@@ -93,6 +93,10 @@ pub enum Request {
     /// entry. With `follow`, new entries (or [`Response::LogsSkipped`])
     /// keep coming until the client disconnects.
     Logs { follow: bool },
+    /// Switch server mode on this machine; peers learn the role through
+    /// the gossip. Answered with [`Response::ServerSet`] or
+    /// [`Response::Error`].
+    SetServer { enabled: bool },
 }
 
 /// A daemon answer to a [`Request`].
@@ -144,6 +148,8 @@ pub enum Response {
     /// This many events were skipped in a followed [`Request::Logs`]
     /// stream: the client read too slowly.
     LogsSkipped(u64),
+    /// Server mode is switched in the mesh state.
+    ServerSet,
 }
 
 /// Header of a [`Request::Logs`] stream.
@@ -198,6 +204,8 @@ pub struct CloneProgress {
 pub struct Status {
     /// This machine's name in the mesh.
     pub name: String,
+    /// Whether this machine runs in server mode.
+    pub server: bool,
     /// This machine's endpoint id.
     pub endpoint: EndpointId,
     /// Seconds since the daemon started.
@@ -242,6 +250,8 @@ pub struct ConflictStatus {
 pub struct PeerStatus {
     pub name: String,
     pub endpoint: EndpointId,
+    /// Whether the peer runs in server mode.
+    pub server: bool,
     pub connection: ConnectionStatus,
 }
 

@@ -68,7 +68,7 @@ impl ControlContext {
     /// Snapshots the daemon state.
     fn status(&self) -> Status {
         let state = self.store.snapshot();
-        let peers = self.peers.statuses();
+        let peers = self.peers.statuses(&state);
         // Peer-related entries are resolved to (and filtered by) the
         // paired name: hub state recorded for a since-unpaired peer can no
         // longer be acted on, and the endpoint is not ours to show.
@@ -104,6 +104,7 @@ impl ControlContext {
 
         Status {
             name: state.machine.name,
+            server: state.machine.server,
             endpoint: self.endpoint.secret_key().public(),
             uptime_secs: self.started.elapsed().unwrap_or_default().as_secs(),
             jj_version: self.jj_version.clone(),
@@ -234,6 +235,7 @@ async fn handle_client(
         Request::ForgetRepo { name } => reply(&mut stream, forget_repo(&ctx, &name)).await,
         Request::RenameMachine { name } => reply(&mut stream, rename_machine(&ctx, &name)).await,
         Request::Logs { follow } => stream_logs(&mut stream, &ctx, follow).await,
+        Request::SetServer { enabled } => reply(&mut stream, set_server(&ctx, enabled)).await,
     };
 
     if let Err(err) = served {
@@ -364,6 +366,13 @@ fn rename_machine(ctx: &ControlContext, name: &str) -> Result<Response> {
         .update(|state| state.rename_machine(name.to_owned()))?;
     info!(machine = %name, "machine renamed");
     Ok(Response::MachineRenamed)
+}
+
+/// Switches server mode; the store gossips the role.
+fn set_server(ctx: &ControlContext, enabled: bool) -> Result<Response> {
+    ctx.store.update(|state| state.set_server(enabled))?;
+    info!(enabled, "server mode switched");
+    Ok(Response::ServerSet)
 }
 
 /// Streams the buffered daemon events, then the new ones when following,

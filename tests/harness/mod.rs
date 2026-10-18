@@ -210,6 +210,12 @@ impl Machine {
         assert!(matches!(response, Response::MachineRenamed), "{response:?}");
     }
 
+    /// Switches server mode, as `jj-mesh server` would.
+    pub async fn set_server(&self, enabled: bool) {
+        let response = self.request(&Request::SetServer { enabled }).await;
+        assert!(matches!(response, Response::ServerSet), "{response:?}");
+    }
+
     /// Issues a pairing ticket on this machine, as `jj-mesh peer add` would.
     pub async fn host_pairing(&self) -> String {
         match self.request(&Request::PairHost).await {

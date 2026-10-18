@@ -159,6 +159,7 @@ mod tests {
                         version: u64::from(u32::MAX),
                         status: crate::config::PeerStatus::Alive {
                             name: "n".repeat(MAX_NAME_LEN),
+                            server: true,
                         },
                     },
                 )

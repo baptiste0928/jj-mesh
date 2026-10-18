@@ -1,9 +1,9 @@
 //! `jj-mesh setup`: get this machine onto the mesh.
 //!
 //! ```text
-//! check jj ─▶ start the daemon ─▶ name the machine ─▶ pair
-//!             (install or start    (only before the   (print a ticket,
-//!              the service)         first peer/repo)   or redeem one)
+//! check jj ─▶ start the daemon ─▶ name the machine ─▶ server mode ─▶ pair
+//!             (install or start    (only before the   (with           (print a ticket,
+//!              the service)         first peer/repo)   `--server`)     or redeem one)
 //! ```
 
 use std::path::Path;
@@ -11,7 +11,7 @@ use std::path::Path;
 use clap::Args;
 use color_eyre::eyre::{OptionExt as _, Result};
 
-use super::{peer, service, ui};
+use super::{peer, server, service, ui};
 use crate::{
     config::{ConfigDir, validate_name},
     net::pair::PairTicket,
@@ -30,6 +30,10 @@ use crate::{
 pub struct SetupArgs {
     /// Pairing ticket printed by `jj-mesh setup` or `jj-mesh peer add`
     ticket: Option<PairTicket>,
+
+    /// Run this machine in server mode (see `jj-mesh server`)
+    #[arg(long)]
+    server: bool,
 }
 
 /// Runs the `setup` command.
@@ -53,6 +57,10 @@ pub fn run(args: SetupArgs, dir: &ConfigDir) -> Result<()> {
         if let Some(name) = name.filter(|name| *name != status.name) {
             peer::rename(dir, &name)?;
         }
+    }
+
+    if args.server && !status.server {
+        server::set(dir, true)?;
     }
 
     peer::pair(dir, args.ticket)?;
