@@ -10,6 +10,7 @@ use iroh::EndpointId;
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    config::RepoId,
     daemon::repos::WorkspaceState,
     net::{hello::Incompatible, sync::StatusReport},
     repo::transfer::TransferProgress,
@@ -41,6 +42,9 @@ pub const CLONE_IDLE_WAIT: Duration = Duration::from_secs(30);
 
 /// A request from the CLI to the daemon.
 ///
+/// Repos are given by name or id, as the user typed it; the daemon resolves it to
+/// the repo's id (see [`crate::config::MeshState::resolve_repo`]).
+///
 /// Postcard encodes variants by position: existing ones must keep their
 /// position *and meaning* (renames are fine), and new ones are only
 /// appended, so an exchange stays semantically sound across a CLI/daemon
@@ -67,7 +71,7 @@ pub enum Request {
     /// Register the repo at `path` under `name`, with a fresh id. Answered
     /// with [`Response::RepoAdded`] or [`Response::Error`].
     AddRepo { name: String, path: PathBuf },
-    /// Retire a repo name from the mesh, unregistering it everywhere (its
+    /// Remove a repo from the mesh, unregistering it everywhere (its
     /// files are left alone). Answered with [`Response::RepoRemoved`] or
     /// [`Response::Error`].
     RemoveRepo { name: String },
@@ -120,7 +124,7 @@ pub enum Response {
         ops: u64,
         git_objects: u64,
     },
-    /// The repo is registered (with a freshly generated internal id).
+    /// The repo is added to the mesh.
     RepoAdded,
     /// The repo is retired from the mesh; `was_local` tells whether it was
     /// registered on this machine.
@@ -201,7 +205,7 @@ pub struct CloneProgress {
 /// Live daemon state, answering [`Request::Status`].
 ///
 /// Anything peer-related is keyed by the peer's paired name, resolved by
-/// the daemon: the CLI displays this structure as-is.
+/// the daemon; repos are keyed by id, named by `repos` and `available`.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Status {
     /// This machine's name in the mesh.
@@ -220,9 +224,9 @@ pub struct Status {
     pub peers: Vec<PeerStatus>,
     /// Repos registered on this machine.
     pub repos: Vec<RepoStatus>,
-    /// Mesh repos not registered here, clonable by name.
-    pub available: Vec<String>,
-    /// Repo names contested by peers announcing a different repo.
+    /// Mesh repos not registered here, clonable.
+    pub available: Vec<ClonableRepo>,
+    /// Names several mesh repos carry.
     pub conflicts: Vec<ConflictStatus>,
     /// The latest health each connected peer reported for itself.
     pub peer_reports: Vec<PeerReport>,
@@ -237,14 +241,19 @@ pub struct PeerReport {
     pub report: StatusReport,
 }
 
-/// A repo name contested by a peer: it announces a different repo (by id)
-/// under a name registered here. Sync with that peer is suspended for the
-/// repo until one side renames or removes it.
+/// A mesh repo not registered here.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ClonableRepo {
+    pub id: RepoId,
+    pub name: String,
+}
+
+/// A name several mesh repos carry, after machines added or renamed repos
+/// concurrently. Each keeps syncing; only selecting them by name fails.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ConflictStatus {
-    pub repo: String,
-    /// The contesting peer's paired name.
-    pub peer: String,
+    pub name: String,
+    pub repos: Vec<RepoId>,
 }
 
 /// Live state of one configured peer.
@@ -309,6 +318,7 @@ pub enum Route {
 /// A registered repo.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct RepoStatus {
+    pub id: RepoId,
     pub name: String,
     pub path: PathBuf,
     pub watch: WatchStatus,

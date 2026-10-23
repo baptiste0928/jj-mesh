@@ -72,9 +72,10 @@ async fn clone_pull_and_register(
     path: &Path,
     progress: &tokio::sync::watch::Sender<CloneProgress>,
 ) -> Result<Response> {
-    let (id, sources) = ctx.hub.clone_sources(name)?;
+    let state = ctx.store.snapshot();
+    let id = state.resolve_repo(name)?;
+    let sources = ctx.hub.clone_sources(&id, name)?;
     let repo = Repo {
-        id,
         path: path.to_owned(),
         bare: false,
     };
@@ -82,7 +83,7 @@ async fn clone_pull_and_register(
     // Fail before the (long) pull when the registration cannot succeed.
     // Only the re-check inside the `store.update` below is authoritative:
     // the state may change during the pull.
-    ctx.store.snapshot().check_clone(name, repo.clone())?;
+    state.check_clone(&id, repo.clone())?;
 
     // The progress publishes latest-wins into the watch; the connection
     // task samples and forwards it on its heartbeat.
@@ -92,9 +93,8 @@ async fn clone_pull_and_register(
             transfer,
         });
     };
-    let (ops, git_objects) = ctx.hub.pull(name, &repo.id, sources, path, &sink).await?;
+    let (ops, git_objects) = ctx.hub.pull(&id, sources, path, &sink).await?;
 
-    ctx.store
-        .update(|state| state.add_clone(name.to_owned(), repo))?;
+    ctx.store.update(|state| state.add_clone(id, repo))?;
     Ok(Response::Cloned { ops, git_objects })
 }

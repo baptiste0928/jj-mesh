@@ -89,11 +89,6 @@ pub fn decompress_payload(bytes: &[u8], max_size: u64) -> Result<Vec<u8>> {
 /// what the server sends back.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct FetchRequest {
-    /// Mesh-wide name of the repo.
-    pub name: String,
-    /// The fetcher's id for the repo; the server refuses a mismatch, the
-    /// backstop against transferring data between unrelated repos that
-    /// contest one name.
     pub id: RepoId,
     pub wants: Vec<Vec<u8>>,
     pub haves: Vec<Vec<u8>>,

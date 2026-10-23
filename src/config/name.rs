@@ -15,7 +15,7 @@ pub const MAX_NAME_LEN: usize = 64;
 const MAX_SANITIZED_LEN: usize = 256;
 
 /// Checks that a peer or repo name is usable; `kind` names it in errors.
-/// Also applied to names arriving from remote machines (announcements).
+/// Also applied to names arriving from remote machines (membership).
 pub(crate) fn validate_name(kind: &str, name: &str) -> Result<()> {
     ensure!(!name.is_empty(), "{kind} name cannot be empty");
     ensure!(

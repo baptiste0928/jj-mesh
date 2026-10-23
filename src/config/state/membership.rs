@@ -13,6 +13,7 @@ use iroh::EndpointId;
 use serde::{Deserialize, Serialize};
 
 use super::{ObjectHash, RepoId, WorkspaceClaims};
+use crate::config::validate_name;
 
 /// Cap on machines tracked in the mesh state, tombstones included. A
 /// personal mesh is a handful of machines; the cap keeps a peer from
@@ -24,8 +25,13 @@ pub const MAX_MESH_PEERS: usize = 256;
 /// gossiped membership.
 pub(super) const MAX_OTHER_PEERS: usize = MAX_MESH_PEERS - 1;
 
-/// Cap on repos tracked in the mesh-wide repo list, same reasoning.
+/// Cap on the live repos of the mesh-wide repo list, same reasoning.
 pub const MAX_MESH_REPOS: usize = 1024;
+
+/// Cap on the records of the mesh-wide repo list, tombstones included.
+/// Repo ids are never reused, so every removal keeps a record for good:
+/// once the cap is reached, no repo can be added anymore.
+pub const MAX_MESH_REPO_RECORDS: usize = 4096;
 
 /// Cap on a record's version. Versions only ever advance by one per local
 /// change, so a record beyond this is corrupted or hostile: without the
@@ -40,7 +46,7 @@ pub(super) const MAX_RECORD_VERSION: u64 = 1 << 32;
 pub struct Membership {
     pub peers: BTreeMap<EndpointId, Peer>,
     /// The mesh-wide repo list, tombstones included.
-    pub repos: BTreeMap<String, MeshRepo>,
+    pub repos: BTreeMap<RepoId, MeshRepo>,
     /// The workspace claims of every alive machine.
     pub claims: BTreeMap<EndpointId, WorkspaceClaims>,
 }
@@ -163,18 +169,24 @@ pub struct MeshRepo {
 }
 
 impl MeshRepo {
-    /// The repo's mesh id and git object hash while the name is in use;
-    /// `None` for a tombstone.
-    pub fn present(&self) -> Option<(&RepoId, ObjectHash)> {
+    /// The repo's name and git object hash while it is in the mesh; `None`
+    /// for a tombstone.
+    pub fn present(&self) -> Option<(&str, ObjectHash)> {
         match &self.status {
-            MeshRepoStatus::Present { id, object_hash } => Some((id, *object_hash)),
+            MeshRepoStatus::Present { name, object_hash } => Some((name, *object_hash)),
             MeshRepoStatus::Removed => None,
         }
     }
 
-    /// The repo's mesh id while the name is in use; `None` for a tombstone.
-    pub fn id(&self) -> Option<&RepoId> {
-        self.present().map(|(id, _)| id)
+    /// The repo's name while it is in the mesh; `None` for a tombstone.
+    pub fn name(&self) -> Option<&str> {
+        self.present().map(|(name, _)| name)
+    }
+
+    /// Whether the record carries a usable name (or is a tombstone).
+    pub(super) fn is_valid(&self) -> bool {
+        self.name()
+            .is_none_or(|name| validate_name("repo", name).is_ok())
     }
 }
 
@@ -183,13 +195,14 @@ impl Register for MeshRepo {
         self.version
     }
 
-    /// Higher version first, removal beating presence on ties, then the
-    /// smaller id and object hash.
+    /// Removal first, whatever the version (repo ids are never reused, so
+    /// nothing may bring a removed repo back), then the higher version,
+    /// then the smaller name and object hash.
     fn outranks(&self, other: &Self) -> bool {
-        fn rank(repo: &MeshRepo) -> (u64, bool, cmp::Reverse<Option<(&RepoId, ObjectHash)>>) {
+        fn rank(repo: &MeshRepo) -> (bool, u64, cmp::Reverse<Option<(&str, ObjectHash)>>) {
             (
+                repo.name().is_none(),
                 repo.version,
-                repo.id().is_none(),
                 cmp::Reverse(repo.present()),
             )
         }
@@ -197,13 +210,12 @@ impl Register for MeshRepo {
     }
 }
 
-/// Whether a repo name is in use on the mesh. `Removed` is a tombstone.
+/// Whether a repo is in the mesh. `Removed` is a tombstone.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MeshRepoStatus {
     Present {
-        id: RepoId,
-        #[serde(default)]
+        name: String,
         object_hash: ObjectHash,
     },
     Removed,

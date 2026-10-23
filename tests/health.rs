@@ -12,6 +12,7 @@ async fn peers_report_their_health() {
     let mesh = TestMesh::new();
     let (a, b) = mesh.connected_pair().await;
     add_and_clone(&mesh, &a, &b, "proj").await;
+    let id = a.status().await.repos[0].id.clone();
 
     a.wait("B's health report", |s| {
         s.peer_reports.iter().any(|r| {
@@ -19,7 +20,7 @@ async fn peers_report_their_health() {
                 && r.report
                     .repos
                     .iter()
-                    .any(|repo| repo.name == "proj" && repo.state == RepoHealthState::Ok)
+                    .any(|repo| repo.id == id && repo.state == RepoHealthState::Ok)
         })
     })
     .await;

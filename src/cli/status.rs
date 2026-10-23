@@ -8,11 +8,11 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use clap::Args;
 use clap_complete::ArgValueCandidates;
-use color_eyre::eyre::{Result, ensure};
+use color_eyre::eyre::{Result, bail};
 
 use super::{complete, ui};
 use crate::{
-    config::{ConfigDir, MAX_MACHINE_WORKSPACES, sanitize},
+    config::{ConfigDir, MAX_MACHINE_WORKSPACES, RepoId, sanitize},
     daemon::control::{
         self, ConnectionStatus, PathInfo, PeerReport, RepoHealthState, Route, Status, WatchStatus,
         WorkspacePlace, WorkspaceState, WorkspaceStatus,
@@ -22,7 +22,7 @@ use crate::{
 /// Show the daemon state and the live mesh status
 #[derive(Debug, Args)]
 pub struct StatusArgs {
-    /// Show the details of this repo
+    /// Show the details of this repo, by name or id
     #[arg(add = ArgValueCandidates::new(complete::mesh_repos))]
     repo: Option<String>,
 }
@@ -31,8 +31,8 @@ pub struct StatusArgs {
 pub fn run(args: &StatusArgs, dir: &ConfigDir) -> Result<()> {
     let status = control::query_status_blocking(dir)?;
     let issues = if let Some(name) = &args.repo {
-        print_repo(&status, name)?;
-        repo_issues(&status, |repo| repo == name)
+        let id = print_repo(&status, name)?;
+        repo_issues(&status, |repo| *repo == id)
     } else {
         print_mesh(&status);
         let mut issues = mesh_issues(&status);
@@ -90,8 +90,8 @@ fn print_repos(status: &Status) {
         return;
     }
     let holders = holders(status);
-    let machines = |name: &str| {
-        let machines = holders.get(name).into_iter().flatten().copied();
+    let machines = |id: &RepoId| {
+        let machines = holders.get(id).into_iter().flatten().copied();
         machines.collect::<Vec<_>>().join(", ")
     };
     let mut rows = Vec::new();
@@ -100,30 +100,67 @@ fn print_repos(status: &Status) {
             repo.name.clone(),
             ui::dim(ui::display_path(&repo.path)).to_string(),
             watch_summary(&repo.watch),
-            machines(&repo.name),
+            machines(&repo.id),
         ]);
     }
-    for name in &status.available {
+    for repo in &status.available {
         rows.push([
-            name.clone(),
+            repo.name.clone(),
             ui::dim("-").to_string(),
             String::new(),
-            machines(name),
+            machines(&repo.id),
         ]);
     }
     print_table(&rows);
 }
 
-/// Prints one repo and its workspaces.
-fn print_repo(status: &Status, name: &str) -> Result<()> {
-    let Some(repo) = status.repos.iter().find(|repo| repo.name == name) else {
-        ensure!(
-            status.available.iter().any(|available| available == name),
-            "no repo named `{name}` in the mesh"
-        );
-        println!("{name}  {}", ui::dim("not cloned"));
-        return Ok(());
+/// Prints one repo, selected by name or id, and its workspaces, returning
+/// its id. A name several repos carry selects the one registered here, as
+/// the daemon does.
+fn print_repo(status: &Status, selector: &str) -> Result<RepoId> {
+    let select = |by_name: bool| {
+        let matches = |name: &str, id: &RepoId| {
+            if by_name {
+                name == selector
+            } else {
+                id.to_string() == selector
+            }
+        };
+        let registered: Vec<_> = status
+            .repos
+            .iter()
+            .filter(|r| matches(&r.name, &r.id))
+            .collect();
+        let available: Vec<_> = status
+            .available
+            .iter()
+            .filter(|r| matches(&r.name, &r.id))
+            .collect();
+        (registered, available)
     };
+    let (mut registered, mut available) = select(true);
+    if registered.is_empty() && available.is_empty() {
+        (registered, available) = select(false);
+    }
+    let repo = match (&registered[..], &available[..]) {
+        ([repo], _) => repo,
+        ([], [repo]) => {
+            println!("{}  {}", repo.name, ui::dim("not cloned"));
+            return Ok(repo.id.clone());
+        }
+        ([], []) => bail!("no repo named `{selector}` in the mesh"),
+        _ => {
+            let ids = registered.iter().map(|repo| &repo.id);
+            let ids = ids
+                .chain(available.iter().map(|repo| &repo.id))
+                .map(ToString::to_string);
+            bail!(
+                "several repos are named `{selector}` ({}). Use the id of the one you mean",
+                ids.collect::<Vec<_>>().join(", "),
+            );
+        }
+    };
+    let name = &repo.name;
 
     // Local workspaces are only known while the repo is watched.
     let listed = repo
@@ -144,7 +181,7 @@ fn print_repo(status: &Status, name: &str) -> Result<()> {
         println!();
         print_table(&rows);
     }
-    Ok(())
+    Ok(repo.id.clone())
 }
 
 /// Columns of a workspace line: name, path or machine, state when not
@@ -249,15 +286,14 @@ fn watch_summary(watch: &WatchStatus) -> String {
 }
 
 /// The peers holding each repo: those claiming a workspace in it and the
-/// connected ones reporting it, except where they report it missing or
-/// announce a different repo under its name.
-fn holders(status: &Status) -> BTreeMap<&str, BTreeSet<&str>> {
+/// connected ones reporting it, except where they report it missing.
+fn holders(status: &Status) -> BTreeMap<&RepoId, BTreeSet<&str>> {
     let mut holders: BTreeMap<_, BTreeSet<_>> = BTreeMap::new();
     for repo in &status.repos {
         for workspace in &repo.workspaces {
             if let WorkspacePlace::Peer { machine } = &workspace.place {
                 holders
-                    .entry(repo.name.as_str())
+                    .entry(&repo.id)
                     .or_default()
                     .insert(machine.as_str());
             }
@@ -265,17 +301,12 @@ fn holders(status: &Status) -> BTreeMap<&str, BTreeSet<&str>> {
     }
     for PeerReport { peer, report } in &status.peer_reports {
         for repo in &report.repos {
-            let peers = holders.entry(repo.name.as_str()).or_default();
+            let peers = holders.entry(&repo.id).or_default();
             if repo.state == RepoHealthState::Missing {
                 peers.remove(peer.as_str());
             } else {
                 peers.insert(peer.as_str());
             }
-        }
-    }
-    for conflict in &status.conflicts {
-        if let Some(peers) = holders.get_mut(conflict.repo.as_str()) {
-            peers.remove(conflict.peer.as_str());
         }
     }
     holders
@@ -303,9 +334,35 @@ fn mesh_issues(status: &Status) -> Vec<String> {
 }
 
 /// Issues about the `wanted` repos, here and on connected peers.
-fn repo_issues(status: &Status, wanted: impl Fn(&str) -> bool) -> Vec<String> {
+fn repo_issues(status: &Status, wanted: impl Fn(&RepoId) -> bool) -> Vec<String> {
+    let names: BTreeMap<&RepoId, &str> = status
+        .repos
+        .iter()
+        .map(|repo| (&repo.id, repo.name.as_str()))
+        .chain(
+            status
+                .available
+                .iter()
+                .map(|repo| (&repo.id, repo.name.as_str())),
+        )
+        .collect();
     let mut issues = Vec::new();
-    for repo in status.repos.iter().filter(|repo| wanted(&repo.name)) {
+    for conflict in &status.conflicts {
+        if conflict.repos.iter().any(&wanted) {
+            issues.push(format!(
+                "`{}`: several repos carry this name ({}). Rename one of them with `jj-mesh repo \
+                 rename <id> <new name>`",
+                conflict.name,
+                conflict
+                    .repos
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            ));
+        }
+    }
+    for repo in status.repos.iter().filter(|repo| wanted(&repo.id)) {
         match &repo.watch {
             WatchStatus::Failed { error, .. } => {
                 issues.push(format!("`{}`: {}", repo.name, sanitize(error)));
@@ -322,20 +379,15 @@ fn repo_issues(status: &Status, wanted: impl Fn(&str) -> bool) -> Vec<String> {
             }
         }
     }
-    for conflict in status.conflicts.iter().filter(|c| wanted(&c.repo)) {
-        issues.push(format!(
-            "`{}`: peer {} announced a different repo under the same name",
-            conflict.repo, conflict.peer,
-        ));
-    }
     for PeerReport { peer, report } in &status.peer_reports {
-        for repo in report.repos.iter().filter(|repo| wanted(&repo.name)) {
+        for repo in report.repos.iter().filter(|repo| wanted(&repo.id)) {
             let problem = match repo.state {
                 RepoHealthState::Ok => continue,
                 RepoHealthState::Failed => "sync error (see that machine's status)",
                 RepoHealthState::Missing => "directory missing on that machine",
             };
-            issues.push(format!("`{}` on {peer}: {problem}", repo.name));
+            let name = names.get(&repo.id).copied().unwrap_or("?");
+            issues.push(format!("`{name}` on {peer}: {problem}"));
         }
     }
     issues

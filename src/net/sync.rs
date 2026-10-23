@@ -18,19 +18,19 @@ use serde::{Deserialize, Serialize};
 
 use super::wire::{read_message, write_message};
 use crate::config::{
-    MAX_MESH_CLAIMED_REPOS, MAX_MESH_PEERS, MAX_MESH_REPOS, MAX_MESH_WORKSPACES, Membership,
-    RepoId, WorkspaceClaims,
+    MAX_MESH_CLAIMED_REPOS, MAX_MESH_PEERS, MAX_MESH_REPO_RECORDS, MAX_MESH_REPOS,
+    MAX_MESH_WORKSPACES, Membership, RepoId, WorkspaceClaims,
 };
 
 /// ALPN of the sync protocol, opening with a [`super::hello`].
 pub const ALPN: &[u8] = b"jj-mesh/sync/3";
 
 /// Cap on uni-stream messages. Sized for the largest legitimate message, a
-/// full membership (peer records are ~100 bytes, repo records and
-/// workspace claims ~100, empty repo claims ~35), with headroom; the peer,
-/// while authenticated, is not trusted with our memory, and every byte
-/// here is decoded before we can check anything.
-const MAX_UNI_SIZE: u32 = 384 * 1024;
+/// full membership (peer records are ~100 bytes, live repo records and
+/// workspace claims ~100, repo tombstones and empty repo claims ~40), with
+/// headroom; the peer, while authenticated, is not trusted with our
+/// memory, and every byte here is decoded before we can check anything.
+const MAX_UNI_SIZE: u32 = 512 * 1024;
 
 /// A message carried by a one-shot uni stream.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -41,15 +41,8 @@ pub enum UniMessage {
 }
 
 /// Advertises the current op heads of one repo.
-///
-/// Repos are identified mesh-wide by their name; the id rides along so a
-/// receiver can detect two different repos contesting one name (see
-/// [`crate::daemon::hub`]) instead of silently merging them.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Announce {
-    /// Mesh-wide name of the repo.
-    pub name: String,
-    /// The sender's id for the repo, for conflict detection.
     pub id: RepoId,
     /// Publish sequence, sender-wide: monotonic across all repos for the
     /// sender's daemon run. Streams have no cross-stream ordering, so the
@@ -76,8 +69,7 @@ pub struct StatusReport {
 /// Health of one repo in a [`StatusReport`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RepoHealth {
-    /// Mesh-wide name of the repo.
-    pub name: String,
+    pub id: RepoId,
     pub state: RepoHealthState,
 }
 
@@ -122,7 +114,13 @@ fn check_bounds(message: &UniMessage) -> Result<()> {
             let (names, repos) = WorkspaceClaims::tally(membership.claims.values());
             ensure!(
                 membership.peers.len() <= MAX_MESH_PEERS
-                    && membership.repos.len() <= MAX_MESH_REPOS
+                    && membership.repos.len() <= MAX_MESH_REPO_RECORDS
+                    && membership
+                        .repos
+                        .values()
+                        .filter(|r| r.name().is_some())
+                        .count()
+                        <= MAX_MESH_REPOS
                     && membership.claims.len() <= MAX_MESH_PEERS
                     && repos <= MAX_MESH_CLAIMED_REPOS
                     && names <= MAX_MESH_WORKSPACES,
@@ -142,8 +140,9 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet};
 
     use crate::config::{
-        MAX_MESH_CLAIMED_REPOS, MAX_MESH_PEERS, MAX_MESH_REPOS, MAX_MESH_WORKSPACES, MAX_NAME_LEN,
-        Membership, MeshRepo, Peer, RepoId, WorkspaceClaims,
+        MAX_MESH_CLAIMED_REPOS, MAX_MESH_PEERS, MAX_MESH_REPO_RECORDS, MAX_MESH_REPOS,
+        MAX_MESH_WORKSPACES, MAX_NAME_LEN, Membership, MeshRepo, MeshRepoStatus, ObjectHash, Peer,
+        RepoId, WorkspaceClaims,
     };
 
     /// A membership carrying the largest state we accept must stay inside
@@ -165,18 +164,22 @@ mod tests {
                 )
             })
             .collect();
-        let repos: BTreeMap<String, MeshRepo> = (0..MAX_MESH_REPOS)
+        // The live repos at their cap, tombstones filling the records.
+        let repos: BTreeMap<RepoId, MeshRepo> = (0..MAX_MESH_REPO_RECORDS)
             .map(|n| {
-                (
-                    format!("{n:0>64}"),
-                    MeshRepo {
-                        version: u64::from(u32::MAX),
-                        status: crate::config::MeshRepoStatus::Present {
-                            id: RepoId::generate(),
-                            object_hash: crate::config::ObjectHash::Sha256,
-                        },
-                    },
-                )
+                let status = if n < MAX_MESH_REPOS {
+                    MeshRepoStatus::Present {
+                        name: format!("{n:0>64}"),
+                        object_hash: ObjectHash::Sha256,
+                    }
+                } else {
+                    MeshRepoStatus::Removed
+                };
+                let record = MeshRepo {
+                    version: u64::from(u32::MAX),
+                    status,
+                };
+                (RepoId::generate(), record)
             })
             .collect();
 
@@ -226,8 +229,8 @@ mod tests {
             daemon_version: "9".repeat(MAX_NAME_LEN),
             jj_version: Some("9".repeat(MAX_NAME_LEN)),
             repos: (0..MAX_MESH_REPOS)
-                .map(|n| super::RepoHealth {
-                    name: format!("{n:0>64}"),
+                .map(|_| super::RepoHealth {
+                    id: RepoId::generate(),
                     state: super::RepoHealthState::Failed,
                 })
                 .collect(),

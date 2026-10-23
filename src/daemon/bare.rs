@@ -101,7 +101,7 @@ struct Task {
     store: Arc<MeshStore>,
     hub: Arc<SyncHub>,
     /// Repos whose pull failed, with their backoff and next attempt.
-    retries: BTreeMap<String, (Backoff, Instant)>,
+    retries: BTreeMap<RepoId, (Backoff, Instant)>,
 }
 
 impl Task {
@@ -114,16 +114,15 @@ impl Task {
 
         let mut state = self.store.snapshot();
         let server = state.machine.server;
-        let clonable: BTreeSet<String> = state.clonable_repo_names().map(str::to_owned).collect();
-        self.retries
-            .retain(|name, _| server && clonable.contains(name));
-        for name in clonable {
+        let clonable: BTreeSet<RepoId> = state.clonable_repos().map(|(id, _)| id.clone()).collect();
+        self.retries.retain(|id, _| server && clonable.contains(id));
+        for id in clonable {
             if !state.machine.server {
                 break;
             }
             // A pull may take long: a fresh state notices server mode going
             // off and repos registered or removed meanwhile.
-            if self.pull(&state, &name).await {
+            if self.pull(&state, &id).await {
                 state = self.store.snapshot();
             }
         }
@@ -145,7 +144,7 @@ impl Task {
     async fn drop_bare(&self) {
         let state = self.store.snapshot();
         let mut dropped = Vec::new();
-        for (name, repo) in state.repos.iter().filter(|(_, repo)| repo.bare) {
+        for (id, repo) in state.repos.iter().filter(|(_, repo)| repo.bare) {
             let reason = if JjRepo::is_missing(&repo.path) {
                 "its directory is gone"
             } else if !state.machine.server && !is_used(&repo.path).await {
@@ -153,15 +152,16 @@ impl Task {
             } else {
                 continue;
             };
+            let name = state.repo_name(id).unwrap_or("?");
             info!(repo = %name, "dropping bare repo: {reason}");
-            dropped.push(name);
+            dropped.push(id);
         }
         if dropped.is_empty() {
             return;
         }
         if let Err(err) = self.store.update(|state| {
-            for name in dropped {
-                state.drop_bare(name);
+            for id in dropped {
+                state.drop_bare(id);
             }
             Ok(())
         }) {
@@ -208,27 +208,26 @@ impl Task {
         Ok(())
     }
 
-    /// Pulls the mesh repo `name` into a new bare repo and registers it,
-    /// unless a pull failed recently or no peer announces it under its
-    /// mesh id. Returns whether it pulled.
-    async fn pull(&mut self, state: &MeshState, name: &str) -> bool {
+    /// Pulls the mesh repo `id` into a new bare repo and registers it,
+    /// unless a pull failed recently or no peer announces it. Returns
+    /// whether it pulled.
+    async fn pull(&mut self, state: &MeshState, id: &RepoId) -> bool {
         if self
             .retries
-            .get(name)
+            .get(id)
             .is_some_and(|(_, at)| *at > Instant::now())
         {
             return false;
         }
-        let Some((_, object_hash)) = state.mesh_repos.get(name).and_then(MeshRepo::present) else {
+        let Some((name, object_hash)) = state.mesh_repos.get(id).and_then(MeshRepo::present) else {
             return false;
         };
-        let target = self.hub.clone_sources(name).and_then(|(id, sources)| {
+        let target = self.hub.clone_sources(id, name).and_then(|sources| {
             let repo = Repo {
                 path: self.root.join(id.to_string()),
-                id,
                 bare: true,
             };
-            Ok((state.check_clone(name, repo)?, sources))
+            Ok((state.check_clone(id, repo)?, sources))
         });
         let (repo, sources) = match target {
             Ok(target) => target,
@@ -239,15 +238,15 @@ impl Task {
         };
 
         info!(repo = %name, "pulling bare repo");
-        match self.pull_into(name, repo, object_hash, sources).await {
+        match self.pull_into(id, name, repo, object_hash, sources).await {
             Ok(()) => {
-                self.retries.remove(name);
+                self.retries.remove(id);
             }
             Err(err) => {
                 warn!(repo = %name, "bare repo pull failed: {err:#}");
                 let (backoff, at) = self
                     .retries
-                    .entry(name.to_owned())
+                    .entry(id.clone())
                     .or_insert_with(|| (Backoff::new(RETRY_MIN, RETRY_MAX), Instant::now()));
                 *at = Instant::now() + backoff.next_delay();
             }
@@ -260,12 +259,13 @@ impl Task {
     /// the next sweep deletes.
     async fn pull_into(
         &self,
+        id: &RepoId,
         name: &str,
         repo: Repo,
         object_hash: ObjectHash,
         sources: Vec<CloneSource>,
     ) -> Result<()> {
-        let partial = self.root.join(format!("{}.tmp", repo.id));
+        let partial = self.root.join(format!("{id}.tmp"));
         {
             let (root, partial) = (self.root.clone(), partial.clone());
             crate::spawn_blocking(move || -> Result<()> {
@@ -277,16 +277,13 @@ impl Task {
             .wrap_err("bare repo init task failed")??;
         }
 
-        let (ops, git_objects) = self
-            .hub
-            .pull(name, &repo.id, sources, &partial, &|_, _| {})
-            .await?;
+        let (ops, git_objects) = self.hub.pull(id, sources, &partial, &|_, _| {}).await?;
 
         fs::rename(&partial, &repo.path)
             .wrap_err_with(|| format!("cannot move the repo to {}", repo.path.display()))?;
         self.store.update(|state| {
             ensure!(state.machine.server, "server mode is off");
-            state.add_clone(name.to_owned(), repo)
+            state.add_clone(id.clone(), repo)
         })?;
         info!(repo = %name, ops, objects = git_objects, "pulled bare repo");
         Ok(())

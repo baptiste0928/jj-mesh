@@ -5,12 +5,10 @@ use std::{fmt, path::PathBuf};
 use data_encoding::HEXLOWER;
 use serde::{Deserialize, Serialize};
 
-/// A repo registered on this machine.
+/// A repo registered on this machine, under its id.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Repo {
-    /// Mesh-wide identifier of the repo.
-    pub id: RepoId,
     /// Local repository root (the directory containing `.jj`), stored
     /// canonicalized on registration.
     pub path: PathBuf,

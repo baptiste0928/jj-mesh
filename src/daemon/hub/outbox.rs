@@ -11,7 +11,7 @@ use tokio::sync::Notify;
 use tracing::debug;
 
 use crate::{
-    config::Membership,
+    config::{Membership, RepoId},
     net::sync::{self, Announce, StatusReport, UniMessage},
 };
 
@@ -32,7 +32,7 @@ pub(super) struct Outbox {
 struct OutboxState {
     membership: Option<Membership>,
     status: Option<StatusReport>,
-    announces: BTreeMap<String, Announce>,
+    announces: BTreeMap<RepoId, Announce>,
 }
 
 impl Outbox {
@@ -41,7 +41,7 @@ impl Outbox {
             .lock()
             .unwrap()
             .announces
-            .insert(announce.name.clone(), announce);
+            .insert(announce.id.clone(), announce);
         self.notify.notify_one();
     }
 

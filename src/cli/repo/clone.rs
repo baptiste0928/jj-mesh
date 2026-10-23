@@ -31,7 +31,7 @@ use super::{
 };
 use crate::{
     cli::{complete, ui},
-    config::{ConfigDir, MeshRepo, MeshState, ObjectHash, validate_name},
+    config::{ConfigDir, MeshRepo, MeshState, ObjectHash, Repo, validate_name},
     daemon::control::{self, CloneProgress, Request, Response, TransferPhase, WorkspaceHold},
     repo::{Identity, JjRepo},
 };
@@ -44,7 +44,7 @@ use crate::{
 /// workspace to it instead.
 #[derive(Debug, Args)]
 pub struct CloneArgs {
-    /// Name of the repo in the mesh (asked when omitted)
+    /// Name or id of the repo in the mesh (asked when omitted)
     #[arg(add = ArgValueCandidates::new(complete::mesh_repos))]
     name: Option<String>,
 
@@ -81,9 +81,21 @@ pub fn run(args: CloneArgs, dir: &ConfigDir) -> Result<()> {
         Some(name) => name,
         None => pick(&state)?,
     };
+    // The daemon has the last word on names: the state read here may lag
+    // behind, not knowing the name yet.
+    let id = match state.resolve_repo(&name) {
+        Ok(id) => Some(id),
+        Err(_) if !state.repo_names().contains(name.as_str()) => None,
+        Err(err) => return Err(err),
+    };
     let path = match args.path {
         Some(path) => path,
-        None => default_path(&name)?,
+        // `name` may be an id.
+        None => default_path(
+            id.as_ref()
+                .and_then(|id| state.repo_name(id))
+                .unwrap_or(&name),
+        )?,
     };
     let colocate: &[&str] = match (args.colocate, args.no_colocate) {
         (true, _) => &["--colocate"],
@@ -91,8 +103,7 @@ pub fn run(args: CloneArgs, dir: &ConfigDir) -> Result<()> {
         _ => &[],
     };
     let settings = &args.settings;
-
-    match state.repos.get(&name) {
+    match id.as_ref().and_then(|id| state.repos.get(id)) {
         Some(repo) if repo.bare => {
             ensure!(
                 colocate.is_empty(),
@@ -115,29 +126,48 @@ pub fn run(args: CloneArgs, dir: &ConfigDir) -> Result<()> {
             )
         }
         None => {
+            // Best-effort pre-check (the daemon re-validates
+            // authoritatively before registering), so an obviously doomed
+            // clone fails before anything is created on disk.
+            let mut object_hash = ObjectHash::default();
+            if let Some(id) = &id {
+                let repo = Repo {
+                    path: path.clone(),
+                    bare: false,
+                };
+                state.check_clone(id, repo)?;
+                if let Some((_, hash)) = state.mesh_repos.get(id).and_then(MeshRepo::present) {
+                    object_hash = hash;
+                }
+            }
             let workspace = args.workspace.unwrap_or_else(|| state.machine.name.clone());
-            clone(dir, &state, &name, &path, &workspace, colocate, settings)
+            clone(
+                dir,
+                &name,
+                &path,
+                &workspace,
+                object_hash,
+                colocate,
+                settings,
+            )
         }
     }
 }
 
-/// Clones the mesh repo `name` in `path`.
+/// Clones the mesh repo `name` in `path`, with its git `object_hash`,
+/// which the user's jj config must not override.
 fn clone(
     dir: &ConfigDir,
-    state: &MeshState,
     name: &str,
     path: &Path,
     workspace: &str,
+    object_hash: ObjectHash,
     colocate: &[&str],
     settings: &SettingsArgs,
 ) -> Result<()> {
-    // Best-effort pre-checks, so an obviously doomed clone fails before
-    // anything is created on disk: the daemon must be up (it is only
-    // contacted once the local repo exists), and the stored state must
-    // accept the repo (the daemon re-validates authoritatively before
-    // registering).
+    // The daemon must be up: it is only contacted once the local repo
+    // exists.
     control::ensure_daemon_blocking(dir)?;
-    state.validate_new_repo(name, path)?;
     ensure!(
         !path.exists(),
         "{} already exists (clone creates the directory)",
@@ -145,14 +175,8 @@ fn clone(
     );
 
     // Fresh repo with a machine-unique workspace name, using the user's
-    // own jj (their config applies to the repo from the start), but the
-    // mesh repo's object hash, which their config must not override.
-    let object_hash = state
-        .mesh_repos
-        .get(name)
-        .and_then(MeshRepo::present)
-        .map_or_else(ObjectHash::default, |(_, object_hash)| object_hash)
-        .to_string();
+    // own jj (their config applies to the repo from the start).
+    let object_hash = object_hash.to_string();
     let path_arg = path.to_string_lossy();
     jj(
         None,
@@ -344,7 +368,7 @@ fn extra_workspace_name(machine: &str, path: &Path) -> Result<String> {
 
 /// Asks which of the mesh repos to clone.
 fn pick(state: &MeshState) -> Result<String> {
-    let available: Vec<&str> = state.mesh_repo_names().collect();
+    let available: Vec<&str> = state.repo_names().into_iter().collect();
     ensure!(
         !available.is_empty(),
         "no repo to clone. Add one with `jj-mesh add` on another machine",
@@ -405,10 +429,7 @@ fn pull(dir: &ConfigDir, name: &str, path: &Path, workspace: &str) -> Result<()>
 fn clean_failed_clone(dir: &ConfigDir, name: &str, path: &Path, err: Report) -> Report {
     let registered = MeshState::load(dir).is_ok_and(|state| {
         let path = std::fs::canonicalize(path);
-        state
-            .repos
-            .get(name)
-            .is_some_and(|repo| path.is_ok_and(|path| path == repo.path))
+        path.is_ok_and(|path| state.repos.values().any(|repo| repo.path == path))
     });
     if registered {
         return err.wrap_err(format!(

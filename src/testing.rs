@@ -25,7 +25,7 @@ use crate::{
     },
     repo::{
         JjRepo, OpenRepo,
-        transfer::{FetchOptions, ProgressSink, RepoIdent, fetch, mirror, serve},
+        transfer::{FetchOptions, ProgressSink, fetch, mirror, serve},
     },
 };
 pub use crate::{net::fetch::GitTransferFormat, repo::transfer::FetchOutcome};
@@ -266,10 +266,7 @@ pub async fn fetch_from(
 ) -> Result<FetchOutcome> {
     fetch(
         fetcher,
-        RepoIdent {
-            name: "test",
-            id: &crate::config::RepoId::generate(),
-        },
+        &crate::config::RepoId::generate(),
         wants,
         FetchOptions {
             format,

@@ -97,12 +97,16 @@ impl Daemon {
         logs: LogBuffer,
     ) -> Result<Self> {
         let key = MachineKey::from_config(dir)?;
-        let state = MeshState::load(dir)?;
 
         // Binding the control socket first doubles as the single-daemon
         // guard. It is served right away so clients reaching a starting
         // daemon get its build, then wait for `ctx`.
         let server = ControlServer::bind(dir)?;
+        let (state, migrated) = MeshState::load_migrated(dir)?;
+        if migrated {
+            state.save(dir)?;
+            info!("mesh state migrated to the current format");
+        }
         let (ctx_tx, ctx_rx) = watch::channel(None);
         let mut tasks = tokio::task::JoinSet::new();
         tasks.spawn(async move { server.serve(ctx_rx).await });

@@ -14,11 +14,11 @@ use pollster::FutureExt as _;
 use tokio::io::{AsyncRead, AsyncWrite};
 
 use super::{
-    FetchOptions, FetchOutcome, OpBatch, ProgressSink, RepoIdent, StoredOp, StoredView,
-    TransferPhase, TransferProgress, apply, pack, to_gix_id,
+    FetchOptions, FetchOutcome, OpBatch, ProgressSink, StoredOp, StoredView, TransferPhase,
+    TransferProgress, apply, pack, to_gix_id,
 };
 use crate::{
-    config::sanitize,
+    config::{RepoId, sanitize},
     net::{
         fetch::{
             FetchRequest, GitFrame, GitRequest, GitTransferFormat, MAX_GIT_FRAME_SIZE,
@@ -62,7 +62,7 @@ const INGEST_SAMPLE_INTERVAL: Duration = Duration::from_millis(200);
 /// data.
 pub async fn fetch(
     repo: &Arc<OpenRepo>,
-    target: RepoIdent<'_>,
+    target: &RepoId,
     wants: &[OperationId],
     options: FetchOptions,
     send: &mut (impl AsyncWrite + Unpin),
@@ -76,8 +76,7 @@ pub async fn fetch(
 
     let batch = bounded(deadline, "op", async {
         let request = FetchRequest {
-            name: target.name.to_owned(),
-            id: target.id.clone(),
+            id: target.clone(),
             wants: wants.iter().map(|id| id.as_bytes().to_vec()).collect(),
             haves: haves.iter().map(|id| id.as_bytes().to_vec()).collect(),
         };

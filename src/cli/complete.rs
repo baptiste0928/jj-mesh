@@ -4,6 +4,8 @@
 //! whether or not the daemon is running. Completion must never get in the
 //! user's way: any error degrades to an empty candidate list.
 
+use std::collections::BTreeSet;
+
 use clap_complete::CompletionCandidate;
 
 use crate::config::{ConfigDir, MeshState};
@@ -16,15 +18,22 @@ fn state() -> MeshState {
         .unwrap_or_default()
 }
 
-/// The repos registered on this machine (`repo forget`).
+/// The names of the repos registered on this machine (`repo forget`).
 pub(super) fn registered_repos() -> Vec<CompletionCandidate> {
-    state().repos.keys().map(CompletionCandidate::new).collect()
+    let state = state();
+    let names: BTreeSet<&str> = state
+        .repos
+        .keys()
+        .filter_map(|id| state.repo_name(id))
+        .collect();
+    names.into_iter().map(CompletionCandidate::new).collect()
 }
 
-/// The repo names in use on the mesh (`repo clone`, `repo remove`).
+/// The names of the repos in the mesh (`repo clone`, `repo remove`).
 pub(super) fn mesh_repos() -> Vec<CompletionCandidate> {
     state()
-        .mesh_repo_names()
+        .repo_names()
+        .into_iter()
         .map(CompletionCandidate::new)
         .collect()
 }

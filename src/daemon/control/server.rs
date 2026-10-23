@@ -8,7 +8,7 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-use color_eyre::eyre::{Result, WrapErr as _, bail, eyre};
+use color_eyre::eyre::{Result, WrapErr as _, bail, ensure, eyre};
 use iroh::Endpoint;
 use tokio::{
     io::{AsyncRead, AsyncReadExt as _},
@@ -20,8 +20,8 @@ use tracing::{debug, info, warn};
 use super::{
     clone,
     protocol::{
-        BUILD, CLIENT_TIMEOUT, ConflictStatus, LogsStart, MAX_BUILD_SIZE, MAX_MESSAGE_SIZE,
-        PeerReport, Request, Response, Status,
+        BUILD, CLIENT_TIMEOUT, ClonableRepo, ConflictStatus, LogsStart, MAX_BUILD_SIZE,
+        MAX_MESSAGE_SIZE, PeerReport, Request, Response, Status,
     },
 };
 use crate::{
@@ -78,15 +78,12 @@ impl ControlContext {
                 .find(|status| &status.endpoint == peer)
                 .map(|status| status.name.clone())
         };
-        let conflicts = self
-            .hub
-            .conflicts()
+        let conflicts = state
+            .name_conflicts()
             .into_iter()
-            .filter_map(|(repo, peer)| {
-                Some(ConflictStatus {
-                    repo,
-                    peer: peer_name(&peer)?,
-                })
+            .map(|(name, repos)| ConflictStatus {
+                name: name.to_owned(),
+                repos: repos.into_iter().cloned().collect(),
             })
             .collect();
         let peer_reports = self
@@ -100,7 +97,13 @@ impl ControlContext {
                 })
             })
             .collect();
-        let available = state.clonable_repo_names().map(str::to_owned).collect();
+        let available = state
+            .clonable_repos()
+            .map(|(id, name)| ClonableRepo {
+                id: id.clone(),
+                name: name.to_owned(),
+            })
+            .collect();
 
         Status {
             name: state.machine.name,
@@ -331,23 +334,21 @@ async fn add_repo(ctx: &ControlContext, name: String, path: PathBuf) -> Result<R
     .wrap_err("repo validation task failed")??;
 
     ctx.store.update(|state| {
-        state.add_repo(
-            name,
-            Repo {
-                id: RepoId::generate(),
-                path: root,
-                bare: false,
-            },
-            object_hash,
-        )
+        let repo = Repo {
+            path: root,
+            bare: false,
+        };
+        state.add_repo(RepoId::generate(), name, repo, object_hash)
     })?;
     Ok(Response::RepoAdded)
 }
 
-/// Retires a repo name from the mesh; the repo set stops watching it here
-/// and the gossip propagates the removal to the other machines.
+/// Removes a repo from the mesh; the repo set stops watching it here and
+/// the gossip propagates the removal to the other machines.
 fn remove_repo(ctx: &ControlContext, name: &str) -> Result<Response> {
-    let was_local = ctx.store.update(|state| state.remove_repo(name))?;
+    let was_local = ctx
+        .store
+        .update(|state| state.remove_repo(&state.resolve_repo(name)?))?;
     info!(repo = %name, "repo removed from the mesh");
     Ok(Response::RepoRemoved { was_local })
 }
@@ -356,7 +357,9 @@ fn remove_repo(ctx: &ControlContext, name: &str) -> Result<Response> {
 /// it, announcements stop, and the mesh record stays untouched (no gossip
 /// change), so the repo remains clonable here.
 fn forget_repo(ctx: &ControlContext, name: &str) -> Result<Response> {
-    let repo = ctx.store.update(|state| state.forget_repo(name))?;
+    let repo = ctx
+        .store
+        .update(|state| state.forget_repo(&state.resolve_repo(name)?))?;
     info!(repo = %name, "repo forgotten locally");
     Ok(Response::RepoForgotten { path: repo.path })
 }
@@ -392,7 +395,15 @@ async fn hold_workspace(
     repo: &str,
     workspace: &str,
 ) -> Result<()> {
-    let _hold = match ctx.repos.hold(repo, workspace) {
+    let state = ctx.store.snapshot();
+    let hold = state.resolve_repo(repo).and_then(|id| {
+        ensure!(
+            state.repos.contains_key(&id),
+            "`{repo}` is not registered on this machine"
+        );
+        ctx.repos.hold(&id, workspace)
+    });
+    let _hold = match hold {
         Ok(hold) => hold,
         Err(err) => return reply(stream, Err(err)).await,
     };

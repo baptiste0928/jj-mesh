@@ -62,7 +62,7 @@ impl SyncHub {
             return refuse_fetch(send, "repo not available");
         };
         let Ok(permit) = serving.permits.clone().try_acquire_owned() else {
-            debug!(repo = %request.name, "refusing fetch: too many being served");
+            debug!(repo = %request.id, "refusing fetch: too many being served");
             return refuse_fetch(send, "busy, retry later");
         };
 
@@ -82,24 +82,16 @@ impl SyncHub {
     }
 
     /// Resolves the serve handle for a fetch request, logging every kind of
-    /// refusal distinctly. The name needs no validation here: only names that
-    /// passed it at registration are ever in the map, so an invalid one
-    /// simply fails to match.
+    /// refusal distinctly.
     fn lookup_serving(&self, request: &FetchRequest) -> Option<Serving> {
         let state = self.state.lock().unwrap();
-        let Some(entry) = state.repos.get(&request.name) else {
-            debug!(repo = %request.name, "refusing fetch: repo not registered here");
+        let Some(entry) = state.repos.get(&request.id) else {
+            debug!(repo = %request.id, "refusing fetch: repo not registered here");
             return None;
         };
-        // An id mismatch means the fetcher's repo is not ours, whatever the
-        // name says: refuse rather than mix unrelated histories.
-        if entry.id != request.id {
-            debug!(repo = %request.name, "refusing fetch: repo id mismatch");
-            return None;
-        }
         let serving = entry.serving.clone();
         if serving.is_none() {
-            debug!(repo = %request.name, "refusing fetch: repo not open");
+            debug!(repo = %request.id, "refusing fetch: repo not open");
         }
         serving
     }

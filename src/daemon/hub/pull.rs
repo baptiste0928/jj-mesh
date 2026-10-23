@@ -36,13 +36,12 @@ pub struct CloneSource {
 }
 
 impl SyncHub {
-    /// Pulls the full state of the mesh repo `name` into the repo at
+    /// Pulls the full state of the mesh repo `id` into the repo at
     /// `path`, from the first of `sources` that serves it, reporting each
     /// attempt's progress with the source peer's name. Returns the pulled
     /// op and git object counts.
     pub async fn pull(
         &self,
-        name: &str,
         id: &RepoId,
         sources: Vec<CloneSource>,
         path: &Path,
@@ -78,7 +77,7 @@ impl SyncHub {
                 // here, instead of writing every object loose.
                 let outcome = transfer::fetch(
                     &repo,
-                    transfer::RepoIdent { name, id },
+                    id,
                     &wants,
                     transfer::FetchOptions {
                         format: GitTransferFormat::Pack,

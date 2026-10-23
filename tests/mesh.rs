@@ -2,8 +2,11 @@
 
 mod harness;
 
+use std::fs;
+
 use harness::{TestMesh, add_and_clone, connect, descriptions, wait_converged};
 use jj_mesh::daemon::control::{Request, Response};
+use serde_json::json;
 
 /// Machines that never paired directly learn about each other through
 /// gossip: they connect on their own, repos added anywhere become
@@ -63,7 +66,11 @@ async fn forgetting_locally_keeps_the_repo_clonable() {
 
     // B no longer syncs the repo (and forgetting again is an error)...
     b.wait("proj forgotten locally", |s| {
-        s.repos.is_empty() && s.available == ["proj"]
+        s.repos.is_empty()
+            && s.available
+                .iter()
+                .map(|repo| repo.name.as_str())
+                .eq(["proj"])
     })
     .await;
     assert_eq!(a.status().await.repos.len(), 1);
@@ -169,6 +176,76 @@ async fn rename_reaches_the_peers() {
     a.stop().await;
     a.start().await;
     assert_eq!(a.status().await.name, "desk");
+}
+
+/// A daemon upgraded over a format 1 state, which keyed repos by name,
+/// migrates it and keeps syncing.
+#[tokio::test]
+async fn legacy_state_upgrades_seamlessly() {
+    let mesh = TestMesh::new();
+    let (mut a, b) = mesh.connected_pair().await;
+    let (dir_a, dir_b) = add_and_clone(&mesh, &a, &b, "proj").await;
+    let repo = a.status().await.repos.remove(0);
+
+    a.stop().await;
+    let file = a.config_dir().mesh_file();
+    let read =
+        || -> serde_json::Value { serde_json::from_slice(&fs::read(&file).unwrap()).unwrap() };
+    let mut state = read();
+    let state = state.as_object_mut().unwrap();
+    state.remove("format");
+    state.insert(
+        "repos".to_owned(),
+        json!({ "proj": { "id": repo.id, "path": repo.path } }),
+    );
+    state.insert(
+        "mesh_repos".to_owned(),
+        json!({ "proj": { "version": 1, "status": { "present": { "id": repo.id } } } }),
+    );
+    fs::write(&file, serde_json::to_vec(state).unwrap()).unwrap();
+
+    a.start().await;
+    assert_eq!(a.status().await.repos[0].id, repo.id);
+    assert_eq!(read()["format"], 2);
+
+    a.wait_peer_connected(&b.name).await;
+    mesh.jj.commit_file(&dir_a, "a.txt", "after upgrade");
+    wait_converged(&dir_a, &dir_b).await;
+    assert!(descriptions(&mesh, &dir_b).contains("after upgrade"));
+}
+
+/// Repos added under one name by machines not connected yet are kept
+/// apart: the name shows as a conflict and selects the repo held here.
+#[tokio::test]
+async fn repos_sharing_a_name_stay_apart() {
+    let mesh = TestMesh::new();
+    let a = mesh.machine("machine-a").await;
+    let b = mesh.machine("machine-b").await;
+    let dir_a = mesh.jj.init_repo("proj-a");
+    a.add_repo("proj", &dir_a).await;
+    b.add_repo("proj", &mesh.jj.init_repo("proj-b")).await;
+    connect(&a, &b).await;
+
+    for machine in [&a, &b] {
+        machine
+            .wait("name conflict", |s| {
+                s.conflicts
+                    .iter()
+                    .any(|c| c.name == "proj" && c.repos.len() == 2)
+                    && s.repos.len() == 1
+                    && s.available.len() == 1
+            })
+            .await;
+    }
+    let forgotten = a
+        .request(&Request::ForgetRepo {
+            name: "proj".to_owned(),
+        })
+        .await;
+    let Response::RepoForgotten { path } = forgotten else {
+        panic!("{forgotten:?}");
+    };
+    assert_eq!(path, fs::canonicalize(&dir_a).unwrap());
 }
 
 /// Hosting again replaces the outstanding ticket: only the newest one is

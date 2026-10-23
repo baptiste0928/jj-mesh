@@ -9,7 +9,7 @@ use tokio::sync::mpsc;
 
 use super::{RepoSet, RepoUpdate, Settings};
 use crate::{
-    config::{MeshState, Repo, RepoId, WorkspaceClaims},
+    config::{MeshState, ObjectHash, Repo, RepoId, WorkspaceClaims},
     daemon::{
         control::{self, WatchStatus, WorkspacePlace, WorkspaceState},
         hub::SyncHub,
@@ -131,14 +131,13 @@ async fn wait_changed(set: &RepoSet) {
 
 fn state_with(name: &str, path: &Path) -> MeshState {
     let mut state = MeshState::default();
-    state.repos.insert(
-        name.to_owned(),
-        Repo {
-            id: RepoId::generate(),
-            path: path.to_owned(),
-            bare: false,
-        },
-    );
+    let repo = Repo {
+        path: path.to_owned(),
+        bare: false,
+    };
+    state
+        .add_repo(RepoId::generate(), name.to_owned(), repo, ObjectHash::Sha1)
+        .unwrap();
     state
 }
 
@@ -476,7 +475,7 @@ fn stale_child(fx: &Fixture, dir: &Path) -> PathBuf {
 
 /// Claims the named workspaces of the single repo in `state`.
 fn claim(state: &mut MeshState, names: &[&str]) {
-    let id = state.repos.values().next().unwrap().id.clone();
+    let id = state.repos.keys().next().unwrap().clone();
     let names = names.iter().map(|name| (*name).to_owned()).collect();
     state.set_claims(&id, names).unwrap();
 }
@@ -550,7 +549,7 @@ async fn leaves_contested_workspaces_alone() {
     claim(&mut state, &["default", "child"]);
     let peer = iroh::SecretKey::generate().public();
     state.add_peer(peer, "desktop".to_owned()).unwrap();
-    let id = state.repos["a"].id.clone();
+    let id = state.repos.keys().next().unwrap().clone();
     let names = BTreeSet::from(["child".to_owned(), "desktop".to_owned()]);
     state.peer_claims.insert(
         peer,

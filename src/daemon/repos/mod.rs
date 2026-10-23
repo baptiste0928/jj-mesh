@@ -31,7 +31,7 @@ use std::{
     time::{Instant, SystemTime},
 };
 
-use color_eyre::eyre::{Result, ensure};
+use color_eyre::eyre::{Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Notify, mpsc, watch};
 use tracing::debug;
@@ -43,30 +43,29 @@ use crate::{
     net::sync::{RepoHealth, RepoHealthState},
 };
 
-/// The set of managed repos, synced from the mesh state and keyed by their
-/// mesh-wide name.
+/// The set of managed repos, synced from the mesh state.
 #[derive(Debug)]
 pub struct RepoSet {
     hub: Arc<SyncHub>,
-    repos: Mutex<BTreeMap<String, RepoHandle>>,
+    repos: Mutex<BTreeMap<RepoId, RepoHandle>>,
     /// Pinged on every repo state change, driving the status broadcast.
     changed: Arc<Notify>,
     /// Settings for every workspace instead of their jj config (tests).
     settings: Option<Settings>,
     /// Where repo tasks send the changes to persist.
     updates: mpsc::UnboundedSender<RepoUpdate>,
-    /// The workspaces being created, as `(repo, workspace)` names.
+    /// The workspaces being created.
     holds: watch::Sender<Holds>,
 }
 
-/// Workspaces whose task waits, as `(repo, workspace)` names.
-type Holds = BTreeSet<(String, String)>;
+/// Workspaces whose task waits, as `(repo, workspace name)` pairs.
+type Holds = BTreeSet<(RepoId, String)>;
 
 /// Holds back a workspace task until dropped (see [`RepoSet::hold`]).
 #[derive(Debug)]
 pub struct WorkspaceHold {
     holds: watch::Sender<Holds>,
-    key: (String, String),
+    key: (RepoId, String),
 }
 
 impl Drop for WorkspaceHold {
@@ -114,7 +113,9 @@ pub enum RepoUpdate {
 /// Book-keeping for one repo task.
 #[derive(Debug)]
 struct RepoHandle {
-    id: RepoId,
+    /// The repo's name in the mesh, which its task logs: a new name
+    /// respawns the task.
+    name: String,
     path: PathBuf,
     state: Arc<Mutex<RepoState>>,
     /// The claims on the repo's workspaces, fed to its task.
@@ -185,18 +186,17 @@ impl RepoSet {
     /// Holds back the task of the workspace named `workspace` of `repo`
     /// until the returned guard drops, so a workspace being created starts
     /// with the settings its creator writes.
-    pub fn hold(&self, repo: &str, workspace: &str) -> Result<WorkspaceHold> {
-        ensure!(
-            self.repos.lock().unwrap().contains_key(repo),
-            "`{repo}` is not registered on this machine",
-        );
-        let key = (repo.to_owned(), workspace.to_owned());
+    pub fn hold(&self, repo: &RepoId, workspace: &str) -> Result<WorkspaceHold> {
+        let Some(name) = self.repos.lock().unwrap().get(repo).map(|h| h.name.clone()) else {
+            bail!("the repo is not registered on this machine");
+        };
+        let key = (repo.clone(), workspace.to_owned());
         let added = self
             .holds
             .send_if_modified(|holds| holds.insert(key.clone()));
         ensure!(
             added,
-            "the workspace `{workspace}` of `{repo}` is already being created",
+            "the workspace `{workspace}` of `{name}` is already being created",
         );
         Ok(WorkspaceHold {
             holds: self.holds.clone(),
@@ -206,39 +206,37 @@ impl RepoSet {
 
     /// Aligns the managed repos with the mesh state: spawns tasks for new
     /// repos, shuts down removed ones and passes on workspace claims. A
-    /// repo whose path or id changed is respawned.
+    /// repo whose path or name changed is respawned.
     pub fn sync(&self, state: &MeshState) {
         let mut repos = self.repos.lock().unwrap();
 
-        repos.retain(|name, handle| {
-            let keep = state
-                .repos
-                .get(name)
-                .is_some_and(|repo| handle.path == repo.path && handle.id == repo.id);
+        repos.retain(|id, handle| {
+            let keep = state.repos.get(id).is_some_and(|repo| {
+                handle.path == repo.path && state.repo_name(id) == Some(&handle.name)
+            });
             if !keep {
-                debug!(repo = %name, "removing repo watch");
+                debug!(repo = %handle.name, "removing repo watch");
                 handle.task.abort();
-                self.hub.unregister_repo(name);
+                self.hub.unregister_repo(id);
             }
             keep
         });
 
-        for (name, repo) in &state.repos {
-            let claims = state.repo_claims(&repo.id);
-            if let Some(handle) = repos.get(name) {
+        for (id, repo) in &state.repos {
+            let claims = state.repo_claims(id);
+            if let Some(handle) = repos.get(id) {
                 if *handle.claims.borrow() != claims {
                     handle.claims.send_replace(claims);
                 }
-            } else {
-                debug!(repo = %name, "managing repo");
-                let recorded = state
-                    .mesh_repos
-                    .get(name)
-                    .and_then(MeshRepo::present)
-                    .map(|(_, object_hash)| object_hash);
-                let handle = spawn_repo(self, name.clone(), repo, claims, recorded);
-                repos.insert(name.clone(), handle);
+                continue;
             }
+            let Some((name, object_hash)) = state.mesh_repos.get(id).and_then(MeshRepo::present)
+            else {
+                continue;
+            };
+            debug!(repo = %name, "managing repo");
+            let handle = spawn_repo(self, id, name.to_owned(), repo, claims, object_hash);
+            repos.insert(id.clone(), handle);
         }
         self.changed.notify_one();
     }
@@ -250,7 +248,7 @@ impl RepoSet {
         let repos = self.repos.lock().unwrap();
         repos
             .iter()
-            .map(|(name, handle)| {
+            .map(|(id, handle)| {
                 let state = match &*handle.state.lock().unwrap() {
                     // Opening and indexing are transitions, not faults.
                     RepoState::Opening | RepoState::Watching { .. } | RepoState::Indexing => {
@@ -260,7 +258,7 @@ impl RepoSet {
                     RepoState::Missing { .. } => RepoHealthState::Missing,
                 };
                 RepoHealth {
-                    name: name.clone(),
+                    id: id.clone(),
                     state,
                 }
             })
@@ -273,7 +271,7 @@ impl RepoSet {
 
         repos
             .iter()
-            .map(|(name, handle)| {
+            .map(|(id, handle)| {
                 let mut workspaces = Vec::new();
                 let watch = match &*handle.state.lock().unwrap() {
                     RepoState::Opening => control::WatchStatus::Opening,
@@ -311,7 +309,8 @@ impl RepoSet {
                     }));
                 }
                 control::RepoStatus {
-                    name: name.clone(),
+                    id: id.clone(),
+                    name: handle.name.clone(),
                     path: handle.path.clone(),
                     watch,
                     workspaces,

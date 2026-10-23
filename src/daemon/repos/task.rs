@@ -100,24 +100,24 @@ const OPEN_STREAM_TIMEOUT: Duration = Duration::from_secs(30);
 /// or reconnects. Kept coarse: the failures it covers are not urgent.
 const FETCH_RETRY: Duration = Duration::from_secs(30);
 
-/// Spawns the watch task for the repo registered as `name`, in a span
-/// that gives its events (and its workspace tasks') the repo field.
+/// Spawns the watch task for the repo `id`, named `name`, in a span that
+/// gives its events (and its workspace tasks') the repo field.
 pub(super) fn spawn_repo(
     set: &RepoSet,
+    id: &RepoId,
     name: String,
     repo: &Repo,
     claims: RepoClaims,
-    recorded_hash: Option<ObjectHash>,
+    recorded_hash: ObjectHash,
 ) -> RepoHandle {
     let state = Arc::new(Mutex::new(RepoState::Opening));
-    let announcements = set.hub.register_repo(name.clone(), repo.id.clone());
+    let announcements = set.hub.register_repo(id.clone());
     let (claims, claims_rx) = watch::channel(claims);
 
     let span = info_span!("repo", repo = %name);
     let task = tokio::spawn(
         run_repo(RepoTask {
-            id: repo.id.clone(),
-            name,
+            id: id.clone(),
             path: repo.path.clone(),
             state: state.clone(),
             hub: set.hub.clone(),
@@ -133,7 +133,7 @@ pub(super) fn spawn_repo(
     );
 
     RepoHandle {
-        id: repo.id.clone(),
+        name,
         path: repo.path.clone(),
         state,
         claims,
@@ -144,7 +144,6 @@ pub(super) fn spawn_repo(
 /// Everything a repo task owns.
 struct RepoTask {
     id: RepoId,
-    name: String,
     path: PathBuf,
     state: Arc<Mutex<RepoState>>,
     hub: Arc<SyncHub>,
@@ -158,7 +157,7 @@ struct RepoTask {
     /// The workspaces of every repo being created.
     holds: watch::Receiver<Holds>,
     /// The git object hash the mesh recorded for the repo at spawn.
-    recorded_hash: Option<ObjectHash>,
+    recorded_hash: ObjectHash,
     updates: mpsc::UnboundedSender<RepoUpdate>,
 }
 
@@ -177,7 +176,7 @@ async fn run_repo(task: RepoTask) {
             // cleanly instead of sitting out a backoff unserved.
             Ok(()) => {
                 info!("repo configuration changed; reopening");
-                task.hub.repo_closed(&task.name, &task.id);
+                task.hub.repo_closed(&task.id);
                 backoff.reset();
                 continue;
             }
@@ -186,7 +185,7 @@ async fn run_repo(task: RepoTask) {
         warn!("repo watch failed: {err:#}");
         // The stores may be stale (moved disk, replaced repo): stop
         // serving fetches from them until the reopen succeeds.
-        task.hub.repo_closed(&task.name, &task.id);
+        task.hub.repo_closed(&task.id);
 
         if started.elapsed() >= STABLE_WATCH {
             backoff.reset();
@@ -226,7 +225,7 @@ impl RepoTask {
         let (jj, repo, fingerprint) = self.open().await?;
         // Fetch serving is dispatched by the hub (see `hub::serve`), never
         // by this loop: a fetch below may block on the very peer being served.
-        self.hub.repo_opened(&self.name, &self.id, repo.clone());
+        self.hub.repo_opened(&self.id, repo.clone());
         self.correct_object_hash(&repo);
 
         // Watch before the first read: changes racing the setup produce at
@@ -242,7 +241,7 @@ impl RepoTask {
         // Publishing on watch start doubles as anti-entropy: changes made
         // while the watch was down are absorbed into the baseline above and
         // would otherwise never be announced.
-        self.hub.publish(&self.name, &self.id, wire_heads(&heads));
+        self.hub.publish(&self.id, wire_heads(&heads));
         // Heal heads left without a commit index (a fetch whose index
         // build failed, or a repo synced by an older jj-mesh) before any
         // jj run below pays for the rebuild.
@@ -326,7 +325,7 @@ impl RepoTask {
                 } else {
                     info!("announcing local change");
                 }
-                self.hub.publish(&self.name, &self.id, wire_heads(&heads));
+                self.hub.publish(&self.id, wire_heads(&heads));
                 rescan = true;
             }
             if rescan {
@@ -420,7 +419,7 @@ impl RepoTask {
             .holds
             .borrow()
             .iter()
-            .filter(|(repo, _)| *repo == self.name)
+            .filter(|(repo, _)| *repo == self.id)
             .map(|(_, workspace)| workspace.clone())
             .collect();
         for found in scan.found {
@@ -539,10 +538,7 @@ impl RepoTask {
             .map_err(|_| eyre!("timed out opening the fetch stream"))??;
         let outcome = transfer::fetch(
             repo,
-            transfer::RepoIdent {
-                name: &self.name,
-                id: &self.id,
-            },
+            &self.id,
             wants,
             transfer::FetchOptions {
                 format: GitTransferFormat::Loose,
@@ -598,11 +594,7 @@ impl RepoTask {
     /// records written before the hash was gossiped read as SHA-1.
     fn correct_object_hash(&self, repo: &OpenRepo) {
         match repo.object_hash() {
-            Ok(object_hash)
-                if self
-                    .recorded_hash
-                    .is_some_and(|recorded| recorded != object_hash) =>
-            {
+            Ok(object_hash) if self.recorded_hash != object_hash => {
                 info!(%object_hash, "correcting the object hash the mesh records");
                 let _ = self.updates.send(RepoUpdate::ObjectHash {
                     repo: self.id.clone(),

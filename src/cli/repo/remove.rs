@@ -19,7 +19,7 @@ use crate::{
 /// forget` instead.
 #[derive(Debug, Args)]
 pub struct RemoveArgs {
-    /// Name of the repo in the mesh
+    /// Name or id of the repo in the mesh
     #[arg(add = ArgValueCandidates::new(complete::mesh_repos))]
     name: String,
 

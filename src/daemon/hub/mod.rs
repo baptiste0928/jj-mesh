@@ -31,7 +31,7 @@ use std::{
 
 use iroh::{EndpointId, endpoint::Connection};
 use tokio::sync::Notify;
-use tracing::{debug, warn};
+use tracing::debug;
 
 pub use self::inbox::{Inbox, PeerAnnounce};
 pub use self::pull::CloneSource;
@@ -41,7 +41,7 @@ use self::{
     serve::Serving,
 };
 use crate::{
-    config::{Membership, RepoId, sanitize, validate_name},
+    config::{Membership, RepoId, sanitize},
     net::sync::{Announce, StatusReport},
     repo::OpenRepo,
 };
@@ -65,7 +65,7 @@ pub struct SyncHub {
 
 #[derive(Debug, Default)]
 struct HubState {
-    repos: BTreeMap<String, RepoEntry>,
+    repos: BTreeMap<RepoId, RepoEntry>,
     peers: BTreeMap<EndpointId, PeerSender>,
     /// Announcement sequence, monotonic across every repo for the whole
     /// daemon run. Shared rather than per repo so a repo forgotten and
@@ -73,7 +73,7 @@ struct HubState {
     /// reset their per-repo watermark on a new connection.
     announce_seq: u64,
     /// See [`orphans`].
-    orphans: BTreeMap<String, BTreeMap<EndpointId, OrphanAnnounce>>,
+    orphans: BTreeMap<RepoId, BTreeMap<EndpointId, OrphanAnnounce>>,
     /// This machine's latest membership, replayed to connecting peers and
     /// broadcast on every change (see [`SyncHub::publish_membership`]).
     membership: Membership,
@@ -105,12 +105,11 @@ impl HubState {
 
     /// Drops everything learned from `peer` over its previous connection.
     /// Sequence tracking is per connection (a restarted peer daemon starts
-    /// over from 1), and conflicts, orphan announcements and reports come
-    /// back with the replay if still real.
+    /// over from 1), and orphan announcements and reports come back with
+    /// the replay if still real.
     fn forget_peer(&mut self, peer: &EndpointId) {
         for entry in self.repos.values_mut() {
             entry.inbox.forget(peer);
-            entry.conflicts.remove(peer);
         }
         self.forget_orphan_peer(peer);
         self.reports.remove(peer);
@@ -120,10 +119,6 @@ impl HubState {
 /// Hub-side state of one registered repo.
 #[derive(Debug)]
 struct RepoEntry {
-    /// The local id of the repo, checked against announcements and fetch
-    /// requests: a name match with a different id is a conflict, never a
-    /// sync.
-    id: RepoId,
     /// Sequence of the latest publish (drawn from [`HubState::announce_seq`]),
     /// stamped into announcements so receivers can discard reordered ones.
     seq: u64,
@@ -131,10 +126,6 @@ struct RepoEntry {
     /// until the repo task first publishes (repo not opened yet).
     published: Option<Vec<Vec<u8>>>,
     inbox: Arc<Inbox>,
-    /// Peers whose last announcement for this name carried a different id.
-    /// An entry clears when its peer announces the matching id again or
-    /// disconnects.
-    conflicts: BTreeMap<EndpointId, RepoId>,
     /// Serve handle, present while the repo task has the repo open (see
     /// [`serve`] for why the hub dispatches fetches itself).
     serving: Option<Serving>,
@@ -154,36 +145,23 @@ impl SyncHub {
     }
 
     /// Registers a repo, returning the inbox its task drains inbound
-    /// announcements from. Replaces any previous registration for the name.
-    /// Orphan announcements held for the name seed the inbox, so they move
-    /// back to the orphans on unregistration, or become conflicts when
-    /// their id disagrees; the peers that sent them would otherwise never
-    /// re-warn an idle repo.
-    pub fn register_repo(&self, name: String, id: RepoId) -> Arc<Inbox> {
+    /// announcements from. Replaces any previous registration of the repo.
+    /// Orphan announcements held for it seed the inbox, so they move back
+    /// to the orphans on unregistration; the peers that sent them would
+    /// otherwise never re-warn an idle repo.
+    pub fn register_repo(&self, id: RepoId) -> Arc<Inbox> {
         let inbox = Arc::new(Inbox::default());
         let mut state = self.state.lock().unwrap();
-
-        let mut conflicts = BTreeMap::new();
-        for (peer, announce) in state.take_orphans(&name) {
-            if announce.id == id {
-                inbox.offer(peer, announce.seq, announce.heads);
-            } else {
-                warn!(
-                    repo = %name, peer = %peer_name(&state.names, &peer),
-                    "peer announces a different repo under this name; not syncing with it",
-                );
-                conflicts.insert(peer, announce.id);
-            }
+        for (peer, announce) in state.take_orphans(&id) {
+            inbox.offer(peer, announce.seq, announce.heads);
         }
 
         state.repos.insert(
-            name,
+            id,
             RepoEntry {
-                id,
                 seq: 0,
                 published: None,
                 inbox: inbox.clone(),
-                conflicts,
                 serving: None,
             },
         );
@@ -191,32 +169,16 @@ impl SyncHub {
     }
 
     /// Makes an opened repo servable. Called by the repo task once its
-    /// stores are open; replaces the handle from a previous open. The id
-    /// guards against a stale task of a replaced same-name repo installing
-    /// the wrong stores (aborts only land at the task's next await point).
-    pub fn repo_opened(&self, name: &str, id: &RepoId, repo: Arc<OpenRepo>) {
-        if let Some(entry) = self
-            .state
-            .lock()
-            .unwrap()
-            .repos
-            .get_mut(name)
-            .filter(|entry| &entry.id == id)
-        {
+    /// stores are open; replaces the handle from a previous open.
+    pub fn repo_opened(&self, id: &RepoId, repo: Arc<OpenRepo>) {
+        if let Some(entry) = self.state.lock().unwrap().repos.get_mut(id) {
             entry.serving = Some(Serving::new(repo));
         }
     }
 
     /// Stops serving a repo (its watch failed; the stores may be stale).
-    pub fn repo_closed(&self, name: &str, id: &RepoId) {
-        if let Some(entry) = self
-            .state
-            .lock()
-            .unwrap()
-            .repos
-            .get_mut(name)
-            .filter(|entry| &entry.id == id)
-        {
+    pub fn repo_closed(&self, id: &RepoId) {
+        if let Some(entry) = self.state.lock().unwrap().repos.get_mut(id) {
             entry.serving = None;
         }
     }
@@ -228,38 +190,28 @@ impl SyncHub {
     }
 
     /// Removes a repo registration (a local forget, a mesh-wide removal,
-    /// or a same-name replacement).
+    /// or a restart of its task).
     ///
     /// The peers' last announcements move back to the orphan store, so the
     /// repo stays immediately clonable here: peers only re-announce on a
     /// head change or a reconnect, which could otherwise be arbitrarily
     /// far away. A retraction (an announcement with no heads) also goes
-    /// out, so peers holding a name conflict against this instance release
-    /// it instead of staying stuck until this machine disconnects.
-    pub fn unregister_repo(&self, name: &str) {
+    /// out, so peers stop counting this machine as a source.
+    pub fn unregister_repo(&self, id: &RepoId) {
         let mut state = self.state.lock().unwrap();
-        let Some(entry) = state.repos.remove(name) else {
+        let Some(entry) = state.repos.remove(id) else {
             return;
         };
 
         for PeerAnnounce { peer, seq, heads } in entry.inbox.snapshot() {
-            state.remember_orphan(
-                peer,
-                name.to_owned(),
-                OrphanAnnounce {
-                    id: entry.id.clone(),
-                    seq,
-                    heads,
-                },
-            );
+            state.remember_orphan(peer, id.clone(), OrphanAnnounce { seq, heads });
         }
         self.orphaned.notify_one();
 
         if entry.published.is_some() {
             state.announce_seq += 1;
             let announce = Announce {
-                name: name.to_owned(),
-                id: entry.id,
+                id: id.clone(),
                 seq: state.announce_seq,
                 heads: Vec::new(),
             };
@@ -269,12 +221,11 @@ impl SyncHub {
 
     /// Publishes a repo's current op heads: cached for peers that connect
     /// later and queued to every connected peer's outbox, coalescing with
-    /// any announcement still pending there. The id guards against a stale
-    /// task of a replaced same-name repo announcing the wrong heads.
-    pub fn publish(&self, name: &str, id: &RepoId, heads: Vec<Vec<u8>>) {
+    /// any announcement still pending there.
+    pub fn publish(&self, id: &RepoId, heads: Vec<Vec<u8>>) {
         let mut guard = self.state.lock().unwrap();
         let state = &mut *guard;
-        let Some(entry) = state.repos.get_mut(name).filter(|entry| &entry.id == id) else {
+        let Some(entry) = state.repos.get_mut(id) else {
             return;
         };
         state.announce_seq += 1;
@@ -282,8 +233,7 @@ impl SyncHub {
         entry.published = Some(heads.clone());
 
         let announce = Announce {
-            name: name.to_owned(),
-            id: entry.id.clone(),
+            id: id.clone(),
             seq: entry.seq,
             heads,
         };
@@ -336,11 +286,10 @@ impl SyncHub {
         if let Some(report) = &state.status {
             outbox.push_status(report.clone());
         }
-        for (name, entry) in &state.repos {
+        for (id, entry) in &state.repos {
             if let Some(heads) = &entry.published {
                 outbox.push_announce(Announce {
-                    name: name.clone(),
-                    id: entry.id.clone(),
+                    id: id.clone(),
                     seq: entry.seq,
                     heads: heads.clone(),
                 });
@@ -379,22 +328,13 @@ impl SyncHub {
     }
 
     /// Routes an inbound announcement to its repo's inbox; announcements
-    /// for unregistered names are remembered for `clone`, and a registered
-    /// name announced with a different id is recorded as a conflict.
+    /// for unregistered repos are remembered for `clone`.
     ///
     /// An announcement without heads is a retraction (the peer forgot its
     /// instance; a held repo always has at least one op head): it releases
-    /// everything attributed to the peer for the name, like a disconnect
+    /// everything attributed to the peer for the repo, like a disconnect
     /// scoped to one repo.
     pub fn route(&self, peer: EndpointId, announce: Announce) {
-        // Repo names arriving from peers are validated before any use:
-        // they end up in logs and as map keys, and must never carry
-        // unbounded length or confusables.
-        if validate_name("repo", &announce.name).is_err() {
-            let peer = self.peer_name(&peer);
-            debug!(%peer, "dropping announcement with an invalid repo name");
-            return;
-        }
         // Bounds what an announcement holds, kept as an orphan or in an
         // inbox.
         if announce.heads.len() > MAX_ANNOUNCED_HEADS
@@ -408,21 +348,16 @@ impl SyncHub {
 
         let mut guard = self.state.lock().unwrap();
         let state = &mut *guard;
-        let Some(entry) = state.repos.get_mut(&announce.name) else {
+        let Some(entry) = state.repos.get_mut(&announce.id) else {
             if retraction {
-                state.forget_orphan(&announce.name, &peer);
+                state.forget_orphan(&announce.id, &peer);
                 return;
             }
-            let remembered = state.remember_orphan(
-                peer,
-                announce.name,
-                OrphanAnnounce {
-                    id: announce.id,
-                    seq: announce.seq,
-                    heads: announce.heads,
-                },
-            );
-            if remembered {
+            let orphan = OrphanAnnounce {
+                seq: announce.seq,
+                heads: announce.heads,
+            };
+            if state.remember_orphan(peer, announce.id, orphan) {
                 self.orphaned.notify_one();
             } else {
                 let peer = peer_name(&state.names, &peer);
@@ -432,44 +367,18 @@ impl SyncHub {
         };
 
         if retraction {
-            entry.conflicts.remove(&peer);
             entry.inbox.retract(peer, announce.seq);
-            return;
+        } else {
+            entry.inbox.offer(peer, announce.seq, announce.heads);
         }
-
-        if entry.id != announce.id {
-            if !entry.conflicts.contains_key(&peer) {
-                warn!(
-                    repo = %announce.name, peer = %peer_name(&state.names, &peer),
-                    "peer announces a different repo under this name; not syncing with it",
-                );
-            }
-            entry.conflicts.insert(peer, announce.id);
-            return;
-        }
-        entry.conflicts.remove(&peer);
-        entry.inbox.offer(peer, announce.seq, announce.heads);
-    }
-
-    /// The current name conflicts, one entry per contesting peer.
-    pub fn conflicts(&self) -> Vec<(String, EndpointId)> {
-        let state = self.state.lock().unwrap();
-        state
-            .repos
-            .iter()
-            .flat_map(|(name, entry)| entry.conflicts.keys().map(|peer| (name.clone(), *peer)))
-            .collect()
     }
 
     /// Stores a peer's status report for `jj-mesh status`. The peer is
     /// authenticated but its strings reach the user's terminal, so the
-    /// free-form fields are sanitized and invalid repo names dropped.
+    /// free-form fields are sanitized.
     pub fn route_status(&self, peer: EndpointId, mut report: StatusReport) {
         report.daemon_version = sanitize(&report.daemon_version);
         report.jj_version = report.jj_version.as_deref().map(sanitize);
-        report
-            .repos
-            .retain(|repo| validate_name("repo", &repo.name).is_ok());
 
         let mut state = self.state.lock().unwrap();
         // Only connected peers may hold a slot, or a report racing its

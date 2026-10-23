@@ -300,7 +300,7 @@ impl Machine {
     /// Waits until the mesh repo `name` is clonable on this machine.
     pub async fn wait_available(&self, name: &str) {
         self.wait(&format!("{name} available"), |s| {
-            s.available.iter().any(|repo| repo == name)
+            s.available.iter().any(|repo| repo.name == name)
         })
         .await;
     }
