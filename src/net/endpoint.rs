@@ -1,14 +1,15 @@
 //! Iroh endpoint construction.
 
 use color_eyre::eyre::Result;
-use iroh::{Endpoint, endpoint::presets};
+use iroh::{Endpoint, endpoint::presets, tls::CaTlsConfig};
 
 use crate::config::MachineKey;
 
 /// How the iroh endpoint reaches the network.
 #[derive(Debug, Clone, Default)]
 pub enum EndpointOptions {
-    /// The n0 defaults: public relays with pkarr/DNS discovery.
+    /// The n0 defaults: public relays with pkarr/DNS discovery, verifying
+    /// their TLS certificates against the system CA store.
     #[default]
     Production,
     /// Hermetic mode for tests: no relays, no external discovery. The bound
@@ -43,6 +44,7 @@ pub async fn bind_endpoint(
     match options {
         EndpointOptions::Production => {
             let endpoint = Endpoint::builder(presets::N0)
+                .ca_tls_config(CaTlsConfig::system())
                 .secret_key(key.secret().clone())
                 .alpns(alpns)
                 .bind()
