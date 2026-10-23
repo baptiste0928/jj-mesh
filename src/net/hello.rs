@@ -62,13 +62,13 @@ impl Incompatible {
 impl fmt::Display for Incompatible {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let update = if self.outdated_here() {
-            "update this machine"
+            "Update this machine"
         } else {
-            "update it"
+            "Update it"
         };
         write!(
             f,
-            "the peer runs jj-mesh {} (protocol {}, ours is {PROTOCOL}): {update}",
+            "the peer runs jj-mesh {} (protocol {}, ours is {PROTOCOL}). {update}",
             self.0.version, self.0.protocol,
         )
     }

@@ -486,7 +486,7 @@ impl OpenRepo {
         let git = self.git_backend().git_repo();
         ensure!(
             !git.is_shallow(),
-            "the git repo is shallow, which syncing does not support; fetch \
+            "the git repo is shallow, which syncing does not support. Fetch \
              its full history with `git --git-dir {} fetch --unshallow`",
             self.git_repo_path().display(),
         );

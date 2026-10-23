@@ -245,7 +245,7 @@ impl MeshState {
         if let Some(mesh_id) = self.mesh_repo_id(name)
             && mesh_id != id
         {
-            bail!("a repo named `{name}` already exists in the mesh; clone it instead");
+            bail!("a repo named `{name}` already exists in the mesh. Clone it instead");
         }
 
         Ok(())
@@ -316,8 +316,8 @@ impl MeshState {
         match matches[..] {
             [endpoint] => return Ok(*endpoint),
             [_, _, ..] => bail!(
-                "several peers are named `{selector}`; use the endpoint id \
-                 (see `jj-mesh status`)"
+                "several peers are named `{selector}`. Rename one of them with \
+                 `jj-mesh peer rename` on its machine"
             ),
             [] => {}
         }
@@ -432,7 +432,7 @@ impl MeshState {
             None => bail!("no repo named `{name}` is registered on this machine"),
             Some(repo) if repo.bare => {
                 bail!(
-                    "`{name}` is a bare repo kept by server mode; disable it or remove the repo from the mesh"
+                    "`{name}` is a bare repo kept by server mode. Disable server mode or remove the repo from the mesh"
                 )
             }
             Some(_) => Ok(self.unregister_repo(name).expect("registered")),
@@ -1004,7 +1004,7 @@ mod tests {
                 ObjectHash::Sha1,
             )
             .unwrap_err();
-        assert!(err.to_string().contains("clone"), "{err:#}");
+        assert!(err.to_string().contains("Clone it"), "{err:#}");
     }
 
     #[test]
@@ -1077,7 +1077,7 @@ mod tests {
                 ObjectHash::Sha1,
             )
             .unwrap_err();
-        assert!(err.to_string().contains("clone"), "{err:#}");
+        assert!(err.to_string().contains("Clone it"), "{err:#}");
     }
 
     #[test]

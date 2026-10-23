@@ -29,13 +29,10 @@ pub(super) fn mesh_repos() -> Vec<CompletionCandidate> {
         .collect()
 }
 
-/// The alive peers (`peer remove`), with their endpoint id as help text
-/// since names can be ambiguous.
+/// The alive peers (`peer remove`).
 pub(super) fn peers() -> Vec<CompletionCandidate> {
     state()
         .alive_peers()
-        .map(|(endpoint, name)| {
-            CompletionCandidate::new(name).help(Some(endpoint.to_string().into()))
-        })
+        .map(|(_, name)| CompletionCandidate::new(name))
         .collect()
 }

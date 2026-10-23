@@ -208,7 +208,7 @@ fn add_workspace(
 ) -> Result<()> {
     ensure!(
         !path.exists(),
-        "{} already exists: `{name}` is already cloned in {}, pass the directory of a new workspace",
+        "{} already exists and `{name}` is already cloned in {}. Pass the directory of a new workspace",
         path.display(),
         repo.display(),
     );
@@ -314,7 +314,7 @@ fn create_workspace(
     if !hold.is_held() {
         eprintln!(
             "{} the daemon restarted while the workspace was created and may run it with \
-             other settings: restart it with `jj-mesh service restart`",
+             other settings. Restart it with `jj-mesh service restart`",
             ui::warn("warning:").for_stderr(),
         );
     }
@@ -347,7 +347,7 @@ fn pick(state: &MeshState) -> Result<String> {
     let available: Vec<&str> = state.mesh_repo_names().collect();
     ensure!(
         !available.is_empty(),
-        "no repo to clone: add one with `jj-mesh add` on another machine",
+        "no repo to clone. Add one with `jj-mesh add` on another machine",
     );
     let name = ui::select("Repo to clone", &available)?
         .ok_or_eyre("the name of the repo to clone is required")?;
@@ -364,7 +364,7 @@ fn default_path(name: &str) -> Result<PathBuf> {
             path.components().collect::<Vec<_>>()[..],
             [Component::Normal(_)]
         ),
-        "`{name}` is not a directory name: pass the directory to clone into",
+        "`{name}` is not a directory name. Pass the directory to clone into",
     );
     Ok(path)
 }

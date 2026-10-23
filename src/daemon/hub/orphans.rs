@@ -105,15 +105,15 @@ impl SyncHub {
 
         let Some(id) = sources.first().map(|(_, announce)| announce.id.clone()) else {
             bail!(
-                "no connected peer announces a repo named `{name}`; check \
+                "no connected peer announces a repo named `{name}`. Check \
                  that the other machine's daemon is running and the name is \
                  correct"
             );
         };
         ensure!(
             sources.iter().all(|(_, announce)| announce.id == id),
-            "peers announce different repos under the name `{name}`; \
-             resolve the conflict before cloning",
+            "peers announce different repos under the name `{name}`. \
+             Resolve the conflict before cloning",
         );
 
         Ok((

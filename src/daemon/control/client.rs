@@ -17,7 +17,7 @@ use crate::{
 };
 
 /// Hint for a daemon of another build.
-const RESTART_HINT: &str = "restart it with `jj-mesh service restart`";
+const RESTART_HINT: &str = "Restart it with `jj-mesh service restart`";
 
 /// Environment variable that, when set to a non-empty value, lets the CLI
 /// talk to a daemon of another build, for testing builds known to be
@@ -83,12 +83,12 @@ impl ControlClient {
             .ok()
             .and_then(Result::ok)
             .ok_or_else(|| {
-                eyre!("the daemon did not send its build, it likely runs an older jj-mesh: {RESTART_HINT}")
+                eyre!("the daemon did not send its build, it likely runs an older jj-mesh. {RESTART_HINT}")
             })?;
         let ignore = std::env::var_os(IGNORE_BUILD_VAR).is_some_and(|value| !value.is_empty());
         if !ignore && builds_differ(&build, BUILD) {
             bail!(
-                "the daemon runs jj-mesh build {build} while this command is build {BUILD}: \
+                "the daemon runs jj-mesh build {build} while this command is build {BUILD}. \
                  {RESTART_HINT}"
             );
         }
@@ -120,9 +120,10 @@ impl ControlClient {
                 .map_err(|_| eyre!("the daemon did not answer"))?,
             None => read.await,
         };
-        response.wrap_err_with(|| {
-            format!("cannot read the daemon's answer: if it runs another build, {RESTART_HINT}")
-        })
+        response.wrap_err(
+            "cannot read the daemon's answer (if it runs another build, restart it with \
+             `jj-mesh service restart`)",
+        )
     }
 }
 

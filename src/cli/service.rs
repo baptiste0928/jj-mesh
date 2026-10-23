@@ -112,7 +112,7 @@ pub(super) fn ensure_running(dir: &ConfigDir) -> Result<control::Status> {
         None => {
             ensure!(
                 ui::confirm("Install the background service?", true)?.unwrap_or(false),
-                "jj-mesh needs its daemon: install it with `jj-mesh service install`",
+                "jj-mesh needs its daemon. Install it with `jj-mesh service install`",
             );
             install(dir, None, None)
         }
@@ -120,7 +120,7 @@ pub(super) fn ensure_running(dir: &ConfigDir) -> Result<control::Status> {
         Some(service) => {
             ensure!(
                 ui::confirm("The background service is stopped. Start it?", true)?.unwrap_or(false),
-                "jj-mesh needs its daemon: start it with `jj-mesh service start`",
+                "jj-mesh needs its daemon. Start it with `jj-mesh service start`",
             );
             start(&service, dir)
         }
@@ -129,15 +129,15 @@ pub(super) fn ensure_running(dir: &ConfigDir) -> Result<control::Status> {
 
 /// The installed service.
 fn installed() -> Result<Service> {
-    Service::find()?.ok_or_eyre("the service is not installed: run `jj-mesh service install`")
+    Service::find()?.ok_or_eyre("the service is not installed. Run `jj-mesh service install`")
 }
 
 /// Refuses to replace or remove a service another program manages.
 fn ensure_ours(service: &Service) -> Result<()> {
     ensure!(
         !service.is_external(),
-        "{} is managed by another program (such as Home Manager): \
-         update that configuration instead",
+        "{} is managed by another program (such as Home Manager). \
+         Update that configuration instead",
         service.path().display(),
     );
     Ok(())
@@ -158,7 +158,7 @@ fn install(
     let running = installed.is_some_and(|s| s.status().is_ok_and(|s| s == Status::Running));
     ensure!(
         running || matches!(control::block_on(ControlClient::connect(dir)), Ok(None)),
-        "a jj-mesh daemon already runs outside the service: stop it first",
+        "a jj-mesh daemon already runs outside the service. Stop it first",
     );
     let service = Service::ours()?;
 
@@ -178,7 +178,7 @@ fn install(
     let jj = jj.unwrap_or_else(|| jj_bin().into());
     let jj = which(&jj, &search_path()).ok_or_else(|| {
         eyre!(
-            "cannot find {}: pass its path with `--jj-bin`",
+            "cannot find {}. Pass its path with `--jj-bin`",
             jj.display()
         )
     })?;
@@ -231,7 +231,7 @@ fn wait_started(service: &Service, dir: &ConfigDir) -> Result<control::Status> {
     std::thread::sleep(START_SETTLE);
     ensure!(
         service.status()? == Status::Running,
-        "the service started but died; check its logs",
+        "the service started but died. Check its logs",
     );
     Ok(status)
 }
@@ -247,7 +247,7 @@ fn wait_ready(dir: &ConfigDir) -> Result<control::Status> {
         }
         if left.is_zero() {
             bail!(
-                "no daemon answered for {}; check the service logs, and that the service uses \
+                "no daemon answered for {}. Check the service logs, and that the service uses \
                  this config directory",
                 dir.path().display(),
             );

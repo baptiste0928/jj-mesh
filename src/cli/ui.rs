@@ -17,7 +17,7 @@ use std::{
 };
 
 use color_eyre::eyre::{Result, WrapErr as _};
-use console::{StyledObject, Term, style};
+use console::{Alignment, StyledObject, Term, measure_text_width, pad_str, style};
 use dialoguer::{Confirm, Input, Select, theme::ColorfulTheme};
 
 /// Bold section heading.
@@ -69,10 +69,35 @@ pub(super) fn format_duration(secs: u64) -> String {
     }
 }
 
-/// Width of the longest name, for column alignment. Counts chars to match
-/// the `{:width$}` padding, which is not byte-based.
-pub(super) fn name_width<'a>(names: impl Iterator<Item = &'a str>) -> usize {
-    names.map(|name| name.chars().count()).max().unwrap_or(0)
+/// Formats an age in seconds with its largest unit only (`12m`, `3d`...).
+pub(super) fn format_age(secs: u64) -> String {
+    match secs {
+        s if s < 60 => format!("{s}s"),
+        s if s < 3600 => format!("{}m", s / 60),
+        s if s < 86400 => format!("{}h", s / 3600),
+        s => format!("{}d", s / 86400),
+    }
+}
+
+/// Lays out rows as left-aligned columns two spaces apart. Cells may be
+/// styled: widths ignore escape codes. Trailing empty cells add no padding.
+pub(super) fn table<const N: usize>(rows: &[[String; N]]) -> Vec<String> {
+    let mut widths = [0; N];
+    for row in rows {
+        for (width, cell) in widths.iter_mut().zip(row) {
+            *width = (*width).max(measure_text_width(cell));
+        }
+    }
+    rows.iter()
+        .map(|row| {
+            let cells: Vec<_> = row
+                .iter()
+                .zip(&widths)
+                .map(|(cell, &width)| pad_str(cell, width, Alignment::Left, None))
+                .collect();
+            cells.join("  ").trim_end().to_owned()
+        })
+        .collect()
 }
 
 /// Whether prompts can be shown.

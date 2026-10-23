@@ -41,7 +41,7 @@ pub fn run(args: SetupArgs, dir: &ConfigDir) -> Result<()> {
     // Resolved as the service will run it.
     let path = std::env::var_os("PATH").unwrap_or_default();
     let jj = crate::service::which(Path::new(&jj_bin()), &path)
-        .ok_or_eyre("jj is not found (on PATH or via JJ_BIN): install it first")?;
+        .ok_or_eyre("jj is not found on PATH or via JJ_BIN. Install it first")?;
     if let Some(warning) = jj_version_warning(jj_version(jj.as_os_str()).as_deref()) {
         eprintln!("{} {warning}", ui::warn("warning:").for_stderr());
     }

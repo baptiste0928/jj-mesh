@@ -37,7 +37,11 @@ use crate::config::ConfigDir;
 /// Use `jj-mesh status` to inspect peers, repos, and synchronization status.
 #[allow(rustdoc::bare_urls, rustdoc::invalid_html_tags)]
 #[derive(Debug, Parser)]
-#[command(name = "jj-mesh", version, verbatim_doc_comment)]
+#[command(
+    name = "jj-mesh",
+    version = concat!(env!("CARGO_PKG_VERSION"), " (", env!("JJ_MESH_COMMIT"), ")"),
+    verbatim_doc_comment
+)]
 pub struct Cli {
     /// Custom configuration directory
     ///
@@ -90,7 +94,7 @@ pub fn run() -> Result<()> {
         Command::Server(args) => server::run(&args, &dir),
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         Command::Service(args) => service::run(args, &dir),
-        Command::Status(args) => status::run(args, &dir),
+        Command::Status(args) => status::run(&args, &dir),
         Command::Logs(args) => logs::run(&args, &dir),
         Command::RunDaemon(args) => run_daemon::run(args, &dir),
     }

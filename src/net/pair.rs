@@ -315,8 +315,8 @@ pub async fn join(
             if close.error_code == VarInt::from_u32(0)
                 && close.reason.as_ref() == PAIRED_REASON => {}
         reason => bail!(
-            "connection lost before pairing completed ({reason}); \
-             check `jj-mesh status` on the other machine before retrying",
+            "connection lost before pairing completed ({reason}). \
+             Check `jj-mesh status` on the other machine before retrying",
         ),
     }
 
