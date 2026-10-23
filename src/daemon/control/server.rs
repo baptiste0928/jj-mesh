@@ -243,6 +243,9 @@ async fn handle_client(
         Request::HoldWorkspace { repo, workspace } => {
             hold_workspace(&mut stream, &ctx, &repo, &workspace).await
         }
+        Request::RenameRepo { name, new } => {
+            reply(&mut stream, rename_repo(&ctx, &name, &new)).await
+        }
     };
 
     if let Err(err) = served {
@@ -351,6 +354,15 @@ fn remove_repo(ctx: &ControlContext, name: &str) -> Result<Response> {
         .update(|state| state.remove_repo(&state.resolve_repo(name)?))?;
     info!(repo = %name, "repo removed from the mesh");
     Ok(Response::RepoRemoved { was_local })
+}
+
+/// Renames a mesh repo; the gossip propagates the new name to the other
+/// machines.
+fn rename_repo(ctx: &ControlContext, name: &str, new: &str) -> Result<Response> {
+    ctx.store
+        .update(|state| state.rename_repo(&state.resolve_repo(name)?, new.to_owned()))?;
+    info!(repo = %new, from = %name, "repo renamed");
+    Ok(Response::RepoRenamed)
 }
 
 /// Unregisters a repo on this machine only: the repo set stops watching

@@ -224,6 +224,18 @@ impl Machine {
         was_local
     }
 
+    /// Renames the mesh repo `name` to `new`, as `jj-mesh repo rename`
+    /// would.
+    pub async fn rename_repo(&self, name: &str, new: &str) {
+        let response = self
+            .request(&Request::RenameRepo {
+                name: name.to_owned(),
+                new: new.to_owned(),
+            })
+            .await;
+        assert!(matches!(response, Response::RepoRenamed), "{response:?}");
+    }
+
     /// Switches server mode, as `jj-mesh server` would.
     pub async fn set_server(&self, server: bool) {
         let response = self.request(&Request::SetServer { server }).await;

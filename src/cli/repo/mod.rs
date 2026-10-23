@@ -4,6 +4,7 @@ mod add;
 mod clone;
 mod forget;
 mod remove;
+mod rename;
 mod settings;
 
 use std::path::Path;
@@ -34,6 +35,7 @@ enum RepoCommand {
     Clone(clone::CloneArgs),
     Forget(forget::ForgetArgs),
     Remove(remove::RemoveArgs),
+    Rename(rename::RenameArgs),
 }
 
 /// Runs the `repo` command.
@@ -43,6 +45,7 @@ pub fn run(args: RepoArgs, dir: &ConfigDir) -> Result<()> {
         RepoCommand::Clone(args) => clone::run(args, dir),
         RepoCommand::Forget(args) => forget::run(args, dir),
         RepoCommand::Remove(args) => remove::run(args, dir),
+        RepoCommand::Rename(args) => rename::run(args, dir),
     }
 }
 

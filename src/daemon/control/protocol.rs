@@ -22,7 +22,7 @@ pub(super) const MAX_MESSAGE_SIZE: u32 = 1 << 20;
 /// Time budget for the quick parts of an exchange (request, status answer).
 pub const CLIENT_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Time budget the CLI grants quick mutating requests (add, remove).
+/// Time budget the CLI grants quick mutating requests (add, remove, rename).
 pub const MUTATE_WAIT: Duration = Duration::from_secs(10);
 
 /// How long an issued pairing ticket stays valid. Kept here because the
@@ -101,6 +101,10 @@ pub enum Request {
     /// or [`Response::Error`]; the hold lasts until the client
     /// disconnects.
     HoldWorkspace { repo: String, workspace: String },
+    /// Rename the mesh repo `name` to `new`; the other machines learn it
+    /// through the gossip. Answered with [`Response::RepoRenamed`] or
+    /// [`Response::Error`].
+    RenameRepo { name: String, new: String },
 }
 
 /// A daemon answer to a [`Request`].
@@ -156,6 +160,8 @@ pub enum Response {
     ServerSet,
     /// The workspace is held until the client disconnects.
     WorkspaceHeld,
+    /// The repo is renamed in the mesh state.
+    RepoRenamed,
 }
 
 /// Header of a [`Request::Logs`] stream.

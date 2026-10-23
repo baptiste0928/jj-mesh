@@ -214,6 +214,28 @@ async fn legacy_state_upgrades_seamlessly() {
     assert!(descriptions(&mesh, &dir_b).contains("after upgrade"));
 }
 
+/// A repo renamed on one machine keeps syncing under its new name on the
+/// machines holding it.
+#[tokio::test]
+async fn renamed_repo_keeps_syncing() {
+    let mesh = TestMesh::new();
+    let (a, b) = mesh.connected_pair().await;
+    let (dir_a, dir_b) = add_and_clone(&mesh, &a, &b, "proj").await;
+
+    a.rename_repo("proj", "renamed").await;
+    b.wait("proj renamed", |s| {
+        s.repos
+            .iter()
+            .map(|repo| repo.name.as_str())
+            .eq(["renamed"])
+    })
+    .await;
+
+    mesh.jj.commit_file(&dir_a, "a.txt", "after rename");
+    wait_converged(&dir_a, &dir_b).await;
+    assert!(descriptions(&mesh, &dir_b).contains("after rename"));
+}
+
 /// Repos added under one name by machines not connected yet are kept
 /// apart: the name shows as a conflict and selects the repo held here.
 #[tokio::test]

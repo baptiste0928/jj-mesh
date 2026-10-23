@@ -475,6 +475,27 @@ impl MeshState {
         Ok(self.unregister_repo(id).is_some())
     }
 
+    /// Renames a mesh repo; the bumped version propagates the name through
+    /// the gossip. Renaming to the current name changes nothing.
+    pub fn rename_repo(&mut self, id: &RepoId, new: String) -> Result<()> {
+        validate_name("repo", &new)?;
+        let Some((name, object_hash)) = self.mesh_repos.get(id).and_then(MeshRepo::present) else {
+            bail!("the mesh no longer lists repo {id}");
+        };
+        if name == new {
+            return Ok(());
+        }
+        ensure!(
+            !self.repo_names().contains(new.as_str()),
+            "a repo named `{new}` already exists"
+        );
+        let status = MeshRepoStatus::Present {
+            name: new,
+            object_hash,
+        };
+        self.set_mesh_repo(id, status)
+    }
+
     /// Unregisters a repo on this machine only, returning its record. The
     /// mesh record is untouched: the other machines keep syncing the repo
     /// among themselves, and it stays clonable here.
