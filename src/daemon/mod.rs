@@ -6,22 +6,22 @@
 //!                     (mesh.json) │             SyncHub ─ orphans ───────────┐
 //!                                 │                │                         │
 //!                                 ├─► RepoSet ─ repo tasks ◄──► jj repos     │
-//!                                 └─► Replicas ─ replica task ◄──────────────┘
+//!                                 └─► BareRepos ─ bare task ◄────────────────┘
 //! ```
 //!
 //! `MeshStore` owns the mesh state, and every mutation aligns the `PeerSet`
 //! (one connection task per peer) and the `RepoSet` (one watch task per
-//! repo) with it, and wakes the replica task of server mode. Peer and repo
+//! repo) with it, and wakes the bare repo task of server mode. Peer and repo
 //! tasks never talk directly: the `SyncHub` routes announcements and
 //! fetches between them.
 
 mod backoff;
+mod bare;
 pub mod control;
 mod hub;
 mod logs;
 mod pairing;
 mod peers;
-mod replicas;
 mod repos;
 mod store;
 
@@ -37,11 +37,11 @@ use tracing::{debug, info, warn};
 
 pub use self::logs::LogBuffer;
 use self::{
+    bare::BareRepos,
     control::{ControlContext, ControlServer},
     hub::SyncHub,
     pairing::Pairing,
     peers::PeerSet,
-    replicas::Replicas,
     repos::{RepoSet, RepoUpdate},
     store::MeshStore,
 };
@@ -130,14 +130,14 @@ impl Daemon {
         ));
         let (update_tx, update_rx) = mpsc::unbounded_channel();
         let repos = Arc::new(RepoSet::new(hub.clone(), update_tx));
-        let replicas = Arc::new(Replicas::default());
+        let bare = Arc::new(BareRepos::default());
         let store = Arc::new(MeshStore::new(
             dir.clone(),
             key.endpoint_id(),
             state,
             peers.clone(),
             repos.clone(),
-            replicas.clone(),
+            bare.clone(),
             hub.clone(),
         ));
         let pairing = Arc::new(Pairing::new(
@@ -161,12 +161,7 @@ impl Daemon {
         tasks.spawn(accept_loop(endpoint.clone(), peers, pairing));
         tasks.spawn(membership_loop(gossip_rx, store.clone()));
         tasks.spawn(update_loop(update_rx, store.clone()));
-        tasks.spawn(replicas::run(
-            dir.clone(),
-            store.clone(),
-            hub.clone(),
-            replicas,
-        ));
+        tasks.spawn(bare::run(dir.clone(), store.clone(), hub.clone(), bare));
         tasks.spawn(status_loop(repos, hub, jj_version));
         tasks.spawn(gossip_loop(store));
 

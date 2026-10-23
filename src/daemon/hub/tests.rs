@@ -39,7 +39,7 @@ async fn routes_to_registered_repo() {
 
     // Malformed announcements are dropped.
     hub.route(peer, announce("a", &id, 2, vec![vec![1; MAX_HEAD_LEN + 1]]));
-    let heads = vec![vec![1; 64]; MAX_MESH_REPOS + 1];
+    let heads = vec![vec![1; 64]; MAX_ANNOUNCED_HEADS + 1];
     hub.route(peer, announce("a", &id, 3, heads));
     assert!(inbox.drain().is_empty());
 }

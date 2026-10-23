@@ -7,9 +7,10 @@
 //! [`JjRepo`] is a validated repo on disk, [`StoreFingerprint`] its
 //! captured store configuration, and [`Workspace`] one of its working
 //! copies. A bare repo (see [`JjRepo::init_bare`]) has the main workspace
-//! layout without a working copy. The `jj` module invokes the user's jj binary, `open` opens the
-//! stores through jj_lib (with raw batched writes in `write`), `codec`
-//! validates replicated bytes, and `transfer` moves them between peers.
+//! layout without a working copy. The `jj` module invokes the user's jj
+//! binary, `open` opens the stores through jj_lib (with raw batched writes
+//! in `write`), `codec` validates replicated bytes, and `transfer` moves
+//! them between peers.
 
 mod codec;
 mod jj;
@@ -112,6 +113,13 @@ impl JjRepo {
         .block_on()
         .wrap_err_with(|| format!("cannot create a repo in {}", root.display()))?;
         Self::at(root)
+    }
+
+    /// Whether no repo storage is at `root`: its `.jj/repo` is missing, not
+    /// merely unreadable.
+    pub fn is_missing(root: &Path) -> bool {
+        fs::symlink_metadata(root.join(".jj").join("repo"))
+            .is_err_and(|err| err.kind() == std::io::ErrorKind::NotFound)
     }
 
     /// The main workspace root (the directory containing `.jj/repo`).

@@ -35,10 +35,10 @@
 //! # Consistency
 //!
 //! Sync replicates full history, so it must never lose or corrupt data:
-//! - **Append-only**: no op or object is ever deleted, and jj reconciles
+//! - **Append-only**: sync never deletes an op or object, and jj reconciles
 //!   divergent op logs. Only git refs move, to follow the synced state.
-//!   Servers delete whole replicas that no workspace uses (see
-//!   `daemon::replicas`).
+//!   Server mode deletes whole bare repos that no workspace uses (see
+//!   `daemon::bare`).
 //! - **Raw bytes**: ops, views and git objects travel as the bytes stored on
 //!   the sender and are never re-encoded (see the `repo::transfer` docs).
 //! - **Crash-safe**: writes land in an order where a crash at any point

@@ -28,15 +28,7 @@ async fn membership_gossips_transitively() {
 
     // Removing the repo on A gossips a tombstone that unregisters it
     // everywhere, including on C where it is registered.
-    let removed = a
-        .request(&Request::RemoveRepo {
-            name: "proj".to_owned(),
-        })
-        .await;
-    assert!(
-        matches!(removed, Response::RepoRemoved { was_local: true }),
-        "{removed:?}",
-    );
+    assert!(a.remove_repo("proj").await);
     assert!(a.status().await.repos.is_empty());
     c.wait("proj removed", |s| {
         s.repos.is_empty() && s.available.is_empty()

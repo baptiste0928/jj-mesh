@@ -146,7 +146,7 @@ impl Register for Peer {
 pub enum PeerStatus {
     Alive {
         name: String,
-        /// Whether it replicates every mesh repo.
+        /// Whether it runs in server mode.
         #[serde(default)]
         server: bool,
     },

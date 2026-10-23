@@ -3,7 +3,7 @@
 
 use std::path::Path;
 
-use color_eyre::eyre::{Result, bail};
+use color_eyre::eyre::Result;
 use tokio::net::UnixStream;
 use tracing::info;
 
@@ -72,19 +72,17 @@ async fn clone_pull_and_register(
     path: &Path,
     progress: &tokio::sync::watch::Sender<CloneProgress>,
 ) -> Result<Response> {
-    let (repo_id, sources) = ctx.hub.clone_sources(name)?;
+    let (id, sources) = ctx.hub.clone_sources(name)?;
+    let repo = Repo {
+        id,
+        path: path.to_owned(),
+        bare: false,
+    };
 
     // Fail before the (long) pull when the registration cannot succeed.
-    // Only the re-validation inside the `store.update` below is
-    // authoritative: the state may change during the pull.
-    {
-        let state = ctx.store.snapshot();
-        state.validate_new_repo(name, path)?;
-        state.ensure_mesh_id(name, &repo_id)?;
-        if let Some(existing) = state.repo_name(&repo_id) {
-            bail!("`{name}` is the repo already registered here as `{existing}`");
-        }
-    }
+    // Only the re-check inside the `store.update` below is authoritative:
+    // the state may change during the pull.
+    ctx.store.snapshot().check_clone(name, repo.clone())?;
 
     // The progress publishes latest-wins into the watch; the connection
     // task samples and forwards it on its heartbeat.
@@ -94,17 +92,9 @@ async fn clone_pull_and_register(
             transfer,
         });
     };
-    let (ops, git_objects) = ctx.hub.pull(name, &repo_id, sources, path, &sink).await?;
+    let (ops, git_objects) = ctx.hub.pull(name, &repo.id, sources, path, &sink).await?;
 
-    ctx.store.update(|state| {
-        state.add_clone(
-            name.to_owned(),
-            Repo {
-                id: repo_id.clone(),
-                path: path.to_owned(),
-                bare: false,
-            },
-        )
-    })?;
+    ctx.store
+        .update(|state| state.add_clone(name.to_owned(), repo))?;
     Ok(Response::Cloned { ops, git_objects })
 }

@@ -6,11 +6,11 @@
 //! working copy on trunk. A failed clone removes the directory it created.
 //!
 //! A repo already registered here gets a new workspace instead, which the
-//! daemon syncs like the others. On a server, the workspace of a replica
+//! daemon syncs like the others. On a server, the workspace of a bare repo
 //! is added through jj_lib (see [`JjRepo::add_workspace`]), since the jj CLI
 //! needs a workspace to run in.
 //!
-//! Settings flags go to the repo config of a fresh clone or of a replica
+//! Settings flags go to the repo config of a fresh clone or of a bare repo
 //! without workspaces, and to the workspace config otherwise (see the
 //! `settings` module).
 
@@ -96,14 +96,14 @@ pub fn run(args: CloneArgs, dir: &ConfigDir) -> Result<()> {
         Some(repo) if repo.bare => {
             ensure!(
                 colocate.is_empty(),
-                "`{name}` is a server replica, whose git store cannot be colocated",
+                "`{name}` is a bare repo kept by server mode, whose git store cannot be colocated",
             );
-            let replica = JjRepo::at(&repo.path)?;
+            let bare = JjRepo::at(&repo.path)?;
             let workspace = match args.workspace {
                 Some(workspace) => workspace,
-                None => replica_workspace_name(&replica, &state.machine.name, &path)?,
+                None => bare_workspace_name(&bare, &state.machine.name, &path)?,
             };
-            add_replica_workspace(dir, &name, &replica, &path, &workspace, settings)
+            add_bare_workspace(dir, &name, &bare, &path, &workspace, settings)
         }
         Some(repo) => {
             let workspace = match args.workspace {
@@ -243,12 +243,12 @@ fn add_workspace(
     Ok(())
 }
 
-/// Adds a workspace of the server replica of `name` in `path`, then starts
-/// its working copy on trunk.
-fn add_replica_workspace(
+/// Adds a workspace of the bare repo of `name` in `path`, then starts its
+/// working copy on trunk.
+fn add_bare_workspace(
     dir: &ConfigDir,
     name: &str,
-    replica: &JjRepo,
+    bare: &JjRepo,
     path: &Path,
     workspace: &str,
     settings: &SettingsArgs,
@@ -269,22 +269,22 @@ fn add_replica_workspace(
         name: config("user.name"),
         email: config("user.email"),
     };
-    if replica.has_workspaces()? {
+    if bare.has_workspaces()? {
         create_workspace(dir, name, workspace, path, settings, || {
-            replica.add_workspace(path, workspace, &user)
+            bare.add_workspace(path, workspace, &user)
         })?;
     } else {
         // The first workspace: the settings go to the repo config, where
         // the next ones also find them.
-        settings.write(replica.root(), Scope::Repo)?;
-        replica.add_workspace(path, workspace, &user)?;
+        settings.write(bare.root(), Scope::Repo)?;
+        bare.add_workspace(path, workspace, &user)?;
     }
     start_on_trunk(path);
 
     println!(
         "{}",
         ui::good(format_args!(
-            "Added workspace `{workspace}` of the server replica of `{name}` in {}",
+            "Added workspace `{workspace}` of the bare repo of `{name}` in {}",
             path.display(),
         )),
     );
@@ -321,10 +321,10 @@ fn create_workspace(
     Ok(())
 }
 
-/// The default name of a workspace of a server replica: the machine name,
-/// or the [`extra_workspace_name`] once a workspace holds it.
-fn replica_workspace_name(replica: &JjRepo, machine: &str, path: &Path) -> Result<String> {
-    let repo = replica.open()?;
+/// The default name of a workspace of a bare repo: the machine name, or
+/// the [`extra_workspace_name`] once a workspace holds it.
+fn bare_workspace_name(bare: &JjRepo, machine: &str, path: &Path) -> Result<String> {
+    let repo = bare.open()?;
     let heads = repo.op_heads().block_on()?;
     if repo.workspace_names(&heads).block_on()?.contains(machine) {
         extra_workspace_name(machine, path)
@@ -400,11 +400,17 @@ fn pull(dir: &ConfigDir, name: &str, path: &Path, workspace: &str) -> Result<()>
 
 /// Removes the directory a failed clone created. The daemon registers the
 /// repo only once the pull succeeded, so the directory is normally
-/// unregistered; when the state lists the repo anyway (the pull succeeded
-/// but its response was lost), the directory holds a valid clone and is
-/// kept.
+/// unregistered; when the state lists it anyway (the pull succeeded but its
+/// response was lost), it holds a valid clone and is kept.
 fn clean_failed_clone(dir: &ConfigDir, name: &str, path: &Path, err: Report) -> Report {
-    if MeshState::load(dir).is_ok_and(|state| state.repos.contains_key(name)) {
+    let registered = MeshState::load(dir).is_ok_and(|state| {
+        let path = std::fs::canonicalize(path);
+        state
+            .repos
+            .get(name)
+            .is_some_and(|repo| path.is_ok_and(|path| path == repo.path))
+    });
+    if registered {
         return err.wrap_err(format!(
             "the pull succeeded and `{name}` is registered at {}, but its result was lost",
             path.display(),

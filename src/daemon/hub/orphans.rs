@@ -4,54 +4,29 @@
 //! Peers replay all their repos on connect, so the [`HubState::orphans`]
 //! map is how `clone` and server mode learn a repo's id and heads and who
 //! serves it; [`SyncHub::clone_sources`] resolves that into
-//! [`CloneSource`]s, which [`SyncHub::pull`] pulls from. The map is
-//! bounded per peer and pruned on disconnect.
+//! [`CloneSource`]s to pull from (see [`super::pull`]). The map is bounded
+//! per peer and pruned on disconnect.
 
-use std::{collections::BTreeMap, path::Path, sync::Arc, time::Duration};
+use std::collections::BTreeMap;
 
-use color_eyre::eyre::{Result, WrapErr as _, bail, ensure, eyre};
+use color_eyre::eyre::{Result, bail, ensure};
 use iroh::EndpointId;
-use jj_lib::op_store::OperationId;
-use tracing::warn;
 
-use super::{HubState, SyncHub};
-use crate::{
-    config::{MAX_MESH_REPOS, RepoId},
-    net::fetch::GitTransferFormat,
-    repo::{
-        JjRepo,
-        transfer::{self, TransferPhase, TransferProgress},
-    },
-};
-
-/// Budget for opening the pull stream on an established connection: a
-/// peer that never grants stream credit must not stall the pull (a
-/// clone's progress heartbeat would mask the hang from the CLI).
-const OPEN_STREAM_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// Deadline for the network-facing work of a pull (it may transfer an
-/// entire repository); its local apply and index work runs unbounded.
-const PULL_NET_TIMEOUT: Duration = Duration::from_mins(30);
-
-/// A peer that can serve a `clone` of an unregistered repo, with the op
-/// heads it claims.
-#[derive(Debug)]
-pub struct CloneSource {
-    pub peer: EndpointId,
-    pub heads: Vec<Vec<u8>>,
-}
+use super::{CloneSource, HubState, SyncHub};
+use crate::config::{MAX_MESH_REPOS, RepoId};
 
 /// The latest announcement one peer made for an unregistered repo name.
 #[derive(Debug, Clone)]
 pub(super) struct OrphanAnnounce {
     pub(super) id: RepoId,
+    pub(super) seq: u64,
     pub(super) heads: Vec<Vec<u8>>,
 }
 
 impl HubState {
     /// Records `announce` as `peer`'s latest for the unregistered `name`.
     /// Refuses (returning `false`) a new name that would put the peer over
-    /// [`MAX_ORPHAN_REPOS_PER_PEER`]; a known name always updates.
+    /// [`MAX_MESH_REPOS`]; a known name always updates.
     pub(super) fn remember_orphan(
         &mut self,
         peer: EndpointId,
@@ -93,7 +68,7 @@ impl HubState {
     }
 
     /// How many orphan names hold an entry for `peer`, against
-    /// [`MAX_ORPHAN_REPOS_PER_PEER`].
+    /// [`MAX_MESH_REPOS`].
     fn orphans_held_by(&self, peer: &EndpointId) -> usize {
         self.orphans
             .values()
@@ -151,70 +126,5 @@ impl SyncHub {
                 })
                 .collect(),
         ))
-    }
-
-    /// Pulls the full state of the mesh repo `name` into the repo at
-    /// `path`, from the first of `sources` that serves it, reporting each
-    /// attempt's progress with the source peer's name. Returns the pulled
-    /// op and git object counts.
-    pub async fn pull(
-        &self,
-        name: &str,
-        id: &RepoId,
-        sources: Vec<CloneSource>,
-        path: &Path,
-        progress: &(dyn Fn(&str, TransferProgress) + Send + Sync),
-    ) -> Result<(u64, u64)> {
-        let repo_path = path.to_owned();
-        let repo = crate::spawn_blocking(move || -> Result<_> {
-            Ok(Arc::new(JjRepo::at(&repo_path)?.open()?))
-        })
-        .await
-        .wrap_err("repo open task failed")??;
-
-        let mut last_error = eyre!("no usable source peer");
-        for CloneSource { peer, heads } in sources {
-            let wants: Vec<OperationId> = heads.into_iter().map(OperationId::new).collect();
-            let Some(conn) = self.connection(&peer) else {
-                continue;
-            };
-
-            // Reset to zeroed counters before dialing, so a fallback to
-            // this source is visible.
-            let peer_name = self.peer_name(&peer);
-            let sink = |transfer| progress(&peer_name, transfer);
-            sink(TransferProgress::start(TransferPhase::Ops));
-
-            let pull = async {
-                let (mut send, mut recv) =
-                    tokio::time::timeout(OPEN_STREAM_TIMEOUT, conn.open_bi())
-                        .await
-                        .map_err(|_| eyre!("timed out opening the pull stream"))??;
-                // A pull fetches a whole history: the pack format reuses
-                // the server's on-disk deltas and lands as one pack file
-                // here, instead of writing every object loose.
-                let outcome = transfer::fetch(
-                    &repo,
-                    transfer::RepoIdent { name, id },
-                    &wants,
-                    transfer::FetchOptions {
-                        format: GitTransferFormat::Pack,
-                        net_timeout: PULL_NET_TIMEOUT,
-                    },
-                    &mut send,
-                    &mut recv,
-                    transfer::ProgressSink::new(&sink),
-                )
-                .await?;
-                let _ = send.finish();
-                Ok::<_, color_eyre::Report>(outcome)
-            };
-            match pull.await {
-                Err(err) => last_error = err.wrap_err(format!("pull from {peer_name} failed")),
-                Ok(outcome) => return Ok((outcome.ops as u64, outcome.git_objects as u64)),
-            }
-            warn!("pull attempt failed: {last_error:#}");
-        }
-        Err(last_error)
     }
 }

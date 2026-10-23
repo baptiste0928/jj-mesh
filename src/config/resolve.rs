@@ -25,8 +25,8 @@ pub struct ConfigDir {
     custom: bool,
     /// See [`Self::socket_path`].
     socket: PathBuf,
-    /// See [`Self::replicas_dir`].
-    replicas: PathBuf,
+    /// See [`Self::bare_dir`].
+    bare: PathBuf,
 }
 
 impl ConfigDir {
@@ -41,7 +41,7 @@ impl ConfigDir {
 
             return Ok(ConfigDir {
                 socket: config_dir.join(SOCKET),
-                replicas: config_dir.join("repos"),
+                bare: config_dir.join("repos"),
                 path: config_dir,
                 custom: true,
             });
@@ -69,7 +69,7 @@ impl ConfigDir {
             path: config_dir,
             custom: false,
             socket,
-            replicas: strategy.data_dir().join("jj-mesh").join("repos"),
+            bare: strategy.data_dir().join("jj-mesh").join("repos"),
         })
     }
 
@@ -101,13 +101,13 @@ impl ConfigDir {
         &self.socket
     }
 
-    /// Directory of the bare repos server mode replicates, created
+    /// Directory of the bare repos server mode keeps, created
     /// user-only (see [`create_private`]) on first use.
     ///
     /// Usually `~/.local/share/jj-mesh/repos`; kept inside custom config
     /// directories, like the socket.
-    pub fn replicas_dir(&self) -> &Path {
-        &self.replicas
+    pub fn bare_dir(&self) -> &Path {
+        &self.bare
     }
 }
 

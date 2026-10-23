@@ -90,7 +90,7 @@ pub enum Request {
     /// Switch server mode on this machine; peers learn the role through
     /// the gossip. Answered with [`Response::ServerSet`] or
     /// [`Response::Error`].
-    SetServer { enabled: bool },
+    SetServer { server: bool },
     /// Hold back the daemon from keeping the workspace named `workspace`
     /// of the registered repo `repo` fresh, so the CLI can create it and
     /// write its settings first. Answered with [`Response::WorkspaceHeld`]

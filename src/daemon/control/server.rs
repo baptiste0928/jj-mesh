@@ -236,7 +236,7 @@ async fn handle_client(
         Request::ForgetRepo { name } => reply(&mut stream, forget_repo(&ctx, &name)).await,
         Request::RenameMachine { name } => reply(&mut stream, rename_machine(&ctx, &name)).await,
         Request::Logs { follow } => stream_logs(&mut stream, &ctx, follow).await,
-        Request::SetServer { enabled } => reply(&mut stream, set_server(&ctx, enabled)).await,
+        Request::SetServer { server } => reply(&mut stream, set_server(&ctx, server)).await,
         Request::HoldWorkspace { repo, workspace } => {
             hold_workspace(&mut stream, &ctx, &repo, &workspace).await
         }
@@ -320,7 +320,7 @@ async fn pair_join(stream: &mut UnixStream, ctx: &ControlContext, ticket: &str) 
 /// surface later as a watch failure. Storing the discovered main workspace
 /// root (canonicalized) also keeps two spellings of one repo, or two of its
 /// workspaces, from registering twice. Its git object hash goes to the mesh
-/// record, so clones and replicas use the same.
+/// record, so clones and bare repos use the same.
 async fn add_repo(ctx: &ControlContext, name: String, path: PathBuf) -> Result<Response> {
     let (root, object_hash) = crate::spawn_blocking(move || -> Result<_> {
         let repo = JjRepo::discover(&path)?;
@@ -378,9 +378,9 @@ fn rename_machine(ctx: &ControlContext, name: &str) -> Result<Response> {
 }
 
 /// Switches server mode; the store gossips the role.
-fn set_server(ctx: &ControlContext, enabled: bool) -> Result<Response> {
-    ctx.store.update(|state| state.set_server(enabled))?;
-    info!(enabled, "server mode switched");
+fn set_server(ctx: &ControlContext, server: bool) -> Result<Response> {
+    ctx.store.update(|state| state.set_server(server))?;
+    info!(server, "server mode switched");
     Ok(Response::ServerSet)
 }
 

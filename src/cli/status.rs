@@ -34,7 +34,7 @@ pub fn run(_args: StatusArgs, dir: &ConfigDir) -> Result<()> {
         ui::format_duration(status.uptime_secs)
     );
     let role = if status.server {
-        format!(" {}", ui::dim("[server]"))
+        format!(" {}", ui::dim("(server)"))
     } else {
         String::new()
     };

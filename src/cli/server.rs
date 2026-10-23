@@ -22,9 +22,9 @@ pub struct ServerArgs {
 
 #[derive(Debug, Subcommand)]
 enum ServerCommand {
-    /// Replicate every mesh repo on this machine
+    /// Keep a bare repo of every mesh repo on this machine
     Enable,
-    /// Stop replicating the mesh repos, deleting the replicas no workspace uses
+    /// Stop keeping bare repos, deleting those no workspace uses
     Disable,
 }
 
@@ -34,15 +34,15 @@ pub fn run(args: &ServerArgs, dir: &ConfigDir) -> Result<()> {
 }
 
 /// Switches server mode through the daemon.
-pub fn set(dir: &ConfigDir, enabled: bool) -> Result<()> {
-    let request = Request::SetServer { enabled };
+pub fn set(dir: &ConfigDir, server: bool) -> Result<()> {
+    let request = Request::SetServer { server };
     let response = control::request_blocking(dir, &request, control::MUTATE_WAIT)?;
     let Response::ServerSet = response else {
         bail!("unexpected response from the daemon: {response:?}");
     };
 
-    let message = if enabled {
-        "Server mode enabled: this machine replicates every mesh repo"
+    let message = if server {
+        "Server mode enabled: this machine keeps a bare repo of every mesh repo"
     } else {
         "Server mode disabled"
     };

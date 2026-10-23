@@ -16,8 +16,8 @@ use super::{
 #[serde(deny_unknown_fields)]
 pub struct Machine {
     pub name: String,
-    /// Whether this machine replicates every mesh repo (see
-    /// `daemon::replicas`).
+    /// Whether this machine keeps a bare repo of every mesh repo (see
+    /// `daemon::bare`).
     #[serde(default)]
     pub server: bool,
     pub version: u64,

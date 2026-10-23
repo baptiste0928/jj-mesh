@@ -210,9 +210,23 @@ impl Machine {
         assert!(matches!(response, Response::MachineRenamed), "{response:?}");
     }
 
+    /// Removes the repo `name` from the mesh, as `jj-mesh repo remove`
+    /// would, returning whether it was registered here.
+    pub async fn remove_repo(&self, name: &str) -> bool {
+        let response = self
+            .request(&Request::RemoveRepo {
+                name: name.to_owned(),
+            })
+            .await;
+        let Response::RepoRemoved { was_local } = response else {
+            panic!("{response:?}");
+        };
+        was_local
+    }
+
     /// Switches server mode, as `jj-mesh server` would.
-    pub async fn set_server(&self, enabled: bool) {
-        let response = self.request(&Request::SetServer { enabled }).await;
+    pub async fn set_server(&self, server: bool) {
+        let response = self.request(&Request::SetServer { server }).await;
         assert!(matches!(response, Response::ServerSet), "{response:?}");
     }
 

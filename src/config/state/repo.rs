@@ -14,8 +14,8 @@ pub struct Repo {
     /// Local repository root (the directory containing `.jj`), stored
     /// canonicalized on registration.
     pub path: PathBuf,
-    /// Whether it is a bare replica made by server mode, in
-    /// [`crate::config::ConfigDir::replicas_dir`].
+    /// Whether it is a bare repo made by server mode, in
+    /// [`crate::config::ConfigDir::bare_dir`].
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub bare: bool,
 }

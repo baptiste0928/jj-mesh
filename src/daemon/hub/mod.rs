@@ -12,12 +12,14 @@
 //!
 //! Owning the outboxes, the hub also carries the membership and status
 //! reports to peers, remembers announcements for unregistered repos (see
-//! [`orphans`]), serves inbound fetches (see [`serve`]), and holds the
-//! peers' paired names (see [`SyncHub::peer_name`]).
+//! [`orphans`]), pulls whole repos from them (see [`pull`]), serves inbound
+//! fetches (see [`serve`]), and holds the peers' paired names (see
+//! [`SyncHub::peer_name`]).
 
 mod inbox;
 mod orphans;
 mod outbox;
+mod pull;
 mod serve;
 #[cfg(test)]
 mod tests;
@@ -32,7 +34,7 @@ use tokio::sync::Notify;
 use tracing::{debug, warn};
 
 pub use self::inbox::{Inbox, PeerAnnounce};
-pub use self::orphans::CloneSource;
+pub use self::pull::CloneSource;
 use self::{
     orphans::OrphanAnnounce,
     outbox::{Outbox, run_sender},
@@ -153,16 +155,19 @@ impl SyncHub {
 
     /// Registers a repo, returning the inbox its task drains inbound
     /// announcements from. Replaces any previous registration for the name.
-    /// Orphan announcements held for the name become conflicts when their
-    /// id disagrees; the peers that sent them would otherwise never re-warn
-    /// an idle repo.
+    /// Orphan announcements held for the name seed the inbox, so they move
+    /// back to the orphans on unregistration, or become conflicts when
+    /// their id disagrees; the peers that sent them would otherwise never
+    /// re-warn an idle repo.
     pub fn register_repo(&self, name: String, id: RepoId) -> Arc<Inbox> {
         let inbox = Arc::new(Inbox::default());
         let mut state = self.state.lock().unwrap();
 
         let mut conflicts = BTreeMap::new();
         for (peer, announce) in state.take_orphans(&name) {
-            if announce.id != id {
+            if announce.id == id {
+                inbox.offer(peer, announce.seq, announce.heads);
+            } else {
                 warn!(
                     repo = %name, peer = %peer_name(&state.names, &peer),
                     "peer announces a different repo under this name; not syncing with it",
@@ -237,12 +242,13 @@ impl SyncHub {
             return;
         };
 
-        for (peer, heads) in entry.inbox.snapshot() {
+        for PeerAnnounce { peer, seq, heads } in entry.inbox.snapshot() {
             state.remember_orphan(
                 peer,
                 name.to_owned(),
                 OrphanAnnounce {
                     id: entry.id.clone(),
+                    seq,
                     heads,
                 },
             );
@@ -412,6 +418,7 @@ impl SyncHub {
                 announce.name,
                 OrphanAnnounce {
                     id: announce.id,
+                    seq: announce.seq,
                     heads: announce.heads,
                 },
             );

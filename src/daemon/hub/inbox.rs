@@ -82,15 +82,19 @@ impl Inbox {
         true
     }
 
-    /// The last announced heads of every peer, drained or not, for
-    /// demotion to orphan announcements on unregistration. Peers that
-    /// retracted the repo (no heads) are not included.
-    pub(super) fn snapshot(&self) -> Vec<(EndpointId, Vec<Vec<u8>>)> {
+    /// The last announcement of every peer, drained or not, for demotion
+    /// to orphan announcements on unregistration. Peers that retracted the
+    /// repo (no heads) are not included.
+    pub(super) fn snapshot(&self) -> Vec<PeerAnnounce> {
         let slots = self.slots.lock().unwrap();
         slots
             .iter()
             .filter(|(_, slot)| !slot.heads.is_empty())
-            .map(|(peer, slot)| (*peer, slot.heads.clone()))
+            .map(|(peer, slot)| PeerAnnounce {
+                peer: *peer,
+                seq: slot.seq,
+                heads: slot.heads.clone(),
+            })
             .collect()
     }
 

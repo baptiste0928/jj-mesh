@@ -241,7 +241,7 @@ impl MeshState {
     /// name the mesh already knows may only be registered with its id (that
     /// is what a clone does), since anything else forks the name into two
     /// unrelated repos.
-    pub fn ensure_mesh_id(&self, name: &str, id: &RepoId) -> Result<()> {
+    fn ensure_mesh_id(&self, name: &str, id: &RepoId) -> Result<()> {
         if let Some(mesh_id) = self.mesh_repo_id(name)
             && mesh_id != id
         {
@@ -366,14 +366,22 @@ impl MeshState {
     /// list under the repo's id. Unlike [`Self::add_repo`], the mesh record
     /// is left alone: a clone finishing after a removal must not undo it.
     pub fn add_clone(&mut self, name: String, repo: Repo) -> Result<()> {
-        let repo = self.check_new_repo(&name, repo)?;
-        ensure!(
-            self.mesh_repo_id(&name) == Some(&repo.id),
-            "`{name}` is no longer in the mesh",
-        );
+        let repo = self.check_clone(&name, repo)?;
         self.repos.insert(name, repo);
 
         Ok(())
+    }
+
+    /// Checks that `repo` can be registered as a clone of the mesh repo
+    /// `name` (see [`Self::add_clone`]), canonicalizing its path.
+    pub fn check_clone(&self, name: &str, repo: Repo) -> Result<Repo> {
+        let repo = self.check_new_repo(name, repo)?;
+        ensure!(
+            self.mesh_repo_id(name) == Some(&repo.id),
+            "the mesh does not list `{name}` as repo {}",
+            repo.id,
+        );
+        Ok(repo)
     }
 
     /// Checks that `repo` can be registered under `name`, canonicalizing
@@ -390,7 +398,7 @@ impl MeshState {
     /// Retires a repo name from the mesh: tombstones the mesh record and
     /// unregisters the repo here. The tombstone propagates the removal, so
     /// every machine stops syncing the repo; only servers delete their
-    /// replica, unless a workspace uses it.
+    /// bare repo, unless a workspace uses it.
     /// Returns whether the repo was registered on this machine.
     pub fn remove_repo(&mut self, name: &str) -> Result<bool> {
         match (self.mesh_repos.get(name), self.repos.contains_key(name)) {
@@ -418,23 +426,22 @@ impl MeshState {
     /// among themselves, and it stays clonable here (that is also the only
     /// way back in, since re-adding it would fork the name).
     ///
-    /// Bare replicas cannot be forgotten: server mode would replicate them
-    /// again.
+    /// Bare repos cannot be forgotten: server mode would pull them again.
     pub fn forget_repo(&mut self, name: &str) -> Result<Repo> {
         match self.repos.get(name) {
             None => bail!("no repo named `{name}` is registered on this machine"),
             Some(repo) if repo.bare => {
                 bail!(
-                    "`{name}` is a server replica; disable server mode or remove it from the mesh"
+                    "`{name}` is a bare repo kept by server mode; disable it or remove the repo from the mesh"
                 )
             }
             Some(_) => Ok(self.unregister_repo(name).expect("registered")),
         }
     }
 
-    /// Unregisters a bare replica (server mode is off and no workspace uses
-    /// it); other repos are left alone.
-    pub fn drop_replica(&mut self, name: &str) {
+    /// Unregisters a bare repo (see `daemon::bare`); other repos are left
+    /// alone.
+    pub fn drop_bare(&mut self, name: &str) {
         if self.repos.get(name).is_some_and(|repo| repo.bare) {
             self.unregister_repo(name);
         }

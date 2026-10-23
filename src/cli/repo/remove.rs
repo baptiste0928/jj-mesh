@@ -13,7 +13,7 @@ use crate::{
 /// Remove a repo from the whole mesh
 ///
 /// Every machine stops synchronizing the repo. The files stay untouched,
-/// except on servers: their replica is deleted unless a workspace uses it.
+/// except on servers: their bare repo is deleted unless a workspace uses it.
 ///
 /// If you want to stop synchronizing on this machine only, use `jj-mesh repo
 /// forget` instead.
