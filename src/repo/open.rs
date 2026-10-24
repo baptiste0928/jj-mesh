@@ -19,6 +19,7 @@ use std::{
     collections::{BTreeSet, HashSet},
     path::{Path, PathBuf},
     sync::LazyLock,
+    time::{Duration, Instant},
 };
 
 use color_eyre::eyre::{Result, WrapErr as _, ensure, eyre};
@@ -30,6 +31,7 @@ use jj_lib::{
     default_index::DefaultIndexStore,
     git_backend::GitBackend,
     index::MutableIndex,
+    lock::FileLock,
     object_id::{HexPrefix, ObjectId, PrefixResolution},
     op_store::{Operation, OperationId, View, ViewId},
     op_walk,
@@ -61,6 +63,11 @@ impl std::fmt::Debug for OpenRepo {
             .finish_non_exhaustive()
     }
 }
+
+/// How long [`OpenRepo::lock_git_import_export`] waits for a jj command,
+/// and how often it retries meanwhile.
+const LOCK_TIMEOUT: Duration = Duration::from_mins(1);
+const LOCK_RETRY: Duration = Duration::from_millis(50);
 
 /// jj settings shared by every opened repo: jj's built-in defaults only.
 /// The daemon must not depend on the user's jj configuration; settings
@@ -590,6 +597,23 @@ impl OpenRepo {
         match std::fs::read_dir(git.join("worktrees")) {
             Ok(mut worktrees) => worktrees.next().is_none(),
             Err(err) => err.kind() == std::io::ErrorKind::NotFound,
+        }
+    }
+
+    /// Takes jj's git import/export lock, failing after [`LOCK_TIMEOUT`].
+    pub(super) fn lock_git_import_export(&self) -> Result<FileLock> {
+        let path = self.repo.repo_dir().join("git_import_export.lock");
+        let deadline = Instant::now() + LOCK_TIMEOUT;
+        loop {
+            if let Some(lock) = FileLock::try_lock(path.clone())? {
+                return Ok(lock);
+            }
+            ensure!(
+                Instant::now() < deadline,
+                "jj held {} for over {LOCK_TIMEOUT:?}",
+                path.display(),
+            );
+            std::thread::sleep(LOCK_RETRY);
         }
     }
 }

@@ -106,7 +106,17 @@ pub(super) fn stage(
 /// thread.
 pub(super) fn publish(repo: &Arc<OpenRepo>, staged: &Staged) -> Result<()> {
     let Staged { to_publish, ops } = staged;
+    if to_publish.is_empty() {
+        return Ok(());
+    }
 
+    // A colocated jj command importing between the mirror and the
+    // publication would read the moved refs against the old heads, and
+    // record the moves as its own op. jj does not lock where it does not
+    // import.
+    let _lock = (!repo.owns_git_refs())
+        .then(|| repo.lock_git_import_export())
+        .transpose()?;
     mirror::run(repo, to_publish)?;
     fail::fail_point!("publish.after_mirror", |_| Err(eyre!(
         "crash point publish.after_mirror"
@@ -121,9 +131,7 @@ pub(super) fn publish(repo: &Arc<OpenRepo>, staged: &Staged) -> Result<()> {
             "crash point publish.after_head"
         )));
     }
-    if !to_publish.is_empty() {
-        debug!(heads = to_publish.len(), ops, "applied synced operations");
-    }
+    debug!(heads = to_publish.len(), ops, "applied synced operations");
     Ok(())
 }
 

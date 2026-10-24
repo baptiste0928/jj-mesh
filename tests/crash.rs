@@ -5,8 +5,9 @@
 //! server's.
 //!
 //! The crash points are the `fail_point!` sites in the crate, enabled
-//! through `fail`. Failpoints are process-global, so this is a separate
-//! test binary and `fail`'s scenario guard serializes the cases.
+//! through `fail`, which also hold the apply's race windows open.
+//! Failpoints are process-global, so this is a separate test binary and
+//! `fail`'s scenario guard serializes the cases.
 
 use std::{
     collections::BTreeMap,
@@ -14,6 +15,7 @@ use std::{
     os::unix::fs::MetadataExt as _,
     path::{Path, PathBuf},
     sync::Arc,
+    time::Duration,
 };
 
 use jj_lib::{object_id::ObjectId as _, op_store::OperationId};
@@ -331,6 +333,45 @@ async fn run(build: impl AsyncFnOnce() -> Scenario, point: Point) {
         &scenario.fetcher,
         &["log", "-r", "all()", "--ignore-working-copy"],
     );
+}
+
+/// A colocated jj command racing a publication waits for the op heads,
+/// instead of importing the mirrored refs against the old heads as its
+/// own op.
+#[tokio::test]
+async fn jj_waits_for_publication() {
+    let _guard = fail::FailScenario::setup();
+    let fx = Fixture::new();
+    let a = fx.init_repo("a");
+    fx.jj(&a, &["bookmark", "create", "main", "-r", "@"]);
+    fx.jj(&a, &["new", "-m", "export"]);
+    let b = fx.path().join("b");
+    fork(&a, &b);
+    fx.jj(&a, &["bookmark", "delete", "main"]);
+
+    let (mirrored, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    fail::cfg_callback("publish.after_mirror", move || {
+        mirrored.send(()).unwrap();
+        std::thread::sleep(Duration::from_millis(500));
+    })
+    .unwrap();
+    let (ra, rb) = (open(&a), open(&b));
+    let sync = tokio::spawn({
+        let rb = rb.clone();
+        async move { sync_missing(&rb, &ra).await }
+    });
+    rx.recv().await.unwrap();
+    fx.jj(&b, &["status"]);
+    sync.await.unwrap();
+    fail::remove("publish.after_mirror");
+
+    // Read before any other jj command merges divergent heads.
+    let heads = rb.op_heads().await.unwrap();
+    let ops = fx.jj_output(
+        &b,
+        &["op", "log", "--no-graph", "-T", "description ++ \"\\n\""],
+    );
+    assert_eq!(heads.len(), 1, "{ops}");
 }
 
 /// Every op head and its view can be read.

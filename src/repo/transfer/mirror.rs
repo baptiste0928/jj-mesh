@@ -13,23 +13,26 @@
 //! the op heads fold pairwise, each pair three-way merged against its
 //! closest common ancestors, and each ref merged by `merge_ref_targets`
 //! over the commit index (which picks the descendant when both sides moved
-//! a ref along one line). Each ref then moves in git from a "before" value
-//! to the merged "after" value by compare-and-swap. The "before" depends
-//! on who else writes the git repo:
+//! a ref along one line). Each ref then moves in git from a "before" value,
+//! the merged view of the heads before the publication, to the merged
+//! "after" value by compare-and-swap. A ref moved meanwhile, by the user
+//! or a running jj command (`jj git fetch` writes refs before recording
+//! them), fails its swap and stays for jj to import.
 //!
-//! - Git repo inside `.jj` with no worktree: only jj writes there, so
-//!   "before" is what the repo actually holds and any difference from the
-//!   merged view is staleness. [`heal`] runs the same pass on watch start.
-//! - Colocated `.git`, external git repo, or a git worktree (a colocated
-//!   secondary workspace): the user may have moved
-//!   refs there that jj has not imported yet, so "before" is the merged
-//!   view of the heads before the publication, and a ref moved by the
-//!   user fails its swap and stays for jj to import.
+//! [`heal`] runs on watch start for git repos inside `.jj` with no
+//! worktree: only jj writes there, so its "before" is what the repo
+//! actually holds, and any difference from the merged view is staleness
+//! unless a jj command is running then.
 //!
 //! Only refs jj imports are touched, whichever names the replicated views
-//! carry. Refs that conflict on either side are left alone: a conflict
-//! has no representation in git, and jj's import resolves it to the local
-//! git value on every machine.
+//! carry. A conflict has no representation in git: concurrent exports on
+//! two machines leave each git holding its own side. A conflicted "before"
+//! is thus whichever of its sides git holds, and a conflicted "after" is
+//! written as its lowest present side. Every machine then holds the same
+//! value, so their imports record the same resolution: imports of
+//! different sides would merge back to the value before both exports.
+//! The import abandons the commits only the other sides reached; the op
+//! log keeps them.
 //!
 //! ```text
 //!   read heads ──► merge refs ──► merge refs ──► swap ──► publish
@@ -60,6 +63,9 @@ use crate::repo::OpenRepo;
 
 type GitRefs = BTreeMap<GitRefNameBuf, RefTarget>;
 
+/// A ref's value in git: its commit, `None` when the ref is missing.
+type GitValue = Option<CommitId>;
+
 /// The ref namespaces jj imports; [`is_imported`] narrows them further.
 const NAMESPACES: [&str; 3] = ["refs/heads/", "refs/remotes/", "refs/tags/"];
 
@@ -67,11 +73,8 @@ const NAMESPACES: [&str; 3] = ["refs/heads/", "refs/remotes/", "refs/tags/"];
 /// it supersedes) changes in jj's merged git refs. The heads are re-read
 /// here, not taken from the fetch's snapshot: an operation the user ran
 /// during the transfer keeps its refs. A ref whose swap fails is logged
-/// and left to jj's import. A no-op when nothing is published.
+/// and left to jj's import.
 pub(super) fn run(repo: &OpenRepo, to_publish: &[(OperationId, Vec<OperationId>)]) -> Result<()> {
-    if to_publish.is_empty() {
-        return Ok(());
-    }
     let heads = repo.op_heads().block_on()?;
     let superseded: HashSet<&OperationId> = to_publish.iter().flat_map(|(_, s)| s).collect();
     let after: Vec<OperationId> = heads
@@ -85,11 +88,7 @@ pub(super) fn run(repo: &OpenRepo, to_publish: &[(OperationId, Vec<OperationId>)
 
     let merger = Merger::new(repo, heads.iter().chain(&after))?;
     let after = merger.merged_refs(&after)?;
-    let before = if repo.owns_git_refs() {
-        stored_refs(repo, &after)?
-    } else {
-        merger.merged_refs(&heads)?
-    };
+    let before = merger.merged_refs(&heads)?;
     swap(repo, &before, &after)
 }
 
@@ -233,8 +232,8 @@ fn target<'a>(refs: &'a GitRefs, name: &GitRefName) -> &'a RefTarget {
 }
 
 /// Moves each imported ref in the git repo from its `before` value to
-/// its `after` value, skipping unchanged refs and conflicts on either
-/// side.
+/// its `after` value (see [`exported`] and [`written`]), skipping
+/// unchanged refs.
 fn swap(repo: &OpenRepo, before: &GitRefs, after: &GitRefs) -> Result<()> {
     use gix::refs::transaction::{Change, LogChange, PreviousValue, RefEdit, RefLog};
 
@@ -246,15 +245,8 @@ fn swap(repo: &OpenRepo, before: &GitRefs, after: &GitRefs) -> Result<()> {
         .filter(|name| is_imported(name))
         .collect();
     for name in names {
-        let (Some(before_id), Some(after_id)) = (
-            target(before, name).as_resolved(),
-            target(after, name).as_resolved(),
-        ) else {
-            continue;
-        };
-        if before_id == after_id {
-            continue;
-        }
+        // Checked first: git fails on reading an invalid name, and a peer
+        // may send one.
         let Ok(full_name) = name.as_str().try_into() else {
             warn!(
                 "skipping git ref mirror of {}: invalid ref name",
@@ -262,11 +254,20 @@ fn swap(repo: &OpenRepo, before: &GitRefs, after: &GitRefs) -> Result<()> {
             );
             continue;
         };
-        let expected = match before_id {
+        let (Some(before_id), Some(after_id)) = (
+            exported(&git, name, target(before, name))?,
+            written(target(after, name)),
+        ) else {
+            continue;
+        };
+        if before_id == after_id {
+            continue;
+        }
+        let expected = match &before_id {
             Some(id) => PreviousValue::MustExistAndMatch(stored_target(&git, name, id)?),
             None => PreviousValue::MustNotExist,
         };
-        let change = match after_id {
+        let change = match &after_id {
             Some(id) => Change::Update {
                 log: LogChange::default(),
                 expected,
@@ -294,6 +295,33 @@ fn swap(repo: &OpenRepo, before: &GitRefs, after: &GitRefs) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// The value a ref's `before` target leaves in git: the target itself
+/// when resolved, else whichever of its sides git holds. `None` when git
+/// holds none of them: a move for jj to import.
+fn exported(
+    git: &gix::Repository,
+    name: &GitRefName,
+    before: &RefTarget,
+) -> Result<Option<GitValue>> {
+    if let Some(id) = before.as_resolved() {
+        return Ok(Some(id.clone()));
+    }
+    let stored = git
+        .try_find_reference(name.as_str())?
+        .and_then(|mut reference| reference.peel_to_commit().ok())
+        .map(|commit| CommitId::from_bytes(commit.id.as_bytes()));
+    Ok(before.adds().any(|side| *side == stored).then_some(stored))
+}
+
+/// The value to write for a ref's `after` target: the target itself when
+/// resolved, else its lowest present side. `None` when no side is present.
+fn written(after: &RefTarget) -> Option<GitValue> {
+    match after.as_resolved() {
+        Some(id) => Some(id.clone()),
+        None => after.present_adds().min().cloned().map(Some),
+    }
 }
 
 /// The placeholder jj points an unborn HEAD to (jj's `UNBORN_ROOT_REF_NAME`).

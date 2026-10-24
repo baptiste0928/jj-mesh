@@ -1274,6 +1274,89 @@ async fn divergent_moves_along_one_line_mirror_the_descendant() {
     assert_eq!(main, b_main);
 }
 
+/// Both sides moving a ref to unrelated commits conflict, and each `.git`
+/// holds its own side: the mirror must write the same side on both, or
+/// their imports resolve to different sides and merge back to the base.
+#[tokio::test]
+async fn concurrent_moves_of_one_ref_resolve_alike() {
+    let fx = Fixture::new();
+    let (a, b, ra, rb) = settled_colocated_pair(&fx).await;
+    let a_main = move_bookmark(&fx, &a, "main", "a.txt");
+    let b_main = move_bookmark(&fx, &b, "main", "b.txt");
+    let lowest = a_main.clone().min(b_main.clone());
+
+    sync_missing(&rb, &ra).await;
+    sync_missing(&ra, &rb).await;
+    assert_eq!(git_rev(&a, "refs/heads/main"), lowest);
+    assert_eq!(git_rev(&b, "refs/heads/main"), lowest);
+
+    // Both import before seeing the other's import.
+    fx.jj(&a, &["status"]);
+    fx.jj(&b, &["status"]);
+    sync_missing(&rb, &ra).await;
+    sync_missing(&ra, &rb).await;
+    for dir in [&a, &b] {
+        // The losing side's working copy was rebased away.
+        fx.jj(dir, &["workspace", "update-stale"]);
+        let main = fx.jj_output(dir, &["log", "-r", "main", "--no-graph", "-T", "commit_id"]);
+        assert_eq!(main, lowest);
+        assert_eq!(git_rev(dir, "refs/heads/main"), lowest);
+    }
+}
+
+/// A receiver still divergent over a conflicted ref holds one of its
+/// sides in git: a peer's resolution must replace it, or the receiver's
+/// next import reverts the resolution.
+#[tokio::test]
+async fn conflicted_ref_follows_the_peer_resolution() {
+    let fx = Fixture::new();
+    let (a, b, ra, rb) = settled_colocated_pair(&fx).await;
+    move_bookmark(&fx, &a, "main", "a.txt");
+    move_bookmark(&fx, &b, "main", "b.txt");
+    sync_missing(&rb, &ra).await;
+    sync_missing(&ra, &rb).await;
+    assert_eq!(rb.op_heads().await.unwrap().len(), 2);
+
+    fx.jj(&a, &["status"]);
+    let resolved = move_bookmark(&fx, &a, "main", "resolved.txt");
+    sync_missing(&rb, &ra).await;
+    assert_eq!(git_rev(&b, "refs/heads/main"), resolved);
+
+    let imports = || {
+        fx.jj_output(&b, &["op", "log", "--ignore-working-copy"])
+            .matches("import git refs")
+            .count()
+    };
+    let before = imports();
+    // b's working copy is stale when its side lost the conflict.
+    fx.jj(&b, &["workspace", "update-stale"]);
+    assert_eq!(imports(), before);
+    assert_eq!(git_rev(&b, "refs/heads/main"), resolved);
+}
+
+/// A ref jj wrote but has not recorded yet (a running `jj git fetch`)
+/// survives a sync into a store only jj writes.
+#[tokio::test]
+async fn sync_keeps_refs_jj_has_not_recorded_yet() {
+    let fx = Fixture::new();
+    let a = fx.init_repo("a");
+    let b = fx.init_pull_target("b", "machine-b");
+    let (ra, rb) = (open(&a), open(&b));
+    sync_missing(&rb, &ra).await;
+    fx.jj(&b, &["status"]);
+
+    let store = store_git_dir(&b);
+    let tree = git_output(&store, &["hash-object", "-t", "tree", "-w", "/dev/null"]);
+    let fetched = git_output(&store, &["commit-tree", &tree, "-m", "fetched"]);
+    git(
+        &store,
+        &["update-ref", "refs/remotes/origin/main", &fetched],
+    );
+    fx.commit_file(&a, "a.txt", "unrelated");
+    sync_missing(&rb, &ra).await;
+    assert_eq!(git_rev_at(&store, "refs/remotes/origin/main"), fetched);
+}
+
 /// A non-colocated pull target must mirror refs into its backing git
 /// repo too: jj only imports git when the user enables colocation, and
 /// then reads every ref the replicated view lists but git lacks as a

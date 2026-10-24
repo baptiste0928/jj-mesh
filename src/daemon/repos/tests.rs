@@ -264,6 +264,33 @@ async fn auto_snapshots_working_copy_edits() {
     wait_changed(&set).await;
 }
 
+/// A git operation in progress (here a rebase) holds snapshots until it
+/// ends, which leaves no event in the working copy.
+#[tokio::test]
+async fn holds_snapshots_during_git_operations() {
+    let fx = Fixture::new();
+    let dir = fx.init_repo("a");
+    let rebase = dir.join(".git").join("rebase-merge");
+    std::fs::create_dir(&rebase).unwrap();
+
+    let set = start(SNAPSHOT, state_with("a", &dir));
+    wait_watching(&set).await;
+    std::fs::write(dir.join("conflicted.txt"), "<<<<<<<").unwrap();
+    let changed = |s: &[control::RepoStatus]| {
+        matches!(
+            s,
+            [status] if matches!(
+                status.watch,
+                WatchStatus::Watching { last_change_secs: Some(_), .. }
+            )
+        )
+    };
+    assert!(!wait_for_within(&set, Duration::from_secs(3), changed).await);
+
+    std::fs::remove_dir(&rebase).unwrap();
+    wait_changed(&set).await;
+}
+
 /// A stale working copy (op head advanced without updating it, which
 /// is what applying synced operations does) is healed on watch start.
 #[tokio::test]

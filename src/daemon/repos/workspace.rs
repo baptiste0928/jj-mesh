@@ -13,6 +13,10 @@
 //! by an operation the working copy never saw). When enabled, `jj workspace
 //! update-stale` runs after syncs that applied operations, while the op head
 //! is single.
+//!
+//! Both wait while git has an operation in progress in a colocated working
+//! copy (a rebase, a merge...): jj would snapshot its half-done files, and
+//! resetting git HEAD would abort it.
 
 use std::{
     path::Path,
@@ -36,6 +40,10 @@ use crate::{
 /// Budget for one spawned jj command. Generous: the first snapshot of a
 /// large working copy legitimately takes a while.
 const JJ_TIMEOUT: Duration = Duration::from_mins(5);
+
+/// How often a jj command waiting on a git operation checks whether it
+/// ended: git leaves no event in the working copy when it does.
+const GIT_POLL: Duration = Duration::from_secs(2);
 
 /// The op head after the last sync that applied operations, `None` when
 /// divergent.
@@ -239,6 +247,7 @@ impl WorkspaceTask {
     /// by an ongoing command, and the next trigger retries. Returns whether
     /// the command succeeded.
     async fn run_jj(&self, args: &[&str], tree: &mut Option<TreeWatcher>) -> Result<bool> {
+        self.wait_git_idle().await;
         let result = {
             let _serial = self.ctx.jj.lock().await;
             run_jj(self.workspace.root(), args, JJ_TIMEOUT).await
@@ -251,6 +260,32 @@ impl WorkspaceTask {
         }
         Ok(result.is_ok())
     }
+
+    /// Waits until git has no operation in progress in the working copy.
+    async fn wait_git_idle(&self) {
+        let Some(operation) = git_operation(self.workspace.root()).await else {
+            return;
+        };
+        info!("git {operation:?} in progress, holding jj until it ends");
+        while git_operation(self.workspace.root()).await.is_some() {
+            tokio::time::sleep(GIT_POLL).await;
+        }
+        info!("git operation ended");
+    }
+}
+
+/// The operation in progress in the colocated git worktree at `root`, if
+/// any. A bisect is left out: jj imports each commit it checks out, and
+/// one left unfinished would hold jj indefinitely.
+async fn git_operation(root: &Path) -> Option<gix::state::InProgress> {
+    let root = root.to_owned();
+    crate::spawn_blocking(move || {
+        let state = gix::open(root).ok()?.state()?;
+        (state != gix::state::InProgress::Bisect).then_some(state)
+    })
+    .await
+    .ok()
+    .flatten()
 }
 
 /// Scheduling state of one workspace's auto-snapshots.
