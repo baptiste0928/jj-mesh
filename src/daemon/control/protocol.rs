@@ -269,6 +269,9 @@ pub struct PeerStatus {
     pub endpoint: EndpointId,
     /// Whether the peer runs in server mode.
     pub server: bool,
+    /// Seconds since the last connection ended, if one did since the
+    /// daemon started.
+    pub last_seen_secs: Option<u64>,
     pub connection: ConnectionStatus,
 }
 
@@ -289,8 +292,6 @@ pub enum ConnectionStatus {
     },
     /// Last attempt failed; waiting before redialing.
     Backoff {
-        /// Seconds until the next attempt.
-        retry_in_secs: u64,
         /// Why the last attempt failed.
         error: String,
     },
@@ -299,8 +300,6 @@ pub enum ConnectionStatus {
     Incompatible {
         /// The peer's hello.
         peer: Incompatible,
-        /// Seconds until the next attempt.
-        retry_in_secs: u64,
     },
 }
 

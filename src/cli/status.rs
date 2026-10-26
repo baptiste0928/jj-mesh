@@ -14,8 +14,8 @@ use super::{complete, ui};
 use crate::{
     config::{ConfigDir, MAX_MACHINE_WORKSPACES, RepoId, sanitize},
     daemon::control::{
-        self, ConnectionStatus, PathInfo, PeerReport, RepoHealthState, Route, Status, WatchStatus,
-        WorkspacePlace, WorkspaceState, WorkspaceStatus,
+        self, ConnectionStatus, PathInfo, PeerReport, PeerStatus, RepoHealthState, Route, Status,
+        WatchStatus, WorkspacePlace, WorkspaceState, WorkspaceStatus,
     },
 };
 
@@ -76,7 +76,7 @@ fn print_peers(status: &Status) {
         .peers
         .iter()
         .map(|peer| {
-            let (state, detail) = connection(&peer.connection);
+            let (state, detail) = connection(peer);
             [machine(&peer.name, peer.server), state, detail]
         })
         .collect();
@@ -215,23 +215,14 @@ fn print_table<const N: usize>(rows: &[[String; N]]) {
     }
 }
 
-/// State and details of a peer connection.
-fn connection(connection: &ConnectionStatus) -> (String, String) {
-    match connection {
-        ConnectionStatus::Connecting { failures: 0 } => {
-            (ui::warn("connecting").to_string(), String::new())
+/// State and details of a peer.
+fn connection(peer: &PeerStatus) -> (String, String) {
+    let state = match &peer.connection {
+        ConnectionStatus::Connecting { failures: 0 } => ui::warn("connecting").to_string(),
+        ConnectionStatus::Connecting { .. } | ConnectionStatus::Backoff { .. } => {
+            ui::bad("offline").to_string()
         }
-        ConnectionStatus::Connecting { .. } => {
-            (ui::bad("offline").to_string(), "retrying".to_owned())
-        }
-        ConnectionStatus::Backoff { retry_in_secs, .. } => (
-            ui::bad("offline").to_string(),
-            format!("retry in {}", ui::format_duration(*retry_in_secs)),
-        ),
-        ConnectionStatus::Incompatible { retry_in_secs, .. } => (
-            ui::bad("incompatible").to_string(),
-            format!("retry in {}", ui::format_duration(*retry_in_secs)),
-        ),
+        ConnectionStatus::Incompatible { .. } => ui::bad("incompatible").to_string(),
         ConnectionStatus::Connected { path, .. } => {
             let route = match path {
                 Some(PathInfo {
@@ -244,9 +235,13 @@ fn connection(connection: &ConnectionStatus) -> (String, String) {
                 }) => format!("relay {}, {rtt_ms} ms", relay_host(url)),
                 None => "path pending".to_owned(),
             };
-            (ui::good("connected").to_string(), route)
+            return (ui::good("connected").to_string(), route);
         }
-    }
+    };
+    let seen = peer
+        .last_seen_secs
+        .map(|secs| format!("seen {} ago", ui::format_age(secs)));
+    (state, seen.unwrap_or_default())
 }
 
 /// A machine name, marked when it runs in server mode.

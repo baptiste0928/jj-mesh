@@ -80,10 +80,17 @@ struct PeerHandle {
     task: tokio::task::JoinHandle<()>,
 }
 
-/// Live state of one peer connection, shared between its task and status
-/// snapshots.
+/// State of one peer, shared between its task and status snapshots.
 #[derive(Debug)]
-enum PeerState {
+struct PeerState {
+    link: Link,
+    /// When the last connection ended, if one did.
+    last_seen: Option<SystemTime>,
+}
+
+/// The connection to one peer.
+#[derive(Debug)]
+enum Link {
     /// Dialing, after `failures` consecutive failed attempts.
     Connecting {
         failures: u32,
@@ -93,7 +100,6 @@ enum PeerState {
         since: SystemTime,
     },
     Backoff {
-        until: Instant,
         failure: Failure,
     },
 }
@@ -216,36 +222,34 @@ impl PeerSet {
         peers
             .iter()
             .map(|(id, handle)| {
-                let connection = match &*handle.state.lock().unwrap() {
-                    PeerState::Connecting { failures } => control::ConnectionStatus::Connecting {
+                let peer_state = handle.state.lock().unwrap();
+                let connection = match &peer_state.link {
+                    Link::Connecting { failures } => control::ConnectionStatus::Connecting {
                         failures: *failures,
                     },
-                    PeerState::Backoff { until, failure } => {
-                        let retry_in_secs =
-                            until.saturating_duration_since(Instant::now()).as_secs();
-                        match failure {
-                            Failure::Error(error) => control::ConnectionStatus::Backoff {
-                                retry_in_secs,
-                                error: error.clone(),
-                            },
-                            Failure::Incompatible(peer) => {
-                                control::ConnectionStatus::Incompatible {
-                                    peer: peer.clone(),
-                                    retry_in_secs,
-                                }
-                            }
+                    Link::Backoff { failure } => match failure {
+                        Failure::Error(error) => control::ConnectionStatus::Backoff {
+                            error: error.clone(),
+                        },
+                        Failure::Incompatible(peer) => {
+                            control::ConnectionStatus::Incompatible { peer: peer.clone() }
                         }
-                    }
-                    PeerState::Connected { conn, since } => control::ConnectionStatus::Connected {
+                    },
+                    Link::Connected { conn, since } => control::ConnectionStatus::Connected {
                         path: selected_path(conn),
                         since_secs: since.elapsed().unwrap_or_default().as_secs(),
                     },
                 };
+                let last_seen_secs = peer_state
+                    .last_seen
+                    .map(|at| at.elapsed().unwrap_or_default().as_secs());
+                drop(peer_state);
 
                 control::PeerStatus {
                     name: self.hub.peer_name(id),
                     endpoint: *id,
                     server: state.peers.get(id).is_some_and(Peer::is_server),
+                    last_seen_secs,
                     connection,
                 }
             })
@@ -253,7 +257,10 @@ impl PeerSet {
     }
 
     fn spawn_peer(&self, peer_id: EndpointId) -> PeerHandle {
-        let state = Arc::new(Mutex::new(PeerState::Connecting { failures: 0 }));
+        let state = Arc::new(Mutex::new(PeerState {
+            link: Link::Connecting { failures: 0 },
+            last_seen: None,
+        }));
         let (tx, rx) = mpsc::channel(4);
 
         let task = tokio::spawn(run_peer(PeerTask {
@@ -277,7 +284,7 @@ impl PeerSet {
 impl PeerHandle {
     fn shutdown(&self) {
         self.task.abort();
-        if let PeerState::Connected { conn, .. } = &*self.state.lock().unwrap() {
+        if let Link::Connected { conn, .. } = &self.state.lock().unwrap().link {
             conn.close(0u32.into(), b"peer removed");
         }
     }
@@ -335,10 +342,7 @@ async fn run_peer(mut task: PeerTask) {
         if let Some(failure) = failure.take() {
             failures += 1;
             let delay = backoff.next_delay();
-            task.set_state(PeerState::Backoff {
-                until: Instant::now() + delay,
-                failure,
-            });
+            task.set_link(Link::Backoff { failure });
             tokio::select! {
                 () = tokio::time::sleep(delay) => {}
                 Some(conn) = task.inbound.recv() => adopted = Some((conn, false)),
@@ -399,7 +403,7 @@ impl PeerTask {
     /// mirrored connections that the other side just abandoned, redialing
     /// in a loop.
     async fn establish(&mut self, failures: u32) -> Result<(Connection, bool), Failure> {
-        self.set_state(PeerState::Connecting { failures });
+        self.set_link(Link::Connecting { failures });
 
         if self.local_id < self.peer_id {
             dial(&self.endpoint, self.peer_id, &self.hub)
@@ -426,7 +430,7 @@ impl PeerTask {
 
         self.hub.peer_connected(self.peer_id, &conn);
         let reason = loop {
-            self.set_state(PeerState::Connected {
+            self.set_link(Link::Connected {
                 conn: conn.clone(),
                 since,
             });
@@ -465,6 +469,7 @@ impl PeerTask {
             }
         };
         self.hub.peer_disconnected(&self.peer_id);
+        self.state.lock().unwrap().last_seen = Some(SystemTime::now());
         reason
     }
 
@@ -533,8 +538,8 @@ impl PeerTask {
         self.hub.peer_name(&self.peer_id)
     }
 
-    fn set_state(&self, state: PeerState) {
-        *self.state.lock().unwrap() = state;
+    fn set_link(&self, link: Link) {
+        self.state.lock().unwrap().link = link;
     }
 }
 
