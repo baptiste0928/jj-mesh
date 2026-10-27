@@ -28,6 +28,7 @@ use crate::{
     config::{ConfigDir, Repo, RepoId},
     daemon::{
         backoff::Backoff,
+        bare::BareRepos,
         hub::SyncHub,
         logs::{LogBuffer, Subscription},
         pairing::Pairing,
@@ -58,6 +59,7 @@ pub struct ControlContext {
     pub repos: Arc<RepoSet>,
     pub hub: Arc<SyncHub>,
     pub store: Arc<MeshStore>,
+    pub bare: Arc<BareRepos>,
     pub pairing: Arc<Pairing>,
     pub logs: LogBuffer,
     /// The jj version found on PATH at daemon start, for status warnings.
@@ -246,6 +248,7 @@ async fn handle_client(
         Request::RenameRepo { name, new } => {
             reply(&mut stream, rename_repo(&ctx, &name, &new)).await
         }
+        Request::StoreRepo { repo } => reply(&mut stream, store_repo(&ctx, &repo).await).await,
     };
 
     if let Err(err) = served {
@@ -369,11 +372,24 @@ fn rename_repo(ctx: &ControlContext, name: &str, new: &str) -> Result<Response> 
 /// it, announcements stop, and the mesh record stays untouched (no gossip
 /// change), so the repo remains clonable here.
 fn forget_repo(ctx: &ControlContext, name: &str) -> Result<Response> {
-    let repo = ctx
-        .store
-        .update(|state| state.forget_repo(&state.resolve_repo(name)?))?;
+    let state = ctx.store.snapshot();
+    let id = state.resolve_repo(name)?;
+    let missing = state
+        .repos
+        .get(&id)
+        .is_some_and(|repo| JjRepo::is_missing(&repo.path));
+    let repo = ctx.store.update(|state| state.forget_repo(&id, missing))?;
     info!(repo = %name, "repo forgotten locally");
     Ok(Response::RepoForgotten { path: repo.path })
+}
+
+/// Moves the storage of a registered repo to a bare repo (see
+/// `daemon::bare`).
+async fn store_repo(ctx: &ControlContext, name: &str) -> Result<Response> {
+    let id = ctx.store.snapshot().resolve_repo(name)?;
+    let path = ctx.bare.store(&ctx.store, &id).await?;
+    info!(repo = %name, "repo moved to a bare repo");
+    Ok(Response::RepoStored { path })
 }
 
 /// Tombstones a paired peer; the peer set disconnects it immediately and
@@ -411,7 +427,7 @@ async fn hold_workspace(
     let hold = state.resolve_repo(repo).and_then(|id| {
         ensure!(
             state.repos.contains_key(&id),
-            "`{repo}` is not registered on this machine"
+            "{repo} is not registered on this machine"
         );
         ctx.repos.hold(&id, workspace)
     });

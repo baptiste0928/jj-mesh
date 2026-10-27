@@ -97,7 +97,7 @@ pub fn run(args: AddArgs, dir: &ConfigDir) -> Result<()> {
     println!(
         "{}",
         ui::good(format_args!(
-            "Added repo `{name}` at {}",
+            "Added repo {name} at {}",
             repo.root().display()
         ))
     );

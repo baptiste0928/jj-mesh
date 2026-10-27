@@ -37,8 +37,8 @@ pub const MAX_MESH_CLAIMED_REPOS: usize = 4096;
 /// Cap on the other machines' claimed repos, leaving room for our own.
 pub(super) const MAX_OTHER_REPOS: usize = MAX_MESH_CLAIMED_REPOS - MAX_MACHINE_REPOS;
 
-/// The workspaces one machine claims, by repo. An empty set claims the
-/// repo without any workspace.
+/// The workspaces one machine claims, by repo. Repos without claimed
+/// workspaces are left out.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkspaceClaims {

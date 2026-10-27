@@ -107,7 +107,7 @@ pub fn run(args: CloneArgs, dir: &ConfigDir) -> Result<()> {
         Some(repo) if repo.bare => {
             ensure!(
                 colocate.is_empty(),
-                "`{name}` is a bare repo kept by server mode, whose git store cannot be colocated",
+                "{name} is a bare repo kept by server mode, whose git store cannot be colocated",
             );
             let bare = JjRepo::at(&repo.path)?;
             let workspace = match args.workspace {
@@ -215,7 +215,7 @@ fn clone(
 
     println!(
         "{}",
-        ui::good(format_args!("Cloned `{name}` in {}", path.display())),
+        ui::good(format_args!("Cloned {name} in {}", path.display())),
     );
     Ok(())
 }
@@ -232,7 +232,7 @@ fn add_workspace(
 ) -> Result<()> {
     ensure!(
         !path.exists(),
-        "{} already exists and `{name}` is already cloned in {}. Pass the directory of a new workspace",
+        "{} already exists and {name} is already cloned in {}. Pass the directory of a new workspace",
         path.display(),
         repo.display(),
     );
@@ -259,7 +259,7 @@ fn add_workspace(
     println!(
         "{}",
         ui::good(format_args!(
-            "`{name}` is already cloned in {}, added workspace `{workspace}` in {}",
+            "{name} is already cloned in {}, added workspace {workspace} in {}",
             repo.display(),
             path.display(),
         )),
@@ -308,7 +308,7 @@ fn add_bare_workspace(
     println!(
         "{}",
         ui::good(format_args!(
-            "Added workspace `{workspace}` of the bare repo of `{name}` in {}",
+            "Added workspace {workspace} of the bare repo of {name} in {}",
             path.display(),
         )),
     );
@@ -388,7 +388,7 @@ fn default_path(name: &str) -> Result<PathBuf> {
             path.components().collect::<Vec<_>>()[..],
             [Component::Normal(_)]
         ),
-        "`{name}` is not a directory name. Pass the directory to clone into",
+        "{name} is not a directory name. Pass the directory to clone into",
     );
     Ok(path)
 }
@@ -400,7 +400,7 @@ fn default_path(name: &str) -> Result<PathBuf> {
 fn pull(dir: &ConfigDir, name: &str, path: &Path, workspace: &str) -> Result<()> {
     jj(Some(path), &["workspace", "rename", workspace])?;
 
-    println!("Pulling repo `{name}` from the mesh...");
+    println!("Pulling repo {name} from the mesh...");
     let request = Request::CloneRepo {
         name: name.to_owned(),
         path: std::fs::canonicalize(path)
@@ -433,7 +433,7 @@ fn clean_failed_clone(dir: &ConfigDir, name: &str, path: &Path, err: Report) -> 
     });
     if registered {
         return err.wrap_err(format!(
-            "the pull succeeded and `{name}` is registered at {}, but its result was lost",
+            "the pull succeeded and {name} is registered at {}, but its result was lost",
             path.display(),
         ));
     }
@@ -492,23 +492,23 @@ fn show_progress(bar: &ProgressBar, progress: &CloneProgress) {
     match transfer.phase {
         TransferPhase::Ops => match transfer.total {
             None => spin(format!(
-                "Pulling history from `{peer}`: {} operations",
+                "Pulling history from {peer}: {} operations",
                 transfer.current,
             )),
             Some(total) => {
                 counted(total);
-                bar.set_prefix(format!("Pulling history from `{peer}`"));
+                bar.set_prefix(format!("Pulling history from {peer}"));
                 bar.set_message("operations");
             }
         },
         TransferPhase::Git => match transfer.total {
             None => spin(format!(
-                "Pulling files from `{peer}`: {}",
+                "Pulling files from {peer}: {}",
                 HumanBytes(transfer.bytes),
             )),
             Some(total) => {
                 counted(total);
-                bar.set_prefix(format!("Pulling files from `{peer}`"));
+                bar.set_prefix(format!("Pulling files from {peer}"));
                 bar.set_message(format!("objects ({})", HumanBytes(transfer.bytes)));
             }
         },

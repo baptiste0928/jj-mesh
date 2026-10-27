@@ -29,6 +29,6 @@ pub fn run(args: RemoveArgs, dir: &ConfigDir) -> Result<()> {
         bail!("unexpected response from the daemon: {response:?}");
     };
 
-    println!("{}", ui::good(format_args!("Removed peer `{peer}`")));
+    println!("{}", ui::good(format_args!("Removed peer {peer}")));
     Ok(())
 }

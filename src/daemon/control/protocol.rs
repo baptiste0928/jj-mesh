@@ -80,8 +80,9 @@ pub enum Request {
     /// [`Response::PeerRemoved`] or [`Response::Error`].
     RemovePeer { peer: String },
     /// Unregister a repo on this machine only (its files are left alone);
-    /// the mesh keeps the repo and it stays clonable here. Answered with
-    /// [`Response::RepoForgotten`] or [`Response::Error`].
+    /// the mesh keeps the repo and it stays clonable here. Refused when no
+    /// other machine holds it. Answered with [`Response::RepoForgotten`] or
+    /// [`Response::Error`].
     ForgetRepo { name: String },
     /// Rename this machine; peers learn the new name through the gossip.
     /// Answered with [`Response::MachineRenamed`] or [`Response::Error`].
@@ -105,6 +106,10 @@ pub enum Request {
     /// through the gossip. Answered with [`Response::RepoRenamed`] or
     /// [`Response::Error`].
     RenameRepo { name: String, new: String },
+    /// Move the storage of the registered repo `repo` to a bare repo, in
+    /// server mode; its workspaces then use the bare repo. Answered with
+    /// [`Response::RepoStored`] or [`Response::Error`].
+    StoreRepo { repo: String },
 }
 
 /// A daemon answer to a [`Request`].
@@ -162,6 +167,10 @@ pub enum Response {
     WorkspaceHeld,
     /// The repo is renamed in the mesh state.
     RepoRenamed,
+    /// The repo storage moved to the bare repo at `path`.
+    RepoStored {
+        path: PathBuf,
+    },
 }
 
 /// Header of a [`Request::Logs`] stream.

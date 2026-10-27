@@ -1,6 +1,7 @@
 //! `jj-mesh repo`: manage the repos synchronized on the mesh.
 
 mod add;
+mod batch;
 mod clone;
 mod forget;
 mod remove;

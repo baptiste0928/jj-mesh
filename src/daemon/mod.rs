@@ -134,7 +134,7 @@ impl Daemon {
         ));
         let (update_tx, update_rx) = mpsc::unbounded_channel();
         let repos = Arc::new(RepoSet::new(hub.clone(), update_tx));
-        let bare = Arc::new(BareRepos::default());
+        let bare = Arc::new(BareRepos::new(dir));
         let store = Arc::new(MeshStore::new(
             dir.clone(),
             key.endpoint_id(),
@@ -157,6 +157,7 @@ impl Daemon {
             repos: repos.clone(),
             hub: hub.clone(),
             store: store.clone(),
+            bare: bare.clone(),
             pairing: pairing.clone(),
             logs,
             jj_version: jj_version.clone(),
@@ -165,7 +166,7 @@ impl Daemon {
         tasks.spawn(accept_loop(endpoint.clone(), peers, pairing));
         tasks.spawn(membership_loop(gossip_rx, store.clone()));
         tasks.spawn(update_loop(update_rx, store.clone()));
-        tasks.spawn(bare::run(dir.clone(), store.clone(), hub.clone(), bare));
+        tasks.spawn(bare::run(store.clone(), hub.clone(), bare.clone()));
         tasks.spawn(status_loop(repos, hub, jj_version));
         tasks.spawn(gossip_loop(store));
 

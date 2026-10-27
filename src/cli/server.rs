@@ -5,7 +5,7 @@ use color_eyre::eyre::{Result, bail};
 
 use super::ui;
 use crate::{
-    config::ConfigDir,
+    config::{ConfigDir, MeshState},
     daemon::control::{self, Request, Response},
 };
 
@@ -47,5 +47,26 @@ pub fn set(dir: &ConfigDir, server: bool) -> Result<()> {
         "Server mode disabled"
     };
     println!("{}", ui::good(message));
+    if server {
+        print_unstored(&MeshState::load(dir)?);
+    }
     Ok(())
+}
+
+/// Lists the repos registered with their own storage, which server mode
+/// leaves where they are.
+fn print_unstored(state: &MeshState) {
+    let names: Vec<_> = state
+        .repos
+        .iter()
+        .filter(|(_, repo)| !repo.bare)
+        .filter_map(|(id, _)| state.repo_name(id))
+        .collect();
+    if names.is_empty() {
+        return;
+    }
+    println!(
+        "Not in bare repos: {}. `jj-mesh repo forget <name>` moves one into a bare repo.",
+        names.join(", "),
+    );
 }

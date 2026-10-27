@@ -196,7 +196,7 @@ impl RepoSet {
             .send_if_modified(|holds| holds.insert(key.clone()));
         ensure!(
             added,
-            "the workspace `{workspace}` of `{name}` is already being created",
+            "the workspace {workspace} of {name} is already being created",
         );
         Ok(WorkspaceHold {
             holds: self.holds.clone(),

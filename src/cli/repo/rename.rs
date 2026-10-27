@@ -36,9 +36,6 @@ pub fn run(args: RenameArgs, dir: &ConfigDir) -> Result<()> {
         bail!("unexpected response from the daemon: {response:?}");
     };
 
-    println!(
-        "{}",
-        ui::good(format_args!("Renamed repo `{name}` to `{new}`"))
-    );
+    println!("{}", ui::good(format_args!("Renamed repo {name} to {new}")));
     Ok(())
 }

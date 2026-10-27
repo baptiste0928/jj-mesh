@@ -85,7 +85,7 @@ async fn join(client: &mut ControlClient, ticket: &PairTicket) -> Result<()> {
 
     match client.recv(None).await? {
         Response::Paired { name, .. } => {
-            println!("{}", ui::good(format_args!("Paired with `{name}`")));
+            println!("{}", ui::good(format_args!("Paired with {name}")));
             Ok(())
         }
         Response::Error(err) => bail!("pairing failed: {err}"),

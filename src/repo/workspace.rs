@@ -12,6 +12,7 @@ use std::{
     collections::BTreeSet,
     ffi::OsStr,
     fs,
+    io::ErrorKind,
     os::unix::ffi::OsStrExt as _,
     path::{Path, PathBuf},
 };
@@ -144,6 +145,23 @@ impl Workspace {
             operation: OperationId::new(checkout.operation_id),
         })
     }
+
+    /// Deletes the directories of `workspaces`, the main one (which may
+    /// contain the others) last.
+    pub fn delete_all(workspaces: &[Workspace]) -> Result<()> {
+        let (main, others): (Vec<_>, Vec<_>) =
+            workspaces.iter().partition(|workspace| workspace.is_main());
+        for workspace in others.into_iter().chain(main) {
+            match fs::remove_dir_all(&workspace.root) {
+                Err(err) if err.kind() != ErrorKind::NotFound => {
+                    return Err(err)
+                        .wrap_err_with(|| format!("cannot delete {}", workspace.root.display()));
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
 }
 
 impl JjRepo {
@@ -184,6 +202,15 @@ impl JjRepo {
         Ok(found)
     }
 
+    /// The workspaces on disk of the repo at `root`, none when its storage
+    /// is missing (see [`Self::is_missing`]).
+    pub fn local_workspaces_at(root: &Path) -> Result<Vec<Workspace>> {
+        if Self::is_missing(root) {
+            return Ok(Vec::new());
+        }
+        Self::at(root)?.local_workspaces()
+    }
+
     /// Whether a workspace on disk uses the repo (see
     /// [`Self::local_workspaces`]).
     pub fn has_workspaces(&self) -> Result<bool> {
@@ -202,7 +229,7 @@ impl JjRepo {
         let path = self.workspace_index_path();
         let bytes = match fs::read(&path) {
             Ok(bytes) => bytes,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
             Err(err) => {
                 return Err(err).wrap_err_with(|| format!("cannot read {}", path.display()));
             }
@@ -235,7 +262,7 @@ impl JjRepo {
         let names = repo.view().wc_commit_ids();
         ensure!(
             !names.contains_key(WorkspaceName::new(name)),
-            "the workspace `{name}` already exists",
+            "the workspace {name} already exists",
         );
 
         fs::create_dir_all(root).wrap_err_with(|| format!("cannot create {}", root.display()))?;

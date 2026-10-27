@@ -19,6 +19,10 @@
 //! complete, so an `<id>` directory always holds a complete repo. Only
 //! directories named after repo ids in the bare repo directory are deleted,
 //! and only when no workspace uses them (see [`JjRepo::has_workspaces`]).
+//!
+//! A repo registered with its own storage can move into a bare repo
+//! instead of being pulled again, its workspaces then using the bare repo
+//! (see [`BareRepos::store`]).
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -29,7 +33,7 @@ use std::{
 };
 
 use color_eyre::eyre::{Result, WrapErr as _, ensure};
-use tokio::sync::Notify;
+use tokio::sync::{Mutex, Notify};
 use tracing::{debug, info, warn};
 
 use super::{
@@ -40,7 +44,7 @@ use super::{
 };
 use crate::{
     config::{ConfigDir, MeshRepo, MeshState, ObjectHash, Repo, RepoId, create_private},
-    repo::JjRepo,
+    repo::{JjRepo, RelocationError, run_jj},
 };
 
 /// How often to reconcile without a wakeup: workspaces come and go without
@@ -54,23 +58,97 @@ const RETRY_MIN: Duration = Duration::from_secs(30);
 /// Ceiling of the pull retry delay.
 const RETRY_MAX: Duration = Duration::from_mins(30);
 
-/// Wakes the bare repo task on mesh state changes.
-#[derive(Debug, Default)]
+/// Budget for making a repo non-colocated before moving it: jj moves the
+/// git store with a rename.
+const COLOCATION_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The bare repo directory, and the wakeups of the bare repo task.
+#[derive(Debug)]
 pub struct BareRepos {
+    root: PathBuf,
     changed: Notify,
+    /// Held while dropping and deleting bare repos, and while moving one in.
+    cleanup: Mutex<()>,
 }
 
 impl BareRepos {
+    pub fn new(dir: &ConfigDir) -> Self {
+        BareRepos {
+            root: dir.bare_dir().to_owned(),
+            changed: Notify::new(),
+            cleanup: Mutex::new(()),
+        }
+    }
+
     /// Notes a mesh state change; the task reconciles with it.
     pub fn sync(&self) {
         self.changed.notify_one();
     }
+
+    /// Moves the storage of the registered repo `id` into a bare repo,
+    /// returning its path (see [`Relocation`]). Holds the cleanup lock so
+    /// the task does not drop the bare repo before it is complete.
+    pub async fn store(&self, store: &MeshStore, id: &RepoId) -> Result<PathBuf> {
+        let _cleanup = self.cleanup.lock().await;
+        let state = store.snapshot();
+        state.check_store(id)?;
+        let repo = state.repos[id].clone();
+        let (root, path, dir_name) = (self.root.clone(), repo.path.clone(), id.to_string());
+        let (relocation, target) = crate::spawn_blocking(move || -> Result<_> {
+            create_private(&root)?;
+            let target = fs::canonicalize(&root)
+                .wrap_err("cannot resolve the bare repos")?
+                .join(dir_name);
+            Ok((JjRepo::at(&path)?.relocation(&target)?, target))
+        })
+        .await
+        .wrap_err("repo move task failed")??;
+
+        store.update(|state| {
+            ensure!(
+                state.repos.get(id) == Some(&repo),
+                "the repo changed meanwhile"
+            );
+            state.store_repo(id, target.clone())
+        })?;
+        let disabled = if relocation.colocated() {
+            let args = ["git", "colocation", "disable"];
+            run_jj(&repo.path, &args, COLOCATION_TIMEOUT).await
+        } else {
+            Ok(())
+        };
+        let moved = match disabled {
+            Ok(()) => crate::spawn_blocking(move || relocation.apply())
+                .await
+                .unwrap_or_else(|err| Err(RelocationError::Unmoved(err.into()))),
+            Err(err) => Err(RelocationError::Unmoved(err)),
+        };
+        match moved {
+            Ok(()) => Ok(target),
+            Err(RelocationError::Moved(err)) => Err(err),
+            Err(RelocationError::Unmoved(err)) => {
+                restore(store, id, repo);
+                Err(err)
+            }
+        }
+    }
+}
+
+/// Registers `repo` again after its storage failed to move.
+fn restore(store: &MeshStore, id: &RepoId, repo: Repo) {
+    let restored = store.update(|state| {
+        state.repos.insert(id.clone(), repo);
+        Ok(())
+    });
+    if let Err(err) = restored {
+        warn!("cannot register the repo again: {err:#}");
+    }
 }
 
 /// Reconciles the bare repos forever (see the module docs).
-pub async fn run(dir: ConfigDir, store: Arc<MeshStore>, hub: Arc<SyncHub>, bare: Arc<BareRepos>) {
+pub async fn run(store: Arc<MeshStore>, hub: Arc<SyncHub>, bare: Arc<BareRepos>) {
     let mut task = Task {
-        root: dir.bare_dir().to_owned(),
+        bare: bare.clone(),
         store,
         hub,
         retries: BTreeMap::new(),
@@ -96,8 +174,7 @@ pub async fn run(dir: ConfigDir, store: Arc<MeshStore>, hub: Arc<SyncHub>, bare:
 }
 
 struct Task {
-    /// The bare repo directory.
-    root: PathBuf,
+    bare: Arc<BareRepos>,
     store: Arc<MeshStore>,
     hub: Arc<SyncHub>,
     /// Repos whose pull failed, with their backoff and next attempt.
@@ -107,9 +184,12 @@ struct Task {
 impl Task {
     /// Runs one reconciliation, returning whether server mode is on.
     async fn reconcile(&mut self) -> bool {
-        self.drop_bare().await;
-        if let Err(err) = self.sweep().await {
-            warn!("cannot clean up the bare repos: {err:#}");
+        {
+            let _cleanup = self.bare.cleanup.lock().await;
+            self.drop_bare().await;
+            if let Err(err) = self.sweep().await {
+                warn!("cannot clean up the bare repos: {err:#}");
+            }
         }
 
         let mut state = self.store.snapshot();
@@ -172,13 +252,13 @@ impl Task {
     /// Deletes the bare repos that are not registered and no workspace
     /// uses, and the leftovers of interrupted pulls.
     async fn sweep(&self) -> Result<()> {
-        let entries = match fs::read_dir(&self.root) {
+        let entries = match fs::read_dir(&self.bare.root) {
             Ok(entries) => entries,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
             Err(err) => return Err(err).wrap_err("cannot list the bare repos"),
         };
         // Registered paths are canonical.
-        let root = fs::canonicalize(&self.root).wrap_err("cannot resolve the bare repos")?;
+        let root = fs::canonicalize(&self.bare.root).wrap_err("cannot resolve the bare repos")?;
         let state = self.store.snapshot();
         let registered: BTreeSet<&Path> = state.repos.values().map(|repo| &*repo.path).collect();
         for entry in entries {
@@ -224,7 +304,7 @@ impl Task {
         };
         let target = self.hub.clone_sources(id, name).and_then(|sources| {
             let repo = Repo {
-                path: self.root.join(id.to_string()),
+                path: self.bare.root.join(id.to_string()),
                 bare: true,
             };
             Ok((state.check_clone(id, repo)?, sources))
@@ -265,9 +345,9 @@ impl Task {
         object_hash: ObjectHash,
         sources: Vec<CloneSource>,
     ) -> Result<()> {
-        let partial = self.root.join(format!("{id}.tmp"));
+        let partial = self.bare.root.join(format!("{id}.tmp"));
         {
-            let (root, partial) = (self.root.clone(), partial.clone());
+            let (root, partial) = (self.bare.root.clone(), partial.clone());
             crate::spawn_blocking(move || -> Result<()> {
                 create_private(&root)?;
                 JjRepo::init_bare(&partial, object_hash)?;

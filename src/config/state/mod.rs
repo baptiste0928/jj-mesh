@@ -221,7 +221,7 @@ impl MeshState {
             _ => {
                 let ids: Vec<String> = ids.iter().map(ToString::to_string).collect();
                 bail!(
-                    "several repos are named `{selector}` ({}). Use the id of the one you mean",
+                    "several repos are named {selector} ({}). Use the id of the one you mean",
                     ids.join(", "),
                 );
             }
@@ -229,8 +229,24 @@ impl MeshState {
 
         match RepoId::try_from(selector.to_owned()) {
             Ok(id) if self.repo_name(&id).is_some() => Ok(id),
-            _ => bail!("no repo named `{selector}` in the mesh"),
+            _ => bail!("no repo named {selector} in the mesh"),
         }
+    }
+
+    /// The other alive machines holding a repo: those claiming one of its
+    /// workspaces, and servers, which hold every repo.
+    pub fn holders(&self, id: &RepoId) -> BTreeSet<&str> {
+        self.alive_peers()
+            .filter(|(endpoint, _)| {
+                self.peers[*endpoint].is_server()
+                    || self
+                        .peer_claims
+                        .get(*endpoint)
+                        .and_then(|claims| claims.repos.get(id))
+                        .is_some_and(|names| !names.is_empty())
+            })
+            .map(|(_, name)| name)
+            .collect()
     }
 
     /// The claims on the workspaces of a repo.
@@ -287,7 +303,7 @@ impl MeshState {
     pub fn validate_new_peer(&self, name: &str, endpoint: &EndpointId) -> Result<()> {
         validate_name("peer", name)?;
         if let Some(existing) = self.peer_name(endpoint) {
-            bail!("endpoint {endpoint} is already paired as `{existing}`");
+            bail!("endpoint {endpoint} is already paired as {existing}");
         }
 
         Ok(())
@@ -300,9 +316,9 @@ impl MeshState {
         if let Some((id, _)) = self.mesh_repo_names().find(|(_, other)| *other == name) {
             ensure!(
                 !self.repos.contains_key(id),
-                "a repo named `{name}` already exists"
+                "a repo named {name} already exists"
             );
-            bail!("a repo named `{name}` already exists in the mesh. Clone it instead");
+            bail!("a repo named {name} already exists in the mesh. Clone it instead");
         }
         self.validate_new_path(path)
     }
@@ -314,9 +330,9 @@ impl MeshState {
     /// now.
     fn validate_new_path(&self, path: &Path) -> Result<()> {
         let path = canonical_path(path);
-        if let Some((id, _)) = self.repos.iter().find(|(_, repo)| repo.path == path) {
+        if let Some(id) = self.repo_at(&path) {
             let name = self.repo_name(id).unwrap_or("?");
-            bail!("{} is already added as `{name}`", path.display());
+            bail!("{} is already added as {name}", path.display());
         }
 
         Ok(())
@@ -387,14 +403,14 @@ impl MeshState {
         match matches[..] {
             [endpoint] => return Ok(*endpoint),
             [_, _, ..] => bail!(
-                "several peers are named `{selector}`. Rename one of them with \
+                "several peers are named {selector}. Rename one of them with \
                  `jj-mesh peer rename` on its machine"
             ),
             [] => {}
         }
 
         let Ok(endpoint) = selector.parse::<EndpointId>() else {
-            bail!("no peer named `{selector}`");
+            bail!("no peer named {selector}");
         };
         ensure!(
             self.peer_name(&endpoint).is_some(),
@@ -454,7 +470,7 @@ impl MeshState {
         };
         ensure!(
             !self.repos.contains_key(id),
-            "`{name}` is already registered on this machine"
+            "{name} is already registered on this machine"
         );
         repo.path = canonical_path(&repo.path);
         self.validate_new_path(&repo.path)?;
@@ -487,7 +503,7 @@ impl MeshState {
         }
         ensure!(
             !self.repo_names().contains(new.as_str()),
-            "a repo named `{new}` already exists"
+            "a repo named {new} already exists"
         );
         let status = MeshRepoStatus::Present {
             name: new,
@@ -499,19 +515,57 @@ impl MeshState {
     /// Unregisters a repo on this machine only, returning its record. The
     /// mesh record is untouched: the other machines keep syncing the repo
     /// among themselves, and it stays clonable here.
-    ///
-    /// Bare repos cannot be forgotten: server mode would pull them again.
-    pub fn forget_repo(&mut self, id: &RepoId) -> Result<Repo> {
+    pub fn forget_repo(&mut self, id: &RepoId, missing: bool) -> Result<Repo> {
+        self.check_forget(id, missing)?;
+        Ok(self.unregister_repo(id).expect("registered"))
+    }
+
+    /// Checks that a repo can be forgotten, `missing` telling whether its
+    /// directory is gone. Server mode keeps bare repos, and a repo no other
+    /// machine holds would be lost, unless its directory is already gone.
+    pub fn check_forget(&self, id: &RepoId, missing: bool) -> Result<()> {
         let name = self.repo_name(id).unwrap_or("?");
+        let Some(repo) = self.repos.get(id) else {
+            bail!("{name} is not registered on this machine");
+        };
+        ensure!(
+            !(repo.bare && self.machine.server),
+            "{name} is a bare repo kept by server mode. Disable server mode or remove the repo \
+             from the mesh",
+        );
+        ensure!(
+            missing || !self.holders(id).is_empty(),
+            "no other machine holds {name}. Use `jj-mesh repo remove {name}`",
+        );
+        Ok(())
+    }
+
+    /// Registers a repo as the bare repo at `path`, where its storage is
+    /// moving (see `daemon::bare`).
+    pub fn store_repo(&mut self, id: &RepoId, path: PathBuf) -> Result<()> {
+        self.check_store(id)?;
+        self.repos.insert(id.clone(), Repo { path, bare: true });
+        Ok(())
+    }
+
+    /// Checks that the storage of a repo can move to a bare repo: server
+    /// mode is on and it has its own.
+    pub fn check_store(&self, id: &RepoId) -> Result<()> {
+        let name = self.repo_name(id).unwrap_or("?");
+        ensure!(self.machine.server, "server mode is off");
         match self.repos.get(id) {
-            None => bail!("`{name}` is not registered on this machine"),
-            Some(repo) if repo.bare => {
-                bail!(
-                    "`{name}` is a bare repo kept by server mode. Disable server mode or remove the repo from the mesh"
-                )
-            }
-            Some(_) => Ok(self.unregister_repo(id).expect("registered")),
+            None => bail!("{name} is not registered on this machine"),
+            Some(repo) => ensure!(!repo.bare, "{name} is already a bare repo"),
         }
+        Ok(())
+    }
+
+    /// The registered repo whose root is `path`, canonical.
+    pub fn repo_at(&self, path: &Path) -> Option<&RepoId> {
+        self.repos
+            .iter()
+            .find(|(_, repo)| repo.path == path)
+            .map(|(id, _)| id)
     }
 
     /// Unregisters a bare repo (see `daemon::bare`); other repos are left
@@ -721,6 +775,15 @@ mod tests {
             .add_repo(id.clone(), name.to_owned(), repo, ObjectHash::Sha1)
             .unwrap();
         id
+    }
+
+    /// Adds a peer claiming a workspace of `id`, which then holds the repo.
+    fn add_holder(state: &mut MeshState, id: &RepoId) {
+        let endpoint = SecretKey::generate().public();
+        state.add_peer(endpoint, "holder".to_owned()).unwrap();
+        state
+            .peer_claims
+            .insert(endpoint, claims(1, id, &["holder"]));
     }
 
     #[test]
@@ -1090,7 +1153,8 @@ mod tests {
         assert_eq!(state.name_conflicts()["proj"], both);
         // The name selects the repo registered here, ids select either.
         assert_eq!(state.resolve_repo("proj").unwrap(), ours);
-        state.forget_repo(&ours).unwrap();
+        add_holder(&mut state, &ours);
+        state.forget_repo(&ours, false).unwrap();
         let err = state.resolve_repo("proj").unwrap_err();
         assert!(err.to_string().contains(&theirs.to_string()), "{err:#}");
         assert_eq!(state.resolve_repo(&theirs.to_string()).unwrap(), theirs);
@@ -1142,10 +1206,15 @@ mod tests {
         let mut state = MeshState::default();
         let id = add(&mut state, "proj");
 
-        let repo = state.forget_repo(&id).unwrap();
+        // The last machine holding the repo cannot forget it.
+        let err = state.forget_repo(&id, false).unwrap_err();
+        assert!(err.to_string().contains("repo remove"), "{err:#}");
+        add_holder(&mut state, &id);
+
+        let repo = state.forget_repo(&id, false).unwrap();
         assert_eq!(repo.path, PathBuf::from("/tmp/proj"));
         assert!(state.repos.is_empty());
-        assert!(state.forget_repo(&id).is_err());
+        assert!(state.forget_repo(&id, false).is_err());
 
         // The mesh still knows the repo: it stays clonable here, and a
         // plain re-add would fork the name.
@@ -1350,7 +1419,8 @@ mod tests {
             .set_claims(&other, BTreeSet::from(["x".to_owned()]))
             .unwrap();
         assert!(!state.claims.repos.contains_key(&other));
-        state.forget_repo(&id).unwrap();
+        add_holder(&mut state, &id);
+        state.forget_repo(&id, false).unwrap();
         assert!(state.claims.repos.is_empty());
     }
 

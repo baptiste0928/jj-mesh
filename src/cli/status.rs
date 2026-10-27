@@ -148,14 +148,14 @@ fn print_repo(status: &Status, selector: &str) -> Result<RepoId> {
             println!("{}  {}", repo.name, ui::dim("not cloned"));
             return Ok(repo.id.clone());
         }
-        ([], []) => bail!("no repo named `{selector}` in the mesh"),
+        ([], []) => bail!("no repo named {selector} in the mesh"),
         _ => {
             let ids = registered.iter().map(|repo| &repo.id);
             let ids = ids
                 .chain(available.iter().map(|repo| &repo.id))
                 .map(ToString::to_string);
             bail!(
-                "several repos are named `{selector}` ({}). Use the id of the one you mean",
+                "several repos are named {selector} ({}). Use the id of the one you mean",
                 ids.collect::<Vec<_>>().join(", "),
             );
         }
@@ -345,7 +345,7 @@ fn repo_issues(status: &Status, wanted: impl Fn(&RepoId) -> bool) -> Vec<String>
     for conflict in &status.conflicts {
         if conflict.repos.iter().any(&wanted) {
             issues.push(format!(
-                "`{}`: several repos carry this name ({}). Rename one of them with `jj-mesh repo \
+                "{}: several repos carry this name ({}). Rename one of them with `jj-mesh repo \
                  rename <id> <new name>`",
                 conflict.name,
                 conflict
@@ -360,17 +360,17 @@ fn repo_issues(status: &Status, wanted: impl Fn(&RepoId) -> bool) -> Vec<String>
     for repo in status.repos.iter().filter(|repo| wanted(&repo.id)) {
         match &repo.watch {
             WatchStatus::Failed { error, .. } => {
-                issues.push(format!("`{}`: {}", repo.name, sanitize(error)));
+                issues.push(format!("{}: {}", repo.name, sanitize(error)));
             }
             WatchStatus::Missing { .. } => issues.push(format!(
-                "`{0}`: directory missing. Run `jj-mesh repo forget {0}` if it was deleted",
+                "{0}: directory missing. Run `jj-mesh repo forget {0}` if it was deleted",
                 repo.name
             )),
             _ => {}
         }
         for workspace in &repo.workspaces {
             if let Some(issue) = workspace_issue(&workspace.name, &workspace.place) {
-                issues.push(format!("`{}`: {issue}", repo.name));
+                issues.push(format!("{}: {issue}", repo.name));
             }
         }
     }
@@ -382,7 +382,7 @@ fn repo_issues(status: &Status, wanted: impl Fn(&RepoId) -> bool) -> Vec<String>
                 RepoHealthState::Missing => "directory missing on that machine",
             };
             let name = names.get(&repo.id).copied().unwrap_or("?");
-            issues.push(format!("`{name}` on {peer}: {problem}"));
+            issues.push(format!("{name} on {peer}: {problem}"));
         }
     }
     issues
@@ -401,23 +401,23 @@ fn workspace_issue(name: &str, place: &WorkspacePlace) -> Option<String> {
         WorkspacePlace::Local { state, .. } => match state {
             WorkspaceState::Claimed => return None,
             WorkspaceState::Contested { machines } => format!(
-                "workspace `{name}` also exists on {}, so neither copy is synced. On one machine, {recreate}",
+                "workspace {name} also exists on {}, so neither copy is synced. On one machine, {recreate}",
                 sanitize(&machines.join(", ")),
             ),
             WorkspaceState::Foreign { machines } => format!(
-                "workspace `{name}` here is not synced, it belongs to {}. To sync it, {recreate}",
+                "workspace {name} here is not synced, it belongs to {}. To sync it, {recreate}",
                 sanitize(&machines.join(", ")),
             ),
             WorkspaceState::Stale => format!(
-                "workspace `{name}` was stale when found. Run `jj workspace update-stale` in it to sync it"
+                "workspace {name} was stale when found. Run `jj workspace update-stale` in it to sync it"
             ),
             WorkspaceState::Unclaimable => format!(
-                "workspace `{name}` cannot be synced because its name is not valid in the mesh, or this \
+                "workspace {name} cannot be synced because its name is not valid in the mesh, or this \
                  machine syncs {MAX_MACHINE_WORKSPACES} workspaces already"
             ),
         },
         WorkspacePlace::Missing => format!(
-            "workspace `{name}` is missing. Run `jj workspace forget {name}` if it was deleted"
+            "workspace {name} is missing. Run `jj workspace forget {name}` if it was deleted"
         ),
         WorkspacePlace::Peer { .. } => return None,
     };

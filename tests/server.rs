@@ -2,7 +2,9 @@
 
 mod harness;
 
-use harness::{TestMesh, descriptions, wait_converged, wait_until};
+use std::path::PathBuf;
+
+use harness::{Machine, TestMesh, add_and_clone, descriptions, wait_converged, wait_until};
 use jj_mesh::{
     config::ObjectHash,
     daemon::control::{Request, Response, Status},
@@ -36,6 +38,17 @@ async fn server_keeps_every_repo() {
 
     mesh.jj.commit_file(&late, "file.txt", "after the pull");
     wait_converged(&late, &late_bare).await;
+
+    // The server holds every repo: another machine can forget them.
+    let forgotten = a
+        .request(&Request::ForgetRepo {
+            name: "early".to_owned(),
+        })
+        .await;
+    assert!(
+        matches!(forgotten, Response::RepoForgotten { .. }),
+        "{forgotten:?}"
+    );
 
     let forgotten = server
         .try_request(&Request::ForgetRepo {
@@ -109,6 +122,62 @@ async fn disabling_server_mode_keeps_bare_repos_in_use() {
     a.add_repo("late", &late).await;
     server.wait_repo("late").await;
     assert!(used_bare.exists());
+}
+
+/// A repo with its own storage moves into a bare repo on a server instead
+/// of being pulled again, so no peer is needed: its workspaces, the
+/// secondary ones included, keep working and syncing, and a colocated one
+/// is made non-colocated.
+#[tokio::test]
+async fn storing_a_repo_moves_it_into_a_bare_repo() {
+    let mesh = TestMesh::new();
+    let (mut a, server) = mesh.connected_pair().await;
+    let (dir_a, dir) = add_and_clone(&mesh, &a, &server, "proj").await;
+    let secondary = mesh.jj.path().join("proj-secondary");
+    let secondary_arg = secondary.to_str().unwrap();
+    mesh.jj.jj(
+        &dir,
+        &["workspace", "add", "--name", "secondary", secondary_arg],
+    );
+    let colocated_a = mesh.jj.init_repo("colocated");
+    a.add_repo("colocated", &colocated_a).await;
+    server.wait_available("colocated").await;
+    let colocated = mesh
+        .jj
+        .init_colocated_pull_target("colocated-on-b", "machine-b");
+    server.clone_repo("colocated", &colocated).await;
+    server.set_server(true).await;
+    a.stop().await;
+
+    let path = store(&server, "proj").await;
+    assert_eq!(server.wait_repo("proj").await, path);
+    assert!(dir.join(".jj/repo").is_file());
+    mesh.jj
+        .commit_file(&secondary, "secondary.txt", "from the secondary");
+    mesh.jj.commit_file(&dir, "main.txt", "from the main");
+    assert!(descriptions(&mesh, &dir).contains("from the secondary"));
+
+    store(&server, "colocated").await;
+    assert!(!colocated.join(".git").exists());
+    mesh.jj.commit_file(&colocated, "file.txt", "non-colocated");
+
+    a.start().await;
+    wait_converged(&dir_a, &path).await;
+    assert!(descriptions(&mesh, &dir_a).contains("from the main"));
+}
+
+/// Moves the storage of `repo` into a bare repo on `server`, returning its
+/// path.
+async fn store(server: &Machine, repo: &str) -> PathBuf {
+    let stored = server
+        .request(&Request::StoreRepo {
+            repo: repo.to_owned(),
+        })
+        .await;
+    let Response::RepoStored { path } = stored else {
+        panic!("{stored:?}");
+    };
+    path
 }
 
 /// Whether `status` lists the peer `name` as a server.

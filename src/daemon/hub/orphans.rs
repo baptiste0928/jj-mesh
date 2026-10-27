@@ -100,7 +100,7 @@ impl SyncHub {
             .collect();
         ensure!(
             !sources.is_empty(),
-            "no connected peer holds `{name}`. Check that the other machine's daemon is running"
+            "no connected peer holds {name}. Check that the other machine's daemon is running"
         );
         Ok(sources)
     }

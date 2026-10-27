@@ -5,7 +5,7 @@ mod harness;
 use std::fs;
 
 use harness::{TestMesh, add_and_clone, connect, descriptions, wait_converged};
-use jj_mesh::daemon::control::{Request, Response};
+use jj_mesh::daemon::control::{Request, Response, WorkspacePlace};
 use serde_json::json;
 
 /// Machines that never paired directly learn about each other through
@@ -39,8 +39,8 @@ async fn membership_gossips_transitively() {
     .await;
 }
 
-/// Forgetting a repo locally unregisters it on that machine only: the
-/// mesh keeps the repo, it can be cloned again right away (the daemon
+/// Forgetting a repo locally unregisters it on that machine only, as long
+/// as another machine holds it: the mesh keeps the repo, it can be cloned again right away (the daemon
 /// keeps the peers' announcements), and sync resumes in both directions
 /// afterwards (announcement sequences survive the re-registration).
 #[tokio::test]
@@ -80,6 +80,25 @@ async fn forgetting_locally_keeps_the_repo_clonable() {
         })
         .await;
     assert!(matches!(again, Response::Error(_)), "{again:?}");
+    // A, the last machine holding the repo once B's claims are gone,
+    // cannot forget it.
+    a.wait("machine-b claims released", |s| {
+        s.repos.iter().all(|repo| {
+            repo.workspaces
+                .iter()
+                .all(|ws| !matches!(ws.place, WorkspacePlace::Peer { .. }))
+        })
+    })
+    .await;
+    let last = a
+        .try_request(&Request::ForgetRepo {
+            name: "proj".to_owned(),
+        })
+        .await;
+    let Response::Error(message) = last else {
+        panic!("{last:?}");
+    };
+    assert!(message.contains("no other machine holds"), "{message}");
 
     // ...but the repo clones again into a fresh directory and catches up...
     let dir_b2 = mesh.jj.init_pull_target("proj-again", "machine-b-again");
@@ -259,15 +278,6 @@ async fn repos_sharing_a_name_stay_apart() {
             })
             .await;
     }
-    let forgotten = a
-        .request(&Request::ForgetRepo {
-            name: "proj".to_owned(),
-        })
-        .await;
-    let Response::RepoForgotten { path } = forgotten else {
-        panic!("{forgotten:?}");
-    };
-    assert_eq!(path, fs::canonicalize(&dir_a).unwrap());
 }
 
 /// Hosting again replaces the outstanding ticket: only the newest one is

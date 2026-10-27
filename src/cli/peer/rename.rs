@@ -35,6 +35,6 @@ pub fn rename(dir: &ConfigDir, name: &str) -> Result<()> {
         bail!("unexpected response from the daemon: {response:?}");
     };
 
-    println!("{}", ui::good(format_args!("This machine is now `{name}`")));
+    println!("{}", ui::good(format_args!("This machine is now {name}")));
     Ok(())
 }
