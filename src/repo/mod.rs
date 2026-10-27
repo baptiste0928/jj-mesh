@@ -9,18 +9,21 @@
 //! copies. A bare repo (see [`JjRepo::init_bare`]) has the main workspace
 //! layout without a working copy. The `jj` module invokes the user's jj
 //! binary, `open` opens the stores through jj_lib (with raw batched writes
-//! in `write`), `codec` validates replicated bytes, and `transfer` moves
-//! them between peers.
+//! in `write`), `codec` validates replicated bytes, `transfer` moves
+//! them between peers, and `relocate` moves a repo's storage on disk.
 
 mod codec;
 mod jj;
 mod open;
+mod relocate;
 pub(crate) mod transfer;
 mod workspace;
 mod write;
 
 use std::{
+    ffi::OsStr,
     fs,
+    os::unix::ffi::OsStrExt as _,
     path::{Path, PathBuf},
 };
 
@@ -35,6 +38,7 @@ pub use self::{
         jj_bin, jj_output, jj_peer_warning, jj_version, jj_version_warning, repo_present, run_jj,
     },
     open::OpenRepo,
+    relocate::{Relocation, RelocationError},
     workspace::{Checkout, Identity, Workspace},
 };
 
@@ -130,6 +134,28 @@ impl JjRepo {
     /// The repo storage directory (`.jj/repo`).
     pub fn repo_dir(&self) -> PathBuf {
         self.root.join(".jj").join("repo")
+    }
+
+    /// The repo storage directory, canonical.
+    pub(crate) fn canonical_repo_dir(&self) -> Result<PathBuf> {
+        fs::canonicalize(self.repo_dir())
+            .wrap_err_with(|| format!("cannot resolve {}", self.repo_dir().display()))
+    }
+
+    /// The git store directory, canonical, as `store/git_target` locates it.
+    pub fn git_dir(&self) -> Result<PathBuf> {
+        let store = self.repo_dir().join("store");
+        let target = store.join("git_target");
+        let git =
+            fs::read(&target).wrap_err_with(|| format!("cannot read {}", target.display()))?;
+        let git = store.join(OsStr::from_bytes(git.trim_ascii()));
+        fs::canonicalize(&git).wrap_err_with(|| format!("cannot resolve {}", git.display()))
+    }
+
+    /// Whether the git store is colocated: `.git` at the main workspace root.
+    pub fn is_colocated(&self) -> Result<bool> {
+        let git = self.git_dir()?;
+        Ok(fs::canonicalize(self.root.join(".git")).is_ok_and(|root_git| root_git == git))
     }
 
     /// Directory holding the op head marker files. Every mutating jj

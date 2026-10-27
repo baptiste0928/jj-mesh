@@ -152,31 +152,64 @@ impl JjRepo {
         Workspace::at(self.root())
     }
 
-    /// Whether a workspace on disk uses the repo: a root its workspace store
-    /// records still points back to it. Decided from local data only,
-    /// unlike [`OpenRepo::workspaces`]: operations synced from peers must
-    /// not decide what jj-mesh deletes.
+    /// The workspaces on disk using the repo: the main one unless the repo
+    /// is bare, then the roots its workspace store records that still point
+    /// back to it. Decided from local data only, unlike
+    /// [`OpenRepo::workspaces`]: operations synced from peers must not
+    /// decide what jj-mesh deletes or moves.
+    pub fn local_workspaces(&self) -> Result<Vec<Workspace>> {
+        let mut found = Vec::new();
+        if self.root().join(".jj").join("working_copy").is_dir() {
+            found.push(self.workspace()?);
+        }
+        let Some(index) = self.workspace_index()? else {
+            return Ok(found);
+        };
+        let repo_dir = self.canonical_repo_dir()?;
+        for entry in index.workspaces {
+            // Recorded relative to the repo dir.
+            let Ok(root) = fs::canonicalize(self.repo_dir().join(OsStr::from_bytes(&entry.path)))
+            else {
+                continue;
+            };
+            if found.iter().any(|workspace| workspace.root == root) {
+                continue;
+            }
+            if let Ok(workspace) = Workspace::at(&root)
+                && workspace.repo_dir == repo_dir
+            {
+                found.push(workspace);
+            }
+        }
+        Ok(found)
+    }
+
+    /// Whether a workspace on disk uses the repo (see
+    /// [`Self::local_workspaces`]).
     pub fn has_workspaces(&self) -> Result<bool> {
-        let index = self.repo_dir().join("workspace_store").join("index");
-        let bytes = match fs::read(&index) {
+        Ok(!self.local_workspaces()?.is_empty())
+    }
+
+    /// The path of the workspace store index.
+    pub(super) fn workspace_index_path(&self) -> PathBuf {
+        self.repo_dir().join("workspace_store").join("index")
+    }
+
+    /// Reads the workspace store index, `None` when the repo has none yet.
+    pub(super) fn workspace_index(
+        &self,
+    ) -> Result<Option<protos::simple_workspace_store::Workspaces>> {
+        let path = self.workspace_index_path();
+        let bytes = match fs::read(&path) {
             Ok(bytes) => bytes,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(err) => {
-                return Err(err).wrap_err_with(|| format!("cannot read {}", index.display()));
+                return Err(err).wrap_err_with(|| format!("cannot read {}", path.display()));
             }
         };
-        let store = protos::simple_workspace_store::Workspaces::decode(&*bytes)
-            .wrap_err_with(|| format!("cannot decode {}", index.display()))?;
-        let repo_dir = fs::canonicalize(self.repo_dir())
-            .wrap_err_with(|| format!("cannot resolve {}", self.repo_dir().display()))?;
-        Ok(store.workspaces.iter().any(|workspace| {
-            // Recorded relative to the repo dir.
-            let root = self.repo_dir().join(OsStr::from_bytes(&workspace.path));
-            fs::canonicalize(root)
-                .ok()
-                .and_then(|root| Workspace::at(&root).ok())
-                .is_some_and(|found| found.repo_dir == repo_dir)
-        }))
+        let index = protos::simple_workspace_store::Workspaces::decode(&*bytes)
+            .wrap_err_with(|| format!("cannot decode {}", path.display()))?;
+        Ok(Some(index))
     }
 
     /// Adds a workspace named `name` at `root`, which must not exist, like
