@@ -99,6 +99,13 @@ impl ControlContext {
                 })
             })
             .collect();
+        let holders = state
+            .mesh_repo_names()
+            .map(|(id, _)| {
+                let names = state.holders(id).into_iter().map(str::to_owned);
+                (id.clone(), names.collect())
+            })
+            .collect();
         let available = state
             .clonable_repos()
             .map(|(id, name)| ClonableRepo {
@@ -116,6 +123,7 @@ impl ControlContext {
             peers,
             repos: self.repos.statuses(),
             available,
+            holders,
             conflicts,
             peer_reports,
         }

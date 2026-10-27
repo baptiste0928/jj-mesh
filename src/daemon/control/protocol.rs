@@ -2,6 +2,7 @@
 //! daemon exchange, and the timing budgets that bound the exchange.
 
 use std::{
+    collections::BTreeMap,
     path::PathBuf,
     time::{Duration, SystemTime},
 };
@@ -276,6 +277,9 @@ pub struct Status {
     pub repos: Vec<RepoStatus>,
     /// Mesh repos not registered here, clonable.
     pub available: Vec<ClonableRepo>,
+    /// The other machines holding each mesh repo, by paired name, online or
+    /// not: servers, and peers claiming one of its workspaces.
+    pub holders: BTreeMap<RepoId, Vec<String>>,
     /// Names several mesh repos carry.
     pub conflicts: Vec<ConflictStatus>,
     /// The latest health each connected peer reported for itself.
@@ -370,6 +374,8 @@ pub struct RepoStatus {
     pub id: RepoId,
     pub name: String,
     pub path: PathBuf,
+    /// Whether it is a bare repo kept by server mode.
+    pub bare: bool,
     pub watch: WatchStatus,
     /// Its workspaces across the mesh: those on this machine (known while
     /// watching), then those peers claim.

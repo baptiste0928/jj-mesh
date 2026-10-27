@@ -14,8 +14,8 @@ use super::{complete, ui};
 use crate::{
     config::{ConfigDir, MAX_MACHINE_WORKSPACES, RepoId, sanitize},
     daemon::control::{
-        self, ConnectionStatus, PathInfo, PeerReport, PeerStatus, RepoHealthState, Route, Status,
-        WatchStatus, WorkspacePlace, WorkspaceState, WorkspaceStatus,
+        self, ConnectionStatus, PathInfo, PeerReport, PeerStatus, RepoHealthState, RepoStatus,
+        Route, Status, WatchStatus, WorkspacePlace, WorkspaceState, WorkspaceStatus,
     },
     hint::hinted,
 };
@@ -99,7 +99,7 @@ fn print_repos(status: &Status) {
     for repo in &status.repos {
         rows.push([
             repo.name.clone(),
-            ui::dim(ui::path(&repo.path)).to_string(),
+            location(repo),
             watch_summary(&repo.watch),
             machines(&repo.id),
         ]);
@@ -174,11 +174,7 @@ fn print_repo(status: &Status, selector: &str) -> Result<RepoId> {
     if listed {
         println!("{name}  {}", watch_summary(&repo.watch));
     } else {
-        println!(
-            "{name}  {}  {}",
-            ui::dim(ui::path(&repo.path)),
-            watch_summary(&repo.watch)
-        );
+        println!("{name}  {}  {}", location(repo), watch_summary(&repo.watch));
     }
     if !repo.workspaces.is_empty() {
         let rows: Vec<_> = repo.workspaces.iter().map(workspace_row).collect();
@@ -186,6 +182,16 @@ fn print_repo(status: &Status, selector: &str) -> Result<RepoId> {
         print_table(&rows);
     }
     Ok(repo.id.clone())
+}
+
+/// Where a registered repo is: its path, or `server` for a repo server
+/// mode keeps, whose path in the config directory says nothing.
+fn location(repo: &RepoStatus) -> String {
+    if repo.bare {
+        ui::dim("server").to_string()
+    } else {
+        ui::dim(ui::path(&repo.path)).to_string()
+    }
 }
 
 /// Columns of a workspace line: name, path or machine, state when not
@@ -285,19 +291,14 @@ fn watch_summary(watch: &WatchStatus) -> String {
 }
 
 /// The peers holding each repo: those claiming a workspace in it and the
-/// connected ones reporting it, except where they report it missing.
+/// The other machines holding each repo: those the mesh state lists, and
+/// connected peers reporting it, unless they report its directory gone.
 fn holders(status: &Status) -> BTreeMap<&RepoId, BTreeSet<&str>> {
-    let mut holders: BTreeMap<_, BTreeSet<_>> = BTreeMap::new();
-    for repo in &status.repos {
-        for workspace in &repo.workspaces {
-            if let WorkspacePlace::Peer { machine } = &workspace.place {
-                holders
-                    .entry(&repo.id)
-                    .or_default()
-                    .insert(machine.as_str());
-            }
-        }
-    }
+    let mut holders: BTreeMap<_, BTreeSet<_>> = status
+        .holders
+        .iter()
+        .map(|(id, machines)| (id, machines.iter().map(String::as_str).collect()))
+        .collect();
     for PeerReport { peer, report } in &status.peer_reports {
         for repo in &report.repos {
             let peers = holders.entry(&repo.id).or_default();

@@ -117,6 +117,7 @@ struct RepoHandle {
     /// respawns the task.
     name: String,
     path: PathBuf,
+    bare: bool,
     state: Arc<Mutex<RepoState>>,
     /// The claims on the repo's workspaces, fed to its task.
     claims: watch::Sender<RepoClaims>,
@@ -312,6 +313,7 @@ impl RepoSet {
                     id: id.clone(),
                     name: handle.name.clone(),
                     path: handle.path.clone(),
+                    bare: handle.bare,
                     watch,
                     workspaces,
                 }

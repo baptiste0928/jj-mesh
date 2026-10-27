@@ -135,6 +135,7 @@ pub(super) fn spawn_repo(
     RepoHandle {
         name,
         path: repo.path.clone(),
+        bare: repo.bare,
         state,
         claims,
         task,
