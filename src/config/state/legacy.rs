@@ -6,7 +6,7 @@
 
 use std::{collections::BTreeMap, path::PathBuf};
 
-use color_eyre::eyre::Result;
+use anyhow::Result;
 use iroh::EndpointId;
 use serde::Deserialize;
 

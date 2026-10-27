@@ -2,7 +2,7 @@
 
 use std::{path::Path, time::Duration};
 
-use color_eyre::eyre::{Result, WrapErr as _, bail};
+use anyhow::{Context as _, Result, bail};
 use notify::{
     Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher as _, event::ModifyKind,
 };
@@ -40,7 +40,7 @@ impl DirWatcher {
         // as macOS's /var), so death detection must compare against one.
         let target = dir
             .canonicalize()
-            .wrap_err_with(|| format!("cannot resolve {}", dir.display()))?;
+            .with_context(|| format!("cannot resolve {}", dir.display()))?;
 
         let mut watcher = backend::watcher(
             move |event| {
@@ -59,7 +59,7 @@ impl DirWatcher {
 
         watcher
             .watch(dir, RecursiveMode::NonRecursive)
-            .wrap_err_with(|| format!("cannot watch {}", dir.display()))?;
+            .with_context(|| format!("cannot watch {}", dir.display()))?;
 
         Ok(DirWatcher {
             _watcher: watcher,

@@ -8,7 +8,7 @@
 
 use std::collections::BTreeSet;
 
-use color_eyre::eyre::{Report, Result, bail, ensure, eyre};
+use anyhow::{Error, Result, ensure};
 
 use crate::{
     cli::ui,
@@ -19,7 +19,7 @@ use crate::{
 /// Failures collected while acting on a batch of repos.
 pub(super) struct Batch {
     total: usize,
-    errors: Vec<Report>,
+    errors: Vec<Error>,
 }
 
 impl Batch {
@@ -44,17 +44,18 @@ impl Batch {
             .collect()
     }
 
-    /// Fails with the collected errors, each reported.
-    pub fn finish(mut self) -> Result<()> {
+    /// Fails with the collected errors: the error itself for a single
+    /// repo, else each reported, then how many `outcome`.
+    pub fn finish(mut self, outcome: &str) -> Result<()> {
         if self.total == 1 {
             return self.errors.pop().map_or(Ok(()), Err);
         }
         for err in &self.errors {
-            crate::cli::report_error(err);
+            ui::error(err);
         }
         ensure!(
             self.errors.is_empty(),
-            "{} of {} repos failed",
+            "{} of {} repos {outcome}",
             self.errors.len(),
             self.total
         );
@@ -79,18 +80,19 @@ pub(super) fn check<T>(
         };
         match checked {
             Ok(value) => values.push(value),
-            Err(err) => errors.push(format!("{err:#}")),
+            Err(err) => errors.push(err),
         }
     }
-    match &errors[..] {
-        [] => Ok(values),
-        [error] => bail!("{error}"),
-        _ => bail!("nothing done:\n  {}", errors.join("\n  ")),
-    }
+    let batch = Batch {
+        total: values.len() + errors.len(),
+        errors,
+    };
+    batch.finish("refused, nothing done")?;
+    Ok(values)
 }
 
 /// Asks to confirm "{verb} {names}{scope}", and deleting the workspaces
-/// when `delete`. Without a terminal, `--yes` is required.
+/// when `delete`.
 pub(super) fn confirm<'a>(
     verb: &str,
     names: impl IntoIterator<Item = &'a str>,
@@ -103,10 +105,9 @@ pub(super) fn confirm<'a>(
     } else {
         ""
     };
-    let confirmed = ui::confirm(&format!("{verb} {names}{scope}{delete}?"), false)?
-        .ok_or_else(|| eyre!("pass --yes to confirm"))?;
+    let confirmed = ui::approve(&format!("{verb} {names}{scope}{delete}?"))?;
     if !confirmed {
-        println!("Aborted");
+        ui::info("Aborted");
     }
     Ok(confirmed)
 }
@@ -118,13 +119,11 @@ pub(super) fn show_workspaces(workspaces: &[Workspace]) {
         .map(|workspace| {
             [
                 workspace.name().unwrap_or_else(|_| "?".to_owned()),
-                ui::dim(ui::display_path(workspace.root()))
-                    .for_stderr()
-                    .to_string(),
+                ui::dim(ui::path(workspace.root())).for_stderr().to_string(),
             ]
         })
         .collect();
     for line in ui::table(&rows) {
-        eprintln!("  {line}");
+        ui::info(format_args!("  {line}"));
     }
 }

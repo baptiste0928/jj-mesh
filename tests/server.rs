@@ -55,7 +55,7 @@ async fn server_keeps_every_repo() {
             name: "late".to_owned(),
         })
         .await;
-    assert!(matches!(forgotten, Response::Error(_)), "{forgotten:?}");
+    assert!(forgotten.is_err(), "{forgotten:?}");
 
     a.remove_repo("late").await;
     server

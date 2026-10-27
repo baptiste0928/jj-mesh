@@ -5,7 +5,7 @@
 //! masked of characters that could hide or reorder what the user sees.
 //! Local diagnostics (jj stderr) embed repo bytes and get the same mask.
 
-use color_eyre::eyre::{Result, ensure};
+use anyhow::{Result, ensure};
 
 /// Maximum length of a peer or repo name, in bytes.
 pub const MAX_NAME_LEN: usize = 64;

@@ -13,10 +13,12 @@ mod setup;
 mod status;
 mod ui;
 
+pub use self::ui::error;
+
 use std::path::PathBuf;
 
+use anyhow::Result;
 use clap::{CommandFactory as _, Parser, Subcommand, ValueHint};
-use color_eyre::eyre::Result;
 
 use crate::config::ConfigDir;
 
@@ -98,18 +100,6 @@ pub fn run() -> Result<()> {
         Command::Logs(args) => logs::run(&args, &dir),
         Command::RunDaemon(args) => run_daemon::run(args, &dir),
     }
-}
-
-/// Prints a top-level CLI error to stderr in the shared palette. The
-/// expected "daemon not running" case prints as a plain message, without
-/// the error prefix.
-pub fn report_error(err: &color_eyre::Report) {
-    let message = if err.is::<crate::daemon::control::DaemonNotRunning>() {
-        format!("{err:#}")
-    } else {
-        format!("Error: {err:#}")
-    };
-    eprintln!("{}", ui::bad(message).for_stderr());
 }
 
 #[cfg(test)]

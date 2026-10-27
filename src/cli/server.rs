@@ -1,7 +1,7 @@
 //! `jj-mesh server`: switch server mode on this machine.
 
+use anyhow::{Result, bail};
 use clap::{Args, Subcommand};
-use color_eyre::eyre::{Result, bail};
 
 use super::ui;
 use crate::{
@@ -42,20 +42,20 @@ pub fn set(dir: &ConfigDir, server: bool) -> Result<()> {
     };
 
     let message = if server {
-        "Server mode enabled: this machine keeps a bare repo of every mesh repo"
+        "Enabled server mode: this machine keeps a bare repo of every mesh repo"
     } else {
-        "Server mode disabled"
+        "Disabled server mode"
     };
-    println!("{}", ui::good(message));
+    ui::success(message);
     if server {
-        print_unstored(&MeshState::load(dir)?);
+        show_unstored(&MeshState::load(dir)?);
     }
     Ok(())
 }
 
 /// Lists the repos registered with their own storage, which server mode
 /// leaves where they are.
-fn print_unstored(state: &MeshState) {
+fn show_unstored(state: &MeshState) {
     let names: Vec<_> = state
         .repos
         .iter()
@@ -65,8 +65,6 @@ fn print_unstored(state: &MeshState) {
     if names.is_empty() {
         return;
     }
-    println!(
-        "Not in bare repos: {}. `jj-mesh repo forget <name>` moves one into a bare repo.",
-        names.join(", "),
-    );
+    ui::info(format_args!("Not in bare repos: {}", names.join(", ")));
+    ui::hint("Move one into a bare repo with `jj-mesh repo forget <name>`");
 }

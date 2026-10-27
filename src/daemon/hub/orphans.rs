@@ -9,11 +9,14 @@
 
 use std::collections::BTreeMap;
 
-use color_eyre::eyre::{Result, ensure};
+use anyhow::{Result, ensure};
 use iroh::EndpointId;
 
 use super::{CloneSource, HubState, SyncHub};
-use crate::config::{MAX_MESH_REPOS, RepoId};
+use crate::{
+    config::{MAX_MESH_REPOS, RepoId},
+    hint::hinted,
+};
 
 /// The latest announcement one peer made for an unregistered repo.
 #[derive(Debug, Clone)]
@@ -100,7 +103,10 @@ impl SyncHub {
             .collect();
         ensure!(
             !sources.is_empty(),
-            "no connected peer holds {name}. Check that the other machine's daemon is running"
+            hinted(
+                format!("no connected peer holds {name}"),
+                "Check that the other machine's daemon is running"
+            )
         );
         Ok(sources)
     }

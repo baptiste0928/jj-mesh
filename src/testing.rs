@@ -13,7 +13,7 @@ use std::{
     time::Duration,
 };
 
-use color_eyre::eyre::Result;
+use anyhow::Result;
 use jj_lib::{object_id::ObjectId as _, op_store::OperationId};
 use tokio::io::{AsyncRead, AsyncWrite};
 

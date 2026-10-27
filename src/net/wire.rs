@@ -5,7 +5,7 @@
 //! size followed by the postcard encoding. Callers bound the accepted size,
 //! as the prefix is attacker-controlled on unauthenticated streams.
 
-use color_eyre::eyre::{Result, WrapErr as _, ensure};
+use anyhow::{Context as _, Result, ensure};
 use serde::{Serialize, de::DeserializeOwned};
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 
@@ -15,7 +15,7 @@ pub async fn write_message<T: Serialize>(
     message: &T,
     max_size: u32,
 ) -> Result<()> {
-    let bytes = postcard::to_stdvec(message).wrap_err("cannot encode message")?;
+    let bytes = postcard::to_stdvec(message).context("cannot encode message")?;
     let size = u32::try_from(bytes.len()).expect("messages fit in u32");
     ensure!(size <= max_size, "message too large");
 
@@ -38,7 +38,7 @@ pub async fn read_message<T: DeserializeOwned>(
     let mut bytes = vec![0u8; size as usize];
     recv.read_exact(&mut bytes).await?;
 
-    let (message, rest) = postcard::take_from_bytes(&bytes).wrap_err("cannot decode message")?;
+    let (message, rest) = postcard::take_from_bytes(&bytes).context("cannot decode message")?;
     ensure!(rest.is_empty(), "cannot decode message: trailing bytes");
 
     Ok(message)

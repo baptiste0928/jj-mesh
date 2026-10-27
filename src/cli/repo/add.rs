@@ -2,14 +2,15 @@
 
 use std::path::PathBuf;
 
+use anyhow::{Result, bail};
 use clap::{Args, ValueHint};
-use color_eyre::eyre::{Result, bail, eyre};
 
 use super::settings::{Scope, SettingsArgs};
 use crate::{
     cli::ui,
     config::{ConfigDir, MeshState},
     daemon::control::{self, Request, Response},
+    hint::hinted,
     repo::Workspace,
 };
 
@@ -46,12 +47,11 @@ pub fn run(args: AddArgs, dir: &ConfigDir) -> Result<()> {
     let workspace = Workspace::discover(&path)?;
     let repo = workspace.repo()?;
     if !workspace.is_main() {
-        eprintln!(
-            "{} {} is a secondary workspace, adding its repo at {} (all its workspaces are synced)",
-            ui::warn("warning:").for_stderr(),
-            workspace.root().display(),
-            repo.root().display(),
-        );
+        ui::warning(format_args!(
+            "{} is a secondary workspace, adding its repo at {} (all its workspaces are synced)",
+            ui::path(workspace.root()),
+            ui::path(repo.root()),
+        ));
     }
 
     let name = match args.name {
@@ -59,7 +59,12 @@ pub fn run(args: AddArgs, dir: &ConfigDir) -> Result<()> {
         None => repo
             .root()
             .file_name()
-            .ok_or_else(|| eyre!("cannot derive a name from {}, use --name", path.display()))?
+            .ok_or_else(|| {
+                hinted(
+                    format!("cannot derive a name from {}", ui::path(&path)),
+                    "Pass one with `--name`",
+                )
+            })?
             .to_string_lossy()
             .into_owned(),
     };
@@ -94,16 +99,13 @@ pub fn run(args: AddArgs, dir: &ConfigDir) -> Result<()> {
         bail!("unexpected response from the daemon: {response:?}");
     };
 
-    println!(
-        "{}",
-        ui::good(format_args!(
-            "Added repo {name} at {}",
-            repo.root().display()
-        ))
-    );
-    println!(
-        "Clone it on another machine with `jj-mesh clone {}`.",
+    ui::success(format_args!(
+        "Added repo {name} at {}",
+        ui::path(repo.root())
+    ));
+    ui::hint(format_args!(
+        "Clone it on another machine with `jj-mesh clone {}`",
         shell_words::quote(&name),
-    );
+    ));
     Ok(())
 }

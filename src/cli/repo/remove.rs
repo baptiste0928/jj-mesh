@@ -1,8 +1,8 @@
 //! `jj-mesh repo remove`: retire repos from the whole mesh.
 
+use anyhow::{Context as _, Result, bail};
 use clap::Args;
 use clap_complete::ArgValueCandidates;
-use color_eyre::eyre::{Result, WrapErr as _, bail};
 
 use super::batch::{self, Batch, confirm, show_workspaces};
 use crate::{
@@ -72,7 +72,7 @@ pub fn run(args: RemoveArgs, dir: &ConfigDir) -> Result<()> {
     let mut batch = Batch::new(repos.len());
     let removed = batch.run(&repos, |repo| repo.apply(dir, delete_files));
     batch.run(removed, Remove::delete);
-    batch.finish()
+    batch.finish("failed")
 }
 
 impl Remove {
@@ -89,10 +89,10 @@ impl Remove {
         })
     }
 
-    /// Lists the workspaces to delete, on stderr.
+    /// Lists the workspaces to delete.
     fn show(&self) {
         if !self.delete.is_empty() {
-            eprintln!("{}:", self.name);
+            ui::info(format_args!("{}:", self.name));
             show_workspaces(&self.delete);
         }
     }
@@ -104,13 +104,13 @@ impl Remove {
             name: self.id.to_string(),
         };
         let response = control::request_blocking(dir, &request, control::MUTATE_WAIT)
-            .wrap_err_with(|| format!("cannot remove {name}"))?;
+            .with_context(|| format!("cannot remove {name}"))?;
         let Response::RepoRemoved { was_local } = response else {
             bail!("unexpected response from the daemon: {response:?}");
         };
-        println!("{}", ui::good(format_args!("Removed {name} from the mesh")));
+        ui::success(format_args!("Removed {name} from the mesh"));
         if was_local && !delete_files {
-            println!("Files on this machine are left untouched.");
+            ui::info("Its files on this machine are left untouched");
         }
         Ok(())
     }
@@ -118,6 +118,6 @@ impl Remove {
     /// Deletes the workspaces listed for deletion.
     fn delete(&self) -> Result<()> {
         Workspace::delete_all(&self.delete)
-            .wrap_err_with(|| format!("removed {}, but could not delete all its files", self.name))
+            .with_context(|| format!("removed {}, but could not delete all its files", self.name))
     }
 }

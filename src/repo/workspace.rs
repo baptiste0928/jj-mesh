@@ -17,7 +17,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use color_eyre::eyre::{Result, WrapErr as _, ensure, eyre};
+use anyhow::{Context as _, Result, anyhow, ensure};
 use jj_lib::{
     config::{ConfigLayer, ConfigSource, StackedConfig},
     default_backend_factories::{default_backend_factories, default_working_copy_factory},
@@ -60,12 +60,12 @@ impl Workspace {
     /// Finds the workspace containing `path`, like jj, by walking up to the
     /// closest `.jj` directory.
     pub fn discover(path: &Path) -> Result<Self> {
-        let path = fs::canonicalize(path)
-            .wrap_err_with(|| format!("cannot resolve {}", path.display()))?;
+        let path =
+            fs::canonicalize(path).with_context(|| format!("cannot resolve {}", path.display()))?;
         let root = path
             .ancestors()
             .find(|dir| dir.join(".jj").is_dir())
-            .ok_or_else(|| eyre!("no jj repo found in {} or its parents", path.display()))?;
+            .ok_or_else(|| anyhow!("no jj repo found in {} or its parents", path.display()))?;
         Self::at(root)
     }
 
@@ -76,14 +76,14 @@ impl Workspace {
         let jj_dir = root.join(".jj");
         let pointer = jj_dir.join("repo");
         let repo_dir = if pointer.is_file() {
-            let target = fs::read(&pointer)
-                .wrap_err_with(|| format!("cannot read {}", pointer.display()))?;
+            let target =
+                fs::read(&pointer).with_context(|| format!("cannot read {}", pointer.display()))?;
             jj_dir.join(OsStr::from_bytes(&target))
         } else {
             pointer
         };
         let repo_dir = fs::canonicalize(&repo_dir)
-            .wrap_err_with(|| format!("cannot resolve the repo of {}", root.display()))?;
+            .with_context(|| format!("cannot resolve the repo of {}", root.display()))?;
 
         Ok(Workspace {
             root: root.to_owned(),
@@ -104,7 +104,7 @@ impl Workspace {
     /// The repo this workspace uses, validated.
     pub fn repo(&self) -> Result<JjRepo> {
         let root = self.main_root().ok_or_else(|| {
-            eyre!(
+            anyhow!(
                 "{} uses a repo outside any workspace: {}",
                 self.root.display(),
                 self.repo_dir.display(),
@@ -133,9 +133,9 @@ impl Workspace {
     /// staleness check it feeds conservative.
     pub fn checkout(&self) -> Result<Checkout> {
         let path = self.root.join(".jj").join("working_copy").join("checkout");
-        let bytes = fs::read(&path).wrap_err_with(|| format!("cannot read {}", path.display()))?;
+        let bytes = fs::read(&path).with_context(|| format!("cannot read {}", path.display()))?;
         let checkout = protos::local_working_copy::Checkout::decode(&*bytes)
-            .wrap_err_with(|| format!("cannot decode {}", path.display()))?;
+            .with_context(|| format!("cannot decode {}", path.display()))?;
         Ok(Checkout {
             // An empty name is jj's legacy form of `default`.
             workspace: match checkout.workspace_name {
@@ -155,7 +155,7 @@ impl Workspace {
             match fs::remove_dir_all(&workspace.root) {
                 Err(err) if err.kind() != ErrorKind::NotFound => {
                     return Err(err)
-                        .wrap_err_with(|| format!("cannot delete {}", workspace.root.display()));
+                        .with_context(|| format!("cannot delete {}", workspace.root.display()));
                 }
                 _ => {}
             }
@@ -231,11 +231,11 @@ impl JjRepo {
             Ok(bytes) => bytes,
             Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
             Err(err) => {
-                return Err(err).wrap_err_with(|| format!("cannot read {}", path.display()));
+                return Err(err).with_context(|| format!("cannot read {}", path.display()));
             }
         };
         let index = protos::simple_workspace_store::Workspaces::decode(&*bytes)
-            .wrap_err_with(|| format!("cannot decode {}", path.display()))?;
+            .with_context(|| format!("cannot decode {}", path.display()))?;
         Ok(Some(index))
     }
 
@@ -265,7 +265,7 @@ impl JjRepo {
             "the workspace {name} already exists",
         );
 
-        fs::create_dir_all(root).wrap_err_with(|| format!("cannot create {}", root.display()))?;
+        fs::create_dir_all(root).with_context(|| format!("cannot create {}", root.display()))?;
         jj_lib::workspace::Workspace::init_workspace_with_existing_repo(
             root,
             &repo_dir,
@@ -274,7 +274,7 @@ impl JjRepo {
             WorkspaceNameBuf::from(name),
         )
         .block_on()
-        .wrap_err_with(|| format!("cannot add a workspace in {}", root.display()))?;
+        .with_context(|| format!("cannot add a workspace in {}", root.display()))?;
         Ok(())
     }
 }
@@ -314,7 +314,7 @@ impl OpenRepo {
         for name in names {
             let Some(path) = store
                 .get_workspace_path(name.as_ref())
-                .wrap_err("cannot read the workspace store")?
+                .context("cannot read the workspace store")?
             else {
                 continue;
             };

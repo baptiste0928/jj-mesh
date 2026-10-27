@@ -1,7 +1,7 @@
 //! Shared plumbing for the notify backend: signal type and callback
 //! construction common to both watchers.
 
-use color_eyre::eyre::{Result, WrapErr as _};
+use anyhow::{Context as _, Result};
 use notify::{Event, RecommendedWatcher};
 
 /// What a notify callback reports to the async side.
@@ -31,5 +31,5 @@ pub(super) fn watcher<T>(
             deliver(signal);
         }
     })
-    .wrap_err("cannot create filesystem watcher")
+    .context("cannot create filesystem watcher")
 }

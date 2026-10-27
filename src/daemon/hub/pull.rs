@@ -3,7 +3,7 @@
 
 use std::{path::Path, sync::Arc, time::Duration};
 
-use color_eyre::eyre::{Result, WrapErr as _, eyre};
+use anyhow::{Context as _, Result, anyhow};
 use iroh::EndpointId;
 use jj_lib::op_store::OperationId;
 use tracing::warn;
@@ -52,9 +52,9 @@ impl SyncHub {
             Ok(Arc::new(JjRepo::at(&repo_path)?.open()?))
         })
         .await
-        .wrap_err("repo open task failed")??;
+        .context("repo open task failed")??;
 
-        let mut last_error = eyre!("no usable source peer");
+        let mut last_error = anyhow!("no usable source peer");
         for CloneSource { peer, heads } in sources {
             let wants: Vec<OperationId> = heads.into_iter().map(OperationId::new).collect();
             let Some(conn) = self.connection(&peer) else {
@@ -71,7 +71,7 @@ impl SyncHub {
                 let (mut send, mut recv) =
                     tokio::time::timeout(OPEN_STREAM_TIMEOUT, conn.open_bi())
                         .await
-                        .map_err(|_| eyre!("timed out opening the pull stream"))??;
+                        .map_err(|_| anyhow!("timed out opening the pull stream"))??;
                 // A pull fetches a whole history: the pack format reuses
                 // the serving peer's on-disk deltas and lands as one pack file
                 // here, instead of writing every object loose.
@@ -89,10 +89,10 @@ impl SyncHub {
                 )
                 .await?;
                 let _ = send.finish();
-                Ok::<_, color_eyre::Report>(outcome)
+                Ok::<_, anyhow::Error>(outcome)
             };
             match pull.await {
-                Err(err) => last_error = err.wrap_err(format!("pull from {peer_name} failed")),
+                Err(err) => last_error = err.context(format!("pull from {peer_name} failed")),
                 Ok(outcome) => return Ok((outcome.ops as u64, outcome.git_objects as u64)),
             }
             warn!("pull attempt failed: {last_error:#}");

@@ -6,12 +6,14 @@ use std::{
     time::{Duration, SystemTime},
 };
 
+use anyhow::{Error, Result};
 use iroh::EndpointId;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    config::RepoId,
+    config::{RepoId, sanitize},
     daemon::repos::WorkspaceState,
+    hint::{self, hinted},
     net::{hello::Incompatible, sync::StatusReport},
     repo::transfer::TransferProgress,
 };
@@ -45,13 +47,16 @@ pub const CLONE_IDLE_WAIT: Duration = Duration::from_secs(30);
 /// Repos are given by name or id, as the user typed it; the daemon resolves it to
 /// the repo's id (see [`crate::config::MeshState::resolve_repo`]).
 ///
+/// A failure is answered with [`Response::Error`], or with
+/// [`Response::HintedError`] when the error carries a hint.
+///
 /// Postcard encodes variants by position: existing ones must keep their
 /// position *and meaning* (renames are fine), and new ones are only
 /// appended, so an exchange stays semantically sound across a CLI/daemon
 /// version skew.
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Request {
-    /// Report the daemon state; answered with [`Response::Status`].
+    /// Error the daemon state; answered with [`Response::Status`].
     Status,
     /// Host a pairing: issue a fresh one-time ticket, revoking any
     /// outstanding one. Answered with [`Response::PairTicket`] or
@@ -171,6 +176,36 @@ pub enum Response {
     RepoStored {
         path: PathBuf,
     },
+    /// The request failed, and `hint` tells what to do about it.
+    HintedError {
+        error: String,
+        hint: String,
+    },
+}
+
+impl Response {
+    /// The response of a failed request: [`Response::HintedError`] when the
+    /// error carries a hint (see [`crate::hint`]).
+    pub fn error(err: &Error) -> Self {
+        let error = format!("{err:#}");
+        match hint::of(err) {
+            Some(hint) => Response::HintedError {
+                error,
+                hint: hint.to_owned(),
+            },
+            None => Response::Error(error),
+        }
+    }
+
+    /// Turns the error responses into errors, so callers only match their
+    /// success variants. Their text is sanitized for the terminal.
+    pub fn into_result(self) -> Result<Self> {
+        match self {
+            Response::Error(error) => Err(Error::msg(sanitize(&error))),
+            Response::HintedError { error, hint } => Err(hinted(sanitize(&error), sanitize(&hint))),
+            response => Ok(response),
+        }
+    }
 }
 
 /// Header of a [`Request::Logs`] stream.

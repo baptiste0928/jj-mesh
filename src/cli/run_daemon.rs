@@ -2,8 +2,8 @@
 //!
 //! It can be run directly (with `RUST_LOG`) for debugging purposes.
 
+use anyhow::Result;
 use clap::Args;
-use color_eyre::eyre::Result;
 use tracing::Subscriber;
 use tracing_subscriber::{
     EnvFilter, Layer as _, layer::SubscriberExt as _, util::SubscriberInitExt as _,

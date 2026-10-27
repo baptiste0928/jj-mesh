@@ -11,7 +11,7 @@
 
 use std::collections::HashSet;
 
-use color_eyre::eyre::{Result, WrapErr as _, bail, ensure};
+use anyhow::{Context as _, Result, bail, ensure};
 use jj_lib::{
     backend::CommitId,
     op_store::{OperationId, ViewId},
@@ -34,7 +34,7 @@ pub struct OpMeta {
 
 /// Decodes a replicated operation's bytes and validates their structure.
 pub fn parse_operation(bytes: &[u8]) -> Result<OpMeta> {
-    let op = proto::Operation::decode(bytes).wrap_err("malformed operation bytes")?;
+    let op = proto::Operation::decode(bytes).context("malformed operation bytes")?;
     ensure!(
         op.view_id.len() == STORE_ID_LEN,
         "operation has a bad view id length ({})",
@@ -80,7 +80,7 @@ pub struct ViewMeta {
 // forms; reading them is the point.
 #[expect(deprecated)]
 pub fn parse_view(bytes: &[u8]) -> Result<ViewMeta> {
-    let view = proto::View::decode(bytes).wrap_err("malformed view bytes")?;
+    let view = proto::View::decode(bytes).context("malformed view bytes")?;
 
     let mut heads = IdSet::default();
     view.head_ids.iter().for_each(|id| heads.add(id));
@@ -90,13 +90,13 @@ pub fn parse_view(bytes: &[u8]) -> Result<ViewMeta> {
     view.wc_commit_ids.values().for_each(|id| ids.add(id));
     for bookmark in &view.bookmarks {
         ids.add_target(bookmark.local_target.as_ref())
-            .wrap_err_with(|| format!("bookmark {}", bookmark.name))?;
+            .with_context(|| format!("bookmark {}", bookmark.name))?;
         // Legacy per-bookmark remote refs, pre remote_views.
         for remote in &bookmark.remote_bookmarks {
             ids.add_target(remote.target.as_ref())
-                .wrap_err_with(|| format!("bookmark {}@{}", bookmark.name, remote.remote_name))?;
+                .with_context(|| format!("bookmark {}@{}", bookmark.name, remote.remote_name))?;
             if let Some(state) = remote.state {
-                check_remote_ref_state(state).wrap_err_with(|| {
+                check_remote_ref_state(state).with_context(|| {
                     format!("bookmark {}@{}", bookmark.name, remote.remote_name)
                 })?;
             }
@@ -104,12 +104,12 @@ pub fn parse_view(bytes: &[u8]) -> Result<ViewMeta> {
     }
     for tag in &view.local_tags {
         ids.add_target(tag.target.as_ref())
-            .wrap_err_with(|| format!("tag {}", tag.name))?;
+            .with_context(|| format!("tag {}", tag.name))?;
     }
     for remote in &view.remote_views {
         for remote_ref in remote.bookmarks.iter().chain(&remote.tags) {
             ids.add_remote_ref(remote_ref)
-                .wrap_err_with(|| format!("remote ref {}@{}", remote_ref.name, remote.name))?;
+                .with_context(|| format!("remote ref {}@{}", remote_ref.name, remote.name))?;
         }
     }
     for git_ref in &view.git_refs {
@@ -121,7 +121,7 @@ pub fn parse_view(bytes: &[u8]) -> Result<ViewMeta> {
         );
         ids.add(&git_ref.commit_id); // Legacy pre-RefTarget form.
         ids.add_target(git_ref.target.as_ref())
-            .wrap_err_with(|| format!("git ref {}", git_ref.name))?;
+            .with_context(|| format!("git ref {}", git_ref.name))?;
     }
     // Reading an unmigrated view (one an honest jj never writes, since it
     // always marks views migrated) runs jj's pre-0.34 Git-tracking tag
@@ -146,11 +146,10 @@ pub fn parse_view(bytes: &[u8]) -> Result<ViewMeta> {
     }
     // Repository-wide forms, read when the per-workspace map is empty.
     ids.add(&view.git_head_legacy);
-    ids.add_target(view.git_head.as_ref())
-        .wrap_err("git head")?;
+    ids.add_target(view.git_head.as_ref()).context("git head")?;
     for git_head in &view.git_heads {
         ids.add_target(git_head.target.as_ref())
-            .wrap_err_with(|| format!("git head of workspace {}", git_head.name))?;
+            .with_context(|| format!("git head of workspace {}", git_head.name))?;
     }
 
     Ok(ViewMeta {

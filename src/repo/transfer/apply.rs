@@ -13,7 +13,7 @@ use std::{
     sync::Arc,
 };
 
-use color_eyre::eyre::{Result, eyre};
+use anyhow::{Result, anyhow};
 use jj_lib::{backend::CommitId, op_store::OperationId};
 use pollster::FutureExt as _;
 use tracing::debug;
@@ -54,8 +54,8 @@ pub(super) fn stage(
         .collect();
     repo.git_backend()
         .import_head_commits(&new_commit_heads)
-        .map_err(|err| eyre!("cannot import commit metadata: {err}"))?;
-    fail::fail_point!("stage.after_import", |_| Err(eyre!(
+        .map_err(|err| anyhow!("cannot import commit metadata: {err}"))?;
+    fail::fail_point!("stage.after_import", |_| Err(anyhow!(
         "crash point stage.after_import"
     )));
 
@@ -69,7 +69,7 @@ pub(super) fn stage(
         writes.write_operation_bytes(&op.id, &op.bytes)?;
     }
     writes.persist()?;
-    fail::fail_point!("stage.after_persist", |_| Err(eyre!(
+    fail::fail_point!("stage.after_persist", |_| Err(anyhow!(
         "crash point stage.after_persist"
     )));
 
@@ -118,7 +118,7 @@ pub(super) fn publish(repo: &Arc<OpenRepo>, staged: &Staged) -> Result<()> {
         .then(|| repo.lock_git_import_export())
         .transpose()?;
     mirror::run(repo, to_publish)?;
-    fail::fail_point!("publish.after_mirror", |_| Err(eyre!(
+    fail::fail_point!("publish.after_mirror", |_| Err(anyhow!(
         "crash point publish.after_mirror"
     )));
 
@@ -127,7 +127,7 @@ pub(super) fn publish(repo: &Arc<OpenRepo>, staged: &Staged) -> Result<()> {
     // was never published.
     for (want, covered) in to_publish {
         repo.update_op_heads(covered, want).block_on()?;
-        fail::fail_point!("publish.after_head", |_| Err(eyre!(
+        fail::fail_point!("publish.after_head", |_| Err(anyhow!(
             "crash point publish.after_head"
         )));
     }

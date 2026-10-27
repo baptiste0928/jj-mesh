@@ -12,7 +12,7 @@
 
 use std::{path::Path, time::Duration};
 
-use color_eyre::eyre::{Result, WrapErr as _, ensure, eyre};
+use anyhow::{Context as _, Result, anyhow, ensure};
 use jiff::SignedDuration;
 use serde::Deserialize;
 
@@ -103,8 +103,8 @@ pub fn parse_interval(text: &str) -> Result<u64> {
     }
     let interval: SignedDuration = text
         .parse()
-        .map_err(|_| eyre!("invalid duration `{text}`, expected e.g. `30s`, `5m` or `1h30m`"))?;
-    let interval = Duration::try_from(interval).wrap_err("the interval cannot be negative")?;
+        .map_err(|_| anyhow!("invalid duration `{text}`, expected e.g. `30s`, `5m` or `1h30m`"))?;
+    let interval = Duration::try_from(interval).context("the interval cannot be negative")?;
     ensure!(
         interval.is_zero() || interval.as_secs() > 0,
         "the interval must be at least a second, or 0 to disable",
@@ -124,18 +124,18 @@ impl Settings {
         for line in output.lines() {
             let (name, value) = line
                 .split_once('\t')
-                .ok_or_else(|| eyre!("unexpected jj config output: {line}"))?;
+                .ok_or_else(|| anyhow!("unexpected jj config output: {line}"))?;
             let key = name
                 .strip_prefix(TABLE)
                 .and_then(|key| key.strip_prefix('.'))
-                .ok_or_else(|| eyre!("unexpected jj config key: {name}"))?;
+                .ok_or_else(|| anyhow!("unexpected jj config key: {name}"))?;
             let value = serde_json::from_str(value)
-                .wrap_err_with(|| format!("unexpected jj config value: {line}"))?;
+                .with_context(|| format!("unexpected jj config value: {line}"))?;
             table.insert(key.to_owned(), value);
         }
 
         let table: Table = serde_json::from_value(table.into())
-            .wrap_err_with(|| format!("invalid [{TABLE}] config"))?;
+            .with_context(|| format!("invalid [{TABLE}] config"))?;
         Ok(table.into())
     }
 }

@@ -2,8 +2,8 @@
 
 use std::time::Duration;
 
+use anyhow::{Context as _, Result, bail};
 use clap::Args;
-use color_eyre::eyre::{Result, bail};
 
 use crate::{
     cli::ui,
@@ -55,40 +55,43 @@ pub fn pair(dir: &ConfigDir, ticket: Option<PairTicket>) -> Result<()> {
 async fn host(client: &mut ControlClient) -> Result<()> {
     client.send(&Request::PairHost).await?;
 
-    match client.recv(Some(TICKET_TIMEOUT)).await? {
+    match client
+        .recv(Some(TICKET_TIMEOUT))
+        .await?
+        .into_result()
+        .context("cannot start pairing")?
+    {
         Response::PairTicket(ticket) => {
-            println!("Run this on the other machine to pair:\n");
+            ui::info("Run this on the other machine to pair:");
             // `setup` joins from fresh and paired machines alike.
-            println!(
-                "    {}\n",
-                ui::heading(format_args!("jj-mesh setup {ticket}"))
-            );
-            println!(
-                "{}",
-                ui::dim(format_args!(
-                    "The paired machine will have access to all repos from the mesh. The ticket is valid for {} minutes.",
-                    PAIR_TICKET_TTL.as_secs() / 60,
-                )),
-            );
+            println!("{}", ui::heading(format_args!("jj-mesh setup {ticket}")));
+            ui::note(format_args!(
+                "The paired machine will have access to all repos from the mesh. The ticket is \
+                 valid for {} minutes",
+                PAIR_TICKET_TTL.as_secs() / 60,
+            ));
             Ok(())
         }
-        Response::Error(err) => bail!("cannot start pairing: {err}"),
         other => bail!("unexpected response from the daemon: {other:?}"),
     }
 }
 
 /// Joins a pairing hosted by another machine, waiting for the outcome.
 async fn join(client: &mut ControlClient, ticket: &PairTicket) -> Result<()> {
-    println!("Connecting to the pairing host...");
+    ui::info("Connecting to the pairing host...");
     let ticket = ticket.to_string();
     client.send(&Request::PairJoin { ticket }).await?;
 
-    match client.recv(None).await? {
+    match client
+        .recv(None)
+        .await?
+        .into_result()
+        .context("cannot pair")?
+    {
         Response::Paired { name, .. } => {
-            println!("{}", ui::good(format_args!("Paired with {name}")));
+            ui::success(format_args!("Paired with {name}"));
             Ok(())
         }
-        Response::Error(err) => bail!("pairing failed: {err}"),
         other => bail!("unexpected response from the daemon: {other:?}"),
     }
 }

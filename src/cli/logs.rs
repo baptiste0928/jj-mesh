@@ -2,8 +2,8 @@
 
 use std::io;
 
+use anyhow::{Result, bail};
 use clap::Args;
-use color_eyre::eyre::{Result, bail};
 use jiff::Zoned;
 
 use super::ui;
@@ -53,7 +53,7 @@ pub fn run(args: &LogsArgs, dir: &ConfigDir) -> Result<()> {
             })
             .await?;
 
-        let start = match client.recv(Some(CLIENT_TIMEOUT)).await? {
+        let start = match client.recv(Some(CLIENT_TIMEOUT)).await?.into_result()? {
             Response::LogsStart(start) => start,
             other => bail!("unexpected response from the daemon: {other:?}"),
         };
@@ -81,9 +81,9 @@ pub fn run(args: &LogsArgs, dir: &ConfigDir) -> Result<()> {
             } else {
                 ""
             };
-            println!("{}", ui::dim(format_args!("no {matching}events {history}")));
+            ui::note(format_args!("No {matching}events {history}"));
         } else {
-            println!("{}", ui::dim(format_args!("(events {history})")));
+            ui::note(format_args!("Events {history}"));
         }
         let skip = args.lines.map_or(0, |n| backlog.len().saturating_sub(n));
         for entry in &backlog[skip..] {
@@ -98,7 +98,7 @@ pub fn run(args: &LogsArgs, dir: &ConfigDir) -> Result<()> {
                 Ok(Response::Log(entry)) if args.matches(&entry) => print_entry(&entry),
                 Ok(Response::Log(_)) => {}
                 Ok(Response::LogsSkipped(count)) => {
-                    println!("{}", ui::warn(format_args!("({count} events skipped)")));
+                    ui::warning(format_args!("{count} events skipped"));
                 }
                 Ok(other) => bail!("unexpected response from the daemon: {other:?}"),
                 Err(err) if is_eof(&err) => bail!("the daemon stopped"),
@@ -109,7 +109,7 @@ pub fn run(args: &LogsArgs, dir: &ConfigDir) -> Result<()> {
 }
 
 /// Whether a receive failed because the daemon closed the connection.
-fn is_eof(err: &color_eyre::Report) -> bool {
+fn is_eof(err: &anyhow::Error) -> bool {
     err.chain().any(|cause| {
         cause
             .downcast_ref::<io::Error>()
@@ -126,7 +126,7 @@ fn print_entry(entry: &LogEntry) {
     let message = sanitize(&entry.message);
     let message = match entry.level {
         LogLevel::Info => message,
-        LogLevel::Warn => ui::warn(message).to_string(),
+        LogLevel::Warn => ui::caution(message).to_string(),
         LogLevel::Error => ui::bad(message).to_string(),
     };
 

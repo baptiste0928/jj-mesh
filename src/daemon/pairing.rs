@@ -10,13 +10,16 @@ use std::{
     time::{Duration, Instant},
 };
 
-use color_eyre::eyre::{Result, eyre};
+use anyhow::Result;
 use iroh::{Endpoint, endpoint::Connection};
 use tokio::sync::Semaphore;
 use tracing::{debug, info, warn};
 
 use super::{control::PAIR_TICKET_TTL, store::MeshStore};
-use crate::net::{hello, pair};
+use crate::{
+    hint::hinted,
+    net::{hello, pair},
+};
 
 /// How long to wait for a relay connection when issuing a ticket.
 const ONLINE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -73,7 +76,9 @@ impl Pairing {
         if self.uses_relays {
             tokio::time::timeout(ONLINE_TIMEOUT, self.endpoint.online())
                 .await
-                .map_err(|_| eyre!("cannot reach an iroh relay, check network connectivity"))?;
+                .map_err(|_| {
+                    hinted("cannot reach an iroh relay", "Check the network connection")
+                })?;
         }
 
         let ticket = pair::PairTicket::generate(self.endpoint.addr());

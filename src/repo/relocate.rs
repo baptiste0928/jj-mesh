@@ -27,7 +27,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use color_eyre::eyre::{OptionExt as _, Report, Result, WrapErr as _, bail, ensure};
+use anyhow::{Context as _, Error, Result, bail, ensure};
 use jj_lib::{
     file_util::{normalize_path, relative_path},
     lock::FileLock,
@@ -35,6 +35,7 @@ use jj_lib::{
 use prost::Message as _;
 
 use super::{JjRepo, Workspace};
+use crate::hint::hinted;
 
 /// A checked move of a repo's storage (see [`JjRepo::relocation`]).
 #[derive(Debug)]
@@ -52,9 +53,9 @@ pub struct Relocation {
 #[derive(Debug)]
 pub enum RelocationError {
     /// Nothing moved.
-    Unmoved(Report),
+    Unmoved(Error),
     /// The storage moved, but workspaces may not point to it.
-    Moved(Report),
+    Moved(Error),
 }
 
 /// Name of the new workspace pointers, written aside in `.jj`.
@@ -69,22 +70,22 @@ impl JjRepo {
             Ok(_) => bail!("{} already exists", root.display()),
             Err(err) if err.kind() == ErrorKind::NotFound => {}
             Err(err) => {
-                return Err(err).wrap_err_with(|| format!("cannot stat {}", root.display()));
+                return Err(err).with_context(|| format!("cannot stat {}", root.display()));
             }
         }
         let link = fs::symlink_metadata(self.repo_dir())
-            .wrap_err_with(|| format!("cannot stat {}", self.repo_dir().display()))?;
+            .with_context(|| format!("cannot stat {}", self.repo_dir().display()))?;
         ensure!(
             !link.is_symlink(),
             "{} is a symlink",
             self.repo_dir().display()
         );
         let from = self.canonical_repo_dir()?;
-        let parent = root.parent().ok_or_eyre("cannot move a repo to /")?;
+        let parent = root.parent().context("cannot move a repo to /")?;
         let device = |path: &Path| {
             fs::metadata(path)
                 .map(|meta| meta.dev())
-                .wrap_err_with(|| format!("cannot stat {}", path.display()))
+                .with_context(|| format!("cannot stat {}", path.display()))
         };
         ensure!(
             device(&from)? == device(parent)?,
@@ -105,8 +106,13 @@ impl JjRepo {
         let worktrees = fs::read_dir(git.join("worktrees")).map_or(0, Iterator::count);
         ensure!(
             worktrees == 0,
-            "{} has colocated secondary workspaces (git worktrees), forget them first",
-            self.root().display()
+            hinted(
+                format!(
+                    "{} has colocated secondary workspaces (git worktrees)",
+                    self.root().display()
+                ),
+                "Forget them first with `jj workspace forget`"
+            )
         );
 
         Ok(Relocation {
@@ -134,11 +140,11 @@ impl JjRepo {
 
         let dir = path.parent().expect("the index is in a directory");
         let temp = tempfile::NamedTempFile::new_in(dir)
-            .wrap_err_with(|| format!("cannot write in {}", dir.display()))?;
+            .with_context(|| format!("cannot write in {}", dir.display()))?;
         fs::write(temp.path(), index.encode_to_vec())
-            .wrap_err_with(|| format!("cannot write {}", temp.path().display()))?;
+            .with_context(|| format!("cannot write {}", temp.path().display()))?;
         temp.persist(&path)
-            .wrap_err_with(|| format!("cannot replace {}", path.display()))?;
+            .with_context(|| format!("cannot replace {}", path.display()))?;
         Ok(())
     }
 }
@@ -157,7 +163,7 @@ impl Relocation {
             RelocationError::Unmoved(err)
         })?;
         fs::rename(&self.from, &self.to)
-            .wrap_err_with(|| {
+            .with_context(|| {
                 format!(
                     "cannot move {} to {}",
                     self.from.display(),
@@ -169,7 +175,7 @@ impl Relocation {
                 RelocationError::Unmoved(err)
             })?;
         self.swap_pointers().map_err(|err| {
-            RelocationError::Moved(err.wrap_err(format!("the repo moved to {}", self.to.display())))
+            RelocationError::Moved(err.context(format!("the repo moved to {}", self.to.display())))
         })
     }
 
@@ -187,10 +193,10 @@ impl Relocation {
             let pointer = relative_path(&jj_dir, &self.to);
             let path = jj_dir.join(NEW_POINTER);
             fs::write(&path, pointer.as_os_str().as_bytes())
-                .wrap_err_with(|| format!("cannot write {}", path.display()))?;
+                .with_context(|| format!("cannot write {}", path.display()))?;
         }
         let jj_dir = self.to.parent().expect("`.jj/repo` has a parent");
-        fs::create_dir_all(jj_dir).wrap_err_with(|| format!("cannot create {}", jj_dir.display()))
+        fs::create_dir_all(jj_dir).with_context(|| format!("cannot create {}", jj_dir.display()))
     }
 
     /// Moves the new pointers in place, the main workspace's first.
@@ -199,7 +205,7 @@ impl Relocation {
         for workspace in main.into_iter().chain(others) {
             let jj_dir = workspace.root().join(".jj");
             fs::rename(jj_dir.join(NEW_POINTER), jj_dir.join("repo"))
-                .wrap_err_with(|| format!("cannot point {} to it", workspace.root().display()))?;
+                .with_context(|| format!("cannot point {} to it", workspace.root().display()))?;
         }
         Ok(())
     }

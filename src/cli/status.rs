@@ -6,9 +6,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use anyhow::{Result, bail};
 use clap::Args;
 use clap_complete::ArgValueCandidates;
-use color_eyre::eyre::{Result, bail};
 
 use super::{complete, ui};
 use crate::{
@@ -17,6 +17,7 @@ use crate::{
         self, ConnectionStatus, PathInfo, PeerReport, PeerStatus, RepoHealthState, Route, Status,
         WatchStatus, WorkspacePlace, WorkspaceState, WorkspaceStatus,
     },
+    hint::hinted,
 };
 
 /// Show the daemon state and the live mesh status
@@ -43,7 +44,7 @@ pub fn run(args: &StatusArgs, dir: &ConfigDir) -> Result<()> {
     if !issues.is_empty() {
         println!();
         for issue in &issues {
-            println!("{}", ui::warn(issue));
+            println!("{}", ui::caution(issue));
         }
     }
     Ok(())
@@ -98,7 +99,7 @@ fn print_repos(status: &Status) {
     for repo in &status.repos {
         rows.push([
             repo.name.clone(),
-            ui::dim(ui::display_path(&repo.path)).to_string(),
+            ui::dim(ui::path(&repo.path)).to_string(),
             watch_summary(&repo.watch),
             machines(&repo.id),
         ]);
@@ -154,10 +155,13 @@ fn print_repo(status: &Status, selector: &str) -> Result<RepoId> {
             let ids = ids
                 .chain(available.iter().map(|repo| &repo.id))
                 .map(ToString::to_string);
-            bail!(
-                "several repos are named {selector} ({}). Use the id of the one you mean",
-                ids.collect::<Vec<_>>().join(", "),
-            );
+            return Err(hinted(
+                format!(
+                    "several repos are named {selector} ({})",
+                    ids.collect::<Vec<_>>().join(", ")
+                ),
+                "Use the id of the one you mean",
+            ));
         }
     };
     let name = &repo.name;
@@ -172,7 +176,7 @@ fn print_repo(status: &Status, selector: &str) -> Result<RepoId> {
     } else {
         println!(
             "{name}  {}  {}",
-            ui::dim(ui::display_path(&repo.path)),
+            ui::dim(ui::path(&repo.path)),
             watch_summary(&repo.watch)
         );
     }
@@ -191,7 +195,7 @@ fn workspace_row(workspace: &WorkspaceStatus) -> [String; 3] {
         WorkspacePlace::Peer { machine } => (sanitize(machine), String::new()),
         WorkspacePlace::Missing => (
             ui::dim("-").to_string(),
-            ui::warn("directory missing").to_string(),
+            ui::caution("directory missing").to_string(),
         ),
         WorkspacePlace::Local { path, state } => {
             let state = match state {
@@ -201,7 +205,7 @@ fn workspace_row(workspace: &WorkspaceStatus) -> [String; 3] {
                 | WorkspaceState::Stale
                 | WorkspaceState::Unclaimable => ui::dim("not synced").to_string(),
             };
-            (ui::dim(ui::display_path(path)).to_string(), state)
+            (ui::dim(ui::path(path)).to_string(), state)
         }
     };
     // `@` marks workspace names, as in `jj log`.
@@ -218,7 +222,7 @@ fn print_table<const N: usize>(rows: &[[String; N]]) {
 /// State and details of a peer.
 fn connection(peer: &PeerStatus) -> (String, String) {
     let state = match &peer.connection {
-        ConnectionStatus::Connecting { failures: 0 } => ui::warn("connecting").to_string(),
+        ConnectionStatus::Connecting { failures: 0 } => ui::caution("connecting").to_string(),
         ConnectionStatus::Connecting { .. } | ConnectionStatus::Backoff { .. } => {
             ui::bad("offline").to_string()
         }
@@ -275,7 +279,7 @@ fn watch_summary(watch: &WatchStatus) -> String {
             ui::bad("error"),
             ui::format_duration(*retry_in_secs)
         ),
-        WatchStatus::Missing { .. } => ui::warn("directory missing").to_string(),
+        WatchStatus::Missing { .. } => ui::caution("directory missing").to_string(),
         WatchStatus::Indexing => "indexing commits".to_owned(),
     }
 }

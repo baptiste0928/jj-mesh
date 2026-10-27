@@ -4,8 +4,8 @@ mod add;
 mod remove;
 mod rename;
 
+use anyhow::Result;
 use clap::{Args, Subcommand};
-use color_eyre::eyre::Result;
 
 pub(super) use self::{add::pair, rename::rename};
 use crate::config::ConfigDir;

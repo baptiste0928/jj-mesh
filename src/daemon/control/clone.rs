@@ -3,7 +3,7 @@
 
 use std::path::Path;
 
-use color_eyre::eyre::Result;
+use anyhow::Result;
 use tokio::net::UnixStream;
 use tracing::info;
 
@@ -44,7 +44,7 @@ pub(super) async fn clone_repo(
     let response = loop {
         tokio::select! {
             result = &mut clone => {
-                break result.unwrap_or_else(|err| Response::Error(format!("{err:#}")));
+                break result.unwrap_or_else(|err| Response::error(&err));
             }
             _ = heartbeat.tick() => {
                 let latest = progress.borrow().clone();

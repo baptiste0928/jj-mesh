@@ -24,7 +24,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use color_eyre::eyre::Result;
+use anyhow::Result;
 use jj_lib::op_store::OperationId;
 use pollster::FutureExt as _;
 use tokio::sync::{Mutex, watch};

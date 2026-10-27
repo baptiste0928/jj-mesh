@@ -27,7 +27,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use color_eyre::eyre::{Result, WrapErr as _, ensure};
+use anyhow::{Context as _, Result, ensure};
 use jj_lib::{git_backend::GitBackend, repo::ReadonlyRepo, signing_factory::signer_from_settings};
 use pollster::FutureExt as _;
 
@@ -98,7 +98,7 @@ impl JjRepo {
     pub fn init_bare(root: &Path, object_hash: ObjectHash) -> Result<Self> {
         let repo_dir = root.join(".jj").join("repo");
         fs::create_dir_all(&repo_dir)
-            .wrap_err_with(|| format!("cannot create {}", repo_dir.display()))?;
+            .with_context(|| format!("cannot create {}", repo_dir.display()))?;
         let settings = open::settings()?;
         ReadonlyRepo::init(
             settings,
@@ -115,7 +115,7 @@ impl JjRepo {
             ReadonlyRepo::default_submodule_store_initializer(),
         )
         .block_on()
-        .wrap_err_with(|| format!("cannot create a repo in {}", root.display()))?;
+        .with_context(|| format!("cannot create a repo in {}", root.display()))?;
         Self::at(root)
     }
 
@@ -139,17 +139,16 @@ impl JjRepo {
     /// The repo storage directory, canonical.
     pub(crate) fn canonical_repo_dir(&self) -> Result<PathBuf> {
         fs::canonicalize(self.repo_dir())
-            .wrap_err_with(|| format!("cannot resolve {}", self.repo_dir().display()))
+            .with_context(|| format!("cannot resolve {}", self.repo_dir().display()))
     }
 
     /// The git store directory, canonical, as `store/git_target` locates it.
     pub fn git_dir(&self) -> Result<PathBuf> {
         let store = self.repo_dir().join("store");
         let target = store.join("git_target");
-        let git =
-            fs::read(&target).wrap_err_with(|| format!("cannot read {}", target.display()))?;
+        let git = fs::read(&target).with_context(|| format!("cannot read {}", target.display()))?;
         let git = store.join(OsStr::from_bytes(git.trim_ascii()));
-        fs::canonicalize(&git).wrap_err_with(|| format!("cannot resolve {}", git.display()))
+        fs::canonicalize(&git).with_context(|| format!("cannot resolve {}", git.display()))
     }
 
     /// Whether the git store is colocated: `.git` at the main workspace root.
@@ -179,12 +178,12 @@ impl JjRepo {
 
         let git_target = self.repo_dir().join("store").join("git_target");
         let git_target = fs::read_to_string(&git_target)
-            .wrap_err_with(|| format!("cannot read {}", git_target.display()))?;
+            .with_context(|| format!("cannot read {}", git_target.display()))?;
         // The identity (not just the path) of the op heads directory: a
         // repo replaced wholesale keeps the path but not the inode, and
         // leaves the directory watch dead on the old one.
         let heads = fs::metadata(self.op_heads_dir())
-            .wrap_err_with(|| format!("cannot stat {}", self.op_heads_dir().display()))?;
+            .with_context(|| format!("cannot stat {}", self.op_heads_dir().display()))?;
 
         Ok(StoreFingerprint {
             store_types: self.store_types()?,
@@ -200,7 +199,7 @@ impl JjRepo {
         for (actual, (store, _)) in types.iter_mut().zip(SUPPORTED_STORES) {
             let path = self.repo_dir().join(store).join("type");
             fs::read_to_string(&path)
-                .wrap_err_with(|| format!("cannot read {}", path.display()))?
+                .with_context(|| format!("cannot read {}", path.display()))?
                 .trim()
                 .clone_into(actual);
         }

@@ -8,12 +8,10 @@ use std::process::ExitCode;
 static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 fn main() -> ExitCode {
-    color_eyre::install().expect("color_eyre installs once");
-
     match jj_mesh::cli::run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
-            jj_mesh::cli::report_error(&err);
+            jj_mesh::cli::error(&err);
             ExitCode::FAILURE
         }
     }

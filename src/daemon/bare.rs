@@ -32,7 +32,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use color_eyre::eyre::{Result, WrapErr as _, ensure};
+use anyhow::{Context as _, Result, ensure};
 use tokio::sync::{Mutex, Notify};
 use tracing::{debug, info, warn};
 
@@ -97,12 +97,12 @@ impl BareRepos {
         let (relocation, target) = crate::spawn_blocking(move || -> Result<_> {
             create_private(&root)?;
             let target = fs::canonicalize(&root)
-                .wrap_err("cannot resolve the bare repos")?
+                .context("cannot resolve the bare repos")?
                 .join(dir_name);
             Ok((JjRepo::at(&path)?.relocation(&target)?, target))
         })
         .await
-        .wrap_err("repo move task failed")??;
+        .context("repo move task failed")??;
 
         store.update(|state| {
             ensure!(
@@ -255,14 +255,14 @@ impl Task {
         let entries = match fs::read_dir(&self.bare.root) {
             Ok(entries) => entries,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(err) => return Err(err).wrap_err("cannot list the bare repos"),
+            Err(err) => return Err(err).context("cannot list the bare repos"),
         };
         // Registered paths are canonical.
-        let root = fs::canonicalize(&self.bare.root).wrap_err("cannot resolve the bare repos")?;
+        let root = fs::canonicalize(&self.bare.root).context("cannot resolve the bare repos")?;
         let state = self.store.snapshot();
         let registered: BTreeSet<&Path> = state.repos.values().map(|repo| &*repo.path).collect();
         for entry in entries {
-            let path = entry.wrap_err("cannot list the bare repos")?.path();
+            let path = entry.context("cannot list the bare repos")?.path();
             let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
                 continue;
             };
@@ -354,13 +354,13 @@ impl Task {
                 Ok(())
             })
             .await
-            .wrap_err("bare repo init task failed")??;
+            .context("bare repo init task failed")??;
         }
 
         let (ops, git_objects) = self.hub.pull(id, sources, &partial, &|_, _| {}).await?;
 
         fs::rename(&partial, &repo.path)
-            .wrap_err_with(|| format!("cannot move the repo to {}", repo.path.display()))?;
+            .with_context(|| format!("cannot move the repo to {}", repo.path.display()))?;
         self.store.update(|state| {
             ensure!(state.machine.server, "server mode is off");
             state.add_clone(id.clone(), repo)
@@ -376,7 +376,7 @@ async fn is_used(path: &Path) -> bool {
     let path = path.to_owned();
     crate::spawn_blocking(move || JjRepo::at(&path)?.has_workspaces())
         .await
-        .wrap_err("workspace check task failed")
+        .context("workspace check task failed")
         .and_then(|used| used)
         .unwrap_or_else(|err| {
             debug!("cannot check the bare repo workspaces: {err:#}");
@@ -387,8 +387,8 @@ async fn is_used(path: &Path) -> bool {
 /// Deletes a bare repo directory, on a blocking thread.
 async fn remove(path: PathBuf) -> Result<()> {
     crate::spawn_blocking(move || {
-        fs::remove_dir_all(&path).wrap_err_with(|| format!("cannot delete {}", path.display()))
+        fs::remove_dir_all(&path).with_context(|| format!("cannot delete {}", path.display()))
     })
     .await
-    .wrap_err("bare repo deletion task failed")?
+    .context("bare repo deletion task failed")?
 }

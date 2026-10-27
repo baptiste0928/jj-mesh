@@ -22,7 +22,7 @@ use std::{
     sync::atomic::{AtomicBool, Ordering},
 };
 
-use color_eyre::eyre::{Result, WrapErr as _, ensure, eyre};
+use anyhow::{Context as _, Result, anyhow, ensure};
 use gix::progress::{Count, Id, MessageLevel, NestedProgress, Progress, Step, StepShared, UNKNOWN};
 use tokio::sync::mpsc;
 
@@ -62,7 +62,7 @@ pub(super) fn write_pack(
     // chains) only to discard the bytes. Leaving each location
     // `NotLookedUp` lets the entry stage resolve it in parallel with a
     // cheap index lookup.
-    let entry_count = u32::try_from(ids.len()).wrap_err("more objects than a pack can hold")?;
+    let entry_count = u32::try_from(ids.len()).context("more objects than a pack can hold")?;
     let counts: Vec<output::Count> = ids
         .into_iter()
         .map(|id| output::Count {
@@ -110,7 +110,7 @@ pub(super) fn write_pack(
         return Err(err);
     }
     if let Some(err) = write_error {
-        return Err(eyre!("cannot write pack: {err}"));
+        return Err(anyhow!("cannot write pack: {err}"));
     }
     writer.finish()
 }
@@ -120,7 +120,7 @@ pub(super) fn write_pack(
 struct ChunkWriter<F: FnMut(Vec<u8>) -> Result<()>> {
     emit: F,
     buffer: Vec<u8>,
-    failed: Option<color_eyre::Report>,
+    failed: Option<anyhow::Error>,
 }
 
 impl<F: FnMut(Vec<u8>) -> Result<()>> ChunkWriter<F> {
@@ -287,9 +287,9 @@ pub(super) fn ingest_pack(
     // allocation failure aborts the process rather than failing the fetch.
     let mut header = [0u8; 12];
     read.read_exact(&mut header)
-        .wrap_err("cannot read pack header")?;
+        .context("cannot read pack header")?;
     let (_version, objects) =
-        gix::odb::pack::data::header::decode(&header).map_err(|err| eyre!("bad pack: {err}"))?;
+        gix::odb::pack::data::header::decode(&header).map_err(|err| anyhow!("bad pack: {err}"))?;
     ensure!(
         objects <= MAX_PACK_OBJECTS,
         "pack declares {objects} objects, over the {MAX_PACK_OBJECTS} cap",
@@ -319,7 +319,7 @@ pub(super) fn ingest_pack(
             compression: gix::zlib::Compression::BEST_SPEED,
         },
     )
-    .map_err(|err| eyre!("cannot ingest pack: {err}"))?;
+    .map_err(|err| anyhow!("cannot ingest pack: {err}"))?;
     Ok(IngestOutcome {
         objects: outcome.index.num_objects as usize,
         keep: PackKeep(outcome.keep_path),

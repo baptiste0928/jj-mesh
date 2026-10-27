@@ -29,7 +29,7 @@ use std::{
     process::{Command, Output},
 };
 
-use color_eyre::eyre::{Result, WrapErr as _, ensure};
+use anyhow::{Context as _, Result, ensure};
 
 /// What the service runs.
 #[derive(Debug)]
@@ -74,7 +74,7 @@ impl Service {
                 Err(err) if err.kind() == ErrorKind::NotFound => {}
                 Err(err) => {
                     return Err(err)
-                        .wrap_err_with(|| format!("cannot read {}", service.path.display()));
+                        .with_context(|| format!("cannot read {}", service.path.display()));
                 }
             }
         }
@@ -128,10 +128,10 @@ impl Service {
         }
 
         if let Some(dir) = self.path.parent() {
-            fs::create_dir_all(dir).wrap_err_with(|| format!("cannot create {}", dir.display()))?;
+            fs::create_dir_all(dir).with_context(|| format!("cannot create {}", dir.display()))?;
         }
         fs::write(&self.path, platform::render(self, spec)?)
-            .wrap_err_with(|| format!("cannot write {}", self.path.display()))?;
+            .with_context(|| format!("cannot write {}", self.path.display()))?;
         platform::install(self)
     }
 
@@ -177,7 +177,7 @@ pub fn which(bin: &Path, path: &OsStr) -> Option<PathBuf> {
 
 /// Removes a definition file.
 fn remove(path: &Path) -> Result<()> {
-    fs::remove_file(path).wrap_err_with(|| format!("cannot remove {}", path.display()))
+    fs::remove_file(path).with_context(|| format!("cannot remove {}", path.display()))
 }
 
 /// Runs a service manager command, failing with its stderr.
@@ -197,7 +197,7 @@ fn output(program: &str, args: &[&str]) -> Result<Output> {
     Command::new(program)
         .args(args)
         .output()
-        .wrap_err_with(|| format!("cannot run {program}"))
+        .with_context(|| format!("cannot run {program}"))
 }
 
 #[cfg(test)]

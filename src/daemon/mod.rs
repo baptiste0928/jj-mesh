@@ -30,7 +30,7 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
-use color_eyre::eyre::{Result, WrapErr as _, eyre};
+use anyhow::{Context as _, Result, anyhow};
 use iroh::Endpoint;
 use tokio::sync::{Semaphore, mpsc, watch};
 use tracing::{debug, info, warn};
@@ -176,9 +176,9 @@ impl Daemon {
     /// Resolves when a subsystem terminates on its own. That is always
     /// fatal: it would leave a zombie daemon (no control socket, or no
     /// inbound connections) that still looks healthy.
-    pub async fn failed(&mut self) -> color_eyre::Report {
+    pub async fn failed(&mut self) -> anyhow::Error {
         let res = self.tasks.join_next().await;
-        eyre!("a daemon subsystem terminated unexpectedly: {res:?}")
+        anyhow!("a daemon subsystem terminated unexpectedly: {res:?}")
     }
 
     /// Stops all subsystems and closes the endpoint. Waits for the aborted
@@ -288,11 +288,11 @@ async fn update_loop(mut updates: mpsc::UnboundedReceiver<RepoUpdate>, store: Ar
         let (repo, result) = match update {
             RepoUpdate::Claims { repo, names } => {
                 let result = store.update(|state| state.set_claims(&repo, names));
-                (repo, result.wrap_err("cannot claim workspaces"))
+                (repo, result.context("cannot claim workspaces"))
             }
             RepoUpdate::ObjectHash { repo, object_hash } => {
                 let result = store.update(|state| state.set_object_hash(&repo, object_hash));
-                (repo, result.wrap_err("cannot record the object hash"))
+                (repo, result.context("cannot record the object hash"))
             }
         };
         if let Err(err) = result {

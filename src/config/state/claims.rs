@@ -8,7 +8,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
 };
 
-use color_eyre::eyre::{Result, ensure};
+use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
 
 use super::{

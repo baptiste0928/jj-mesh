@@ -13,7 +13,7 @@
 
 use std::{fmt, time::Duration};
 
-use color_eyre::eyre::{Result, WrapErr as _, ensure};
+use anyhow::{Context as _, Result, ensure};
 use iroh::endpoint::{Connection, VarInt};
 use serde::{Deserialize, Serialize};
 
@@ -130,7 +130,7 @@ async fn exchange(conn: &Connection, ours: &Hello, side: Side) -> Result<Result<
         Ok(peer)
     })
     .await
-    .wrap_err("no hello from the peer")??;
+    .context("no hello from the peer")??;
 
     if peer.protocol == ours.protocol {
         return Ok(Ok(()));

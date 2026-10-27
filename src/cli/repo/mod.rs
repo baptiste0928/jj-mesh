@@ -10,8 +10,8 @@ mod settings;
 
 use std::path::Path;
 
+use anyhow::{Context as _, Result, ensure};
 use clap::{Args, Subcommand};
-use color_eyre::eyre::{Result, WrapErr as _, ensure};
 
 pub(super) use self::{
     add::{AddArgs, run as add},
@@ -56,7 +56,7 @@ fn jj(dir: Option<&Path>, args: &[&str]) -> Result<String> {
     if let Some(dir) = dir {
         command.current_dir(dir);
     }
-    let out = command.args(args).output().wrap_err("cannot run jj")?;
+    let out = command.args(args).output().context("cannot run jj")?;
     // Diagnostics embed bytes read from repo files; mask them line by
     // line so escape sequences never reach the terminal.
     let stderr: Vec<String> = String::from_utf8_lossy(&out.stderr)

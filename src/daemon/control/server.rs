@@ -8,7 +8,7 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-use color_eyre::eyre::{Result, WrapErr as _, bail, ensure, eyre};
+use anyhow::{Context as _, Result, anyhow, bail, ensure};
 use iroh::Endpoint;
 use tokio::{
     io::{AsyncRead, AsyncReadExt as _},
@@ -143,14 +143,14 @@ impl ControlServer {
 
         let lock_path = path.with_extension("lock");
         let lock = File::create(&lock_path)
-            .wrap_err_with(|| format!("cannot create {}", lock_path.display()))?;
+            .with_context(|| format!("cannot create {}", lock_path.display()))?;
         match lock.try_lock() {
             Ok(()) => {}
             Err(TryLockError::WouldBlock) => {
                 bail!("another jj-mesh daemon is already running");
             }
             Err(TryLockError::Error(err)) => {
-                return Err(err).wrap_err_with(|| format!("cannot lock {}", lock_path.display()));
+                return Err(err).with_context(|| format!("cannot lock {}", lock_path.display()));
             }
         }
 
@@ -160,10 +160,10 @@ impl ControlServer {
         let tmp = path.with_extension("sock.tmp");
         let _ = fs::remove_file(&tmp);
         let listener = UnixListener::bind(&tmp)
-            .wrap_err_with(|| format!("cannot bind control socket {}", tmp.display()))?;
+            .with_context(|| format!("cannot bind control socket {}", tmp.display()))?;
         fs::set_permissions(&tmp, std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
         fs::rename(&tmp, &path)
-            .wrap_err_with(|| format!("cannot move control socket to {}", path.display()))?;
+            .with_context(|| format!("cannot move control socket to {}", path.display()))?;
 
         Ok(ControlServer {
             listener,
@@ -259,7 +259,7 @@ async fn handle_client(
 /// Sends a handler's outcome, turning any failure into an error response so
 /// every handler does not repeat the conversion.
 async fn reply(stream: &mut UnixStream, result: Result<Response>) -> Result<()> {
-    let response = result.unwrap_or_else(|err| Response::Error(format!("{err:#}")));
+    let response = result.unwrap_or_else(|err| Response::error(&err));
     respond(stream, &response).await
 }
 
@@ -274,7 +274,7 @@ pub(super) async fn respond(
         write_message(stream, response, MAX_MESSAGE_SIZE),
     )
     .await
-    .map_err(|_| eyre!("control client stopped reading"))?
+    .map_err(|_| anyhow!("control client stopped reading"))?
 }
 
 /// Hosts a pairing: issues a fresh one-time ticket, revoking any
@@ -297,7 +297,7 @@ async fn pair_join(stream: &mut UnixStream, ctx: &ControlContext, ticket: &str) 
     };
     let result = tokio::select! {
         result = tokio::time::timeout(PAIRING_TIMEOUT, exchange) => result.unwrap_or_else(|_| {
-            Err(eyre!("pairing timed out after {}s", PAIRING_TIMEOUT.as_secs()))
+            Err(anyhow!("pairing timed out after {}s", PAIRING_TIMEOUT.as_secs()))
         }),
         () = client_gone(&mut read_half) => {
             info!("pairing cancelled by the client");
@@ -317,7 +317,7 @@ async fn pair_join(stream: &mut UnixStream, ctx: &ControlContext, ticket: &str) 
                 endpoint: peer.endpoint,
             }
         }
-        Err(err) => Response::Error(format!("{err:#}")),
+        Err(err) => Response::error(&err),
     };
 
     respond(&mut write_half, &response).await
@@ -337,7 +337,7 @@ async fn add_repo(ctx: &ControlContext, name: String, path: PathBuf) -> Result<R
         Ok((repo.root().to_owned(), object_hash))
     })
     .await
-    .wrap_err("repo validation task failed")??;
+    .context("repo validation task failed")??;
 
     ctx.store.update(|state| {
         let repo = Repo {

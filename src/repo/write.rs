@@ -5,7 +5,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use color_eyre::eyre::{Result, WrapErr as _};
+use anyhow::{Context as _, Result};
 use jj_lib::{
     object_id::ObjectId,
     op_store::{OperationId, ViewId},
@@ -65,7 +65,7 @@ impl<'a> RawWriteBatch<'a> {
             return Ok(());
         }
         let temp = tempfile::NamedTempFile::new_in(dir)
-            .wrap_err_with(|| format!("cannot create temp file in {}", dir.display()))?;
+            .with_context(|| format!("cannot create temp file in {}", dir.display()))?;
         temp.as_file().write_all(bytes)?;
         self.staged.push((temp.into_temp_path(), path));
         Ok(())
@@ -91,7 +91,7 @@ impl<'a> RawWriteBatch<'a> {
                         for (temp, path) in chunk {
                             std::fs::File::open(temp)
                                 .and_then(|file| file.sync_data())
-                                .wrap_err_with(|| {
+                                .with_context(|| {
                                     format!("cannot sync staged write of {}", path.display())
                                 })?;
                         }
@@ -109,8 +109,8 @@ impl<'a> RawWriteBatch<'a> {
             // equivalent content.
             temp.persist(&path)
                 .map_err(|err| err.error)
-                .wrap_err_with(|| format!("cannot persist {}", path.display()))?;
-            fail::fail_point!("persist.after_rename", |_| Err(color_eyre::eyre::eyre!(
+                .with_context(|| format!("cannot persist {}", path.display()))?;
+            fail::fail_point!("persist.after_rename", |_| Err(anyhow::anyhow!(
                 "crash point persist.after_rename"
             )));
         }

@@ -27,7 +27,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use color_eyre::eyre::{Result, WrapErr as _, bail, ensure};
+use anyhow::{Context as _, Result, bail, ensure};
 use iroh::EndpointId;
 use serde::{Deserialize, Serialize};
 use tracing::warn;
@@ -51,6 +51,7 @@ use self::{
     },
 };
 use super::{ConfigDir, validate_name};
+use crate::hint::hinted;
 
 /// Version of the `mesh.json` layout, bumped on incompatible changes.
 const FORMAT: u32 = 2;
@@ -114,10 +115,10 @@ impl MeshState {
                 return Ok((Self::default(), false));
             }
             Err(err) => {
-                return Err(err).wrap_err_with(|| format!("cannot read {}", path.display()));
+                return Err(err).with_context(|| format!("cannot read {}", path.display()));
             }
         };
-        Self::parse(&bytes).wrap_err_with(|| format!("invalid mesh state in {}", path.display()))
+        Self::parse(&bytes).with_context(|| format!("invalid mesh state in {}", path.display()))
     }
 
     /// Parses `mesh.json`, migrating older formats; tells whether it did.
@@ -126,9 +127,10 @@ impl MeshState {
         match value.get("format") {
             None => Ok((legacy::migrate(value)?, true)),
             Some(format) if *format == FORMAT => Ok((serde_json::from_value(value)?, false)),
-            Some(format) => bail!(
-                "format {format} is not supported by this jj-mesh (expected {FORMAT}). Update jj-mesh"
-            ),
+            Some(format) => Err(hinted(
+                format!("format {format} is not supported by this jj-mesh (expected {FORMAT})"),
+                "Update jj-mesh",
+            )),
         }
     }
 
@@ -138,19 +140,19 @@ impl MeshState {
     /// this returns; pairing relies on that to only confirm saved peers.
     pub fn save(&self, dir: &ConfigDir) -> Result<()> {
         let path = dir.mesh_file();
-        let json = serde_json::to_vec_pretty(self).wrap_err("cannot encode mesh state")?;
+        let json = serde_json::to_vec_pretty(self).context("cannot encode mesh state")?;
 
         let mut tmp = tempfile::NamedTempFile::new_in(dir.path())
-            .wrap_err("cannot create temporary state file")?;
+            .context("cannot create temporary state file")?;
         tmp.write_all(&json)
             .and_then(|()| tmp.as_file().sync_all())
-            .wrap_err_with(|| format!("cannot write {}", tmp.path().display()))?;
+            .with_context(|| format!("cannot write {}", tmp.path().display()))?;
         tmp.persist(&path)
-            .wrap_err_with(|| format!("cannot write {}", path.display()))?;
+            .with_context(|| format!("cannot write {}", path.display()))?;
 
         fs::File::open(dir.path())
             .and_then(|dir| dir.sync_all())
-            .wrap_err("cannot sync the config directory")?;
+            .context("cannot sync the config directory")?;
 
         Ok(())
     }
@@ -220,10 +222,10 @@ impl MeshState {
             ([], _) => {}
             _ => {
                 let ids: Vec<String> = ids.iter().map(ToString::to_string).collect();
-                bail!(
-                    "several repos are named {selector} ({}). Use the id of the one you mean",
-                    ids.join(", "),
-                );
+                return Err(hinted(
+                    format!("several repos are named {selector} ({})", ids.join(", ")),
+                    "Use the id of the one you mean",
+                ));
             }
         }
 
@@ -318,7 +320,10 @@ impl MeshState {
                 !self.repos.contains_key(id),
                 "a repo named {name} already exists"
             );
-            bail!("a repo named {name} already exists in the mesh. Clone it instead");
+            return Err(hinted(
+                format!("a repo named {name} already exists in the mesh"),
+                format!("Clone it with `jj-mesh clone {name}`"),
+            ));
         }
         self.validate_new_path(path)
     }
@@ -402,10 +407,12 @@ impl MeshState {
             .collect();
         match matches[..] {
             [endpoint] => return Ok(*endpoint),
-            [_, _, ..] => bail!(
-                "several peers are named {selector}. Rename one of them with \
-                 `jj-mesh peer rename` on its machine"
-            ),
+            [_, _, ..] => {
+                return Err(hinted(
+                    format!("several peers are named {selector}"),
+                    "Rename one of them with `jj-mesh peer rename` on its machine",
+                ));
+            }
             [] => {}
         }
 
@@ -530,12 +537,20 @@ impl MeshState {
         };
         ensure!(
             !(repo.bare && self.machine.server),
-            "{name} is a bare repo kept by server mode. Disable server mode or remove the repo \
-             from the mesh",
+            hinted(
+                format!("{name} is a bare repo kept by server mode"),
+                format!(
+                    "Disable server mode with `jj-mesh server disable`, or remove the repo with \
+                     `jj-mesh repo remove {name}`"
+                )
+            )
         );
         ensure!(
             missing || !self.holders(id).is_empty(),
-            "no other machine holds {name}. Use `jj-mesh repo remove {name}`",
+            hinted(
+                format!("no other machine holds {name}"),
+                format!("Remove it from the mesh with `jj-mesh repo remove {name}`")
+            )
         );
         Ok(())
     }
@@ -1179,7 +1194,7 @@ mod tests {
                 ObjectHash::Sha1,
             )
             .unwrap_err();
-        assert!(err.to_string().contains("Clone it"), "{err:#}");
+        assert!(err.to_string().contains("already exists"), "{err:#}");
     }
 
     #[test]
@@ -1208,7 +1223,11 @@ mod tests {
 
         // The last machine holding the repo cannot forget it.
         let err = state.forget_repo(&id, false).unwrap_err();
-        assert!(err.to_string().contains("repo remove"), "{err:#}");
+        let hint = crate::hint::of(&err);
+        assert!(
+            hint.is_some_and(|hint| hint.contains("repo remove")),
+            "{err:#}"
+        );
         add_holder(&mut state, &id);
 
         let repo = state.forget_repo(&id, false).unwrap();
@@ -1227,7 +1246,11 @@ mod tests {
                 ObjectHash::Sha1,
             )
             .unwrap_err();
-        assert!(err.to_string().contains("Clone it"), "{err:#}");
+        let hint = crate::hint::of(&err);
+        assert!(
+            hint.is_some_and(|hint| hint.contains("jj-mesh clone")),
+            "{err:#}"
+        );
     }
 
     #[test]
@@ -1339,7 +1362,7 @@ mod tests {
 
         let newer = br#"{ "format": 99 }"#;
         let err = MeshState::parse(newer).unwrap_err();
-        assert!(err.to_string().contains("Update jj-mesh"), "{err:#}");
+        assert_eq!(crate::hint::of(&err), Some("Update jj-mesh"));
     }
 
     #[test]

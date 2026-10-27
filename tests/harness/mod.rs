@@ -16,6 +16,7 @@ use std::{
     time::Duration,
 };
 
+use anyhow::Result;
 use iroh::address_lookup::MemoryLookup;
 use jj_mesh::{
     config::{ConfigDir, MeshState},
@@ -149,10 +150,10 @@ impl Machine {
     }
 
     /// One request/response exchange, returning daemon-level errors.
-    pub async fn try_request(&self, request: &Request) -> Response {
+    pub async fn try_request(&self, request: &Request) -> Result<Response> {
         let mut client = self.client().await;
         client.send(request).await.unwrap();
-        client.recv(Some(WAIT_TIMEOUT)).await.unwrap()
+        client.recv(Some(WAIT_TIMEOUT)).await.unwrap().into_result()
     }
 
     /// One request/terminal-response exchange for requests answered by a
@@ -171,12 +172,9 @@ impl Machine {
 
     /// One request/response exchange, panicking on a daemon error.
     pub async fn request(&self, request: &Request) -> Response {
-        match self.try_request(request).await {
-            Response::Error(message) => {
-                panic!("{}: {request:?} failed: {message}", self.name)
-            }
-            response => response,
-        }
+        self.try_request(request)
+            .await
+            .unwrap_or_else(|err| panic!("{}: {request:?} failed: {err:#}", self.name))
     }
 
     /// Snapshots the daemon status.
@@ -252,7 +250,7 @@ impl Machine {
 
     /// Attempts to join a pairing with `ticket` and returns the daemon's
     /// verdict.
-    pub async fn try_join_pairing(&self, ticket: String) -> Response {
+    pub async fn try_join_pairing(&self, ticket: String) -> Result<Response> {
         self.try_request(&Request::PairJoin { ticket }).await
     }
 
@@ -262,7 +260,7 @@ impl Machine {
     pub async fn join_pairing(&self, ticket: String) {
         let joined = self.try_join_pairing(ticket).await;
         assert!(
-            matches!(joined, Response::Paired { .. }),
+            matches!(joined, Ok(Response::Paired { .. })),
             "{}: {joined:?}",
             self.name,
         );
@@ -325,14 +323,16 @@ impl Machine {
             name: name.to_owned(),
             path: std::fs::canonicalize(path).unwrap(),
         };
-        poll(async || match self.try_streaming_request(&request).await {
-            Response::Cloned { .. } => Ok(()),
-            Response::Error(message) => Err(format!(
-                "{}: clone of `{name}` kept failing: {message}",
-                self.name,
-            )),
-            other => panic!("{}: unexpected response {other:?}", self.name),
-        })
+        poll(
+            async || match self.try_streaming_request(&request).await.into_result() {
+                Ok(Response::Cloned { .. }) => Ok(()),
+                Err(err) => Err(format!(
+                    "{}: clone of `{name}` kept failing: {err:#}",
+                    self.name,
+                )),
+                Ok(other) => panic!("{}: unexpected response {other:?}", self.name),
+            },
+        )
         .await;
     }
 }

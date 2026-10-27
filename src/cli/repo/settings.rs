@@ -7,8 +7,8 @@
 
 use std::path::Path;
 
+use anyhow::Result;
 use clap::Args;
-use color_eyre::eyre::Result;
 
 use super::jj;
 use crate::config::{MAX_SNAPSHOT_INTERVAL, SNAPSHOT_INTERVAL, parse_interval};

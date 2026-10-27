@@ -79,7 +79,7 @@ async fn forgetting_locally_keeps_the_repo_clonable() {
             name: "proj".to_owned(),
         })
         .await;
-    assert!(matches!(again, Response::Error(_)), "{again:?}");
+    assert!(again.is_err(), "{again:?}");
     // A, the last machine holding the repo once B's claims are gone,
     // cannot forget it.
     a.wait("machine-b claims released", |s| {
@@ -95,10 +95,16 @@ async fn forgetting_locally_keeps_the_repo_clonable() {
             name: "proj".to_owned(),
         })
         .await;
-    let Response::Error(message) = last else {
-        panic!("{last:?}");
-    };
-    assert!(message.contains("no other machine holds"), "{message}");
+    let err = last.unwrap_err();
+    assert!(
+        format!("{err}").contains("no other machine holds"),
+        "{err:#}"
+    );
+    let hint = jj_mesh::hint::of(&err);
+    assert!(
+        hint.is_some_and(|hint| hint.contains("repo remove")),
+        "{hint:?}"
+    );
 
     // ...but the repo clones again into a fresh directory and catches up...
     let dir_b2 = mesh.jj.init_pull_target("proj-again", "machine-b-again");
@@ -124,7 +130,7 @@ async fn pairing_requires_the_ticket_secret() {
 
     // A join with a tampered secret is rejected; nobody is paired.
     let rejected = b.try_join_pairing(tamper_secret(&ticket)).await;
-    assert!(matches!(rejected, Response::Error(_)), "{rejected:?}");
+    assert!(rejected.is_err(), "{rejected:?}");
     assert!(a.status().await.peers.is_empty());
     assert!(b.status().await.peers.is_empty());
 
@@ -150,7 +156,7 @@ async fn pairing_ticket_is_single_use() {
 
     // Reusing the ticket is refused; the third machine is not paired.
     let reused = c.try_join_pairing(ticket).await;
-    assert!(matches!(reused, Response::Error(_)), "{reused:?}");
+    assert!(reused.is_err(), "{reused:?}");
     assert!(c.status().await.peers.is_empty());
     assert_eq!(a.status().await.peers.len(), 1);
 }
@@ -173,7 +179,7 @@ async fn failed_attempt_keeps_the_ticket_valid() {
     let ticket = a.host_pairing().await;
 
     let rejected = b.try_join_pairing(ticket.clone()).await;
-    assert!(matches!(rejected, Response::Error(_)), "{rejected:?}");
+    assert!(rejected.is_err(), "{rejected:?}");
     assert!(a.status().await.peers.is_empty());
 
     b.rename("machine-b").await;
@@ -294,7 +300,7 @@ async fn rehosting_replaces_the_ticket() {
     // The replaced ticket is dead, and rejecting it does not burn the
     // fresh one...
     let rejected = b.try_join_pairing(stale).await;
-    assert!(matches!(rejected, Response::Error(_)), "{rejected:?}");
+    assert!(rejected.is_err(), "{rejected:?}");
     assert!(a.status().await.peers.is_empty());
 
     // ...while the fresh one pairs.

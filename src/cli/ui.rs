@@ -1,8 +1,24 @@
-//! Shared presentation helpers for the CLI output and prompts.
+//! The CLI output: messages, styles and prompts.
+//!
+//! stdout carries only data meant to be read or piped (`status`, `logs`,
+//! the pairing command); everything else is a message on stderr, through
+//! the functions below:
+//!
+//! - [`success`]: what the command did, once done, e.g. "Removed x from the mesh".
+//! - [`info`]: progress and details, as the command goes, e.g. "Pulling...".
+//! - [`note`]: a secondary detail, de-emphasized.
+//! - [`hint`]: a next step for the user, on its own `Hint:` line.
+//! - [`warning`]: something wrong that does not fail the command.
+//! - [`error`]: the failure ending the command, then its hint, if any
+//!   (see [`crate::hint`]).
+//!
+//! Messages are sentences without a final period, and error messages
+//! start lowercase, as anyhow chains them. Commands go in backticks, names
+//! (repos, peers, workspaces) do not; paths go through [`path`].
 //!
 //! Styling goes through the semantic wrappers below so every command
 //! renders the same palette; `console` disables the colors on its own
-//! when stdout is not a terminal or `NO_COLOR` is set. Peer and repo
+//! when the stream is not a terminal or `NO_COLOR` is set. Peer and repo
 //! names are validated at the daemon boundary and print as-is; free-form
 //! peer- or daemon-provided strings (error messages) must pass through
 //! [`crate::config::sanitize`] before they are printed or styled.
@@ -16,9 +32,45 @@ use std::{
     path::Path,
 };
 
-use color_eyre::eyre::{Result, WrapErr as _};
+use anyhow::{Context as _, Error, Result};
 use console::{Alignment, StyledObject, Term, measure_text_width, pad_str, style};
 use dialoguer::{Confirm, Input, Select, theme::ColorfulTheme};
+
+/// Reports what the command did.
+pub(super) fn success(message: impl Display) {
+    eprintln!("{}", good(message).for_stderr());
+}
+
+/// Reports progress or a detail of what the command does.
+pub(super) fn info(message: impl Display) {
+    eprintln!("{message}");
+}
+
+/// Reports a secondary detail, de-emphasized.
+pub(super) fn note(message: impl Display) {
+    eprintln!("{}", dim(message).for_stderr());
+}
+
+/// Suggests a next step.
+pub(super) fn hint(message: impl Display) {
+    eprintln!("{} {message}", style("Hint:").cyan().for_stderr());
+}
+
+/// Reports something wrong that does not fail the command.
+pub(super) fn warning(message: impl Display) {
+    eprintln!(
+        "{}",
+        caution(format_args!("Warning: {message}")).for_stderr()
+    );
+}
+
+/// Reports the error ending the command, and its hint.
+pub fn error(err: &Error) {
+    eprintln!("{}", bad(format_args!("Error: {err:#}")).for_stderr());
+    if let Some(hint) = crate::hint::of(err) {
+        self::hint(hint);
+    }
+}
 
 /// Bold section heading.
 pub(super) fn heading<D: Display>(text: D) -> StyledObject<D> {
@@ -31,7 +83,7 @@ pub(super) fn good<D: Display>(text: D) -> StyledObject<D> {
 }
 
 /// State that needs attention without being an error.
-pub(super) fn warn<D: Display>(text: D) -> StyledObject<D> {
+pub(super) fn caution<D: Display>(text: D) -> StyledObject<D> {
     style(text).yellow()
 }
 
@@ -46,7 +98,7 @@ pub(super) fn dim<D: Display>(text: D) -> StyledObject<D> {
 }
 
 /// Displays a path with the home directory shortened to `~`.
-pub(super) fn display_path(path: &Path) -> String {
+pub(super) fn path(path: &Path) -> String {
     if let Ok(home) = etcetera::home_dir()
         && let Ok(rest) = path.strip_prefix(&home)
     {
@@ -123,6 +175,17 @@ pub(super) fn confirm(prompt: &str, default: bool) -> Result<Option<bool>> {
     .map(Some)
 }
 
+/// Asks to confirm a destructive action, defaulting to no. Without a
+/// terminal, the user must have passed `--yes`.
+pub(super) fn approve(prompt: &str) -> Result<bool> {
+    confirm(prompt, false)?.ok_or_else(|| {
+        crate::hint::hinted(
+            "cannot ask for confirmation without a terminal",
+            "Pass `--yes`",
+        )
+    })
+}
+
 /// Asks for a line of text, pre-filled with `initial` and re-asked until
 /// `validate` accepts it.
 pub(super) fn input(
@@ -167,6 +230,6 @@ fn answer<T>(result: dialoguer::Result<T>) -> Result<T> {
             let _ = Term::stderr().show_cursor();
             std::process::exit(130);
         }
-        Err(err).wrap_err("cannot read the answer")
+        Err(err).context("cannot read the answer")
     })
 }

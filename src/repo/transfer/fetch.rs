@@ -4,7 +4,7 @@
 
 use std::{collections::HashSet, sync::Arc, time::Duration};
 
-use color_eyre::eyre::{Result, WrapErr as _, bail, ensure, eyre};
+use anyhow::{Context as _, Result, anyhow, bail, ensure};
 use jj_lib::{
     backend::CommitId,
     object_id::ObjectId as _,
@@ -92,7 +92,7 @@ pub async fn fetch(
         let referenced = referenced_commits(&batch);
         crate::spawn_blocking(move || git_wants(&repo, &local_heads, referenced))
             .await
-            .wrap_err("git check task failed")??
+            .context("git check task failed")??
     };
     // A pack of nothing is not a valid transfer; an empty want set falls
     // back to the loose exchange, which the server answers with `Done`.
@@ -158,7 +158,7 @@ pub async fn fetch(
         let wants = wants.to_vec();
         crate::spawn_blocking(move || apply_batch(&repo, &batch, &wants, &local_heads, &to_index))
             .await
-            .wrap_err("apply task failed")??;
+            .context("apply task failed")??;
     }
     // The stage's keep refs now protect the pack's commits.
     drop(pack_keep);
@@ -177,12 +177,12 @@ fn apply_batch(
     local_heads: &[OperationId],
     to_index: &[OperationId],
 ) -> Result<()> {
-    fail::fail_point!("fetch.before_stage", |_| Err(eyre!(
+    fail::fail_point!("fetch.before_stage", |_| Err(anyhow!(
         "crash point fetch.before_stage"
     )));
     let staged = apply::stage(repo, batch, wants, local_heads)?;
     repo.build_commit_indexes(to_index);
-    fail::fail_point!("fetch.after_index", |_| Err(eyre!(
+    fail::fail_point!("fetch.after_index", |_| Err(anyhow!(
         "crash point fetch.after_index"
     )));
     apply::publish(repo, &staged)
@@ -210,7 +210,7 @@ async fn ensure_git_wants_arrived(repo: &Arc<OpenRepo>, requested: Vec<CommitId>
         Ok(absent)
     })
     .await
-    .wrap_err("git verify task failed")??;
+    .context("git verify task failed")??;
     if let Some(first) = absent.first() {
         bail!(
             "peer did not send {} of the requested commits (e.g. {})",
@@ -229,7 +229,7 @@ async fn bounded<T>(
 ) -> Result<T> {
     tokio::time::timeout_at(deadline, section)
         .await
-        .map_err(|_| eyre!("{phase} phase timed out"))?
+        .map_err(|_| anyhow!("{phase} phase timed out"))?
 }
 
 /// Receives and validates the op phase: every frame must decode as jj's
@@ -274,9 +274,9 @@ async fn receive_ops(
                 ensure!(id.len() == id_len, "bad view id length ({})", id.len());
                 let id = ViewId::new(id);
                 let view = decompress_payload(&view, u64::from(MAX_OP_FRAME_SIZE))
-                    .wrap_err_with(|| format!("view {}", id.hex()))?;
+                    .with_context(|| format!("view {}", id.hex()))?;
                 let meta =
-                    codec::parse_view(&view).wrap_err_with(|| format!("view {}", id.hex()))?;
+                    codec::parse_view(&view).with_context(|| format!("view {}", id.hex()))?;
                 if view_ids.insert(id.clone()) {
                     views.push(StoredView {
                         id,
@@ -297,9 +297,9 @@ async fn receive_ops(
                     "peer sent an op claiming the root id",
                 );
                 let op = decompress_payload(&op, u64::from(MAX_OP_FRAME_SIZE))
-                    .wrap_err_with(|| format!("op {}", id.hex()))?;
+                    .with_context(|| format!("op {}", id.hex()))?;
                 let meta =
-                    codec::parse_operation(&op).wrap_err_with(|| format!("op {}", id.hex()))?;
+                    codec::parse_operation(&op).with_context(|| format!("op {}", id.hex()))?;
                 ensure!(!op_ids.contains(&id), "op {} sent twice", id.hex());
                 for parent in &meta.parents {
                     ensure!(
@@ -462,14 +462,14 @@ async fn receive_git_loose(
                 counters.bytes += data.len() as u64;
                 progress.report(counters);
                 let id = gix::ObjectId::try_from(id.as_slice())
-                    .map_err(|err| eyre!("bad object id: {err}"))?;
+                    .map_err(|err| anyhow!("bad object id: {err}"))?;
                 let kind = to_gix_kind(kind);
                 chunk_bytes += data.len();
                 chunk.push((id, kind, data));
                 total += 1;
                 if chunk.len() >= GIT_WRITE_CHUNK || chunk_bytes >= GIT_WRITE_BYTES {
                     if let Some(write) = pending.take() {
-                        write.await.wrap_err("git write task failed")??;
+                        write.await.context("git write task failed")??;
                     }
                     pending = Some(write_git_chunk(repo, std::mem::take(&mut chunk)));
                     chunk_bytes = 0;
@@ -477,11 +477,11 @@ async fn receive_git_loose(
             }
             GitFrame::Done => {
                 if let Some(write) = pending.take() {
-                    write.await.wrap_err("git write task failed")??;
+                    write.await.context("git write task failed")??;
                 }
                 write_git_chunk(repo, chunk)
                     .await
-                    .wrap_err("git write task failed")??;
+                    .context("git write task failed")??;
                 return Ok(total);
             }
             GitFrame::Pack { .. } => bail!("peer sent a pack chunk in a loose transfer"),
@@ -575,7 +575,7 @@ async fn receive_git_pack(
     let failed = streamed?;
     let outcome = loop {
         tokio::select! {
-            outcome = &mut ingest => break outcome.wrap_err("pack ingest task failed")?,
+            outcome = &mut ingest => break outcome.context("pack ingest task failed")?,
             () = tokio::time::sleep(INGEST_SAMPLE_INTERVAL) => {
                 counters.current = indexed.get();
                 progress.report(counters);
@@ -609,9 +609,9 @@ fn write_git_chunk(
         let hash_kind = git.object_hash();
         for (id, kind, data) in chunk {
             let data = decompress_payload(&data, MAX_GIT_OBJECT_SIZE)
-                .wrap_err_with(|| format!("object {id}"))?;
+                .with_context(|| format!("object {id}"))?;
             let computed = gix::objs::compute_hash(hash_kind, kind, &data)
-                .map_err(|err| eyre!("cannot hash object: {err}"))?;
+                .map_err(|err| anyhow!("cannot hash object: {err}"))?;
             ensure!(
                 computed == id,
                 "object {id} does not match its content (hashes to {computed})",
@@ -621,7 +621,7 @@ fn write_git_chunk(
             }
             git.objects
                 .write_buf_with_known_id(kind, &data, id)
-                .map_err(|err| eyre!("cannot write object {id}: {err}"))?;
+                .map_err(|err| anyhow!("cannot write object {id}: {err}"))?;
         }
         Ok(())
     })

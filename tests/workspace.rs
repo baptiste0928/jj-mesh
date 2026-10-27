@@ -79,7 +79,7 @@ async fn clone_writes_workspace_settings() {
 }
 
 /// Takes a hold as the CLI does, off the async runtime.
-async fn take(dir: ConfigDir, repo: &str, workspace: &str) -> color_eyre::Result<WorkspaceHold> {
+async fn take(dir: ConfigDir, repo: &str, workspace: &str) -> anyhow::Result<WorkspaceHold> {
     let (repo, workspace) = (repo.to_owned(), workspace.to_owned());
     #[expect(clippy::disallowed_methods, reason = "no span to keep in tests")]
     tokio::task::spawn_blocking(move || WorkspaceHold::take(&dir, &repo, &workspace))

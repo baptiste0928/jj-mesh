@@ -9,7 +9,7 @@ use std::{
     path::Path,
 };
 
-use color_eyre::eyre::{Result, WrapErr, eyre};
+use anyhow::{Context, Result, anyhow};
 use data_encoding::BASE64;
 use iroh::{EndpointId, SecretKey};
 
@@ -28,7 +28,7 @@ impl MachineKey {
         match fs::read_to_string(&key_file) {
             Ok(content) => Self::from_base64(&content),
             Err(err) if err.kind() == io::ErrorKind::NotFound => Self::generate(&key_file),
-            Err(err) => Err(err).wrap_err_with(|| format!("cannot read {}", key_file.display())),
+            Err(err) => Err(err).with_context(|| format!("cannot read {}", key_file.display())),
         }
     }
 
@@ -36,9 +36,9 @@ impl MachineKey {
     fn from_base64(content: &str) -> Result<Self> {
         let key: [u8; 32] = BASE64
             .decode(content.trim_ascii().as_bytes())
-            .wrap_err("failed to decode machine key")?
+            .context("failed to decode machine key")?
             .try_into()
-            .map_err(|_| eyre!("failed to decode machine key: should be 32 bytes"))?;
+            .map_err(|_| anyhow!("failed to decode machine key: should be 32 bytes"))?;
 
         Ok(Self(SecretKey::from_bytes(&key)))
     }
@@ -60,7 +60,7 @@ impl MachineKey {
         options
             .open(path)?
             .write_all(encoded.as_bytes())
-            .wrap_err("failed to write machine key")?;
+            .context("failed to write machine key")?;
 
         Ok(Self(key))
     }

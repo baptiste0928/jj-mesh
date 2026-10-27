@@ -1,7 +1,7 @@
 //! `jj-mesh peer rename`: rename this machine in the mesh.
 
+use anyhow::{Result, bail};
 use clap::Args;
-use color_eyre::eyre::{Result, bail};
 
 use crate::{
     cli::ui,
@@ -35,6 +35,6 @@ pub fn rename(dir: &ConfigDir, name: &str) -> Result<()> {
         bail!("unexpected response from the daemon: {response:?}");
     };
 
-    println!("{}", ui::good(format_args!("This machine is now {name}")));
+    ui::success(format_args!("Renamed this machine to {name}"));
     Ok(())
 }

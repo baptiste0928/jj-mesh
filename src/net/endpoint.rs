@@ -1,6 +1,6 @@
 //! Iroh endpoint construction.
 
-use color_eyre::eyre::Result;
+use anyhow::Result;
 use iroh::{Endpoint, endpoint::presets, tls::CaTlsConfig};
 
 use crate::config::MachineKey;

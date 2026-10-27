@@ -6,7 +6,7 @@ use std::{
     sync::Arc,
 };
 
-use color_eyre::eyre::{Result, WrapErr as _, eyre};
+use anyhow::{Context as _, Result, anyhow};
 use jj_lib::{
     backend::CommitId,
     object_id::ObjectId as _,
@@ -198,7 +198,7 @@ async fn serve_git_loose(
             walk_git_closure(&repo, &request, |id, kind| {
                 let object = git
                     .find_object(id)
-                    .wrap_err_with(|| format!("missing object {id}"))?;
+                    .with_context(|| format!("missing object {id}"))?;
                 // `detach()` moves the object's buffer out instead of
                 // copying it, which matters for large blobs.
                 let data = compress_payload(&object.detach().data)?;
@@ -320,7 +320,7 @@ async fn serve_phase<T: PhaseFrame + Send + 'static>(
             }
         }
     }
-    producer.await.wrap_err("phase producer task failed")?;
+    producer.await.context("phase producer task failed")?;
 
     let (last, ok) = match failed {
         Some(err) => (T::error(format!("{err_context}: {err:#}")), false),
@@ -333,7 +333,7 @@ async fn serve_phase<T: PhaseFrame + Send + 'static>(
 /// Sends one frame from a producer, failing once the relay side is gone.
 fn produce<T>(tx: &mpsc::Sender<Result<T>>, frame: T) -> Result<()> {
     tx.blocking_send(Ok(frame))
-        .map_err(|_| eyre!("fetcher went away"))
+        .map_err(|_| anyhow!("fetcher went away"))
 }
 
 /// Walks the object closure of the wanted commits, minus what the fetcher
@@ -434,8 +434,8 @@ impl Commit {
     fn read(git: &gix::Repository, id: gix::ObjectId) -> Result<Self> {
         let object = git
             .find_commit(id)
-            .wrap_err_with(|| format!("missing commit {id}"))?;
-        let commit = object.decode().map_err(|err| eyre!("{err}"))?;
+            .with_context(|| format!("missing commit {id}"))?;
+        let commit = object.decode().map_err(|err| anyhow!("{err}"))?;
         Ok(Commit {
             tree: commit.tree(),
             parents: commit.parents().collect(),
@@ -466,7 +466,7 @@ fn walk_tree(
         }
         let find = |id: gix::ObjectId| {
             git.find_tree(id)
-                .wrap_err_with(|| format!("missing tree {id}"))
+                .with_context(|| format!("missing tree {id}"))
         };
         let tree = find(id)?;
         let base_trees = subtree_bases
@@ -475,9 +475,9 @@ fn walk_tree(
             .collect::<Result<Vec<_>>>()?;
         let base_refs = base_trees
             .iter()
-            .map(|base| base.decode().map_err(|err| eyre!("{err}")))
+            .map(|base| base.decode().map_err(|err| anyhow!("{err}")))
             .collect::<Result<Vec<_>>>()?;
-        for entry in tree.decode().map_err(|err| eyre!("{err}"))?.entries {
+        for entry in tree.decode().map_err(|err| anyhow!("{err}"))?.entries {
             // Gitlinks point at commits in other repositories, never ours
             // to send.
             if entry.mode.is_commit() {

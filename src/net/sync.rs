@@ -12,7 +12,7 @@
 //! and git object transfer run on bidirectional streams (see
 //! [`super::fetch`]).
 
-use color_eyre::eyre::{Result, ensure};
+use anyhow::{Result, ensure};
 use iroh::endpoint::{Connection, RecvStream};
 use serde::{Deserialize, Serialize};
 

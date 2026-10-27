@@ -2,7 +2,7 @@
 
 use std::{ffi::OsStr, path::Path};
 
-use color_eyre::eyre::{Result, WrapErr as _, ensure, eyre};
+use anyhow::{Context as _, Result, anyhow, ensure};
 use tokio::io::{AsyncRead, AsyncReadExt as _};
 
 use super::SUPPORTED_JJ_MINORS;
@@ -34,14 +34,14 @@ pub async fn run_jj(root: &Path, args: &[&str], timeout: std::time::Duration) ->
 /// [`run_jj`], returning the command's stdout (capped).
 pub async fn jj_output(root: &Path, args: &[&str], timeout: std::time::Duration) -> Result<String> {
     let stdout = timed_jj(root, args, timeout).await?;
-    String::from_utf8(stdout).wrap_err_with(|| format!("jj {} output is not UTF-8", args.join(" ")))
+    String::from_utf8(stdout).with_context(|| format!("jj {} output is not UTF-8", args.join(" ")))
 }
 
 /// [`spawn_jj`], killed when `timeout` fires.
 async fn timed_jj(root: &Path, args: &[&str], timeout: std::time::Duration) -> Result<Vec<u8>> {
     tokio::time::timeout(timeout, spawn_jj(root, args))
         .await
-        .map_err(|_| eyre!("jj {} timed out", args.join(" ")))?
+        .map_err(|_| anyhow!("jj {} timed out", args.join(" ")))?
 }
 
 /// Spawns one jj command and waits for it, failing with its (bounded,
@@ -60,7 +60,7 @@ async fn spawn_jj(root: &Path, args: &[&str]) -> Result<Vec<u8>> {
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true)
         .spawn()
-        .wrap_err_with(|| {
+        .with_context(|| {
             format!(
                 "cannot run {} (is it on PATH? see JJ_BIN)",
                 jj_bin().display(),
@@ -71,7 +71,7 @@ async fn spawn_jj(root: &Path, args: &[&str]) -> Result<Vec<u8>> {
         read_capped(child.stdout.take()),
         read_capped(child.stderr.take()),
     );
-    let status = child.wait().await.wrap_err("cannot wait for jj")?;
+    let status = child.wait().await.context("cannot wait for jj")?;
 
     ensure!(
         status.success(),

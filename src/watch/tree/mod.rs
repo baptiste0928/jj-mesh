@@ -30,7 +30,7 @@ use std::{
     },
 };
 
-use color_eyre::eyre::{Result, WrapErr as _, bail, ensure, eyre};
+use anyhow::{Context as _, Result, anyhow, bail, ensure};
 use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher as _};
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
@@ -90,7 +90,7 @@ impl TreeWatcher {
         let (root, git_dir) = (root.to_owned(), git_dir.to_owned());
         crate::spawn_blocking(move || Self::build(&root, &git_dir))
             .await
-            .wrap_err("working copy watch task failed")?
+            .context("working copy watch task failed")?
     }
 
     /// Builds the watcher and its initial watched set. Blocking.
@@ -139,7 +139,7 @@ impl TreeWatcher {
                     .signals
                     .recv()
                     .await
-                    .ok_or_else(|| eyre!("filesystem watcher stopped"))?;
+                    .ok_or_else(|| anyhow!("filesystem watcher stopped"))?;
                 self.pending = self.handle(signal)?;
             }
             self.pending |= self.drain_queued()?;
@@ -183,7 +183,7 @@ impl TreeWatcher {
             // syscalls: it must not sit on a runtime worker.
             let dirs = crate::spawn_blocking(move || walk_dirs(&root, rules))
                 .await
-                .wrap_err("working copy walk task failed")??;
+                .context("working copy walk task failed")??;
             self.apply(dirs);
             self.stale = false;
         }

@@ -8,7 +8,7 @@
 
 use std::{borrow::Borrow, cmp, collections::BTreeMap, fmt};
 
-use color_eyre::eyre::{Result, ensure};
+use anyhow::{Result, ensure};
 use iroh::EndpointId;
 use serde::{Deserialize, Serialize};
 

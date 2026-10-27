@@ -1,6 +1,6 @@
 //! This machine's own mesh record.
 
-use color_eyre::eyre::Result;
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
 use super::{

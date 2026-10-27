@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use color_eyre::eyre::{Result, WrapErr as _};
+use anyhow::{Context as _, Result};
 use etcetera::BaseStrategy as _;
 
 use super::{Service, Spec, Status, output, remove, run};
@@ -16,7 +16,7 @@ const RESTART_DELAY_SECS: u32 = 5;
 /// `$XDG_CONFIG_HOME/systemd/user/<label>.service`.
 pub(super) fn path(label: &str) -> Result<PathBuf> {
     Ok(etcetera::choose_base_strategy()
-        .wrap_err("cannot determine the config directory")?
+        .context("cannot determine the config directory")?
         .config_dir()
         .join("systemd/user")
         .join(unit(label)))

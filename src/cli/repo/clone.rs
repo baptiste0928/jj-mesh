@@ -19,9 +19,9 @@ use std::{
     time::Duration,
 };
 
+use anyhow::{Context as _, Error, Result, bail, ensure};
 use clap::{Args, ValueHint};
 use clap_complete::ArgValueCandidates;
-use color_eyre::eyre::{OptionExt as _, Report, Result, WrapErr as _, bail, ensure};
 use indicatif::{HumanBytes, ProgressBar, ProgressStyle};
 use pollster::FutureExt as _;
 
@@ -33,6 +33,7 @@ use crate::{
     cli::{complete, ui},
     config::{ConfigDir, MeshRepo, MeshState, ObjectHash, Repo, validate_name},
     daemon::control::{self, CloneProgress, Request, Response, TransferPhase, WorkspaceHold},
+    hint::hinted,
     repo::{Identity, JjRepo},
 };
 
@@ -171,7 +172,7 @@ fn clone(
     ensure!(
         !path.exists(),
         "{} already exists (clone creates the directory)",
-        path.display(),
+        ui::path(path),
     );
 
     // Fresh repo with a machine-unique workspace name, using the user's
@@ -213,10 +214,7 @@ fn clone(
         }
     }
 
-    println!(
-        "{}",
-        ui::good(format_args!("Cloned {name} in {}", path.display())),
-    );
+    ui::success(format_args!("Cloned repo {name} at {}", ui::path(path)));
     Ok(())
 }
 
@@ -232,16 +230,21 @@ fn add_workspace(
 ) -> Result<()> {
     ensure!(
         !path.exists(),
-        "{} already exists and {name} is already cloned in {}. Pass the directory of a new workspace",
-        path.display(),
-        repo.display(),
+        hinted(
+            format!(
+                "{} already exists and {name} is already cloned in {}",
+                ui::path(path),
+                ui::path(repo),
+            ),
+            "Pass the directory of a new workspace"
+        )
     );
     // The daemon would leave a workspace with an invalid name unsynced.
     validate_name("workspace", workspace)?;
 
     // jj runs from the repo, resolving relative paths from there.
     let path =
-        std::path::absolute(path).wrap_err_with(|| format!("cannot resolve {}", path.display()))?;
+        std::path::absolute(path).with_context(|| format!("cannot resolve {}", path.display()))?;
     let path_arg = path.to_string_lossy();
     create_workspace(dir, name, workspace, &path, settings, || {
         jj(
@@ -256,14 +259,11 @@ fn add_workspace(
         .map(drop)
     })?;
 
-    println!(
-        "{}",
-        ui::good(format_args!(
-            "{name} is already cloned in {}, added workspace {workspace} in {}",
-            repo.display(),
-            path.display(),
-        )),
-    );
+    ui::success(format_args!(
+        "Added workspace {workspace} of repo {name} in {}, as it is already cloned in {}",
+        ui::path(&path),
+        ui::path(repo),
+    ));
     Ok(())
 }
 
@@ -280,7 +280,7 @@ fn add_bare_workspace(
     ensure!(
         !path.exists(),
         "{} already exists (clone creates the directory)",
-        path.display(),
+        ui::path(path),
     );
     validate_name("workspace", workspace)?;
 
@@ -305,13 +305,10 @@ fn add_bare_workspace(
     }
     start_on_trunk(path);
 
-    println!(
-        "{}",
-        ui::good(format_args!(
-            "Added workspace {workspace} of the bare repo of {name} in {}",
-            path.display(),
-        )),
-    );
+    ui::success(format_args!(
+        "Added workspace {workspace} of the bare repo of {name} in {}",
+        ui::path(path),
+    ));
     Ok(())
 }
 
@@ -334,13 +331,13 @@ fn create_workspace(
     create()?;
     settings
         .write(root, Scope::Workspace)
-        .wrap_err("the workspace is created, but its settings could not be written")?;
+        .context("the workspace is created, but its settings could not be written")?;
     if !hold.is_held() {
-        eprintln!(
-            "{} the daemon restarted while the workspace was created and may run it with \
-             other settings. Restart it with `jj-mesh service restart`",
-            ui::warn("warning:").for_stderr(),
+        ui::warning(
+            "the daemon restarted while the workspace was created and may run it with other \
+             settings",
         );
+        ui::hint("Restart it with `jj-mesh service restart`");
     }
     Ok(())
 }
@@ -360,9 +357,12 @@ fn bare_workspace_name(bare: &JjRepo, machine: &str, path: &Path) -> Result<Stri
 /// The default name of another workspace of a local repo: the machine name
 /// and the workspace directory name.
 fn extra_workspace_name(machine: &str, path: &Path) -> Result<String> {
-    let dir_name = path
-        .file_name()
-        .ok_or_eyre("cannot derive a workspace name, use --workspace")?;
+    let dir_name = path.file_name().ok_or_else(|| {
+        hinted(
+            "cannot derive a workspace name",
+            "Pass one with `--workspace`",
+        )
+    })?;
     Ok(format!("{machine}-{}", dir_name.to_string_lossy()))
 }
 
@@ -371,10 +371,17 @@ fn pick(state: &MeshState) -> Result<String> {
     let available: Vec<&str> = state.repo_names().into_iter().collect();
     ensure!(
         !available.is_empty(),
-        "no repo to clone. Add one with `jj-mesh add` on another machine",
+        hinted(
+            "no repo to clone",
+            "Add one with `jj-mesh add` on another machine"
+        )
     );
-    let name = ui::select("Repo to clone", &available)?
-        .ok_or_eyre("the name of the repo to clone is required")?;
+    let name = ui::select("Repo to clone", &available)?.ok_or_else(|| {
+        hinted(
+            "cannot ask for the repo to clone without a terminal",
+            "Pass its name",
+        )
+    })?;
     Ok((*name).to_owned())
 }
 
@@ -388,7 +395,10 @@ fn default_path(name: &str) -> Result<PathBuf> {
             path.components().collect::<Vec<_>>()[..],
             [Component::Normal(_)]
         ),
-        "{name} is not a directory name. Pass the directory to clone into",
+        hinted(
+            format!("{name} is not a directory name"),
+            "Pass the directory to clone into"
+        )
     );
     Ok(path)
 }
@@ -400,11 +410,11 @@ fn default_path(name: &str) -> Result<PathBuf> {
 fn pull(dir: &ConfigDir, name: &str, path: &Path, workspace: &str) -> Result<()> {
     jj(Some(path), &["workspace", "rename", workspace])?;
 
-    println!("Pulling repo {name} from the mesh...");
+    ui::info(format_args!("Pulling repo {name} from the mesh..."));
     let request = Request::CloneRepo {
         name: name.to_owned(),
         path: std::fs::canonicalize(path)
-            .wrap_err_with(|| format!("cannot resolve {}", path.display()))?,
+            .with_context(|| format!("cannot resolve {}", path.display()))?,
     };
 
     let bar = ProgressBar::new_spinner().with_style(spinner_style());
@@ -426,20 +436,20 @@ fn pull(dir: &ConfigDir, name: &str, path: &Path, workspace: &str) -> Result<()>
 /// repo only once the pull succeeded, so the directory is normally
 /// unregistered; when the state lists it anyway (the pull succeeded but its
 /// response was lost), it holds a valid clone and is kept.
-fn clean_failed_clone(dir: &ConfigDir, name: &str, path: &Path, err: Report) -> Report {
+fn clean_failed_clone(dir: &ConfigDir, name: &str, path: &Path, err: Error) -> Error {
     let registered = MeshState::load(dir).is_ok_and(|state| {
         let path = std::fs::canonicalize(path);
         path.is_ok_and(|path| state.repos.values().any(|repo| repo.path == path))
     });
     if registered {
-        return err.wrap_err(format!(
+        return err.context(format!(
             "the pull succeeded and {name} is registered at {}, but its result was lost",
             path.display(),
         ));
     }
     match std::fs::remove_dir_all(path) {
         Ok(()) => err,
-        Err(remove_err) => err.wrap_err(format!(
+        Err(remove_err) => err.context(format!(
             "cannot clean up the repo directory {} ({remove_err}), remove it before retrying",
             path.display(),
         )),

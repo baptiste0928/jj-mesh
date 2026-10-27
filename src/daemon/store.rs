@@ -7,7 +7,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use color_eyre::eyre::Result;
+use anyhow::Result;
 use iroh::EndpointId;
 use tracing::info;
 

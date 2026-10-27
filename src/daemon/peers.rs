@@ -548,7 +548,7 @@ impl PeerTask {
 async fn dial(endpoint: &Endpoint, peer: EndpointId, hub: &SyncHub) -> Result<Connection, Failure> {
     let dialed = tokio::time::timeout(DIAL_TIMEOUT, async {
         let conn = endpoint.connect(peer, sync::ALPN).await?;
-        Ok::<_, color_eyre::Report>(hello::dial(&conn).await?.map(|()| conn))
+        Ok::<_, anyhow::Error>(hello::dial(&conn).await?.map(|()| conn))
     });
     let error = match dialed.await {
         Ok(Ok(Ok(conn))) => return Ok(conn),

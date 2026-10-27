@@ -22,8 +22,8 @@ mod protocol;
 mod server;
 
 pub use client::{
-    ControlClient, DaemonNotRunning, WorkspaceHold, block_on, ensure_daemon_blocking,
-    query_status_blocking, request_blocking, request_streaming_blocking,
+    ControlClient, WorkspaceHold, block_on, ensure_daemon_blocking, query_status_blocking,
+    request_blocking, request_streaming_blocking,
 };
 pub use protocol::*;
 pub(super) use server::{ControlContext, ControlServer};

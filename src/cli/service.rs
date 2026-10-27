@@ -5,13 +5,14 @@ use std::{
     time::{Duration, Instant},
 };
 
+use anyhow::{Context as _, Result, anyhow, bail, ensure};
 use clap::{Args, Subcommand};
-use color_eyre::eyre::{OptionExt as _, Result, WrapErr as _, bail, ensure, eyre};
 
 use super::ui;
 use crate::{
     config::ConfigDir,
-    daemon::control::{self, ControlClient, DaemonNotRunning, Request, Response},
+    daemon::control::{self, ControlClient, Request, Response},
+    hint::hinted,
     repo::jj_bin,
     service::{Service, Spec, Status, which},
 };
@@ -78,24 +79,23 @@ pub fn run(args: ServiceArgs, dir: &ConfigDir) -> Result<()> {
             let service = installed()?;
             ensure_ours(&service)?;
             service.uninstall()?;
-            println!("{}", ui::good("Stopped the service"));
-            println!(
-                "{}",
-                ui::good(format_args!("Removed {}", service.path().display()))
-            );
+            ui::success(format_args!(
+                "Uninstalled the service, removing {}",
+                ui::path(service.path())
+            ));
         }
         ServiceCommand::Start => {
             start(&installed()?, dir)?;
         }
         ServiceCommand::Stop => {
-            installed()?.stop().wrap_err("cannot stop the service")?;
-            println!("{}", ui::good("jj-mesh daemon service stopped"));
+            installed()?.stop().context("cannot stop the service")?;
+            ui::success("Stopped the service");
         }
         ServiceCommand::Restart => {
             let service = installed()?;
-            service.restart().wrap_err("cannot restart the service")?;
+            service.restart().context("cannot restart the service")?;
             wait_started(&service, dir)?;
-            println!("{}", ui::good("jj-mesh daemon service restarted"));
+            ui::success("Restarted the service");
         }
     }
     Ok(())
@@ -104,15 +104,17 @@ pub fn run(args: ServiceArgs, dir: &ConfigDir) -> Result<()> {
 /// Makes sure a daemon is running, installing or starting the service
 /// once the user agrees, and returns its status.
 pub(super) fn ensure_running(dir: &ConfigDir) -> Result<control::Status> {
-    match status(dir, START_WAIT) {
-        Err(err) if err.is::<DaemonNotRunning>() => {}
-        status => return status,
+    if let Some(status) = status(dir, START_WAIT)? {
+        return Ok(status);
     }
     match Service::find()? {
         None => {
             ensure!(
                 ui::confirm("Install the background service?", true)?.unwrap_or(false),
-                "jj-mesh needs its daemon. Install it with `jj-mesh service install`",
+                hinted(
+                    "jj-mesh needs its daemon",
+                    "Install it with `jj-mesh service install`"
+                )
             );
             install(dir, None, None)
         }
@@ -120,7 +122,10 @@ pub(super) fn ensure_running(dir: &ConfigDir) -> Result<control::Status> {
         Some(service) => {
             ensure!(
                 ui::confirm("The background service is stopped. Start it?", true)?.unwrap_or(false),
-                "jj-mesh needs its daemon. Start it with `jj-mesh service start`",
+                hinted(
+                    "jj-mesh needs its daemon",
+                    "Start it with `jj-mesh service start`"
+                )
             );
             start(&service, dir)
         }
@@ -129,16 +134,25 @@ pub(super) fn ensure_running(dir: &ConfigDir) -> Result<control::Status> {
 
 /// The installed service.
 fn installed() -> Result<Service> {
-    Service::find()?.ok_or_eyre("the service is not installed. Run `jj-mesh service install`")
+    Service::find()?.ok_or_else(|| {
+        hinted(
+            "the service is not installed",
+            "Install it with `jj-mesh service install`",
+        )
+    })
 }
 
 /// Refuses to replace or remove a service another program manages.
 fn ensure_ours(service: &Service) -> Result<()> {
     ensure!(
         !service.is_external(),
-        "{} is managed by another program (such as Home Manager or NixOS). \
-         Update that configuration instead",
-        service.path().display(),
+        hinted(
+            format!(
+                "{} is managed by another program (such as Home Manager or NixOS)",
+                ui::path(service.path()),
+            ),
+            "Update that configuration instead"
+        )
     );
     Ok(())
 }
@@ -158,7 +172,10 @@ fn install(
     let running = installed.is_some_and(|s| s.status().is_ok_and(|s| s == Status::Running));
     ensure!(
         running || matches!(control::block_on(ControlClient::connect(dir)), Ok(None)),
-        "a jj-mesh daemon already runs outside the service. Stop it first",
+        hinted(
+            "a jj-mesh daemon already runs outside the service",
+            "Stop it, then retry"
+        )
     );
     let service = Service::ours()?;
 
@@ -177,9 +194,9 @@ fn install(
 
     let jj = jj.unwrap_or_else(|| jj_bin().into());
     let jj = which(&jj, &search_path()).ok_or_else(|| {
-        eyre!(
-            "cannot find {}. Pass its path with `--jj-bin`",
-            jj.display()
+        hinted(
+            format!("cannot find {}", ui::path(&jj)),
+            "Pass its path with `--jj-bin`",
         )
     })?;
     let env = vec![
@@ -192,18 +209,18 @@ fn install(
 
     service
         .install(&Spec { command, env })
-        .wrap_err("cannot install the service")?;
-    println!("Created {}", service.path().display());
-    println!("The daemon runs {}", jj.display());
+        .context("cannot install the service")?;
+    ui::info(format_args!("Created {}", ui::path(service.path())));
+    ui::info(format_args!("The daemon runs {}", ui::path(&jj)));
     let status = wait_started(&service, dir)?;
-    println!("{}", ui::good("Service enabled and started"));
+    ui::success("Installed and started the service");
     Ok(status)
 }
 
 /// This binary as the shell finds it on PATH, so a profile symlink
 /// survives updates, or its resolved path otherwise.
 fn current_program() -> Result<PathBuf> {
-    let exe = std::env::current_exe().wrap_err("cannot resolve the jj-mesh binary path")?;
+    let exe = std::env::current_exe().context("cannot resolve the jj-mesh binary path")?;
     let same =
         |path: &PathBuf| std::fs::canonicalize(path).ok() == std::fs::canonicalize(&exe).ok();
     Ok(which(Path::new("jj-mesh"), &search_path())
@@ -218,9 +235,9 @@ fn search_path() -> std::ffi::OsString {
 
 /// Starts the service and waits for its daemon.
 fn start(service: &Service, dir: &ConfigDir) -> Result<control::Status> {
-    service.start().wrap_err("cannot start the service")?;
+    service.start().context("cannot start the service")?;
     let status = wait_started(service, dir)?;
-    println!("{}", ui::good("jj-mesh daemon service started"));
+    ui::success("Started the service");
     Ok(status)
 }
 
@@ -231,7 +248,7 @@ fn wait_started(service: &Service, dir: &ConfigDir) -> Result<control::Status> {
     std::thread::sleep(START_SETTLE);
     ensure!(
         service.status()? == Status::Running,
-        "the service started but died. Check its logs",
+        hinted("the service started but died", "Check the service logs")
     );
     Ok(status)
 }
@@ -241,35 +258,40 @@ fn wait_ready(dir: &ConfigDir) -> Result<control::Status> {
     let deadline = Instant::now() + START_WAIT;
     loop {
         let left = deadline.saturating_duration_since(Instant::now());
-        match status(dir, left) {
-            Err(err) if err.is::<DaemonNotRunning>() => {}
-            status => return status,
+        if let Some(status) = status(dir, left)? {
+            return Ok(status);
         }
         if left.is_zero() {
-            bail!(
-                "no daemon answered for {}. Check the service logs, and that the service uses \
-                 this config directory",
-                dir.path().display(),
-            );
+            return Err(hinted(
+                format!("no daemon answered for {}", ui::path(dir.path())),
+                "Check the service logs, and that the service uses this config directory",
+            ));
         }
         std::thread::sleep(Duration::from_millis(200));
     }
 }
 
-/// Asks the daemon for its status, waiting up to `limit` for the answer.
-fn status(dir: &ConfigDir, limit: Duration) -> Result<control::Status> {
-    match control::request_blocking(dir, &Request::Status, limit)? {
-        Response::Status(status) => Ok(status),
-        response => bail!("unexpected response from the daemon: {response:?}"),
-    }
+/// Asks the daemon for its status, waiting up to `limit` for the answer;
+/// `None` when no daemon runs.
+fn status(dir: &ConfigDir, limit: Duration) -> Result<Option<control::Status>> {
+    control::block_on(async {
+        let Some(mut client) = ControlClient::connect(dir).await? else {
+            return Ok(None);
+        };
+        client.send(&Request::Status).await?;
+        match client.recv(Some(limit)).await?.into_result()? {
+            Response::Status(status) => Ok(Some(status)),
+            response => bail!("unexpected response from the daemon: {response:?}"),
+        }
+    })
 }
 
 /// A path as written into the service definition: absolute, since the
 /// daemon runs from another directory, and UTF-8.
 fn service_path(what: &str, path: &Path) -> Result<String> {
     let path = std::path::absolute(path)
-        .wrap_err_with(|| format!("cannot resolve {what} {}", path.display()))?;
+        .with_context(|| format!("cannot resolve {what} {}", path.display()))?;
     path.into_os_string()
         .into_string()
-        .map_err(|path| eyre!("{what} is not valid UTF-8: {}", Path::new(&path).display()))
+        .map_err(|path| anyhow!("{what} is not valid UTF-8: {}", Path::new(&path).display()))
 }

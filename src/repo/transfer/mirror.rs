@@ -44,7 +44,7 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashSet},
 };
 
-use color_eyre::eyre::{Result, eyre};
+use anyhow::{Result, anyhow};
 use jj_lib::{
     backend::CommitId,
     git::{RESERVED_REMOTE_REF_NAMESPACE, parse_git_ref},
@@ -142,7 +142,7 @@ impl<'a> Merger<'a> {
     fn merge(&self, ops: &[Operation]) -> Result<GitRefs> {
         let (first, rest) = ops
             .split_first()
-            .ok_or_else(|| eyre!("no op head to merge"))?;
+            .ok_or_else(|| anyhow!("no op head to merge"))?;
         let mut refs = view_refs(first)?;
         let mut folded = vec![first.clone()];
         for other in rest {
@@ -204,7 +204,7 @@ fn stored_refs(repo: &OpenRepo, hint: &GitRefs) -> Result<GitRefs> {
     let mut refs = GitRefs::new();
     for namespace in NAMESPACES {
         for reference in platform.prefixed(namespace)? {
-            let mut reference = reference.map_err(|err| eyre!("cannot read git ref: {err}"))?;
+            let mut reference = reference.map_err(|err| anyhow!("cannot read git ref: {err}"))?;
             let name = GitRefNameBuf::from(reference.name().as_bstr().to_string());
             if !is_imported(&name) {
                 continue;
@@ -288,7 +288,7 @@ fn swap(repo: &OpenRepo, before: &GitRefs, after: &GitRefs) -> Result<()> {
         // HEAD moved for nothing.
         let moved = unpin_heads(&git, &heads, name).and_then(|mut edits| {
             edits.push(edit);
-            git.edit_references(edits).map_err(|err| eyre!("{err}"))
+            git.edit_references(edits).map_err(|err| anyhow!("{err}"))
         });
         if let Err(err) = moved {
             warn!("skipping git ref mirror of {}: {err}", name.as_symbol());
@@ -373,7 +373,7 @@ fn unpin_heads(
         let new = if exists {
             let commit = head
                 .peel_to_commit()
-                .map_err(|err| eyre!("cannot resolve {head_name}: {err}"))?;
+                .map_err(|err| anyhow!("cannot resolve {head_name}: {err}"))?;
             gix::refs::Target::Object(commit.id)
         } else {
             gix::refs::Target::Symbolic(placeholder.clone())

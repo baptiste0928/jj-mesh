@@ -1,8 +1,8 @@
 //! `jj-mesh repo rename`: rename a repo across the whole mesh.
 
+use anyhow::{Result, bail};
 use clap::Args;
 use clap_complete::ArgValueCandidates;
-use color_eyre::eyre::{Result, bail};
 
 use crate::{
     cli::{complete, ui},
@@ -36,6 +36,6 @@ pub fn run(args: RenameArgs, dir: &ConfigDir) -> Result<()> {
         bail!("unexpected response from the daemon: {response:?}");
     };
 
-    println!("{}", ui::good(format_args!("Renamed repo {name} to {new}")));
+    ui::success(format_args!("Renamed repo {name} to {new}"));
     Ok(())
 }

@@ -24,7 +24,7 @@
 
 use std::{fmt, str::FromStr, time::Duration};
 
-use color_eyre::eyre::{Context, Result, bail, ensure, eyre};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use data_encoding::BASE32_NOPAD;
 use iroh::{
     Endpoint, EndpointAddr, EndpointId,
@@ -37,7 +37,10 @@ use super::{
     hello,
     wire::{read_message, write_message},
 };
-use crate::config::{MeshState, sanitize_bounded};
+use crate::{
+    config::{MeshState, sanitize_bounded},
+    hint::hinted,
+};
 
 /// ALPN of the pairing protocol.
 pub const ALPN: &[u8] = b"jj-mesh/pair/1";
@@ -98,19 +101,18 @@ impl fmt::Display for PairTicket {
 }
 
 impl FromStr for PairTicket {
-    type Err = color_eyre::eyre::Error;
+    type Err = anyhow::Error;
 
     fn from_str(s: &str) -> Result<Self> {
         let encoded = s
             .trim()
             .strip_prefix(TICKET_PREFIX)
-            .ok_or_else(|| eyre!("not a jj-mesh pairing ticket"))?;
+            .ok_or_else(|| anyhow!("not a jj-mesh pairing ticket"))?;
         let bytes = BASE32_NOPAD
             .decode(encoded.to_ascii_uppercase().as_bytes())
-            .wrap_err("invalid pairing ticket")?;
+            .context("invalid pairing ticket")?;
 
-        let (ticket, rest) =
-            postcard::take_from_bytes(&bytes).wrap_err("invalid pairing ticket")?;
+        let (ticket, rest) = postcard::take_from_bytes(&bytes).context("invalid pairing ticket")?;
         ensure!(rest.is_empty(), "invalid pairing ticket: trailing bytes");
 
         Ok(ticket)
@@ -283,8 +285,8 @@ pub async fn join(
     let conn = endpoint
         .connect(ticket.addr.clone(), ALPN)
         .await
-        .wrap_err("cannot connect to the pairing host")?;
-    hello::dial(&conn).await?.wrap_err("cannot pair")?;
+        .context("cannot connect to the pairing host")?;
+    hello::dial(&conn).await?.context("cannot pair")?;
     let (mut send, mut recv) = conn.open_bi().await?;
 
     let join = Message::Join {
@@ -314,10 +316,12 @@ pub async fn join(
         ConnectionError::ApplicationClosed(close)
             if close.error_code == VarInt::from_u32(0)
                 && close.reason.as_ref() == PAIRED_REASON => {}
-        reason => bail!(
-            "connection lost before pairing completed ({reason}). \
-             Check `jj-mesh status` on the other machine before retrying",
-        ),
+        reason => {
+            return Err(hinted(
+                format!("connection lost before pairing completed ({reason})"),
+                "Check `jj-mesh status` on the other machine before retrying",
+            ));
+        }
     }
 
     Ok(PairedPeer {
@@ -342,7 +346,7 @@ async fn resolve_peer_name(
     }
     if let Err(err) = state.validate_new_peer(&announced, endpoint) {
         send_reject(conn, send, &err.to_string(), REJECT_LINGER).await;
-        return Err(err.wrap_err("cannot pair"));
+        return Err(err.context("cannot pair"));
     }
     Ok(announced)
 }

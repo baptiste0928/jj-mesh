@@ -31,7 +31,7 @@ use std::{
     time::{Instant, SystemTime},
 };
 
-use color_eyre::eyre::{Result, bail, ensure};
+use anyhow::{Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Notify, mpsc, watch};
 use tracing::debug;

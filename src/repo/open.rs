@@ -22,7 +22,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use color_eyre::eyre::{Result, WrapErr as _, ensure, eyre};
+use anyhow::{Context as _, Result, anyhow, ensure};
 use futures::TryStreamExt as _;
 use jj_lib::{
     backend::CommitId,
@@ -81,7 +81,7 @@ static SETTINGS: LazyLock<Result<UserSettings, String>> = LazyLock::new(|| {
 pub(super) fn settings() -> Result<&'static UserSettings> {
     SETTINGS
         .as_ref()
-        .map_err(|err| eyre!("cannot build jj settings: {err}"))
+        .map_err(|err| anyhow!("cannot build jj settings: {err}"))
 }
 
 impl OpenRepo {
@@ -93,7 +93,7 @@ impl OpenRepo {
             &repo.repo_dir(),
             &default_backend_factories(),
         )
-        .wrap_err_with(|| format!("cannot open jj repo at {}", repo.root().display()))?;
+        .with_context(|| format!("cannot open jj repo at {}", repo.root().display()))?;
 
         ensure!(
             loader.store().backend_impl::<GitBackend>().is_some(),
@@ -239,7 +239,7 @@ impl OpenRepo {
         };
         let (first, rest) = ops
             .split_first()
-            .ok_or_else(|| eyre!("no operation to index"))?;
+            .ok_or_else(|| anyhow!("no operation to index"))?;
         let mut index = index_at(first)?.start_modification();
         for op in rest {
             index.merge_in(index_at(op)?.as_ref())?;
@@ -302,7 +302,7 @@ impl OpenRepo {
         index_store
             .build_index_at_operation(&operation, self.loader.store())
             .block_on()
-            .wrap_err_with(|| format!("cannot build commit index at {}", id.hex()))?;
+            .with_context(|| format!("cannot build commit index at {}", id.hex()))?;
         Ok(())
     }
 
@@ -512,7 +512,7 @@ impl OpenRepo {
                 super::codec::parse_view(&self.read_view_bytes(&meta.view_id)?)?;
                 Ok(())
             };
-            parse().wrap_err_with(|| {
+            parse().with_context(|| {
                 format!(
                     "cannot decode op head {}; was the repo written by a jj \
                      release outside the supported {} series?",
@@ -540,10 +540,10 @@ impl OpenRepo {
         let git = self.git_backend().git_repo();
         let object = git
             .find_object(to_gix_id(id)?)
-            .map_err(|err| eyre!("cannot read working-copy commit {}: {err}", id.hex()))?;
+            .map_err(|err| anyhow!("cannot read working-copy commit {}: {err}", id.hex()))?;
         let commit = object
             .try_to_commit_ref()
-            .map_err(|err| eyre!("cannot decode working-copy commit {}: {err}", id.hex()))?;
+            .map_err(|err| anyhow!("cannot decode working-copy commit {}: {err}", id.hex()))?;
 
         ensure!(
             jj_lib::git_backend::extract_change_id_from_commit(&commit).is_some(),
@@ -563,7 +563,8 @@ impl OpenRepo {
 
     /// The git object hash of the repo.
     pub fn object_hash(&self) -> Result<ObjectHash> {
-        ObjectHash::try_from(self.git_backend().git_repo().object_hash()).map_err(|err| eyre!(err))
+        ObjectHash::try_from(self.git_backend().git_repo().object_hash())
+            .map_err(|err| anyhow!(err))
     }
 
     pub fn git_backend(&self) -> &GitBackend {
@@ -620,13 +621,13 @@ impl OpenRepo {
 
 /// Converts a jj commit id into a gix object id.
 pub(super) fn to_gix_id(id: &CommitId) -> Result<gix::ObjectId> {
-    gix::ObjectId::try_from(id.as_bytes()).map_err(|err| eyre!("bad commit id: {err}"))
+    gix::ObjectId::try_from(id.as_bytes()).map_err(|err| anyhow!("bad commit id: {err}"))
 }
 
 /// Reads a raw object file from a simple op store directory.
 fn read_raw(dir: &Path, id: &impl ObjectId) -> Result<Vec<u8>> {
     let path = dir.join(id.hex());
-    std::fs::read(&path).wrap_err_with(|| format!("cannot read {}", path.display()))
+    std::fs::read(&path).with_context(|| format!("cannot read {}", path.display()))
 }
 
 #[cfg(test)]

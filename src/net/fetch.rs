@@ -18,7 +18,7 @@
 //! objects shrink well. Pack chunks are already zlib-compressed and travel
 //! as-is.
 
-use color_eyre::eyre::{Result, ensure};
+use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
 
 use crate::config::RepoId;

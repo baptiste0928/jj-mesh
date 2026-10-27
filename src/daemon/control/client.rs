@@ -4,7 +4,7 @@
 
 use std::{future::Future, io, io::Read as _, time::Duration};
 
-use color_eyre::eyre::{Report, Result, WrapErr as _, bail, eyre};
+use anyhow::{Context as _, Result, anyhow, bail};
 use tokio::net::UnixStream;
 
 use super::protocol::{
@@ -13,6 +13,7 @@ use super::protocol::{
 };
 use crate::{
     config::ConfigDir,
+    hint::{WrapHint as _, hinted},
     net::wire::{read_message, write_message},
 };
 
@@ -23,25 +24,6 @@ const RESTART_HINT: &str = "Restart it with `jj-mesh service restart`";
 /// talk to a daemon of another build, for testing builds known to be
 /// compatible.
 const IGNORE_BUILD_VAR: &str = "JJ_MESH_IGNORE_BUILD";
-
-/// Error of every command that needs the daemon when none is running.
-///
-/// The CLI entry point recognizes this type and reports it as a plain
-/// message rather than an error report: not having started the daemon yet
-/// is an expected situation, not a failure to debug.
-#[derive(Debug)]
-pub struct DaemonNotRunning;
-
-impl std::fmt::Display for DaemonNotRunning {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "The jj-mesh daemon is not running. Set it up with `jj-mesh setup`."
-        )
-    }
-}
-
-impl std::error::Error for DaemonNotRunning {}
 
 /// Whether two builds are known to differ: builds without a known commit
 /// cannot be compared.
@@ -74,7 +56,7 @@ impl ControlClient {
                 return Ok(None);
             }
             Err(err) => {
-                return Err(err).wrap_err_with(|| format!("cannot connect to {}", path.display()));
+                return Err(err).with_context(|| format!("cannot connect to {}", path.display()));
             }
         };
         let greeting = read_message::<String>(&mut stream, MAX_BUILD_SIZE);
@@ -83,25 +65,33 @@ impl ControlClient {
             .ok()
             .and_then(Result::ok)
             .ok_or_else(|| {
-                eyre!("the daemon did not send its build, it likely runs an older jj-mesh. {RESTART_HINT}")
+                hinted(
+                    "the daemon did not send its build, it likely runs an older jj-mesh",
+                    RESTART_HINT,
+                )
             })?;
         let ignore = std::env::var_os(IGNORE_BUILD_VAR).is_some_and(|value| !value.is_empty());
         if !ignore && builds_differ(&build, BUILD) {
-            bail!(
-                "the daemon runs jj-mesh build {build} while this command is build {BUILD}. \
-                 {RESTART_HINT}"
-            );
+            return Err(hinted(
+                format!(
+                    "the daemon runs jj-mesh build {build} while this command is build {BUILD}"
+                ),
+                RESTART_HINT,
+            ));
         }
         Ok(Some(ControlClient { stream }))
     }
 
-    /// Connects to the daemon serving this configuration; errors with
-    /// [`DaemonNotRunning`] when none is. Every command that needs the
+    /// Connects to the daemon serving this configuration; errors when none
+    /// is. Every command that needs the
     /// daemon connects through here, so they all fail the same way.
     pub async fn connect_required(dir: &ConfigDir) -> Result<Self> {
-        Self::connect(dir)
-            .await?
-            .ok_or_else(|| Report::new(DaemonNotRunning))
+        Self::connect(dir).await?.ok_or_else(|| {
+            hinted(
+                "the jj-mesh daemon is not running",
+                "Set it up with `jj-mesh setup`",
+            )
+        })
     }
 
     /// Sends a request.
@@ -117,12 +107,12 @@ impl ControlClient {
         let response = match limit {
             Some(limit) => tokio::time::timeout(limit, read)
                 .await
-                .map_err(|_| eyre!("the daemon did not answer"))?,
+                .map_err(|_| anyhow!("the daemon did not answer"))?,
             None => read.await,
         };
-        response.wrap_err(
-            "cannot read the daemon's answer (if it runs another build, restart it with \
-             `jj-mesh service restart`)",
+        response.wrap_hint(
+            "cannot read the daemon's answer",
+            "If it runs another build, restart it with `jj-mesh service restart`",
         )
     }
 }
@@ -144,15 +134,14 @@ pub fn query_status_blocking(dir: &ConfigDir) -> Result<Status> {
         let mut client = ControlClient::connect_required(dir).await?;
 
         client.send(&Request::Status).await?;
-        match client.recv(Some(CLIENT_TIMEOUT)).await? {
+        match client.recv(Some(CLIENT_TIMEOUT)).await?.into_result()? {
             Response::Status(status) => Ok(status),
             other => bail!("unexpected response from the daemon: {other:?}"),
         }
     })
 }
 
-/// Checks that a daemon is running, erroring with [`DaemonNotRunning`]
-/// otherwise: for commands that want to fail fast before doing local work
+/// Checks that a daemon is running, erroring otherwise: for commands that want to fail fast before doing local work
 /// they would otherwise have to undo.
 pub fn ensure_daemon_blocking(dir: &ConfigDir) -> Result<()> {
     block_on(ControlClient::connect_required(dir)).map(drop)
@@ -160,7 +149,7 @@ pub fn ensure_daemon_blocking(dir: &ConfigDir) -> Result<()> {
 
 /// Sends one request and returns the daemon's answer, for CLI commands with
 /// no tokio runtime of their own. Errors when no daemon is running, and
-/// turns [`Response::Error`] into an error, so callers only match their
+/// turns error responses into errors, so callers only match their
 /// success variant. Progress frames, if any, are dropped.
 pub fn request_blocking(dir: &ConfigDir, request: &Request, limit: Duration) -> Result<Response> {
     request_streaming_blocking(dir, request, limit, |_| {})
@@ -172,8 +161,8 @@ pub fn request_blocking(dir: &ConfigDir, request: &Request, limit: Duration) -> 
 pub struct WorkspaceHold(std::os::unix::net::UnixStream);
 
 impl WorkspaceHold {
-    /// Holds the workspace `workspace` of `repo`. Errors with
-    /// [`DaemonNotRunning`] when no daemon is running. Blocking.
+    /// Holds the workspace `workspace` of `repo`. Errors when no daemon is
+    /// running. Blocking.
     pub fn take(dir: &ConfigDir, repo: &str, workspace: &str) -> Result<Self> {
         block_on(async {
             let mut client = ControlClient::connect_required(dir).await?;
@@ -183,9 +172,8 @@ impl WorkspaceHold {
                     workspace: workspace.to_owned(),
                 })
                 .await?;
-            match client.recv(Some(CLIENT_TIMEOUT)).await? {
+            match client.recv(Some(CLIENT_TIMEOUT)).await?.into_result()? {
                 Response::WorkspaceHeld => {}
-                Response::Error(message) => bail!("{message}"),
                 other => bail!("unexpected response from the daemon: {other:?}"),
             }
             // Outlives this runtime: the hold lasts until the caller drops it.
@@ -220,9 +208,8 @@ pub fn request_streaming_blocking(
 
         client.send(request).await?;
         loop {
-            match client.recv(Some(idle)).await? {
+            match client.recv(Some(idle)).await?.into_result()? {
                 Response::CloneProgress(progress) => on_progress(progress),
-                Response::Error(message) => bail!("{message}"),
                 response => return Ok(response),
             }
         }
@@ -266,7 +253,7 @@ mod tests {
 
         let err = ControlClient::connect(&dir).await.unwrap_err();
         assert!(err.to_string().contains("0000dead"), "{err}");
-        assert!(err.to_string().contains("service restart"), "{err}");
+        assert_eq!(crate::hint::of(&err), Some(RESTART_HINT));
         assert!(ControlClient::connect(&dir).await.unwrap().is_some());
         daemon.await.unwrap();
     }
@@ -291,7 +278,7 @@ mod tests {
         let daemon = tokio::spawn(async move { listener.accept().await.unwrap() });
 
         let err = ControlClient::connect(&dir).await.unwrap_err();
-        assert!(err.to_string().contains("service restart"), "{err}");
+        assert_eq!(crate::hint::of(&err), Some(RESTART_HINT));
         drop(daemon.await.unwrap());
     }
 }

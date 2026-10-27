@@ -8,12 +8,13 @@
 
 use std::path::Path;
 
+use anyhow::Result;
 use clap::Args;
-use color_eyre::eyre::{OptionExt as _, Result};
 
 use super::{peer, server, service, ui};
 use crate::{
     config::{ConfigDir, validate_name},
+    hint::hinted,
     net::pair::PairTicket,
     repo::{jj_bin, jj_version, jj_version_warning},
 };
@@ -40,10 +41,14 @@ pub struct SetupArgs {
 pub fn run(args: SetupArgs, dir: &ConfigDir) -> Result<()> {
     // Resolved as the service will run it.
     let path = std::env::var_os("PATH").unwrap_or_default();
-    let jj = crate::service::which(Path::new(&jj_bin()), &path)
-        .ok_or_eyre("jj is not found on PATH or via JJ_BIN. Install it first")?;
+    let jj = crate::service::which(Path::new(&jj_bin()), &path).ok_or_else(|| {
+        hinted(
+            "jj is not found on `PATH` or through `JJ_BIN`",
+            "Install jj, or set `JJ_BIN` to its path",
+        )
+    })?;
     if let Some(warning) = jj_version_warning(jj_version(jj.as_os_str()).as_deref()) {
-        eprintln!("{} {warning}", ui::warn("warning:").for_stderr());
+        ui::warning(warning);
     }
 
     let status = service::ensure_running(dir)?;
@@ -65,9 +70,9 @@ pub fn run(args: SetupArgs, dir: &ConfigDir) -> Result<()> {
 
     peer::pair(dir, args.ticket)?;
 
-    println!();
-    println!(
-        "Add a repo to the mesh with `jj-mesh add`, or clone one from another machine with `jj-mesh clone`."
+    ui::hint(
+        "Add a repo to the mesh with `jj-mesh add`, or clone one from another machine with \
+         `jj-mesh clone`",
     );
     Ok(())
 }

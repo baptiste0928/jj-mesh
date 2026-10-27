@@ -10,7 +10,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use color_eyre::eyre::{Result, WrapErr, ensure};
+use anyhow::{Context, Result, ensure};
 use etcetera::BaseStrategy;
 
 /// File name of the daemon control socket.
@@ -36,7 +36,7 @@ impl ConfigDir {
     pub fn new(override_dir: Option<PathBuf>) -> Result<Self> {
         if let Some(config_dir) = override_dir {
             let metadata =
-                fs::metadata(&config_dir).wrap_err("cannot open custom config directory")?;
+                fs::metadata(&config_dir).context("cannot open custom config directory")?;
             ensure!(metadata.is_dir(), "custom config path is not a directory");
 
             return Ok(ConfigDir {
@@ -48,7 +48,7 @@ impl ConfigDir {
         }
 
         let strategy =
-            etcetera::choose_base_strategy().wrap_err("cannot determine the config directory")?;
+            etcetera::choose_base_strategy().context("cannot determine the config directory")?;
         // Created user-only: the directory holds the machine's private key.
         let config_dir = strategy.config_dir().join("jj-mesh");
         create_private(&config_dir)?;
@@ -122,5 +122,5 @@ pub(crate) fn create_private(dir: &Path) -> Result<()> {
     }
     builder
         .create(dir)
-        .wrap_err_with(|| format!("cannot create {}", dir.display()))
+        .with_context(|| format!("cannot create {}", dir.display()))
 }

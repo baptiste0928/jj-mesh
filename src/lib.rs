@@ -17,6 +17,7 @@
 //! - [`cli`]: the commands, which drive the daemon over its control socket.
 //! - [`config`]: the machine key and the mesh state (`mesh.json`).
 //! - [`daemon`]: peer connections, repo watches and the control socket.
+//! - [`hint`]: errors carrying a hint for the user.
 //! - [`net`]: the iroh endpoint, and the pairing and sync protocols.
 //! - [`repo`]: jj repo access and the op and git object transfer engine.
 //! - `watch`: filesystem watching of op heads and working copies.
@@ -56,6 +57,7 @@
 pub mod cli;
 pub mod config;
 pub mod daemon;
+pub mod hint;
 pub mod net;
 pub mod repo;
 #[cfg(any(target_os = "linux", target_os = "macos"))]

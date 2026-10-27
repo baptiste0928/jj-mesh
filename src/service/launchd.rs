@@ -5,7 +5,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use color_eyre::eyre::{Result, WrapErr as _, eyre};
+use anyhow::{Context as _, Result, anyhow};
 
 use super::{Service, Spec, Status, output, remove, run};
 
@@ -147,7 +147,7 @@ fn loaded(domain: &str, label: &str) -> Result<bool> {
 fn bootstrap(domain: &str, path: &Path) -> Result<()> {
     let path = path
         .to_str()
-        .ok_or_else(|| eyre!("{} is not valid UTF-8", path.display()))?;
+        .ok_or_else(|| anyhow!("{} is not valid UTF-8", path.display()))?;
     launchctl(&["bootstrap", domain, path])
 }
 
@@ -161,7 +161,7 @@ fn domain() -> Result<String> {
     let uid = String::from_utf8_lossy(&output.stdout);
     let uid = uid.trim();
     if !output.status.success() || uid.is_empty() {
-        return Err(eyre!("cannot determine the user id"));
+        return Err(anyhow!("cannot determine the user id"));
     }
     Ok(format!("gui/{uid}"))
 }
@@ -171,7 +171,7 @@ fn target(domain: &str, label: &str) -> String {
 }
 
 fn home() -> Result<PathBuf> {
-    etcetera::home_dir().wrap_err("cannot determine the home directory")
+    etcetera::home_dir().context("cannot determine the home directory")
 }
 
 /// Escapes XML text.

@@ -33,7 +33,7 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
-use color_eyre::eyre::{Result, WrapErr as _, ensure, eyre};
+use anyhow::{Context as _, Result, anyhow, ensure};
 use iroh::EndpointId;
 use jj_lib::{object_id::ObjectId as _, op_store::OperationId};
 use pollster::FutureExt as _;
@@ -367,7 +367,7 @@ impl RepoTask {
                 Ok((jj, repo, fingerprint))
             })
             .await
-            .wrap_err("repo open task failed")??;
+            .context("repo open task failed")??;
         Ok((jj, Arc::new(repo), fingerprint))
     }
 
@@ -488,7 +488,7 @@ impl RepoTask {
             let repo = repo.clone();
             crate::spawn_blocking(move || repo.missing_heads(&heads))
                 .await
-                .wrap_err("announcement check task failed")?
+                .context("announcement check task failed")?
         };
         let missing = match missing {
             Ok(missing) => missing,
@@ -532,10 +532,10 @@ impl RepoTask {
         let conn = self
             .hub
             .connection(&peer)
-            .ok_or_else(|| eyre!("peer is no longer connected"))?;
+            .ok_or_else(|| anyhow!("peer is no longer connected"))?;
         let (mut send, mut recv) = tokio::time::timeout(OPEN_STREAM_TIMEOUT, conn.open_bi())
             .await
-            .map_err(|_| eyre!("timed out opening the fetch stream"))??;
+            .map_err(|_| anyhow!("timed out opening the fetch stream"))??;
         let outcome = transfer::fetch(
             repo,
             &self.id,
@@ -636,7 +636,7 @@ async fn store_fingerprint(jj: &JjRepo) -> Result<StoreFingerprint> {
     let jj = jj.clone();
     crate::spawn_blocking(move || jj.fingerprint())
         .await
-        .wrap_err("fingerprint task failed")?
+        .context("fingerprint task failed")?
 }
 
 /// The workspace tasks of one repo watch, and what status shows of its
@@ -738,7 +738,7 @@ async fn find_workspaces(
         Ok(Scan { found, claimed })
     })
     .await
-    .wrap_err("workspace search task failed")?
+    .context("workspace search task failed")?
 }
 
 /// The op head, when single: working copies are only caught up on then.
@@ -767,7 +767,7 @@ fn wire_heads(heads: &[OperationId]) -> Vec<Vec<u8>> {
 }
 
 /// Formats an error for storage, bounded by [`MAX_ERROR_LEN`].
-fn truncated_error(err: &color_eyre::Report) -> String {
+fn truncated_error(err: &anyhow::Error) -> String {
     let mut msg = format!("{err:#}");
     if msg.chars().count() > MAX_ERROR_LEN {
         msg = msg.chars().take(MAX_ERROR_LEN).collect();

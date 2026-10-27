@@ -1,8 +1,8 @@
 //! `jj-mesh repo forget`: stop syncing repos on this machine only.
 
+use anyhow::{Context as _, Result, bail};
 use clap::Args;
 use clap_complete::ArgValueCandidates;
-use color_eyre::eyre::{OptionExt as _, Result, WrapErr as _, bail};
 
 use super::batch::{self, Batch, confirm, show_workspaces};
 use crate::{
@@ -105,7 +105,7 @@ pub fn run(args: ForgetArgs, dir: &ConfigDir) -> Result<()> {
     let mut batch = Batch::new(repos.len());
     let forgotten = batch.run(&repos, |repo| repo.apply(dir));
     batch.run(forgotten, Forget::delete);
-    batch.finish()
+    batch.finish("failed")
 }
 
 impl Forget {
@@ -137,23 +137,22 @@ impl Forget {
         })
     }
 
-    /// Describes what forgetting does, on stderr.
+    /// Describes what forgetting does.
     fn show(&self) {
         match self.action {
-            Action::Store { .. } => eprintln!("{}: moves to a bare repo", self.name),
-            Action::Unregister { .. } => eprintln!("{}:", self.name),
+            Action::Store { .. } => ui::info(format_args!("{}: moves to a bare repo", self.name)),
+            Action::Unregister { .. } => ui::info(format_args!("{}:", self.name)),
         }
         show_workspaces(&self.workspaces);
-        let note = |note: &str| eprintln!("  {}", ui::dim(note).for_stderr());
         match &self.action {
-            Action::Store { colocated: true } => note("(colocation will be disabled)"),
+            Action::Store { colocated: true } => ui::note("  (colocation will be disabled)"),
             Action::Store { colocated: false } => {}
             Action::Unregister { missing, holders } => {
                 if *missing {
-                    note("(directory missing)");
+                    ui::note("  (directory missing)");
                 }
                 if !holders.is_empty() {
-                    eprintln!("  Held by: {}", holders.join(", "));
+                    ui::info(format_args!("  Held by: {}", holders.join(", ")));
                 }
             }
         }
@@ -168,15 +167,15 @@ impl Forget {
             Action::Unregister { .. } => Request::ForgetRepo { name: repo },
         };
         let response = control::request_blocking(dir, &request, control::MUTATE_WAIT)
-            .wrap_err_with(|| format!("cannot {} {name}", self.action.verb()))?;
+            .with_context(|| format!("cannot {} {name}", self.action.verb()))?;
         let message = match response {
             Response::RepoForgotten { .. } => format!("Forgot {name}"),
             Response::RepoStored { path } => {
-                format!("Moved {name} to {}", ui::display_path(&path))
+                format!("Moved {name} to {}", ui::path(&path))
             }
             response => bail!("unexpected response from the daemon: {response:?}"),
         };
-        println!("{}", ui::good(message));
+        ui::success(message);
         Ok(())
     }
 
@@ -185,7 +184,7 @@ impl Forget {
         if !self.delete {
             return Ok(());
         }
-        Workspace::delete_all(&self.workspaces).wrap_err_with(|| {
+        Workspace::delete_all(&self.workspaces).with_context(|| {
             let done = match self.action {
                 Action::Store { .. } => "moved",
                 Action::Unregister { .. } => "forgot",
@@ -206,10 +205,10 @@ fn workspaces(repo: &Repo, needed: bool) -> Result<Vec<Workspace>> {
 
 /// The registered repo of the current directory.
 fn current_repo(state: &MeshState) -> Result<RepoId> {
-    let cwd = std::env::current_dir().wrap_err("cannot read the current directory")?;
+    let cwd = std::env::current_dir().context("cannot read the current directory")?;
     let repo = JjRepo::discover(&cwd)?;
     state
         .repo_at(repo.root())
         .cloned()
-        .ok_or_eyre("the current repo is not registered on this machine")
+        .context("the current repo is not registered on this machine")
 }
