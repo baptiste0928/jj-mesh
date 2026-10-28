@@ -7,6 +7,7 @@ use super::ui;
 use crate::{
     config::{ConfigDir, MeshState},
     daemon::control::{self, Request, Response},
+    repo::JjRepo,
 };
 
 /// Manage server mode
@@ -18,6 +19,10 @@ use crate::{
 pub struct ServerArgs {
     #[command(subcommand)]
     command: ServerCommand,
+
+    /// Skip the confirmation prompt
+    #[arg(long, short = 'y', global = true)]
+    yes: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -30,7 +35,41 @@ enum ServerCommand {
 
 /// Runs the `server` command.
 pub fn run(args: &ServerArgs, dir: &ConfigDir) -> Result<()> {
-    set(dir, matches!(args.command, ServerCommand::Enable))
+    let server = matches!(args.command, ServerCommand::Enable);
+    if !args.yes && !confirm(&MeshState::load(dir)?, server)? {
+        ui::info("Aborted");
+        return Ok(());
+    }
+    set(dir, server)
+}
+
+/// Asks to confirm switching server mode.
+fn confirm(state: &MeshState, server: bool) -> Result<bool> {
+    if state.machine.server == server {
+        return Ok(true);
+    }
+    if server {
+        return ui::approve("Enable server mode and keep a copy of every mesh repo here?");
+    }
+    let lost: Vec<_> = state
+        .repos
+        .iter()
+        .filter(|(id, repo)| repo.bare && state.holders(id).is_empty())
+        .filter(|(_, repo)| {
+            matches!(
+                JjRepo::at(&repo.path).and_then(|repo| repo.has_workspaces()),
+                Ok(false)
+            )
+        })
+        .filter_map(|(id, _)| state.repo_name(id))
+        .collect();
+    if !lost.is_empty() {
+        ui::warning(format_args!(
+            "Will be permanently deleted from the mesh: {}",
+            lost.join(", ")
+        ));
+    }
+    ui::approve("Disable server mode and delete its repos from this machine?")
 }
 
 /// Switches server mode through the daemon.

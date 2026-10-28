@@ -40,6 +40,8 @@ struct Remove {
     name: String,
     /// Its workspaces here, to delete.
     delete: Vec<Workspace>,
+    /// Whether it is a bare repo here.
+    bare: bool,
 }
 
 /// Runs the `repo remove` command.
@@ -78,7 +80,8 @@ pub fn run(args: RemoveArgs, dir: &ConfigDir) -> Result<()> {
 impl Remove {
     /// Lists the workspaces of the mesh repo `id` to delete, when asked.
     fn check(state: &MeshState, id: RepoId, delete_files: bool) -> Result<Self> {
-        let delete = match state.repos.get(&id) {
+        let repo = state.repos.get(&id);
+        let delete = match repo {
             Some(repo) if delete_files => JjRepo::local_workspaces_at(&repo.path)?,
             _ => Vec::new(),
         };
@@ -86,6 +89,7 @@ impl Remove {
             name: state.repo_name(&id).unwrap_or("?").to_owned(),
             id,
             delete,
+            bare: repo.is_some_and(|repo| repo.bare),
         })
     }
 
@@ -109,7 +113,7 @@ impl Remove {
             bail!("unexpected response from the daemon: {response:?}");
         };
         ui::success(format_args!("Removed {name} from the mesh"));
-        if was_local && !delete_files {
+        if was_local && !self.bare && !delete_files {
             ui::info("Its files on this machine are left untouched");
         }
         Ok(())
