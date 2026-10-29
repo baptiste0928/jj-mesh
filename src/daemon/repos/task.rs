@@ -252,12 +252,12 @@ impl RepoTask {
         // The op-heads watch above is already live, so any operation the
         // workspace tasks create is picked up like any other.
         let ctx = Arc::new(RepoContext::new(repo.clone(), self.settings));
-        let (synced, _) = watch::channel(None);
+        let (head_tx, _) = watch::channel(single_head(&heads));
         let mut claims = self.claims.clone();
         let mut holds = self.holds.clone();
         let mut workspaces = Workspaces::default();
         let current = claims.borrow_and_update().clone();
-        self.track_workspaces(&ctx, &heads, &synced, &current, &mut workspaces)
+        self.track_workspaces(&ctx, &heads, &head_tx, &current, &mut workspaces)
             .await;
         self.set_state(RepoState::Watching {
             op_heads: heads.len(),
@@ -327,18 +327,14 @@ impl RepoTask {
                     info!("announcing local change");
                 }
                 self.hub.publish(&self.id, wire_heads(&heads));
+                // Workspace tasks update the working copies it left stale.
+                head_tx.send_replace(single_head(&heads));
                 rescan = true;
             }
             if rescan {
                 let current = claims.borrow_and_update().clone();
-                self.track_workspaces(&ctx, &heads, &synced, &current, &mut workspaces)
+                self.track_workspaces(&ctx, &heads, &head_tx, &current, &mut workspaces)
                     .await;
-            }
-
-            // The applied operations may have left the working copies
-            // stale.
-            if drained.synced {
-                synced.send_replace(single_head(&heads));
             }
             self.set_state(RepoState::Watching {
                 op_heads: heads.len(),
@@ -378,7 +374,7 @@ impl RepoTask {
         &self,
         ctx: &Arc<RepoContext>,
         heads: &[OperationId],
-        synced: &watch::Sender<Option<OperationId>>,
+        head_tx: &watch::Sender<Option<OperationId>>,
         claims: &RepoClaims,
         workspaces: &mut Workspaces,
     ) {
@@ -437,8 +433,7 @@ impl RepoTask {
                     ctx.clone(),
                     found.name,
                     found.workspace,
-                    single_head(heads),
-                    synced.subscribe(),
+                    head_tx.subscribe(),
                 )
             });
         }

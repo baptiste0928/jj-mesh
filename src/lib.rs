@@ -47,6 +47,16 @@
 //!   it is validated.
 //! - **Pinned jj**: sync depends on jj internals, so `jj-lib` is pinned to
 //!   an exact version and only the default backends are accepted.
+//!
+//! # jj behavior
+//!
+//! jj-mesh keeps working copies fresh whatever made them stale. Beyond
+//! that, it only handles what plain jj on one machine would not do:
+//! - **Sync side effects**: jj must stay consistent with what sync writes
+//!   behind its back.
+//! - **Own jj runs**: the daemon must not do what a user would not.
+//!
+//! The rest is jj's behavior, left to jj or fixed upstream.
 
 #![warn(clippy::pedantic)]
 #![allow(clippy::doc_markdown)]

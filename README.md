@@ -126,7 +126,7 @@ workspace. Restart the daemon with `jj-mesh service restart` to apply changes.
 [jj-mesh]
 # Interval between automatic snapshots of the working copy, in seconds (0 disables them).
 snapshot-interval = 20
-# Update the working copy after syncing if stale.
+# Update stale working copies.
 update-stale = true
 ```
 

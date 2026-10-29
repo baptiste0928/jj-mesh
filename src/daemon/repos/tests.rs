@@ -471,7 +471,9 @@ async fn tracks_and_snapshots_secondary_workspaces() {
     wait_for(&set, |s| workspace_names(s) == ["default"]).await;
 }
 
-/// A stale claimed secondary working copy is healed like the main one.
+/// A stale claimed secondary working copy is healed on watch start, and
+/// again when a command in another workspace rewrites its working-copy
+/// commit.
 #[tokio::test]
 async fn updates_stale_secondary_workspace() {
     let fx = Fixture::new();
@@ -481,7 +483,11 @@ async fn updates_stale_secondary_workspace() {
     let mut state = state_with("a", &dir);
     claim(&mut state, &["default", "child"]);
     let _set = start(UPDATE_STALE, state);
+    eventually("working copy still stale", || fx.jj_ok(&child, &["status"])).await;
 
+    std::fs::write(child.join("f.txt"), "content").unwrap();
+    fx.jj(&child, &["status"]);
+    fx.jj(&dir, &["abandon", "child@"]);
     eventually("working copy still stale", || fx.jj_ok(&child, &["status"])).await;
 }
 

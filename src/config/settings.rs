@@ -29,7 +29,7 @@ pub const SNAPSHOT_INTERVAL: &str = "jj-mesh.snapshot-interval";
 /// Default seconds between an edit and its automatic snapshot.
 const DEFAULT_SNAPSHOT_INTERVAL: u64 = 20;
 
-/// Default for running `jj workspace update-stale` after syncs.
+/// Default for running `jj workspace update-stale` on stale working copies.
 const DEFAULT_UPDATE_STALE: bool = true;
 
 /// Ceiling on the snapshot interval, so arithmetic on deadlines can never
@@ -56,7 +56,7 @@ pub struct Settings {
     /// Wait between an edit and its snapshot; `None` disables
     /// auto-snapshotting.
     pub snapshot_interval: Option<Duration>,
-    /// Whether to run `jj workspace update-stale` after syncing.
+    /// Whether to run `jj workspace update-stale` on stale working copies.
     pub update_stale: bool,
 }
 

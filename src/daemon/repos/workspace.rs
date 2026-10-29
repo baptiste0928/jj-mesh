@@ -2,17 +2,17 @@
 //! copy of a watched repo.
 //!
 //! Workspace tasks share their repo task's open stores (see
-//! [`RepoContext`]) and learn of every sync that applied operations
-//! through [`Synced`]. A task whose working copy watch dies stops, and the
-//! repo task's next workspace scan respawns it.
+//! [`RepoContext`]) and follow the op head through [`Head`]. A task whose
+//! working copy watch dies stops, and the repo task's next workspace scan
+//! respawns it.
 //!
 //! When auto-snapshotting is enabled, the task watches the working copy
 //! files and snapshots them on the cadence [`Snapshotting`] sets.
 //!
-//! Syncing operations from peers can leave the working copy stale (updated
-//! by an operation the working copy never saw). When enabled, `jj workspace
-//! update-stale` runs after syncs that applied operations, while the op head
-//! is single.
+//! An operation that rewrites the working-copy commit from elsewhere (synced
+//! from a peer, or a command in another workspace) leaves the working copy
+//! stale. When enabled, `jj workspace update-stale` runs on every op head
+//! change that made it stale, while the op head is single.
 //!
 //! Both wait while git has an operation in progress in a colocated working
 //! copy (a rebase, a merge...): jj would snapshot its half-done files, and
@@ -45,9 +45,8 @@ const JJ_TIMEOUT: Duration = Duration::from_mins(5);
 /// ended: git leaves no event in the working copy when it does.
 const GIT_POLL: Duration = Duration::from_secs(2);
 
-/// The op head after the last sync that applied operations, `None` when
-/// divergent.
-pub(super) type Synced = watch::Receiver<Option<OperationId>>;
+/// The current op head, `None` when divergent. Sent on every change.
+pub(super) type Head = watch::Receiver<Option<OperationId>>;
 
 /// What the workspace tasks of one repo share.
 pub(super) struct RepoContext {
@@ -90,23 +89,22 @@ impl Drop for WorkspaceHandle {
 }
 
 /// Spawns the task of workspace `name`, first catching up on staleness at
-/// `head`, the current single op head.
+/// the current `head`.
 pub(super) fn spawn_workspace(
     ctx: Arc<RepoContext>,
     name: String,
     workspace: Workspace,
-    head: Option<OperationId>,
-    synced: Synced,
+    head: Head,
 ) -> WorkspaceHandle {
     let span = info_span!("workspace", workspace = %name);
     let task = WorkspaceTask {
         ctx,
         workspace,
-        synced,
+        head,
     };
     WorkspaceHandle {
         name,
-        task: tokio::spawn(task.run(head).instrument(span)),
+        task: tokio::spawn(task.run().instrument(span)),
     }
 }
 
@@ -114,13 +112,13 @@ pub(super) fn spawn_workspace(
 struct WorkspaceTask {
     ctx: Arc<RepoContext>,
     workspace: Workspace,
-    synced: Synced,
+    head: Head,
 }
 
 impl WorkspaceTask {
     /// Keeps the working copy fresh until the repo watch ends or the
     /// working copy watch fails.
-    async fn run(mut self, head: Option<OperationId>) {
+    async fn run(mut self) {
         let settings = match self.ctx.settings {
             Some(settings) => settings,
             None => Settings::load(self.workspace.root())
@@ -130,14 +128,14 @@ impl WorkspaceTask {
                     Settings::default()
                 }),
         };
-        if let Err(err) = self.keep_fresh(settings, head).await {
+        if let Err(err) = self.keep_fresh(settings).await {
             warn!("working copy watch failed: {err:#}");
         }
     }
 
     /// Runs the auto-snapshot and update-stale loop. Errors when the
     /// working copy watch dies.
-    async fn keep_fresh(&mut self, settings: Settings, head: Option<OperationId>) -> Result<()> {
+    async fn keep_fresh(&mut self, settings: Settings) -> Result<()> {
         let interval = settings.snapshot_interval;
         let mut snap = Snapshotting::default();
         let mut tree = match interval {
@@ -145,10 +143,11 @@ impl WorkspaceTask {
             None => None,
         };
 
+        let head = self.head.borrow_and_update().clone();
         if settings.update_stale
-            && let Some(head) = &head
+            && let Some(head) = head
         {
-            self.update_stale(head, &mut tree).await?;
+            self.update_stale(&head, &mut tree).await?;
         }
         // Edits made while the watch was down produce no event, so the
         // working copy is snapshotted once on start: it is the only
@@ -157,11 +156,11 @@ impl WorkspaceTask {
 
         loop {
             tokio::select! {
-                changed = self.synced.changed() => {
+                changed = self.head.changed() => {
                     let Ok(()) = changed else {
                         return Ok(());
                     };
-                    let head = self.synced.borrow_and_update().clone();
+                    let head = self.head.borrow_and_update().clone();
                     if settings.update_stale
                         && let Some(head) = head
                         && self.update_stale(&head, &mut tree).await?
@@ -195,8 +194,8 @@ impl WorkspaceTask {
 
     /// Runs `jj workspace update-stale` when the working copy may be stale
     /// at `head`; returns whether it ran. The command snapshots the whole
-    /// working copy before checking anything, so it must not run on syncs
-    /// that cannot have made it stale.
+    /// working copy before checking anything, so it must not run on
+    /// operations that cannot have made it stale.
     async fn update_stale(
         &self,
         head: &OperationId,
@@ -348,7 +347,8 @@ async fn tree_changed(tree: &mut Option<TreeWatcher>) -> Result<()> {
 /// Whether the working copy may be stale at the op head `head`: it was
 /// last updated at another operation, one whose view gave its workspace a
 /// different working-copy commit. Same commit means same tree, which jj
-/// treats as fresh, whatever else the operations changed.
+/// treats as fresh, whatever else the operations changed. A workspace
+/// `head` forgot has nothing to update to.
 pub(super) async fn may_be_stale(
     workspace: &Workspace,
     repo: &OpenRepo,
@@ -358,9 +358,11 @@ pub(super) async fn may_be_stale(
     if &checkout.operation == head {
         return Ok(false);
     }
+    let Some(at_head) = repo.wc_commit_id(head, &checkout.workspace).await? else {
+        return Ok(false);
+    };
     let at_checkout = repo
         .wc_commit_id(&checkout.operation, &checkout.workspace)
         .await?;
-    let at_head = repo.wc_commit_id(head, &checkout.workspace).await?;
-    Ok(at_checkout != at_head)
+    Ok(at_checkout != Some(at_head))
 }
