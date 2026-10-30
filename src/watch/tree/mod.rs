@@ -7,6 +7,13 @@
 //! watch, one non-recursive watch each. The same rules (see [`rules`])
 //! filter events for ignored files inside watched directories.
 //!
+//! FSEvents (macOS) is the exception: it watches whole trees natively,
+//! and every registration change restarts its stream with a round trip
+//! to `fseventsd` (hundreds of milliseconds, serialized system-wide).
+//! There the root gets one recursive watch, and events from outside the
+//! watched set are dropped in the callback, so the set stays the single
+//! definition of the watched tree on every platform.
+//!
 //! This is a change signal for snapshot scheduling, not an exact tracker:
 //! a spurious signal only costs a no-op snapshot, and a missed one is
 //! absorbed by the next edit. The invariants that do matter:
@@ -31,7 +38,7 @@ use std::{
 };
 
 use anyhow::{Context as _, Result, anyhow, bail, ensure};
-use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher as _};
+use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher as _, WatcherKind};
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
@@ -65,8 +72,9 @@ pub struct TreeWatcher {
     /// Set by the notify callback when the queue is full, so events lost
     /// to backpressure are handled like a kernel queue overflow.
     overflowed: Arc<AtomicBool>,
-    /// Directories currently holding a watch.
-    watched: BTreeSet<PathBuf>,
+    /// Directories currently watched, shared with the notify callback
+    /// which drops events from outside them.
+    watched: Arc<Mutex<BTreeSet<PathBuf>>>,
     /// Ignore evaluation, shared with the walk that runs off-thread.
     rules: Arc<Mutex<Rules>>,
     /// Whether the watched set must be re-derived. Set while handling
@@ -98,11 +106,26 @@ impl TreeWatcher {
         let (tx, signals) = mpsc::channel(SIGNAL_QUEUE);
         let overflowed = Arc::new(AtomicBool::new(false));
         let full = overflowed.clone();
+        let dirs = Arc::new(Mutex::new(BTreeSet::new()));
+        let filter = dirs.clone();
+        let tree_root = root.to_owned();
 
-        let watcher = backend::watcher(
-            |mut event| {
-                event.paths.retain(|path| !is_internal(path));
-                (!event.paths.is_empty() || event.need_rescan()).then_some(Signal::Event(event))
+        let mut watcher = backend::watcher(
+            move |mut event| {
+                let dirs = filter.lock().unwrap();
+                // Pathless rescans (queue overflows) and FSEvents' own drops,
+                // tagged with an info, concern the whole tree.
+                let rescan = event.need_rescan()
+                    && (event.paths.is_empty()
+                        || event.info().is_some()
+                        || event
+                            .paths
+                            .iter()
+                            .any(|dir| holds_watched(&dirs, &tree_root, dir)));
+                event
+                    .paths
+                    .retain(|path| !is_internal(path) && is_in_tree(&dirs, path));
+                (!event.paths.is_empty() || rescan).then_some(Signal::Event(event))
             },
             move |signal| {
                 if tx.try_send(signal).is_err() {
@@ -110,13 +133,18 @@ impl TreeWatcher {
                 }
             },
         )?;
+        if is_recursive() {
+            watcher
+                .watch(root, RecursiveMode::Recursive)
+                .with_context(|| format!("cannot watch {}", root.display()))?;
+        }
 
         let mut watch = TreeWatcher {
             root: root.to_owned(),
             watcher,
             signals,
             overflowed,
-            watched: BTreeSet::new(),
+            watched: dirs,
             rules: Arc::new(Mutex::new(Rules::new(root, git_dir))),
             stale: false,
             pending: false,
@@ -262,7 +290,7 @@ impl TreeWatcher {
             Ok(meta) if meta.is_dir() => {
                 // Already watched: a metadata event on the directory
                 // itself, whose children report themselves.
-                if self.watched.contains(path) || self.ignored(path, true) || is_nested_repo(path) {
+                if self.is_watched(path) || self.ignored(path, true) || is_nested_repo(path) {
                     return Ok(false);
                 }
                 // It needs watches, and whatever landed inside it before
@@ -275,7 +303,7 @@ impl TreeWatcher {
             // its kernel watch with it, so re-derive (a recreation must
             // be seen as new).
             Err(_) => {
-                if self.watched.contains(path) {
+                if self.is_watched(path) {
                     self.stale = true;
                     return Ok(true);
                 }
@@ -291,22 +319,54 @@ impl TreeWatcher {
         self.rules.lock().unwrap().is_ignored(path, is_dir)
     }
 
-    /// Moves the kernel watches onto a freshly derived directory set.
+    fn is_watched(&self, dir: &Path) -> bool {
+        self.watched.lock().unwrap().contains(dir)
+    }
+
+    /// Moves the watches onto a freshly derived directory set.
     fn apply(&mut self, dirs: BTreeSet<PathBuf>) {
-        for gone in self.watched.difference(&dirs) {
+        if is_recursive() {
+            *self.watched.lock().unwrap() = dirs;
+            return;
+        }
+        // The set is published before registering, so events from new
+        // directories pass the callback as soon as they arrive. The lock
+        // is not held across registration: inotify runs the callback on
+        // the thread serving `watch` calls.
+        let old = std::mem::replace(&mut *self.watched.lock().unwrap(), dirs.clone());
+        for gone in old.difference(&dirs) {
             // Failures are fine: the kernel drops watches of removed
             // directories on its own.
             let _ = self.watcher.unwatch(gone);
         }
-        for new in dirs.difference(&self.watched) {
+        for new in dirs.difference(&old) {
             if let Err(err) = self.watcher.watch(new, RecursiveMode::NonRecursive) {
                 // Racing a deletion is normal; anything else (a watch
                 // limit) degrades that subtree, not the watcher.
                 debug!(dir = %new.display(), "cannot watch directory: {err}");
             }
         }
-        self.watched = dirs;
     }
+}
+
+/// Whether the backend watches the root recursively (FSEvents) instead
+/// of each directory.
+fn is_recursive() -> bool {
+    RecommendedWatcher::kind() == WatcherKind::Fsevent
+}
+
+/// Whether an event on `path` comes from the watched tree: a watched
+/// directory itself or a direct child of one. Under a recursive watch,
+/// events from ignored and nested subtrees arrive too and fail this.
+fn is_in_tree(watched: &BTreeSet<PathBuf>, path: &Path) -> bool {
+    watched.contains(path) || path.parent().is_some_and(|dir| watched.contains(dir))
+}
+
+/// Whether the subtree at `dir` holds watched directories, for rescans
+/// FSEvents reports per subtree. The watched set holds every ancestor of
+/// its members up to `root`.
+fn holds_watched(watched: &BTreeSet<PathBuf>, root: &Path, dir: &Path) -> bool {
+    watched.contains(dir) || root.starts_with(dir)
 }
 
 /// Walks the tree and returns the directories deserving a watch. The
@@ -635,7 +695,7 @@ mod tests {
         drain(&mut watch).await;
 
         assert!(
-            !watch.watched.contains(&root.join("link")),
+            !watch.is_watched(&root.join("link")),
             "a symlink must never hold a watch",
         );
     }

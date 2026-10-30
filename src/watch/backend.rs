@@ -1,10 +1,10 @@
-//! Shared plumbing for the notify backend: signal type and callback
-//! construction common to both watchers.
+//! Shared plumbing for watch sources: the signal they report, and the
+//! notify callback construction.
 
 use anyhow::{Context as _, Result};
 use notify::{Event, RecommendedWatcher};
 
-/// What a notify callback reports to the async side.
+/// What a watch source reports to the async side.
 #[derive(Debug)]
 pub(super) enum Signal<T> {
     /// A relevant event, with whatever payload the watcher needs.

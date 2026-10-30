@@ -2841,6 +2841,8 @@ dependencies = [
  "jiff",
  "jj-lib",
  "jj-mesh",
+ "kqueue",
+ "libc",
  "mimalloc",
  "notify",
  "pollster",

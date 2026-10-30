@@ -374,7 +374,7 @@ pub(crate) mod watch {
     pub(crate) async fn tree(root: &Path, git_dir: &Path) -> TreeWatcher {
         #[expect(clippy::disallowed_methods, reason = "settled below")]
         let build = TreeWatcher::new(root, git_dir);
-        let mut watch = tokio::time::timeout(Duration::from_secs(5), build)
+        let mut watch = tokio::time::timeout(Duration::from_secs(15), build)
             .await
             .expect("building the watcher must not hang")
             .unwrap();

@@ -40,6 +40,10 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 zstd = "0.14.3"
 shell-words = "1.1.1"
 
+[target.'cfg(target_os = "macos")'.dependencies]
+kqueue = "1.2.1"
+libc = "0.2.191"
+
 [features]
 test-util = []
 failpoints = ["fail/failpoints"]

@@ -1,24 +1,33 @@
 //! [`DirWatcher`]: a debounced non-recursive watch on a single directory.
+//!
+//! Events come from a per-platform source reporting [`Signal`]s: kqueue
+//! on macOS, notify elsewhere.
+
+#[cfg(target_os = "macos")]
+mod kqueue;
+#[cfg(not(target_os = "macos"))]
+mod notify;
 
 use std::{path::Path, time::Duration};
 
-use anyhow::{Context as _, Result, bail};
-use notify::{
-    Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher as _, event::ModifyKind,
-};
-use tokio::{sync::mpsc, time::Instant};
+use anyhow::{Result, bail};
+use tokio::time::Instant;
 
+#[cfg(target_os = "macos")]
+use self::kqueue::Events;
+#[cfg(not(target_os = "macos"))]
+use self::notify::Events;
 use super::backend;
 
 /// A change carries no payload here; only its arrival matters.
 type Signal = backend::Signal<()>;
 
+/// Why a watch died when its directory went away.
+const DEATH: &str = "the watched directory was removed or moved";
+
 /// A debounced watch on one directory.
-///
-/// Dropping it stops notify's background threads.
 pub struct DirWatcher {
-    _watcher: RecommendedWatcher,
-    signals: mpsc::UnboundedReceiver<Signal>,
+    events: Events,
     debounce: Duration,
     debounce_max: Duration,
     /// Cap of the burst being debounced, if a change was received but not
@@ -35,35 +44,8 @@ impl DirWatcher {
     /// capped at `debounce_max` total so a busy writer cannot starve the
     /// caller.
     pub fn new(dir: &Path, debounce: Duration, debounce_max: Duration) -> Result<Self> {
-        let (tx, signals) = mpsc::unbounded_channel();
-        // Backends report canonical paths (FSEvents resolves symlinks such
-        // as macOS's /var), so death detection must compare against one.
-        let target = dir
-            .canonicalize()
-            .with_context(|| format!("cannot resolve {}", dir.display()))?;
-
-        let mut watcher = backend::watcher(
-            move |event| {
-                if is_watch_death(&event, &target) {
-                    Some(Signal::Failed(
-                        "the watched directory was removed or moved".to_owned(),
-                    ))
-                } else {
-                    Some(Signal::Event(()))
-                }
-            },
-            move |signal| {
-                let _ = tx.send(signal);
-            },
-        )?;
-
-        watcher
-            .watch(dir, RecursiveMode::NonRecursive)
-            .with_context(|| format!("cannot watch {}", dir.display()))?;
-
         Ok(DirWatcher {
-            _watcher: watcher,
-            signals,
+            events: Events::new(dir)?,
             debounce,
             debounce_max,
             burst: None,
@@ -81,7 +63,7 @@ impl DirWatcher {
         let deadline = if let Some(deadline) = self.burst {
             deadline
         } else {
-            let Ok(signal) = tokio::time::timeout(idle, self.signals.recv()).await else {
+            let Ok(signal) = tokio::time::timeout(idle, self.events.recv()).await else {
                 return Ok(false);
             };
             check(signal)?;
@@ -89,7 +71,7 @@ impl DirWatcher {
         };
         // Wait out the burst, bounded by the cap.
         loop {
-            match tokio::time::timeout(self.debounce, self.signals.recv()).await {
+            match tokio::time::timeout(self.debounce, self.events.recv()).await {
                 Ok(Some(Signal::Event(()))) if Instant::now() < deadline => {}
                 Ok(Some(Signal::Failed(msg))) => bail!(msg),
                 _ => break,
@@ -107,16 +89,6 @@ fn check(signal: Option<Signal>) -> Result<()> {
         Some(Signal::Failed(msg)) => bail!(msg),
         None => bail!("filesystem watcher stopped"),
     }
-}
-
-/// Whether an event means the watch itself is dead: the watched directory
-/// was removed (kernel drops the watch) or renamed (the watch follows the
-/// old inode). Both surface as a self-referential event.
-fn is_watch_death(event: &Event, watched: &Path) -> bool {
-    matches!(
-        event.kind,
-        EventKind::Remove(_) | EventKind::Modify(ModifyKind::Name(_))
-    ) && event.paths.iter().any(|path| path == watched)
 }
 
 #[cfg(test)]
@@ -155,5 +127,18 @@ mod tests {
 
         let outcome = watch.changed_or_idle(Duration::from_secs(5)).await;
         assert!(outcome.is_err(), "removal must surface as a watch error");
+    }
+
+    #[tokio::test]
+    async fn reports_watched_dir_move_as_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("watched");
+        fs::create_dir(&dir).unwrap();
+        let mut watch = watch(&dir).await;
+
+        fs::rename(&dir, tmp.path().join("moved")).unwrap();
+
+        let outcome = watch.changed_or_idle(Duration::from_secs(5)).await;
+        assert!(outcome.is_err(), "a move must surface as a watch error");
     }
 }
