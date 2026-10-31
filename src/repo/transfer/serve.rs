@@ -24,7 +24,7 @@ use crate::{
     net::{
         fetch::{
             FetchRequest, GitFrame, GitRequest, GitTransferFormat, MAX_GIT_FRAME_SIZE, OpFrame,
-            WireObjectKind, compress_payload,
+            PhaseCompressor, WireObjectKind, compress_object,
         },
         wire::{MAX_FRAME_SIZE, read_message, write_message},
     },
@@ -36,12 +36,13 @@ use crate::{
 /// delta at once.
 const OP_STREAM_BUFFER: usize = 16;
 
-/// Loose git objects buffered between the closure walk and the stream
-/// writer.
-const GIT_STREAM_BUFFER: usize = 64;
+/// Git frames (loose objects or pack chunks) buffered between the
+/// blocking producer and the stream writer.
+const GIT_STREAM_BUFFER: usize = 8;
 
-/// Pack chunks buffered between the pack pipeline and the stream writer.
-const PACK_STREAM_BUFFER: usize = 8;
+/// Objects from which a loose transfer is sent as a pack instead: past a
+/// few thousand files, one pack is far cheaper to write and to send.
+pub(super) const PACK_MIN_OBJECTS: usize = 2048;
 
 /// Serves one fetch request over the given stream pair. Read-only on the
 /// repo; errors are reported to the peer as protocol frames where the
@@ -53,17 +54,15 @@ pub async fn serve(
     recv: &mut (impl AsyncRead + Unpin),
 ) -> Result<()> {
     if let Err(message) = validate_request(repo, &request) {
-        write_message(send, &OpFrame::Error { message }, MAX_FRAME_SIZE).await?;
-        return Ok(());
+        return refuse(send, message).await;
     }
-    let wants: Vec<OperationId> = request.wants.into_iter().map(OperationId::new).collect();
-    let haves: Vec<OperationId> = request.haves.into_iter().map(OperationId::new).collect();
+    let ids =
+        |ids: Vec<Vec<u8>>| -> Vec<OperationId> { ids.into_iter().map(OperationId::new).collect() };
+    let (wants, haves) = (ids(request.wants), ids(request.haves));
 
     for want in &wants {
         if !repo.has_operation(want).await? {
-            let message = format!("unknown operation {}", want.hex());
-            write_message(send, &OpFrame::Error { message }, MAX_FRAME_SIZE).await?;
-            return Ok(());
+            return refuse(send, format!("unknown operation {}", want.hex())).await;
         }
     }
 
@@ -71,7 +70,6 @@ pub async fn serve(
     // never sits in memory at once: a clone pulls the entire log. Each view
     // is sent before the first op referencing it, and ops stay
     // parents-first.
-    let mut op_count = 0usize;
     let served = {
         let repo = repo.clone();
         serve_phase(
@@ -83,6 +81,7 @@ pub async fn serve(
                 // The delta is fully collected, so the phase totals are
                 // exact: every unique view is sent exactly once.
                 let views: HashSet<&ViewId> = ops.iter().map(|(_, op)| &op.view_id).collect();
+                let sent_ops = ops.len();
                 produce(
                     tx,
                     OpFrame::Begin {
@@ -90,6 +89,7 @@ pub async fn serve(
                         views: views.len() as u64,
                     },
                 )?;
+                let mut compressor = PhaseCompressor::new()?;
                 let mut sent_views: HashSet<ViewId> = HashSet::with_capacity(views.len());
                 for (id, op) in ops {
                     if sent_views.insert(op.view_id.clone()) {
@@ -98,7 +98,7 @@ pub async fn serve(
                             tx,
                             OpFrame::View {
                                 id: op.view_id.as_bytes().to_vec(),
-                                view: compress_payload(&view)?,
+                                view: compressor.compress(&view)?,
                             },
                         )?;
                     }
@@ -107,26 +107,26 @@ pub async fn serve(
                         tx,
                         OpFrame::Op {
                             id: id.as_bytes().to_vec(),
-                            op: compress_payload(&bytes)?,
+                            op: compressor.compress(&bytes)?,
                         },
                     )?;
                 }
-                Ok(())
-            },
-            |frame| {
-                if matches!(frame, OpFrame::Op { .. }) {
-                    op_count += 1;
-                }
+                Ok(sent_ops)
             },
         )
         .await?
     };
-    if !served {
+    let Some(ops) = served else {
         return Ok(());
-    }
-    debug!(ops = op_count, "served op phase");
+    };
+    debug!(ops, "served op phase");
 
     serve_git_phase(repo, send, recv).await
+}
+
+/// Refuses a fetch, telling the fetcher why.
+pub async fn refuse(send: &mut (impl AsyncWrite + Unpin), message: String) -> Result<()> {
+    write_message(send, &OpFrame::Error { message }, MAX_FRAME_SIZE).await
 }
 
 /// Validates the shape of a fetch request.
@@ -147,14 +147,13 @@ fn validate_request(repo: &OpenRepo, request: &FetchRequest) -> Result<(), Strin
 
 /// Serves the git phase: answers the fetcher's commit wants with the raw
 /// object closure it lacks (see [`walk_git_closure`]), in the requested
-/// format.
+/// format, or as a pack past [`PACK_MIN_OBJECTS`].
 async fn serve_git_phase(
     repo: &Arc<OpenRepo>,
     send: &mut (impl AsyncWrite + Unpin),
     recv: &mut (impl AsyncRead + Unpin),
 ) -> Result<()> {
     let request: GitRequest = read_message(recv, MAX_FRAME_SIZE).await?;
-
     let hash_len = repo.git_backend().git_repo().object_hash().len_in_bytes();
     let ok = request
         .wants
@@ -170,85 +169,63 @@ async fn serve_git_phase(
         write_message(send, &GitFrame::Done, MAX_GIT_FRAME_SIZE).await?;
         return Ok(());
     }
+    let ids = |ids: Vec<Vec<u8>>| -> Vec<CommitId> { ids.into_iter().map(CommitId::new).collect() };
+    let (wants, haves) = (ids(request.wants), ids(request.haves));
 
-    match request.format {
-        GitTransferFormat::Loose => serve_git_loose(repo, request, send).await,
-        GitTransferFormat::Pack => serve_git_pack(repo, request, send).await,
-    }
-}
-
-/// Serves the git phase in the loose format: one object per frame.
-async fn serve_git_loose(
-    repo: &Arc<OpenRepo>,
-    request: GitRequest,
-    send: &mut (impl AsyncWrite + Unpin),
-) -> Result<()> {
-    let mut served = 0usize;
     let repo = repo.clone();
-    let completed = serve_phase(
+    serve_phase(
         send,
         GIT_STREAM_BUFFER,
-        "cannot walk git objects",
+        "cannot send git objects",
         move |tx| {
             let git = repo.git_backend().git_repo();
-            walk_git_closure(&repo, &request, |id, kind| {
-                let object = git
-                    .find_object(id)
-                    .with_context(|| format!("missing object {id}"))?;
-                // `detach()` moves the object's buffer out instead of
-                // copying it, which matters for large blobs.
-                let data = compress_payload(&object.detach().data)?;
-                produce(
-                    tx,
-                    GitFrame::Object {
-                        id: id.as_bytes().to_vec(),
-                        kind,
-                        data,
-                    },
-                )
-            })
+            let objects = walk_git_closure(&repo, &haves, &wants)?;
+            if objects.is_empty() {
+                return Ok(());
+            }
+            let format = if objects.len() >= PACK_MIN_OBJECTS {
+                GitTransferFormat::Pack
+            } else {
+                request.format
+            };
+            let count = objects.len();
+            produce(
+                tx,
+                GitFrame::Begin {
+                    format,
+                    objects: count as u64,
+                },
+            )?;
+            match format {
+                GitTransferFormat::Loose => send_loose(&git, objects, tx)?,
+                GitTransferFormat::Pack => {
+                    let ids = objects.into_iter().map(|(id, _)| id).collect();
+                    pack::write_pack(&git, ids, |chunk| produce(tx, GitFrame::Pack { chunk }))?;
+                }
+            }
+            debug!(?format, objects = count, "served git phase");
+            Ok(())
         },
-        |_| served += 1,
     )
     .await?;
-    if completed {
-        debug!(objects = served, "served git phase");
-    }
     Ok(())
 }
 
-/// Serves the git phase in the pack format: the walk collects the closure's
-/// ids without loading blob contents, then the pack pipeline streams one
-/// packfile in chunks.
-async fn serve_git_pack(
-    repo: &Arc<OpenRepo>,
-    request: GitRequest,
-    send: &mut (impl AsyncWrite + Unpin),
+/// Sends `objects` one per frame, from a phase producer.
+fn send_loose(
+    git: &gix::Repository,
+    objects: Vec<(gix::ObjectId, WireObjectKind)>,
+    tx: &mpsc::Sender<GitFrame>,
 ) -> Result<()> {
-    let mut served = 0usize;
-    let repo = repo.clone();
-    let completed = serve_phase(
-        send,
-        PACK_STREAM_BUFFER,
-        "cannot build pack",
-        move |tx| {
-            let mut ids = Vec::new();
-            walk_git_closure(&repo, &request, |id, _kind| {
-                ids.push(id);
-                Ok(())
-            })?;
-            let git = repo.git_backend().git_repo();
-            pack::write_pack(&git, ids, |chunk| produce(tx, GitFrame::Pack { chunk }))
-        },
-        |frame| {
-            if let GitFrame::Pack { chunk } = frame {
-                served += chunk.len();
-            }
-        },
-    )
-    .await?;
-    if completed {
-        debug!(bytes = served, "served git phase (pack)");
+    for (id, kind) in objects {
+        let object = git
+            .find_object(id)
+            .with_context(|| format!("missing object {id}"))?;
+        // `detach()` moves the object's buffer out instead of copying it,
+        // which matters for large blobs.
+        let data = compress_object(&object.detach().data)?;
+        let id = id.as_bytes().to_vec();
+        produce(tx, GitFrame::Object { id, kind, data })?;
     }
     Ok(())
 }
@@ -282,58 +259,39 @@ impl PhaseFrame for GitFrame {
 
 /// Runs one streamed phase: a blocking producer (`work`, sending frames
 /// with [`produce`]) feeds a bounded channel, the frames are relayed to
-/// the wire (`on_frame` sees each, for counting), and the phase closes
-/// with `Done` — or with an `Error` frame prefixed by `err_context` when
-/// the producer failed, in which case `false` is returned and the
-/// exchange must not continue.
-async fn serve_phase<T: PhaseFrame + Send + 'static>(
+/// the wire, and the phase closes with `Done`, or with an `Error` frame
+/// prefixed by `err_context` when the producer failed. Returns the
+/// producer's value, `None` when it failed: the exchange must not
+/// continue then.
+async fn serve_phase<T: PhaseFrame + Send + 'static, R: Send + 'static>(
     send: &mut (impl AsyncWrite + Unpin),
     buffer: usize,
     err_context: &str,
-    work: impl FnOnce(&mpsc::Sender<Result<T>>) -> Result<()> + Send + 'static,
-    mut on_frame: impl FnMut(&T),
-) -> Result<bool> {
+    work: impl FnOnce(&mpsc::Sender<T>) -> Result<R> + Send + 'static,
+) -> Result<Option<R>> {
     let (tx, mut rx) = mpsc::channel(buffer);
-    let producer = crate::spawn_blocking(move || {
-        // The error, if any, is forwarded as the final channel item.
-        if let Err(err) = work(&tx) {
-            let _ = tx.blocking_send(Err(err));
-        }
-    });
+    let producer = crate::spawn_blocking(move || work(&tx));
 
-    // A producer error ends the relay; it is always the producer's last
-    // item, so not draining further cannot block it.
-    let mut failed = None;
+    // The channel closes once the producer returned, whatever it returned.
     while let Some(frame) = rx.recv().await {
-        match frame {
-            Ok(frame) => {
-                on_frame(&frame);
-                write_message(send, &frame, T::MAX_SIZE).await?;
-            }
-            Err(err) => {
-                failed = Some(err);
-                break;
-            }
-        }
+        write_message(send, &frame, T::MAX_SIZE).await?;
     }
-    producer.await.context("phase producer task failed")?;
-
-    let (last, ok) = match failed {
-        Some(err) => (T::error(format!("{err_context}: {err:#}")), false),
-        None => (T::done(), true),
+    let (last, value) = match producer.await.context("phase producer task failed")? {
+        Ok(value) => (T::done(), Some(value)),
+        Err(err) => (T::error(format!("{err_context}: {err:#}")), None),
     };
     write_message(send, &last, T::MAX_SIZE).await?;
-    Ok(ok)
+    Ok(value)
 }
 
 /// Sends one frame from a producer, failing once the relay side is gone.
-fn produce<T>(tx: &mpsc::Sender<Result<T>>, frame: T) -> Result<()> {
-    tx.blocking_send(Ok(frame))
+fn produce<T>(tx: &mpsc::Sender<T>, frame: T) -> Result<()> {
+    tx.blocking_send(frame)
         .map_err(|_| anyhow!("fetcher went away"))
 }
 
 /// Walks the object closure of the wanted commits, minus what the fetcher
-/// holds, and emits every object's id once.
+/// holds, listing every object's id once.
 ///
 /// The fetcher holds the full closure of each have (our own emit order
 /// guarantees a stored commit implies its trees and ancestry), so the
@@ -344,24 +302,21 @@ fn produce<T>(tx: &mpsc::Sender<Result<T>>, frame: T) -> Result<()> {
 /// its other versions (same change id, as a snapshot, describe or rebase
 /// leaves), so mostly only the paths the commit changed are read and sent.
 ///
-/// Only ids are emitted: blob contents are never loaded here, and each
+/// Only ids are listed: blob contents are never loaded here, and each
 /// format reads what it needs (the loose server per object, the pack
 /// pipeline itself).
 pub(super) fn walk_git_closure(
     repo: &OpenRepo,
-    request: &GitRequest,
-    mut emit: impl FnMut(gix::ObjectId, WireObjectKind) -> Result<()>,
-) -> Result<()> {
-    let ids =
-        |ids: &[Vec<u8>]| -> Vec<CommitId> { ids.iter().cloned().map(CommitId::new).collect() };
-    let (haves, wants) = (ids(&request.haves), ids(&request.wants));
+    haves: &[CommitId],
+    wants: &[CommitId],
+) -> Result<Vec<(gix::ObjectId, WireObjectKind)>> {
     let heads = repo
         .op_heads()
         .block_on()?
         .iter()
         .map(|id| repo.load_operation(id).block_on())
         .collect::<Result<Vec<_>>>()?;
-    let commits = repo.commit_range(&heads, &haves, &wants)?;
+    let commits = repo.commit_range(&heads, haves, wants)?;
 
     let git = repo.git_backend().git_repo();
     // The trees of each change's versions the fetcher holds or received.
@@ -380,6 +335,7 @@ pub(super) fn walk_git_closure(
     // commit implies its trees and ancestry are stored", which the
     // fetcher's missing-commit check relies on when retrying.
     let mut seen: HashSet<gix::ObjectId> = HashSet::new();
+    let mut objects = Vec::new();
     // jj's virtual root commit is in the index, not in git.
     for commit in commits.iter().filter(|commit| !repo.is_root_commit(commit)) {
         let id = to_gix_id(commit)?;
@@ -405,13 +361,13 @@ pub(super) fn walk_git_closure(
                 bases.push(base);
             }
         }
-        walk_tree(&git, commit.tree, &bases, &mut seen, &mut emit)?;
-        emit(id, WireObjectKind::Commit)?;
+        walk_tree(&git, commit.tree, &bases, &mut seen, &mut objects)?;
+        objects.push((id, WireObjectKind::Commit));
         if let Some(change) = commit.change {
             versions.entry(change).or_default().push(commit.tree);
         }
     }
-    Ok(())
+    Ok(objects)
 }
 
 /// Bases a tree is compared against at most: an octopus merge must not
@@ -443,14 +399,14 @@ impl Commit {
     }
 }
 
-/// Emits a tree and its transitive entries, skipping those equal to the
-/// entry at the same path in one of `bases`, and those already emitted.
+/// Lists a tree and its transitive entries, skipping those equal to the
+/// entry at the same path in one of `bases`, and those already listed.
 fn walk_tree(
     git: &gix::Repository,
     root: gix::ObjectId,
     bases: &[gix::ObjectId],
     seen: &mut HashSet<gix::ObjectId>,
-    emit: &mut impl FnMut(gix::ObjectId, WireObjectKind) -> Result<()>,
+    objects: &mut Vec<(gix::ObjectId, WireObjectKind)>,
 ) -> Result<()> {
     if bases.contains(&root) {
         return Ok(());
@@ -498,11 +454,11 @@ fn walk_tree(
                 };
                 stack.push((entry.oid.to_owned(), next));
             } else if seen.insert(entry.oid.to_owned()) {
-                // Blobs are leaves: emitted without ever being loaded.
-                emit(entry.oid.to_owned(), WireObjectKind::Blob)?;
+                // Blobs are leaves: listed without ever being loaded.
+                objects.push((entry.oid.to_owned(), WireObjectKind::Blob));
             }
         }
-        emit(id, WireObjectKind::Tree)?;
+        objects.push((id, WireObjectKind::Tree));
     }
     Ok(())
 }

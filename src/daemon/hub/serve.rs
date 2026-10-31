@@ -16,10 +16,7 @@ use tracing::debug;
 
 use super::SyncHub;
 use crate::{
-    net::{
-        fetch::{FetchRequest, OpFrame},
-        wire,
-    },
+    net::fetch::FetchRequest,
     repo::{OpenRepo, transfer},
 };
 
@@ -100,10 +97,7 @@ impl SyncHub {
 /// Refuses a fetch on a detached task, telling the peer why before closing.
 fn refuse_fetch(mut send: SendStream, message: &'static str) {
     tokio::spawn(async move {
-        let frame = OpFrame::Error {
-            message: message.to_owned(),
-        };
-        let _ = wire::write_message(&mut send, &frame, wire::MAX_FRAME_SIZE).await;
+        let _ = transfer::refuse(&mut send, message.to_owned()).await;
         let _ = send.finish();
     });
 }

@@ -2,46 +2,34 @@
 //! fetching side:
 //!
 //! ```text
-//! fetcher                                     server
-//!    |  FetchRequest { wants, haves }           |
-//!    |----------------------------------------->|
-//!    |  OpFrame: Begin, (View | Op)*, Done      |
-//!    |<-----------------------------------------|
-//!    |  GitRequest { wants, haves, format }     |
-//!    |----------------------------------------->|
-//!    |  GitFrame: (Object* | Pack chunk*), Done |
-//!    |<-----------------------------------------|
+//! fetcher                                             server
+//!    |  FetchRequest { wants, haves }                      |
+//!    |---------------------------------------------------->|
+//!    |  OpFrame: Begin, (View | Op)*, Done | Error          |
+//!    |<----------------------------------------------------|
+//!    |  GitRequest { wants, haves, format }                |
+//!    |---------------------------------------------------->|
+//!    |  GitFrame: [Begin, (Object* | Pack*)], Done | Error  |
+//!    |<----------------------------------------------------|
 //! ```
 //!
-//! Op, view and loose git object payloads travel zstd-compressed (see
-//! [`compress_payload`]); QUIC does not compress, and proto bytes and git
+//! Op and view payloads travel as one zstd stream per op phase (see
+//! [`PhaseCompressor`]), loose git objects zstd-compressed one by one (see
+//! [`compress_object`]); QUIC does not compress, and proto bytes and git
 //! objects shrink well. Pack chunks are already zlib-compressed and travel
 //! as-is.
+
+use std::io::Write as _;
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
 use crate::config::RepoId;
 
-/// Git object frames are bounded only by the wire's `u32` length prefix:
-/// a frame carries a whole blob. Other frames use
+/// Git object and pack frames are bounded only by the wire's `u32` length
+/// prefix: a loose object frame carries a whole blob. Other frames use
 /// [`super::wire::MAX_FRAME_SIZE`].
 pub const MAX_GIT_FRAME_SIZE: u32 = u32::MAX;
-
-/// Compresses a wire payload (op, view or loose git object bytes).
-pub fn compress_payload(bytes: &[u8]) -> Result<Vec<u8>> {
-    // One-shot rather than streaming: the payload length is known, so zstd
-    // sizes its context to the input instead of allocating a full
-    // streaming workspace per call (payloads are mostly a few hundred
-    // bytes, and a clone compresses one per op and view). Level 0 selects
-    // zstd's default (3), a good size/speed balance.
-    Ok(zstd::bulk::compress(bytes, 0)?)
-}
-
-/// Decompresses a wire payload.
-pub fn decompress_payload(bytes: &[u8]) -> Result<Vec<u8>> {
-    Ok(zstd::stream::decode_all(bytes)?)
-}
 
 /// Opens a fetch: the op heads to obtain and a sample of ops the fetcher
 /// already has (its heads plus exponentially spaced ancestors), bounding
@@ -60,19 +48,26 @@ pub struct FetchRequest {
 /// re-encoding them is impossible). The receiver validates the bytes
 /// structurally (`repo`'s codec) before storing them.
 ///
-/// The proto bytes travel zstd-compressed; compression is a wire concern
-/// and the stored bytes stay verbatim.
+/// The proto bytes travel compressed (see [`PhaseCompressor`]);
+/// compression is a wire concern and the stored bytes stay verbatim.
 #[derive(Debug, Serialize, Deserialize)]
 pub enum OpFrame {
     /// Announces the exact number of op and view frames of the phase,
     /// sent before any of them; the fetcher refuses frames past it.
     Begin { ops: u64, views: u64 },
-    /// A view's raw proto bytes (compressed), sent before any op
-    /// referencing it.
-    View { id: Vec<u8>, view: Vec<u8> },
-    /// An operation's raw proto bytes (compressed); its parents (when sent
-    /// at all) were sent before it.
-    Op { id: Vec<u8>, op: Vec<u8> },
+    /// A view's raw proto bytes, sent before any op referencing it.
+    View {
+        id: Vec<u8>,
+        #[serde(with = "serde_bytes")]
+        view: Vec<u8>,
+    },
+    /// An operation's raw proto bytes; its parents (when sent at all) were
+    /// sent before it.
+    Op {
+        id: Vec<u8>,
+        #[serde(with = "serde_bytes")]
+        op: Vec<u8>,
+    },
     /// End of the op phase.
     Done,
     /// The server cannot serve this fetch.
@@ -84,7 +79,7 @@ pub enum OpFrame {
 pub struct GitRequest {
     pub wants: Vec<Vec<u8>>,
     pub haves: Vec<Vec<u8>>,
-    /// How the server should send the objects.
+    /// The format the fetcher asks for.
     pub format: GitTransferFormat,
 }
 
@@ -94,7 +89,8 @@ pub struct GitRequest {
 /// syncs, whose few objects exist only loose on the server anyway. Pack
 /// streams one packfile, letting the server reuse the deltas of its
 /// on-disk packs and the fetcher index the objects into a single pack
-/// instead of thousands of loose files; clones request it.
+/// instead of thousands of loose files. Clones ask for it, and servers
+/// switch large loose transfers to it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GitTransferFormat {
     Loose,
@@ -104,17 +100,27 @@ pub enum GitTransferFormat {
 /// Server-to-fetcher frame of the git phase.
 #[derive(Debug, Serialize, Deserialize)]
 pub enum GitFrame {
+    /// Announces the format and the exact object count of the phase, sent
+    /// before any object. Omitted when there is nothing to send.
+    Begin {
+        format: GitTransferFormat,
+        objects: u64,
+    },
     /// One raw git object, zstd-compressed; `id` is verified against the
     /// decompressed data on receipt. Only sent in the loose format.
     Object {
         id: Vec<u8>,
         kind: WireObjectKind,
+        #[serde(with = "serde_bytes")]
         data: Vec<u8>,
     },
     /// One chunk of the packfile stream. Only sent in the pack format; the
     /// pack's own trailer checksum and the per-object hashing done while
     /// indexing verify the content.
-    Pack { chunk: Vec<u8> },
+    Pack {
+        #[serde(with = "serde_bytes")]
+        chunk: Vec<u8>,
+    },
     /// End of the git phase.
     Done,
     /// The server cannot serve the git phase.
@@ -128,4 +134,78 @@ pub enum WireObjectKind {
     Tree,
     Blob,
     Tag,
+}
+
+/// Compresses a loose git object.
+pub fn compress_object(bytes: &[u8]) -> Result<Vec<u8>> {
+    // One-shot rather than streaming: the payload length is known, so zstd
+    // sizes its context to the input instead of allocating a full
+    // streaming workspace per call. Level 0 selects zstd's default (3), a
+    // good size/speed balance.
+    Ok(zstd::bulk::compress(bytes, 0)?)
+}
+
+/// Decompresses a loose git object.
+pub fn decompress_object(bytes: &[u8]) -> Result<Vec<u8>> {
+    Ok(zstd::stream::decode_all(bytes)?)
+}
+
+/// Window of a phase's zstd stream, bounding the decoder's memory. Covers
+/// dozens of views, which mostly repeat their predecessors.
+const PHASE_WINDOW_LOG: u32 = 22;
+
+/// Compresses the payloads of an op phase as a single zstd stream, each
+/// flushed into its own block: later payloads reference earlier ones.
+pub struct PhaseCompressor(zstd::stream::write::Encoder<'static, Vec<u8>>);
+
+impl PhaseCompressor {
+    /// A compressor for a new phase.
+    pub fn new() -> Result<Self> {
+        let mut encoder = zstd::stream::write::Encoder::new(Vec::new(), 0)?;
+        encoder.window_log(PHASE_WINDOW_LOG)?;
+        Ok(PhaseCompressor(encoder))
+    }
+
+    /// Compresses the next payload of the phase.
+    pub fn compress(&mut self, bytes: &[u8]) -> Result<Vec<u8>> {
+        self.0.write_all(bytes)?;
+        self.0.flush()?;
+        Ok(std::mem::take(self.0.get_mut()))
+    }
+}
+
+/// Decompresses the payloads of a [`PhaseCompressor`], in order.
+pub struct PhaseDecompressor(zstd::stream::write::Decoder<'static, Vec<u8>>);
+
+impl PhaseDecompressor {
+    /// A decompressor for a new phase.
+    pub fn new() -> Result<Self> {
+        let mut decoder = zstd::stream::write::Decoder::new(Vec::new())?;
+        decoder.window_log_max(PHASE_WINDOW_LOG)?;
+        Ok(PhaseDecompressor(decoder))
+    }
+
+    /// Decompresses the next payload of the phase.
+    pub fn decompress(&mut self, bytes: &[u8]) -> Result<Vec<u8>> {
+        self.0.write_all(bytes)?;
+        self.0.flush()?;
+        Ok(std::mem::take(self.0.get_mut()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// A phase stream decodes payload by payload, and compresses repeats
+    /// against earlier payloads.
+    #[test]
+    fn phase_streams_roundtrip() {
+        let mut compressor = super::PhaseCompressor::new().unwrap();
+        let mut decompressor = super::PhaseDecompressor::new().unwrap();
+        let view: Vec<u8> = (0..64 << 10).map(|_| rand::random()).collect();
+        let first = compressor.compress(&view).unwrap();
+        let repeat = compressor.compress(&view).unwrap();
+        assert!(repeat.len() < first.len() / 100, "repeat not compressed");
+        assert_eq!(decompressor.decompress(&first).unwrap(), view);
+        assert_eq!(decompressor.decompress(&repeat).unwrap(), view);
+    }
 }

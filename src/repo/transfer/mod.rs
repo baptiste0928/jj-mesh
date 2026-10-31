@@ -47,7 +47,7 @@ use std::collections::HashMap;
 use jj_lib::op_store::{OperationId, ViewId};
 
 pub use fetch::fetch;
-pub use serve::serve;
+pub use serve::{refuse, serve};
 
 use super::{
     codec::{OpMeta, ViewMeta},
@@ -86,9 +86,7 @@ pub struct TransferProgress {
     /// [`Apply`]: TransferPhase::Apply
     /// [`Index`]: TransferPhase::Index
     pub current: u64,
-    /// Exact end of the phase, `None` until known: announced by the peer
-    /// for the op phase, read from the pack header for the git phase
-    /// (never known in the loose format).
+    /// Exact end of the phase, `None` until the peer announced it.
     pub total: Option<u64>,
     /// Wire (compressed) payload bytes received so far in the phase.
     pub bytes: u64,

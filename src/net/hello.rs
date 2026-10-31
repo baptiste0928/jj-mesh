@@ -6,10 +6,9 @@
 //! connection and report the peer's hello, so the user learns which machine
 //! to update.
 //!
-//! The hello is the only frozen part of the wire format: the protocol
-//! number is bumped for any other change. ALPNs change only with the hello
-//! itself, and a daemon then keeps serving the previous ALPNs with nothing
-//! but its hello, so outdated machines are still told to update.
+//! The hello is the only frozen part of the wire format. Changing it takes
+//! new ALPNs, and daemons must then keep serving the previous ones with the
+//! old hello alone, so outdated machines are still told to update.
 
 use std::{fmt, time::Duration};
 

@@ -2850,6 +2850,7 @@ dependencies = [
  "prost",
  "rand 0.10.3",
  "serde",
+ "serde_bytes",
  "serde_json",
  "shell-words",
  "subtle",

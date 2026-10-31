@@ -22,7 +22,7 @@ use crate::{
     net::{
         fetch::{
             FetchRequest, GitFrame, GitRequest, GitTransferFormat, MAX_GIT_FRAME_SIZE, OpFrame,
-            WireObjectKind, decompress_payload,
+            PhaseDecompressor, WireObjectKind, decompress_object,
         },
         wire::{MAX_FRAME_SIZE, read_message, write_message},
     },
@@ -51,10 +51,10 @@ const MAX_GIT_HAVES: usize = 4096;
 const INGEST_SAMPLE_INTERVAL: Duration = Duration::from_millis(200);
 
 /// Fetches the given op heads from a peer over the stream pair and applies
-/// them locally in crash-safe order. `options.format` picks how git
-/// objects travel (clones request a pack, incremental syncs stay loose,
-/// see [`GitTransferFormat`]); `progress` receives live counters as the
-/// phases advance.
+/// them locally in crash-safe order. `options.format` asks how git objects
+/// travel (clones ask for a pack, incremental syncs for loose objects, see
+/// [`GitTransferFormat`]); `progress` receives live counters as the phases
+/// advance.
 ///
 /// `options.net_timeout` sets one deadline for all network-facing work
 /// (the request writes, the op frames, the git object or pack streaming)
@@ -96,17 +96,10 @@ pub async fn fetch(
             .await
             .context("git check task failed")??
     };
-    // A pack of nothing is not a valid transfer; an empty want set falls
-    // back to the loose exchange, which the server answers with `Done`.
-    let format = if missing.is_empty() {
-        GitTransferFormat::Loose
-    } else {
-        options.format
-    };
     let git_request = GitRequest {
         wants: missing.iter().map(|id| id.as_bytes().to_vec()).collect(),
         haves: git_haves.iter().map(|id| id.as_bytes().to_vec()).collect(),
-        format,
+        format: options.format,
     };
     bounded(
         deadline,
@@ -117,16 +110,7 @@ pub async fn fetch(
     // The keep guard holds a received pack against git GC until the stage
     // writes the keep refs that take over; it is released below, and on any
     // early return or abandoned fetch by its own drop.
-    let (git_objects, pack_keep) = match format {
-        GitTransferFormat::Loose => {
-            let objects = bounded(deadline, "git", receive_git_loose(repo, recv, progress)).await?;
-            (objects, None)
-        }
-        GitTransferFormat::Pack => {
-            let (objects, keep) = receive_git_pack(repo, deadline, recv, progress).await?;
-            (objects, Some(keep))
-        }
-    };
+    let (git_objects, pack_keep) = receive_git(repo, deadline, recv, progress).await?;
 
     ensure_git_wants_arrived(repo, missing).await?;
 
@@ -251,6 +235,8 @@ async fn receive_ops(
     let mut counters = TransferProgress::start(TransferPhase::Ops);
     progress.report(counters);
 
+    let mut decompressor = PhaseDecompressor::new()?;
+
     loop {
         match read_message(recv, MAX_FRAME_SIZE).await? {
             OpFrame::Begin {
@@ -267,10 +253,9 @@ async fn receive_ops(
                 progress.report(counters);
                 ensure!(id.len() == id_len, "bad view id length ({})", id.len());
                 let id = ViewId::new(id);
-                let view =
-                    decompress_payload(&view).with_context(|| format!("view {}", id.hex()))?;
-                let meta =
-                    codec::parse_view(&view).with_context(|| format!("view {}", id.hex()))?;
+                let context = || format!("view {}", id.hex());
+                let view = decompressor.decompress(&view).with_context(context)?;
+                let meta = codec::parse_view(&view).with_context(context)?;
                 if view_ids.insert(id.clone()) {
                     views.push(StoredView {
                         id,
@@ -289,9 +274,9 @@ async fn receive_ops(
                     id != *repo.root_operation_id(),
                     "peer sent an op claiming the root id",
                 );
-                let op = decompress_payload(&op).with_context(|| format!("op {}", id.hex()))?;
-                let meta =
-                    codec::parse_operation(&op).with_context(|| format!("op {}", id.hex()))?;
+                let context = || format!("op {}", id.hex());
+                let op = decompressor.decompress(&op).with_context(context)?;
+                let meta = codec::parse_operation(&op).with_context(context)?;
                 ensure!(!op_ids.contains(&id), "op {} sent twice", id.hex());
                 for parent in &meta.parents {
                     ensure!(
@@ -403,20 +388,56 @@ fn referenced_commits(batch: &OpBatch) -> Vec<CommitId> {
     ids.into_iter().collect()
 }
 
+/// Receives the git phase in the format the server announces. Returns how
+/// many objects the peer sent, and the `.keep` file protecting a received
+/// pack.
+async fn receive_git(
+    repo: &Arc<OpenRepo>,
+    deadline: tokio::time::Instant,
+    recv: &mut (impl AsyncRead + Unpin),
+    progress: ProgressSink<'_>,
+) -> Result<(usize, Option<pack::PackKeep>)> {
+    let first = bounded(deadline, "git", read_message(recv, MAX_GIT_FRAME_SIZE)).await?;
+    let (format, objects) = match first {
+        GitFrame::Begin { format, objects } => (format, objects),
+        GitFrame::Done => return Ok((0, None)),
+        GitFrame::Error { message } => {
+            bail!("peer failed git phase: {}", sanitize(&message))
+        }
+        GitFrame::Object { .. } | GitFrame::Pack { .. } => bail!("peer sent objects before Begin"),
+    };
+    let mut counters = TransferProgress::start(TransferPhase::Git);
+    counters.total = Some(objects);
+    progress.report(counters);
+    match format {
+        GitTransferFormat::Loose => {
+            let received = bounded(
+                deadline,
+                "git",
+                receive_git_loose(repo, recv, counters, progress),
+            )
+            .await?;
+            Ok((received, None))
+        }
+        GitTransferFormat::Pack => {
+            let (received, keep) =
+                receive_git_pack(repo, deadline, recv, counters, progress).await?;
+            Ok((received, Some(keep)))
+        }
+    }
+}
+
 /// Receives the git phase, decompressing and hash-verifying every object
 /// and writing them loose in chunks. Returns how many objects the peer
 /// sent.
 async fn receive_git_loose(
     repo: &Arc<OpenRepo>,
     recv: &mut (impl AsyncRead + Unpin),
+    mut counters: TransferProgress,
     progress: ProgressSink<'_>,
 ) -> Result<usize> {
     let mut chunk: Vec<(gix::ObjectId, gix::object::Kind, Vec<u8>)> = Vec::new();
     let mut chunk_bytes = 0usize;
-    let mut total = 0usize;
-
-    let mut counters = TransferProgress::start(TransferPhase::Git);
-    progress.report(counters);
 
     // The previous chunk writes to disk while the next one streams in;
     // awaiting it only when the next chunk is full keeps the network and
@@ -427,7 +448,7 @@ async fn receive_git_loose(
     loop {
         match read_message(recv, MAX_GIT_FRAME_SIZE).await? {
             GitFrame::Object { id, kind, data } => {
-                counters.current += 1;
+                count_frame(&mut counters)?;
                 counters.bytes += data.len() as u64;
                 progress.report(counters);
                 let id = gix::ObjectId::try_from(id.as_slice())
@@ -435,7 +456,6 @@ async fn receive_git_loose(
                 let kind = to_gix_kind(kind);
                 chunk_bytes += data.len();
                 chunk.push((id, kind, data));
-                total += 1;
                 if chunk.len() >= GIT_WRITE_CHUNK || chunk_bytes >= GIT_WRITE_BYTES {
                     if let Some(write) = pending.take() {
                         write.await.context("git write task failed")??;
@@ -451,8 +471,9 @@ async fn receive_git_loose(
                 write_git_chunk(repo, chunk)
                     .await
                     .context("git write task failed")??;
-                return Ok(total);
+                return Ok(usize::try_from(counters.current)?);
             }
+            GitFrame::Begin { .. } => bail!("peer sent Begin twice"),
             GitFrame::Pack { .. } => bail!("peer sent a pack chunk in a loose transfer"),
             GitFrame::Error { message } => {
                 bail!("peer failed git phase: {}", sanitize(&message))
@@ -470,19 +491,16 @@ async fn receive_git_loose(
 /// delta resolution left once the stream ends is local work, and timing it
 /// out would throw away a fully received pack.
 ///
-/// Progress: the phase total is read off the pack header (its exact object
-/// count), `current` tracks the ingest's objects-indexed counter, sampled
-/// on every received chunk and, once the stream ends, on a timer while
-/// the ingest finishes resolving.
+/// Progress: `current` tracks the ingest's objects-indexed counter,
+/// sampled on every received chunk and, once the stream ends, on a timer
+/// while the ingest finishes resolving.
 async fn receive_git_pack(
     repo: &Arc<OpenRepo>,
     deadline: tokio::time::Instant,
     recv: &mut (impl AsyncRead + Unpin),
+    mut counters: TransferProgress,
     progress: ProgressSink<'_>,
 ) -> Result<(usize, pack::PackKeep)> {
-    let mut counters = TransferProgress::start(TransferPhase::Git);
-    progress.report(counters);
-
     let indexed = pack::SharedObjectCount::default();
     let (tx, rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
     let mut ingest = {
@@ -498,18 +516,6 @@ async fn receive_git_pack(
         loop {
             match read_message(recv, MAX_GIT_FRAME_SIZE).await? {
                 GitFrame::Pack { chunk } => {
-                    // The first chunk starts with the pack header, whose
-                    // object count is the exact phase total. Display only:
-                    // the ingest decodes and enforces the header itself.
-                    if counters.bytes == 0 && chunk.len() >= 12 {
-                        let mut header = [0u8; 12];
-                        header.copy_from_slice(&chunk[..12]);
-                        if let Ok((_version, objects)) =
-                            gix::odb::pack::data::header::decode(&header)
-                        {
-                            counters.total = Some(u64::from(objects));
-                        }
-                    }
                     counters.bytes += chunk.len() as u64;
                     counters.current = indexed.get();
                     progress.report(counters);
@@ -526,6 +532,7 @@ async fn receive_git_pack(
                         sanitize(&message)
                     )));
                 }
+                GitFrame::Begin { .. } => break Ok(Some("peer sent Begin twice".to_owned())),
                 GitFrame::Object { .. } => {
                     break Ok(Some(
                         "peer sent a loose object in a pack transfer".to_owned(),
@@ -577,7 +584,7 @@ fn write_git_chunk(
         let git = repo.git_backend().git_repo();
         let hash_kind = git.object_hash();
         for (id, kind, data) in chunk {
-            let data = decompress_payload(&data).with_context(|| format!("object {id}"))?;
+            let data = decompress_object(&data).with_context(|| format!("object {id}"))?;
             let computed = gix::objs::compute_hash(hash_kind, kind, &data)
                 .map_err(|err| anyhow!("cannot hash object: {err}"))?;
             ensure!(

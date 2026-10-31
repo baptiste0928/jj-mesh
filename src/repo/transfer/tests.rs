@@ -9,13 +9,16 @@ use std::{
     sync::Arc,
 };
 
-use jj_lib::object_id::ObjectId as _;
+use jj_lib::{backend::CommitId, object_id::ObjectId as _};
 
 use super::*;
 use crate::{
     config::ObjectHash,
     net::{
-        fetch::{FetchRequest, GitFrame, GitRequest, MAX_GIT_FRAME_SIZE, OpFrame, WireObjectKind},
+        fetch::{
+            FetchRequest, GitFrame, GitRequest, MAX_GIT_FRAME_SIZE, OpFrame, PhaseCompressor,
+            WireObjectKind,
+        },
         wire::{MAX_FRAME_SIZE, read_message, write_message},
     },
     repo::OpenRepo,
@@ -215,6 +218,69 @@ async fn sync_with_local_commits_transfers_only_new_objects() {
     let (ra, rb) = (open(&a), open(&b));
     let wants = ra.op_heads().await.unwrap();
     sync_exact(&rb, &ra, &wants, GitTransferFormat::Loose).await;
+}
+
+/// Histories that diverged long ago, both rewriting the same commit,
+/// still transfer only what the fetcher lacks: commits it holds hidden
+/// are neither resent nor lost as bases.
+#[tokio::test]
+async fn sync_after_divergence_transfers_only_new_objects() {
+    let fx = Fixture::new();
+    let a = fx.init_repo("a");
+    for n in 0..5 {
+        fx.commit_file(&a, &format!("file{n}.txt"), &format!("commit {n}"));
+    }
+    let b = fx.path().join("b");
+    fork(&a, &b);
+    fx.jj(&b, &["describe", "-r", "@-", "-m", "from b"]);
+    for n in 0..20 {
+        fx.commit_file(&b, &format!("b{n}.txt"), &format!("b {n}"));
+    }
+    fs::write(a.join("file4.txt"), "edited\n").unwrap();
+    fx.jj(&a, &["status"]);
+    fx.jj(&a, &["describe", "-r", "@-", "-m", "from a"]);
+
+    let (ra, rb) = (open(&a), open(&b));
+    let wants = ra.op_heads().await.unwrap();
+    sync_exact(&rb, &ra, &wants, GitTransferFormat::Loose).await;
+}
+
+/// An incremental sync past the pack threshold lands as one pack in the
+/// live repo, complete, and leaves no keep file behind once applied.
+#[tokio::test]
+async fn large_incremental_sync_switches_to_a_pack() {
+    let fx = Fixture::new();
+    let a = fx.init_repo("a");
+    fx.commit_file(&a, "base.txt", "base");
+    let b = fx.path().join("b");
+    fork(&a, &b);
+    for dir in 0..16 {
+        fs::create_dir(a.join(format!("dir{dir}"))).unwrap();
+        for file in 0..serve::PACK_MIN_OBJECTS / 16 {
+            fs::write(
+                a.join(format!("dir{dir}/{file}.txt")),
+                format!("{dir} {file}\n"),
+            )
+            .unwrap();
+        }
+    }
+    fx.jj(&a, &["commit", "-m", "many files"]);
+
+    let (ra, rb) = (open(&a), open(&b));
+    let pack_dir = rb.git_backend().git_repo().path().join("objects/pack");
+    let count = |ext: &str| {
+        let ext = Some(std::ffi::OsStr::new(ext));
+        let entries = fs::read_dir(&pack_dir).unwrap();
+        entries
+            .filter(|e| e.as_ref().unwrap().path().extension() == ext)
+            .count()
+    };
+    let packs = count("pack");
+    let wants = ra.op_heads().await.unwrap();
+    let outcome = sync_exact(&rb, &ra, &wants, GitTransferFormat::Loose).await;
+    assert!(outcome.git_objects >= serve::PACK_MIN_OBJECTS);
+    assert_eq!(count("pack"), packs + 1);
+    assert_eq!(count("keep"), 0);
 }
 
 /// The closure is emitted parents first, each commit after its whole
@@ -431,12 +497,10 @@ async fn closure_refuses_wants_outside_the_op_log() {
     let tree = git_output(&git_dir, &["hash-object", "-t", "tree", "-w", "/dev/null"]);
     let stray = git_output(&git_dir, &["commit-tree", &tree, "-m", "stray"]);
 
-    let request = GitRequest {
-        wants: vec![data_encoding::HEXLOWER.decode(stray.as_bytes()).unwrap()],
-        haves: Vec::new(),
-        format: GitTransferFormat::Loose,
-    };
-    let err = serve::walk_git_closure(&ra, &request, |_, _| Ok(())).unwrap_err();
+    let wants = [CommitId::new(
+        data_encoding::HEXLOWER.decode(stray.as_bytes()).unwrap(),
+    )];
+    let err = serve::walk_git_closure(&ra, &[], &wants).unwrap_err();
     assert!(
         format!("{err:#}").contains("not in the operation log"),
         "{err:#}"
@@ -655,7 +719,7 @@ async fn rejects_fetch_when_referenced_git_objects_are_missing() {
     let server = tokio::spawn(async move {
         use prost::Message as _;
 
-        use crate::net::fetch::compress_payload;
+        let mut compressor = PhaseCompressor::new().unwrap();
         let _request: FetchRequest = read_message(&mut server_rx, MAX_FRAME_SIZE).await.unwrap();
         // A view whose head names a commit the git phase never delivers.
         let view = jj_lib::protos::simple_op_store::View {
@@ -679,11 +743,11 @@ async fn rejects_fetch_when_referenced_git_objects_are_missing() {
             OpFrame::Begin { ops: 1, views: 1 },
             OpFrame::View {
                 id: vec![9; 64],
-                view: compress_payload(&view).unwrap(),
+                view: compressor.compress(&view).unwrap(),
             },
             OpFrame::Op {
                 id: vec![1; 64],
-                op: compress_payload(&op).unwrap(),
+                op: compressor.compress(&op).unwrap(),
             },
             OpFrame::Done,
         ];
@@ -889,8 +953,8 @@ async fn ancestor_rewrite_syncs_without_divergence() {
 }
 
 /// A pack-format fetch with a progress sink must report the phases in
-/// order with exact totals: the op counts the server announced, and
-/// the git object count read from the pack header, both fully reached.
+/// order with exact totals: the op and git object counts the server
+/// announced, both fully reached.
 /// The clone scenario is the one the progress display exists for.
 #[tokio::test]
 async fn progress_reports_phases_and_exact_totals() {
@@ -960,8 +1024,8 @@ async fn progress_reports_phases_and_exact_totals() {
     assert!(last_ops.current >= outcome.ops as u64);
     assert!(last_ops.bytes > 0);
 
-    // Git phase: the total comes off the pack header on the first
-    // chunk, and the indexed count reaches it once the pack landed.
+    // Git phase: the total comes with the phase's Begin, and the indexed
+    // count reaches it once the pack landed.
     let git: Vec<&TransferProgress> = samples
         .iter()
         .filter(|p| p.phase == TransferPhase::Git)
@@ -1424,16 +1488,7 @@ fn closure(
     wants: &[Vec<u8>],
     haves: &[Vec<u8>],
 ) -> Vec<(gix::ObjectId, WireObjectKind)> {
-    let request = GitRequest {
-        wants: wants.to_vec(),
-        haves: haves.to_vec(),
-        format: GitTransferFormat::Loose,
-    };
-    let mut emitted = Vec::new();
-    serve::walk_git_closure(repo, &request, |id, kind| {
-        emitted.push((id, kind));
-        Ok(())
-    })
-    .unwrap();
-    emitted
+    let ids =
+        |ids: &[Vec<u8>]| -> Vec<CommitId> { ids.iter().cloned().map(CommitId::new).collect() };
+    serve::walk_git_closure(repo, &ids(haves), &ids(wants)).unwrap()
 }
