@@ -7,6 +7,7 @@
 mod endpoint;
 pub(crate) mod fetch;
 pub(crate) mod hello;
+pub(crate) mod idle;
 pub(crate) mod pair;
 pub(crate) mod sync;
 pub(crate) mod wire;

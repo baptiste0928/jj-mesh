@@ -21,8 +21,8 @@ use tokio::{
 };
 
 use super::{
-    FetchOptions, FetchOutcome, OpBatch, ProgressSink, StoredOp, StoredView, TransferPhase,
-    TransferProgress, apply, pack, to_gix_id,
+    FetchOutcome, OpBatch, ProgressSink, StoredOp, StoredView, TransferPhase, TransferProgress,
+    apply, pack, to_gix_id,
 };
 use crate::{
     config::{RepoId, sanitize},
@@ -58,41 +58,30 @@ const MAX_GIT_HAVES: usize = 4096;
 const INGEST_SAMPLE_INTERVAL: Duration = Duration::from_millis(200);
 
 /// Fetches the given op heads from a peer over the stream pair and applies
-/// them locally in crash-safe order. `options.format` asks how git objects
-/// travel (clones ask for the store, incremental syncs for loose objects, see
+/// them locally in crash-safe order. `format` asks how git objects travel
+/// (clones ask for the store, incremental syncs for loose objects, see
 /// [`GitTransferFormat`]); `progress` receives live counters as the phases
-/// advance.
-///
-/// `options.net_timeout` sets one deadline for all network-facing work
-/// (the request writes, the op frames, the git object or pack streaming)
-/// so a stalled peer cannot pin the caller past it. Local work
-/// — pack delta resolution, the apply, the index build — runs unbounded,
-/// since timing it out after the transfer would only waste the received
-/// data.
+/// advance. Callers bound stalls on the streams (see [`crate::net::idle`]).
 pub async fn fetch(
     repo: &Arc<OpenRepo>,
     target: &RepoId,
     wants: &[OperationId],
-    options: FetchOptions,
+    format: GitTransferFormat,
     send: &mut (impl AsyncWrite + Unpin),
     recv: &mut (impl AsyncRead + Unpin),
     progress: ProgressSink<'_>,
 ) -> Result<FetchOutcome> {
     ensure!(!wants.is_empty(), "nothing to fetch");
-    let deadline = tokio::time::Instant::now() + options.net_timeout;
     let local_heads = repo.op_heads().await?;
     let haves = sample_haves(repo, &local_heads).await?;
 
-    let batch = bounded(deadline, "op", async {
-        let request = FetchRequest {
-            id: target.clone(),
-            wants: wants.iter().map(|id| id.as_bytes().to_vec()).collect(),
-            haves: haves.iter().map(|id| id.as_bytes().to_vec()).collect(),
-        };
-        write_message(send, &request, MAX_FRAME_SIZE).await?;
-        receive_ops(repo, wants, recv, progress).await
-    })
-    .await?;
+    let request = FetchRequest {
+        id: target.clone(),
+        wants: wants.iter().map(|id| id.as_bytes().to_vec()).collect(),
+        haves: haves.iter().map(|id| id.as_bytes().to_vec()).collect(),
+    };
+    write_message(send, &request, MAX_FRAME_SIZE).await?;
+    let batch = receive_ops(repo, wants, recv, progress).await?;
     let ops_received = batch.ops.len();
 
     let (missing, git_haves) = {
@@ -106,18 +95,13 @@ pub async fn fetch(
     let git_request = GitRequest {
         wants: missing.iter().map(|id| id.as_bytes().to_vec()).collect(),
         haves: git_haves.iter().map(|id| id.as_bytes().to_vec()).collect(),
-        format: options.format,
+        format,
     };
-    bounded(
-        deadline,
-        "git",
-        write_message(send, &git_request, MAX_FRAME_SIZE),
-    )
-    .await?;
+    write_message(send, &git_request, MAX_FRAME_SIZE).await?;
     // The keep guards hold received packs against git GC until the stage
     // writes the keep refs that take over; they are released below, and on
     // any early return or abandoned fetch by their own drop.
-    let (git_objects, pack_keeps) = receive_git(repo, deadline, recv, progress).await?;
+    let (git_objects, pack_keeps) = receive_git(repo, recv, progress).await?;
 
     ensure_git_wants_arrived(repo, missing).await?;
 
@@ -213,17 +197,6 @@ async fn ensure_git_wants_arrived(repo: &Arc<OpenRepo>, requested: Vec<CommitId>
     Ok(())
 }
 
-/// Runs one network-facing section under the fetch's shared deadline.
-async fn bounded<T>(
-    deadline: tokio::time::Instant,
-    phase: &str,
-    section: impl Future<Output = Result<T>>,
-) -> Result<T> {
-    tokio::time::timeout_at(deadline, section)
-        .await
-        .map_err(|_| anyhow!("{phase} phase timed out"))?
-}
-
 /// Receives and validates the op phase: every frame must decode as jj's
 /// proto schema, every op's parents and view must be part of the batch or
 /// already stored, and every want must be covered.
@@ -307,6 +280,7 @@ async fn receive_ops(
                     meta,
                 });
             }
+            OpFrame::Heartbeat => {}
             OpFrame::Done => {
                 for want in wants {
                     ensure!(
@@ -400,35 +374,31 @@ fn referenced_commits(batch: &OpBatch) -> Vec<CommitId> {
 /// received packs.
 async fn receive_git(
     repo: &Arc<OpenRepo>,
-    deadline: tokio::time::Instant,
     recv: &mut (impl AsyncRead + Unpin),
     progress: ProgressSink<'_>,
 ) -> Result<(usize, Vec<pack::PackKeep>)> {
-    let first = bounded(deadline, "git", read_message(recv, MAX_GIT_FRAME_SIZE)).await?;
-    let (format, objects) = match first {
-        GitFrame::Begin { format, objects } => (format, objects),
-        GitFrame::Done => return Ok((0, Vec::new())),
-        GitFrame::Error { message } => {
-            bail!("peer failed git phase: {}", sanitize(&message))
-        }
-        GitFrame::Object { .. } | GitFrame::Pack { .. } | GitFrame::NextPack => {
-            bail!("peer sent objects before Begin")
+    let (format, objects) = loop {
+        match read_message(recv, MAX_GIT_FRAME_SIZE).await? {
+            GitFrame::Begin { format, objects } => break (format, objects),
+            GitFrame::Heartbeat => {}
+            GitFrame::Done => return Ok((0, Vec::new())),
+            GitFrame::Error { message } => {
+                bail!("peer failed git phase: {}", sanitize(&message))
+            }
+            GitFrame::Object { .. } | GitFrame::Pack { .. } | GitFrame::NextPack => {
+                bail!("peer sent objects before Begin")
+            }
         }
     };
     let mut counters = TransferProgress::start(TransferPhase::Git);
     counters.total = Some(objects);
     progress.report(counters);
     if format == GitTransferFormat::Loose {
-        let received = bounded(
-            deadline,
-            "git",
-            receive_git_loose(repo, recv, counters, progress),
-        )
-        .await?;
+        let received = receive_git_loose(repo, recv, counters, progress).await?;
         return Ok((received, Vec::new()));
     }
     let store = format == GitTransferFormat::Store;
-    receive_git_packs(repo, deadline, recv, counters, progress, store).await
+    receive_git_packs(repo, recv, counters, progress, store).await
 }
 
 /// Receives the git phase, decompressing and hash-verifying every object
@@ -477,6 +447,7 @@ async fn receive_git_loose(
                     .context("git write task failed")??;
                 return Ok(usize::try_from(counters.current)?);
             }
+            GitFrame::Heartbeat => {}
             GitFrame::Begin { .. } => bail!("peer sent Begin twice"),
             GitFrame::Pack { .. } | GitFrame::NextPack => {
                 bail!("peer sent a pack chunk in a loose transfer")
@@ -496,17 +467,12 @@ async fn receive_git_loose(
 /// delta resolution only when two packs are already resolving. Returns how
 /// many objects the packs carried and the `.keep` files protecting them.
 ///
-/// Only the frame reads run under the fetch's network `deadline`: delta
-/// resolution is local work, and timing it out would throw away fully
-/// received packs.
-///
 /// Progress: `current` sums the ingests' indexed objects, then their
 /// resolved objects in the [`TransferPhase::Resolve`] that follows the last
 /// pack byte. It is sampled on every received chunk and on a timer while
 /// waiting on an ingest.
 async fn receive_git_packs(
     repo: &Arc<OpenRepo>,
-    deadline: tokio::time::Instant,
     recv: &mut (impl AsyncRead + Unpin),
     mut counters: TransferProgress,
     progress: ProgressSink<'_>,
@@ -517,7 +483,7 @@ async fn receive_git_packs(
     let mut outcomes: Vec<pack::IngestOutcome> = Vec::new();
     let mut tx = start_ingest(repo, &mut counts, &mut running);
     loop {
-        match bounded(deadline, "git", read_message(recv, MAX_GIT_FRAME_SIZE)).await? {
+        match read_message(recv, MAX_GIT_FRAME_SIZE).await? {
             GitFrame::Pack { chunk } => {
                 counters.bytes += chunk.len() as u64;
                 sample(&counts, &mut counters);
@@ -542,6 +508,7 @@ async fn receive_git_packs(
             GitFrame::Error { message } => {
                 bail!("peer failed git phase: {}", sanitize(&message))
             }
+            GitFrame::Heartbeat => {}
             GitFrame::Begin { .. } => bail!("peer sent Begin twice"),
             GitFrame::Object { .. } => bail!("peer sent a loose object in a pack transfer"),
         }

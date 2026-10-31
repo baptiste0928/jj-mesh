@@ -54,21 +54,12 @@ use super::{
     codec::{OpMeta, ViewMeta},
     open::to_gix_id,
 };
-use crate::net::fetch::GitTransferFormat;
 
 /// What a completed fetch did, for logging and status.
 #[derive(Debug)]
 pub struct FetchOutcome {
     pub ops: usize,
     pub git_objects: usize,
-}
-
-/// How a fetch runs: the git transfer format and the shared deadline for
-/// its network-facing work (local work runs unbounded, see [`fetch`]).
-#[derive(Clone, Copy)]
-pub struct FetchOptions {
-    pub format: GitTransferFormat,
-    pub net_timeout: std::time::Duration,
 }
 
 /// A snapshot of an in-flight fetch, for progress display. Serialized as

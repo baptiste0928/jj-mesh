@@ -14,18 +14,30 @@
 //!    |<-----------------------------------------------------------|
 //! ```
 //!
+//! A server with nothing to send yet, walking a large closure say, sends
+//! `Heartbeat` frames in either phase, so the fetcher's idle timeout only
+//! catches a stalled server.
+//!
 //! Op and view payloads travel as one zstd stream per op phase (see
 //! [`PhaseCompressor`]), loose git objects zstd-compressed one by one (see
 //! [`compress_object`]); QUIC does not compress, and proto bytes and git
 //! objects shrink well. Pack chunks are already zlib-compressed and travel
 //! as-is.
 
-use std::io::Write as _;
+use std::{io::Write as _, time::Duration};
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
 use crate::config::RepoId;
+
+/// How long a fetch stream may go without progress before either side
+/// gives up (see [`super::idle`]).
+pub const IDLE_TIMEOUT: Duration = Duration::from_mins(5);
+
+/// How long a server with nothing to send waits before sending a
+/// heartbeat, well within [`IDLE_TIMEOUT`].
+pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Git object and pack frames are bounded only by the wire's `u32` length
 /// prefix: a loose object frame carries a whole blob. Other frames use
@@ -73,6 +85,8 @@ pub enum OpFrame {
     Done,
     /// The server cannot serve this fetch.
     Error { message: String },
+    /// The server is still working; ignored.
+    Heartbeat,
 }
 
 /// Commits the fetcher is missing after the op phase.
@@ -131,6 +145,8 @@ pub enum GitFrame {
     Done,
     /// The server cannot serve the git phase.
     Error { message: String },
+    /// The server is still working; ignored.
+    Heartbeat,
 }
 
 /// Git object kinds on the wire.

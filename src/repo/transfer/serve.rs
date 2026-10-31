@@ -24,8 +24,8 @@ use super::{pack, to_gix_id};
 use crate::{
     net::{
         fetch::{
-            FetchRequest, GitFrame, GitRequest, GitTransferFormat, MAX_GIT_FRAME_SIZE, OpFrame,
-            PhaseCompressor, WireObjectKind, compress_object,
+            FetchRequest, GitFrame, GitRequest, GitTransferFormat, HEARTBEAT_INTERVAL,
+            MAX_GIT_FRAME_SIZE, OpFrame, PhaseCompressor, WireObjectKind, compress_object,
         },
         wire::{MAX_FRAME_SIZE, read_message, write_message},
     },
@@ -270,6 +270,7 @@ trait PhaseFrame: serde::Serialize {
     const MAX_SIZE: u32;
     fn done() -> Self;
     fn error(message: String) -> Self;
+    fn heartbeat() -> Self;
 }
 
 impl PhaseFrame for OpFrame {
@@ -279,6 +280,9 @@ impl PhaseFrame for OpFrame {
     }
     fn error(message: String) -> Self {
         OpFrame::Error { message }
+    }
+    fn heartbeat() -> Self {
+        OpFrame::Heartbeat
     }
 }
 
@@ -290,11 +294,15 @@ impl PhaseFrame for GitFrame {
     fn error(message: String) -> Self {
         GitFrame::Error { message }
     }
+    fn heartbeat() -> Self {
+        GitFrame::Heartbeat
+    }
 }
 
 /// Runs one streamed phase: a blocking producer (`work`, sending frames
 /// with [`produce`]) feeds a bounded channel, the frames are relayed to
-/// the wire, and the phase closes with `Done`, or with an `Error` frame
+/// the wire, with heartbeats while the producer is quiet, and the phase
+/// closes with `Done`, or with an `Error` frame
 /// prefixed by `err_context` when the producer failed. Returns the
 /// producer's value, `None` when it failed: the exchange must not
 /// continue then.
@@ -308,7 +316,12 @@ async fn serve_phase<T: PhaseFrame + Send + 'static, R: Send + 'static>(
     let producer = crate::spawn_blocking(move || work(&tx));
 
     // The channel closes once the producer returned, whatever it returned.
-    while let Some(frame) = rx.recv().await {
+    loop {
+        let frame = match tokio::time::timeout(HEARTBEAT_INTERVAL, rx.recv()).await {
+            Ok(Some(frame)) => frame,
+            Ok(None) => break,
+            Err(_) => T::heartbeat(),
+        };
         write_message(send, &frame, T::MAX_SIZE).await?;
     }
     let (last, value) = match producer.await.context("phase producer task failed")? {
@@ -496,4 +509,39 @@ fn walk_tree(
         objects.push((id, WireObjectKind::Tree));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A producer with nothing to send yet, like a long closure walk, gets
+    /// heartbeats sent in its place.
+    #[tokio::test(start_paused = true)]
+    async fn quiet_producer_sends_heartbeats() {
+        let (mut send, mut recv) = tokio::io::duplex(1 << 10);
+        let (release, wait) = std::sync::mpsc::channel::<()>();
+        let phase = tokio::spawn(async move {
+            serve_phase(&mut send, 1, "walk", move |_: &mpsc::Sender<GitFrame>| {
+                Ok(wait.recv()?)
+            })
+            .await
+        });
+
+        // The paused clock does not advance on its own while a blocking
+        // task runs: let the relay start waiting, then move time on.
+        tokio::task::yield_now().await;
+        tokio::time::advance(HEARTBEAT_INTERVAL).await;
+        let frame: GitFrame = read_message(&mut recv, MAX_GIT_FRAME_SIZE).await.unwrap();
+        assert!(matches!(frame, GitFrame::Heartbeat), "{frame:?}");
+        release.send(()).unwrap();
+        loop {
+            match read_message(&mut recv, MAX_GIT_FRAME_SIZE).await.unwrap() {
+                GitFrame::Heartbeat => {}
+                GitFrame::Done => break,
+                frame => panic!("unexpected {frame:?}"),
+            }
+        }
+        assert!(phase.await.unwrap().unwrap().is_some());
+    }
 }

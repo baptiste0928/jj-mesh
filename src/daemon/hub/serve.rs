@@ -16,7 +16,10 @@ use tracing::debug;
 
 use super::SyncHub;
 use crate::{
-    net::fetch::FetchRequest,
+    net::{
+        fetch::{FetchRequest, IDLE_TIMEOUT},
+        idle::Idle,
+    },
     repo::{OpenRepo, transfer},
 };
 
@@ -27,10 +30,6 @@ const MAX_SERVES: usize = 2;
 /// than [`MAX_SERVES`] peers syncing one change at once, queueing briefly
 /// beats sending the surplus back to their retry timer.
 const QUEUE_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// Hard budget on serving one fetch; QUIC flow control means a stalled
-/// fetcher could otherwise pin a serve task and its permit forever.
-const SERVE_TIMEOUT: Duration = Duration::from_mins(30);
 
 /// What the hub needs to serve fetches for an open repo.
 #[derive(Debug, Clone)]
@@ -62,8 +61,8 @@ impl SyncHub {
         &self,
         peer: EndpointId,
         request: FetchRequest,
-        mut send: SendStream,
-        mut recv: RecvStream,
+        send: SendStream,
+        recv: RecvStream,
     ) {
         let serving = self.lookup_serving(&request);
         let peer = self.peer_name(&peer);
@@ -77,14 +76,13 @@ impl SyncHub {
                 return refuse_and_close(send, "busy, retry later").await;
             };
 
-            let serve = transfer::serve(&serving.repo, request, &mut send, &mut recv);
-            match tokio::time::timeout(SERVE_TIMEOUT, serve).await {
-                Ok(Ok(())) => {
-                    let _ = send.finish();
-                    debug!(%peer, "served fetch");
-                }
-                Ok(Err(err)) => debug!(%peer, "serve failed: {err:#}"),
-                Err(_) => debug!(%peer, "serve timed out"),
+            // A stalled fetcher must not pin the serve and its permit.
+            // Dropping the send stream finishes it.
+            let mut send = Idle::new(send, IDLE_TIMEOUT);
+            let mut recv = Idle::new(recv, IDLE_TIMEOUT);
+            match transfer::serve(&serving.repo, request, &mut send, &mut recv).await {
+                Ok(()) => debug!(%peer, "served fetch"),
+                Err(err) => debug!(%peer, "serve failed: {err:#}"),
             }
         });
     }

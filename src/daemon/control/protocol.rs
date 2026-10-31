@@ -39,8 +39,8 @@ pub(super) const CLONE_PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Time budget the CLI grants between clone frames, not the whole exchange:
 /// the daemon heartbeats progress every [`CLONE_PROGRESS_INTERVAL`] while
-/// the clone runs, so a silent daemon is a dead one. The transfer's
-/// network phases stay bounded by the daemon's own pull deadline.
+/// the clone runs, so a silent daemon is a dead one. A stalled transfer
+/// fails on the daemon's side (see [`crate::net::idle`]).
 pub const CLONE_IDLE_WAIT: Duration = Duration::from_secs(30);
 
 /// A request from the CLI to the daemon.

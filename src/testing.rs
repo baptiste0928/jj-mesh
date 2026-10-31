@@ -21,17 +21,19 @@ use crate::{
     config::ObjectHash,
     net::{
         fetch::FetchRequest,
+        idle::Idle,
         wire::{MAX_FRAME_SIZE, read_message},
     },
     repo::{
         JjRepo, OpenRepo,
-        transfer::{FetchOptions, ProgressSink, fetch, mirror, serve},
+        transfer::{ProgressSink, fetch, mirror, serve},
     },
 };
 pub use crate::{net::fetch::GitTransferFormat, repo::transfer::FetchOutcome};
 
-/// Network deadline of test fetches, large enough to never fire.
-const NET_TIMEOUT: Duration = Duration::from_mins(1);
+/// Stall budget of test fetches, so a protocol bug fails instead of
+/// hanging the suite.
+const IDLE_TIMEOUT: Duration = Duration::from_mins(1);
 
 /// Two endpoints serving `alpn` that dial each other over localhost only.
 pub async fn local_endpoints(alpn: &[u8]) -> [iroh::Endpoint; 2] {
@@ -266,12 +268,9 @@ pub async fn fetch_from(
         fetcher,
         &crate::config::RepoId::generate(),
         wants,
-        FetchOptions {
-            format,
-            net_timeout: NET_TIMEOUT,
-        },
-        send,
-        recv,
+        format,
+        &mut Idle::new(send, IDLE_TIMEOUT),
+        &mut Idle::new(recv, IDLE_TIMEOUT),
         progress,
     )
     .await

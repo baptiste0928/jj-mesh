@@ -12,7 +12,10 @@ use tracing::warn;
 use super::SyncHub;
 use crate::{
     config::RepoId,
-    net::fetch::GitTransferFormat,
+    net::{
+        fetch::{GitTransferFormat, IDLE_TIMEOUT},
+        idle::Idle,
+    },
     repo::{
         JjRepo, OpenRepo,
         transfer::{self, FetchOutcome, ProgressSink, TransferPhase, TransferProgress},
@@ -22,10 +25,6 @@ use crate::{
 /// Budget for opening a fetch stream on an established connection: a peer
 /// that never grants stream credit must not stall the fetch.
 const OPEN_STREAM_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// Deadline for the network-facing work of a fetch (a pull transfers an
-/// entire repository); its local apply and index work runs unbounded.
-const NET_TIMEOUT: Duration = Duration::from_mins(30);
 
 /// A peer that can serve a pull of an unregistered repo, with the op heads
 /// it claims.
@@ -50,14 +49,12 @@ impl SyncHub {
         let conn = self
             .connection(peer)
             .ok_or_else(|| anyhow!("peer is no longer connected"))?;
-        let (mut send, mut recv) = tokio::time::timeout(OPEN_STREAM_TIMEOUT, conn.open_bi())
+        let (send, recv) = tokio::time::timeout(OPEN_STREAM_TIMEOUT, conn.open_bi())
             .await
             .map_err(|_| anyhow!("timed out opening the fetch stream"))??;
-        let options = transfer::FetchOptions {
-            format,
-            net_timeout: NET_TIMEOUT,
-        };
-        transfer::fetch(repo, id, wants, options, &mut send, &mut recv, progress).await
+        let mut send = Idle::new(send, IDLE_TIMEOUT);
+        let mut recv = Idle::new(recv, IDLE_TIMEOUT);
+        transfer::fetch(repo, id, wants, format, &mut send, &mut recv, progress).await
     }
 
     /// Pulls the full state of the mesh repo `id` into the repo at

@@ -487,7 +487,7 @@ impl RepoTask {
         // Sync failures must not kill the watch: the repo is fine, the peer
         // or network is not. The caller requeues for a later retry.
         // Announcement handling and local change publication pause while
-        // the fetch runs, bounded by its network deadline.
+        // the fetch runs, until it completes or stalls.
         let fetch = self.hub.fetch(
             &announce.peer,
             repo,

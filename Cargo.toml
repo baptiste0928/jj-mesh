@@ -52,4 +52,4 @@ failpoints = ["fail/failpoints"]
 [dev-dependencies]
 fail = "0.5.1"
 jj-mesh = { path = ".", features = ["test-util", "failpoints"] }
-tokio = { version = "1.54.1", features = ["macros"] }
+tokio = { version = "1.54.1", features = ["macros", "test-util"] }
