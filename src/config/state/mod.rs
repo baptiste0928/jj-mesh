@@ -32,23 +32,12 @@ use iroh::EndpointId;
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
+use self::membership::{Register as _, bumped_version, should_adopt};
 pub use self::{
-    claims::{
-        MAX_MACHINE_WORKSPACES, MAX_MESH_CLAIMED_REPOS, MAX_MESH_WORKSPACES, RepoClaims,
-        WorkspaceClaims,
-    },
+    claims::{RepoClaims, WorkspaceClaims},
     machine::Machine,
-    membership::{
-        MAX_MESH_PEERS, MAX_MESH_REPO_RECORDS, MAX_MESH_REPOS, Membership, MeshRepo,
-        MeshRepoStatus, Peer, PeerStatus,
-    },
+    membership::{Membership, MeshRepo, MeshRepoStatus, Peer, PeerStatus},
     repo::{ObjectHash, Repo, RepoId},
-};
-use self::{
-    claims::{MAX_OTHER_REPOS, MAX_OTHER_WORKSPACES},
-    membership::{
-        MAX_OTHER_PEERS, MAX_RECORD_VERSION, Register as _, bumped_version, should_adopt,
-    },
 };
 use super::{ConfigDir, validate_name};
 use crate::hint::hinted;
@@ -266,12 +255,7 @@ impl MeshState {
             }
         }
         let ours = self.claims.repos.get(id).cloned().unwrap_or_default();
-        let limit = MAX_MACHINE_WORKSPACES - (self.claims.count() - ours.len());
-        RepoClaims {
-            ours,
-            others,
-            limit,
-        }
+        RepoClaims { ours, others }
     }
 
     /// Corrects the object hash the mesh records for a registered repo, as
@@ -347,14 +331,6 @@ impl MeshState {
     /// bumped version propagates the re-add through the gossip.
     pub fn add_peer(&mut self, endpoint: EndpointId, name: String) -> Result<()> {
         self.validate_new_peer(&name, &endpoint)?;
-        // The same cap the merge and the wire enforce: going past it here
-        // would make our own membership undecodable by every peer, which
-        // silently stops us from gossiping anything at all.
-        ensure!(
-            self.peers.contains_key(&endpoint) || self.peers.len() < MAX_OTHER_PEERS,
-            "the mesh already has {MAX_MESH_PEERS} machines",
-        );
-
         let version = bumped_version(&self.peers, &endpoint)?;
         self.peers.insert(
             endpoint,
@@ -443,14 +419,6 @@ impl MeshState {
         ensure!(
             !self.mesh_repos.contains_key(&id),
             "repo {id} is already in the mesh"
-        );
-        ensure!(
-            self.mesh_repo_names().count() < MAX_MESH_REPOS,
-            "the mesh already has {MAX_MESH_REPOS} repos",
-        );
-        ensure!(
-            self.mesh_repos.len() < MAX_MESH_REPO_RECORDS,
-            "the mesh already recorded {MAX_MESH_REPO_RECORDS} repos, removed ones included",
         );
 
         self.set_mesh_repo(&id, MeshRepoStatus::Present { name, object_hash })?;
@@ -643,19 +611,10 @@ impl MeshState {
     /// Copies of our own record are absorbed by [`Machine::observe`] and
     /// never stored as peers.
     ///
-    /// New entries stop being adopted at the caps ([`MAX_MESH_PEERS`],
-    /// [`MAX_MESH_REPOS`], [`MAX_MESH_REPO_RECORDS`]) while updates to
-    /// known ones keep flowing.
-    ///
     /// Returns the names of the repos unregistered here because the mesh
     /// removed them.
     pub fn merge_membership(&mut self, remote: &Membership, local: &EndpointId) -> Vec<String> {
         for (endpoint, record) in &remote.peers {
-            // Strictly below the ceiling: a record *at* it could never be
-            // superseded by a local change, freezing the machine's status.
-            if record.version >= MAX_RECORD_VERSION {
-                continue;
-            }
             if endpoint == local {
                 self.machine.observe(record);
                 continue;
@@ -665,25 +624,19 @@ impl MeshState {
             {
                 continue;
             }
-            if should_adopt(&self.peers, endpoint, record, MAX_OTHER_PEERS) {
+            if should_adopt(&self.peers, endpoint, record) {
                 self.peers.insert(*endpoint, record.clone());
             }
         }
 
         // Only new ids can add live repos: a tombstone is final.
         let mut removed = Vec::new();
-        let mut live = self.mesh_repo_names().count();
         for (id, record) in &remote.repos {
-            if record.version >= MAX_RECORD_VERSION || !record.is_valid() {
+            if !record.is_valid() {
                 continue;
             }
             let Some(held) = self.mesh_repos.get(id) else {
-                if self.mesh_repos.len() < MAX_MESH_REPO_RECORDS
-                    && (record.name().is_none() || live < MAX_MESH_REPOS)
-                {
-                    live += usize::from(record.name().is_some());
-                    self.mesh_repos.insert(id.clone(), record.clone());
-                }
+                self.mesh_repos.insert(id.clone(), record.clone());
                 continue;
             };
             if !record.outranks(held) {
@@ -693,7 +646,6 @@ impl MeshState {
             // stay where they are.
             if record.name().is_none() {
                 let name = held.name().map(str::to_owned);
-                live -= usize::from(name.is_some());
                 if self.unregister_repo(id).is_some() {
                     removed.push(name.unwrap_or_else(|| id.to_string()));
                 }
@@ -705,14 +657,9 @@ impl MeshState {
         removed
     }
 
-    /// Merges the gossiped workspace claims: only alive peers' are kept,
-    /// and new or grown records stop being adopted at the caps.
+    /// Merges the gossiped workspace claims: only alive peers' are kept.
     fn merge_claims(&mut self, remote: &Membership, local: &EndpointId) {
-        let (mut names, mut repos) = WorkspaceClaims::tally(self.peer_claims.values());
         for (endpoint, record) in &remote.claims {
-            if record.version >= MAX_RECORD_VERSION {
-                continue;
-            }
             if endpoint == local {
                 self.claims.observe(record);
                 continue;
@@ -724,14 +671,6 @@ impl MeshState {
             {
                 continue;
             }
-            let (held_names, held_repos) = WorkspaceClaims::tally(held);
-            let (record_names, record_repos) = WorkspaceClaims::tally([record]);
-            let adopted_names = names - held_names + record_names;
-            let adopted_repos = repos - held_repos + record_repos;
-            if adopted_names > MAX_OTHER_WORKSPACES || adopted_repos > MAX_OTHER_REPOS {
-                continue;
-            }
-            (names, repos) = (adopted_names, adopted_repos);
             self.peer_claims.insert(*endpoint, record.clone());
         }
         self.prune_claims();
@@ -964,15 +903,6 @@ mod tests {
 
         // Records about ourselves never land in the peer map.
         assert!(!state.peers.contains_key(&local));
-
-        // A copy parked next to the version ceiling is clamped: what we
-        // gossip stays below it (records at the ceiling are skipped by
-        // every merge), and the parked record is reported on rename
-        // instead of freezing us silently.
-        state.merge_membership(&about_us(alive(MAX_RECORD_VERSION - 1, "pwned")), &local);
-        assert_eq!(state.machine.version, MAX_RECORD_VERSION - 1);
-        assert!(state.membership(local).peers[&local].version < MAX_RECORD_VERSION);
-        assert!(state.rename_machine("frozen".to_owned()).is_err());
     }
 
     #[test]
@@ -984,101 +914,6 @@ mod tests {
         state.rename_machine("desk".to_owned()).unwrap();
         state.rename_machine("desk".to_owned()).unwrap();
         assert_eq!(state.machine, Machine::new("desk", 1));
-    }
-
-    #[test]
-    fn merge_bounds_the_state_it_adopts() {
-        let local = SecretKey::generate().public();
-        let mut state = MeshState::default();
-        let repos = |status: MeshRepoStatus| -> BTreeMap<RepoId, MeshRepo> {
-            (0..MAX_MESH_REPOS)
-                .map(|_| {
-                    let record = MeshRepo {
-                        version: 1,
-                        status: status.clone(),
-                    };
-                    (RepoId::generate(), record)
-                })
-                .collect()
-        };
-
-        // A peer cannot grow our state past the caps: beyond them, new
-        // entries are dropped rather than making our own membership
-        // ungossipable (it would exceed the wire limit).
-        for _ in 0..3 {
-            let peers = (0..MAX_MESH_PEERS)
-                .map(|_| {
-                    (
-                        SecretKey::generate().public(),
-                        Peer {
-                            version: 1,
-                            status: PeerStatus::Alive {
-                                name: "flood".to_owned(),
-                                server: false,
-                            },
-                        },
-                    )
-                })
-                .collect();
-            let repos = repos(present(1, "flood").status);
-            let membership = Membership {
-                peers,
-                repos,
-                ..Default::default()
-            };
-            state.merge_membership(&membership, &local);
-        }
-        assert_eq!(state.peers.len(), MAX_OTHER_PEERS);
-        assert_eq!(state.mesh_repo_names().count(), MAX_MESH_REPOS);
-        // With our own record added, the membership stays within the wire
-        // cap.
-        assert_eq!(state.membership(local).peers.len(), MAX_MESH_PEERS);
-
-        // Tombstones fill the records up to their own cap.
-        for _ in 0..MAX_MESH_REPO_RECORDS / MAX_MESH_REPOS {
-            let repos = repos(MeshRepoStatus::Removed);
-            let membership = Membership {
-                repos,
-                ..Default::default()
-            };
-            state.merge_membership(&membership, &local);
-        }
-        assert_eq!(state.mesh_repos.len(), MAX_MESH_REPO_RECORDS);
-    }
-
-    #[test]
-    fn merge_rejects_versions_that_would_freeze_a_record() {
-        let local = SecretKey::generate().public();
-        let peer = SecretKey::generate().public();
-
-        // A record parked at an unreachable version could never be
-        // superseded, locking the machine out of the mesh for good. The
-        // ceiling itself must be refused too: a record *at* it leaves the
-        // local bump no headroom.
-        for version in [u64::MAX, MAX_RECORD_VERSION] {
-            let mut state = MeshState::default();
-            state.merge_membership(
-                &Membership {
-                    peers: BTreeMap::from([(
-                        peer,
-                        Peer {
-                            version,
-                            status: PeerStatus::Removed,
-                        },
-                    )]),
-                    repos: BTreeMap::new(),
-                    ..Default::default()
-                },
-                &local,
-            );
-            assert!(state.peers.is_empty(), "version {version} must be refused");
-
-            // Pairing therefore still works.
-            state.add_peer(peer, "laptop".to_owned()).unwrap();
-            assert_eq!(state.peer_name(&peer), Some("laptop"));
-            // And so does removing it again.
-            state.remove_peer("laptop").unwrap();
-        }
     }
 
     /// The machines holding a repo correct the object hash the mesh
@@ -1445,19 +1280,5 @@ mod tests {
         add_holder(&mut state, &id);
         state.forget_repo(&id, false).unwrap();
         assert!(state.claims.repos.is_empty());
-    }
-
-    #[test]
-    fn caps_own_claims() {
-        let mut state = MeshState::default();
-        let id = add(&mut state, "proj");
-        let names = |n: usize| (0..n).map(|i| format!("w{i}")).collect::<BTreeSet<_>>();
-
-        assert!(state.set_claims(&id, names(MAX_MACHINE_WORKSPACES)).is_ok());
-        assert!(
-            state
-                .set_claims(&id, names(MAX_MACHINE_WORKSPACES + 1))
-                .is_err()
-        );
     }
 }

@@ -29,9 +29,10 @@
 //! machine has full read/write access to every mesh repo and can pair other
 //! machines: there are no permissions. Connections are end-to-end encrypted
 //! and mutually authenticated with per-machine keys, and only known peers
-//! connect outside a pairing window. Authenticated does not mean trusted:
-//! everything a peer sends is bounded and validated before it reaches
-//! memory, disk or the terminal.
+//! connect outside a pairing window. Paired machines are trusted: bounds
+//! only guard what unauthenticated endpoints can reach and stop runaway
+//! bugs, while synced data is still validated before it becomes visible
+//! (see below), and text reaching the terminal is sanitized.
 //!
 //! # Consistency
 //!

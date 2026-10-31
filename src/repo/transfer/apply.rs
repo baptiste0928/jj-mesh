@@ -75,9 +75,7 @@ pub(super) fn stage(
 
     // Which local heads each want supersedes, established by walking the
     // want's ancestry through validated data only (the parsed batch and
-    // the local store). Batch membership or parent claims alone are NOT
-    // proof of ancestry: a hostile batch op naming a local head as its
-    // parent must not unlist that head.
+    // the local store): batch membership alone is not proof of ancestry.
     let by_id = batch.ops_by_id();
     let to_publish: Vec<(OperationId, Vec<OperationId>)> = wants
         .iter()

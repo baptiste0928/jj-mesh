@@ -10,8 +10,8 @@
 //! re-encode with identical ids: replicating decoded objects would silently
 //! fork ids across the mesh.
 //!
-//! Peer-supplied data is authenticated but untrusted. The engine guarantees,
-//! and changes here must preserve, that:
+//! A buggy or mismatched peer must not corrupt a repo. The engine
+//! guarantees, and changes here must preserve, that:
 //! - nothing synced becomes visible before it is validated: op and view
 //!   bytes structurally, git objects by hash (loose frames against their
 //!   claimed id, packed objects while indexing the pack);

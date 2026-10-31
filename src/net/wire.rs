@@ -2,12 +2,18 @@
 //!
 //! Shared by every jj-mesh protocol, over QUIC streams between machines and
 //! over the daemon control socket locally: a message is a `u32` little-endian
-//! size followed by the postcard encoding. Callers bound the accepted size,
-//! as the prefix is attacker-controlled on unauthenticated streams.
+//! size followed by the postcard encoding. Callers bound the accepted size:
+//! tightly on unauthenticated streams, whose prefix anyone controls, and
+//! with [`MAX_FRAME_SIZE`] between paired machines.
 
 use anyhow::{Context as _, Result, ensure};
 use serde::{Serialize, de::DeserializeOwned};
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
+
+/// Cap on messages between paired machines (git objects aside) and on the
+/// control socket. Far above any legitimate message: it only stops a
+/// runaway bug before it allocates.
+pub const MAX_FRAME_SIZE: u32 = 64 << 20;
 
 /// Writes a length-prefixed message.
 pub async fn write_message<T: Serialize>(

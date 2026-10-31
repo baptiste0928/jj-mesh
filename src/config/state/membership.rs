@@ -8,36 +8,12 @@
 
 use std::{borrow::Borrow, cmp, collections::BTreeMap, fmt};
 
-use anyhow::{Result, ensure};
+use anyhow::{Context as _, Result};
 use iroh::EndpointId;
 use serde::{Deserialize, Serialize};
 
 use super::{ObjectHash, RepoId, WorkspaceClaims};
 use crate::config::validate_name;
-
-/// Cap on machines tracked in the mesh state, tombstones included. A
-/// personal mesh is a handful of machines; the cap keeps a peer from
-/// growing the state file (and the membership we must be able to gossip)
-/// without bound.
-pub const MAX_MESH_PEERS: usize = 256;
-
-/// Cap on the other machines' records, leaving room for our own in the
-/// gossiped membership.
-pub(super) const MAX_OTHER_PEERS: usize = MAX_MESH_PEERS - 1;
-
-/// Cap on the live repos of the mesh-wide repo list, same reasoning.
-pub const MAX_MESH_REPOS: usize = 1024;
-
-/// Cap on the records of the mesh-wide repo list, tombstones included.
-/// Repo ids are never reused, so every removal keeps a record for good:
-/// once the cap is reached, no repo can be added anymore.
-pub const MAX_MESH_REPO_RECORDS: usize = 4096;
-
-/// Cap on a record's version. Versions only ever advance by one per local
-/// change, so a record beyond this is corrupted or hostile: without the
-/// cap, a record parked at `u64::MAX` could never be superseded again,
-/// permanently freezing a machine out of the mesh.
-pub(super) const MAX_RECORD_VERSION: u64 = 1 << 32;
 
 /// The membership one machine gossips: its whole view of the mesh. Sent as
 /// idempotent latest-wins snapshots (on connect, on every change, and
@@ -70,33 +46,20 @@ where
     next_version(map.get(key).map_or(0, V::version), key)
 }
 
-/// The version after `version` for the record of `subject`. Refuses to
-/// reach [`MAX_RECORD_VERSION`]: every merge skips records at the ceiling,
-/// so handing it out would freeze the subject; a record parked next to it
-/// is reported instead.
+/// The version after `version` for the record of `subject`.
 pub(super) fn next_version(version: u64, subject: impl fmt::Display) -> Result<u64> {
-    ensure!(
-        version + 1 < MAX_RECORD_VERSION,
-        "the mesh record of {subject} is corrupted (version {version}); \
-         remove it from mesh.json on every machine",
-    );
-
-    Ok(version + 1)
+    version.checked_add(1).with_context(|| {
+        format!(
+            "the mesh record of {subject} is corrupted (version {version}); \
+             remove it from mesh.json on every machine"
+        )
+    })
 }
 
-/// Whether a gossiped `record` should be adopted into `map` under `key`: it
-/// must outrank what we hold, and a key we do not know is only added while
-/// the map is below `cap`, so a peer cannot grow our state without bound.
-pub(super) fn should_adopt<K: Ord, V: Register>(
-    map: &BTreeMap<K, V>,
-    key: &K,
-    record: &V,
-    cap: usize,
-) -> bool {
-    match map.get(key) {
-        Some(ours) => record.outranks(ours),
-        None => map.len() < cap,
-    }
+/// Whether a gossiped `record` should be adopted into `map` under `key`:
+/// it must outrank what we hold, if anything.
+pub(super) fn should_adopt<K: Ord, V: Register>(map: &BTreeMap<K, V>, key: &K, record: &V) -> bool {
+    map.get(key).is_none_or(|ours| record.outranks(ours))
 }
 
 /// A machine's record in the mesh.

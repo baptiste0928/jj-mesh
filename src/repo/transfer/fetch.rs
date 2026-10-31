@@ -21,11 +21,10 @@ use crate::{
     config::{RepoId, sanitize},
     net::{
         fetch::{
-            FetchRequest, GitFrame, GitRequest, GitTransferFormat, MAX_GIT_FRAME_SIZE,
-            MAX_GIT_HAVES, MAX_GIT_OBJECT_SIZE, MAX_GIT_REQUEST_SIZE, MAX_HAVES, MAX_OP_FRAME_SIZE,
-            MAX_WANTS, OpFrame, WireObjectKind, decompress_payload,
+            FetchRequest, GitFrame, GitRequest, GitTransferFormat, MAX_GIT_FRAME_SIZE, OpFrame,
+            WireObjectKind, decompress_payload,
         },
-        wire::{read_message, write_message},
+        wire::{MAX_FRAME_SIZE, read_message, write_message},
     },
     repo::{OpenRepo, codec},
 };
@@ -40,9 +39,12 @@ const SAMPLE_BUDGET: usize = 128;
 const GIT_WRITE_CHUNK: usize = 256;
 const GIT_WRITE_BYTES: usize = 32 << 20;
 
-/// Upper bound on op frames accepted in one fetch, against runaway
-/// streams. Far above any real op log delta.
-const MAX_OP_FRAMES: usize = 1 << 20;
+/// Cap on the op haves sampled for a fetch request.
+const MAX_HAVES: usize = 256;
+
+/// Cap on the commit haves sent in the git phase (our view heads, then the
+/// commits the fetched ops reference that we hold).
+const MAX_GIT_HAVES: usize = 4096;
 
 /// How often the pack ingest's object count is sampled for progress once
 /// the stream ended and only local indexing remains.
@@ -56,7 +58,7 @@ const INGEST_SAMPLE_INTERVAL: Duration = Duration::from_millis(200);
 ///
 /// `options.net_timeout` sets one deadline for all network-facing work
 /// (the request writes, the op frames, the git object or pack streaming)
-/// so a stalled or hostile peer cannot pin the caller past it. Local work
+/// so a stalled peer cannot pin the caller past it. Local work
 /// — pack delta resolution, the apply, the index build — runs unbounded,
 /// since timing it out after the transfer would only waste the received
 /// data.
@@ -69,7 +71,7 @@ pub async fn fetch(
     recv: &mut (impl AsyncRead + Unpin),
     progress: ProgressSink<'_>,
 ) -> Result<FetchOutcome> {
-    ensure!(!wants.is_empty() && wants.len() <= MAX_WANTS, "bad wants");
+    ensure!(!wants.is_empty(), "nothing to fetch");
     let deadline = tokio::time::Instant::now() + options.net_timeout;
     let local_heads = repo.op_heads().await?;
     let haves = sample_haves(repo, &local_heads).await?;
@@ -80,7 +82,7 @@ pub async fn fetch(
             wants: wants.iter().map(|id| id.as_bytes().to_vec()).collect(),
             haves: haves.iter().map(|id| id.as_bytes().to_vec()).collect(),
         };
-        write_message(send, &request, MAX_OP_FRAME_SIZE).await?;
+        write_message(send, &request, MAX_FRAME_SIZE).await?;
         receive_ops(repo, wants, recv, progress).await
     })
     .await?;
@@ -109,7 +111,7 @@ pub async fn fetch(
     bounded(
         deadline,
         "git",
-        write_message(send, &git_request, MAX_GIT_REQUEST_SIZE),
+        write_message(send, &git_request, MAX_FRAME_SIZE),
     )
     .await?;
     // The keep guard holds a received pack against git GC until the stage
@@ -189,10 +191,9 @@ fn apply_batch(
 }
 
 /// Fails the fetch when any of the `requested` commits is still absent
-/// after the git phase: a hostile peer can serve views naming commits it
-/// never sends, and published, such a head could never be loaded or
-/// indexed. An honest server stores everything its op log references, so
-/// absence is a hard failure (the announcement retry machinery covers
+/// after the git phase: published, such a head could never be loaded or
+/// indexed. A server stores everything its op log references, so absence
+/// is a hard failure (the announcement retry machinery covers
 /// transients). One sweep on a blocking thread.
 async fn ensure_git_wants_arrived(repo: &Arc<OpenRepo>, requested: Vec<CommitId>) -> Result<()> {
     if requested.is_empty() {
@@ -250,31 +251,24 @@ async fn receive_ops(
     let mut counters = TransferProgress::start(TransferPhase::Ops);
     progress.report(counters);
 
-    // Protocol position, kept apart from the display counters above.
-    let mut begun = false;
-    let mut data_seen = false;
-
-    for _ in 0..MAX_OP_FRAMES {
-        match read_message(recv, MAX_OP_FRAME_SIZE).await? {
+    loop {
+        match read_message(recv, MAX_FRAME_SIZE).await? {
             OpFrame::Begin {
                 ops: total_ops,
                 views: total_views,
             } => {
-                ensure!(!begun, "peer sent Begin twice");
-                ensure!(!data_seen, "peer sent Begin after data");
-                begun = true;
+                ensure!(counters.total.is_none(), "peer sent Begin twice");
                 counters.total = Some(total_ops.saturating_add(total_views));
                 progress.report(counters);
             }
             OpFrame::View { id, view } => {
-                data_seen = true;
-                counters.current += 1;
+                count_frame(&mut counters)?;
                 counters.bytes += view.len() as u64;
                 progress.report(counters);
                 ensure!(id.len() == id_len, "bad view id length ({})", id.len());
                 let id = ViewId::new(id);
-                let view = decompress_payload(&view, u64::from(MAX_OP_FRAME_SIZE))
-                    .with_context(|| format!("view {}", id.hex()))?;
+                let view =
+                    decompress_payload(&view).with_context(|| format!("view {}", id.hex()))?;
                 let meta =
                     codec::parse_view(&view).with_context(|| format!("view {}", id.hex()))?;
                 if view_ids.insert(id.clone()) {
@@ -286,8 +280,7 @@ async fn receive_ops(
                 }
             }
             OpFrame::Op { id, op } => {
-                data_seen = true;
-                counters.current += 1;
+                count_frame(&mut counters)?;
                 counters.bytes += op.len() as u64;
                 progress.report(counters);
                 ensure!(id.len() == id_len, "bad op id length ({})", id.len());
@@ -296,8 +289,7 @@ async fn receive_ops(
                     id != *repo.root_operation_id(),
                     "peer sent an op claiming the root id",
                 );
-                let op = decompress_payload(&op, u64::from(MAX_OP_FRAME_SIZE))
-                    .with_context(|| format!("op {}", id.hex()))?;
+                let op = decompress_payload(&op).with_context(|| format!("op {}", id.hex()))?;
                 let meta =
                     codec::parse_operation(&op).with_context(|| format!("op {}", id.hex()))?;
                 ensure!(!op_ids.contains(&id), "op {} sent twice", id.hex());
@@ -331,47 +323,24 @@ async fn receive_ops(
                         want.hex(),
                     );
                 }
-                let batch = OpBatch { ops, views };
-                ensure_batch_reachable(wants, &batch)?;
-                return Ok(batch);
+                return Ok(OpBatch { ops, views });
             }
             OpFrame::Error { message } => {
                 bail!("peer refused fetch: {}", sanitize(&message))
             }
         }
     }
-    bail!("too many op frames");
 }
 
-/// Rejects batches containing ops not on any want's ancestry. An honest
-/// server only sends ancestors of the wants; anything else has no business
-/// in the batch, and a fabricated op claiming a local head as its parent
-/// could otherwise poison the supersession computation in [`apply`].
-fn ensure_batch_reachable(wants: &[OperationId], batch: &OpBatch) -> Result<()> {
-    let by_id = batch.ops_by_id();
-    let mut reachable: HashSet<&OperationId> = HashSet::new();
-    let mut stack: Vec<&OperationId> = wants
-        .iter()
-        .filter(|want| by_id.contains_key(want))
-        .collect();
-
-    while let Some(id) = stack.pop() {
-        if reachable.insert(id)
-            && let Some(meta) = by_id.get(id)
-        {
-            stack.extend(
-                meta.parents
-                    .iter()
-                    .filter(|parent| by_id.contains_key(*parent)),
-            );
-        }
-    }
-
+/// Counts one data frame of a phase into `counters`, against the total
+/// its `Begin` announced, which also stops a runaway stream.
+fn count_frame(counters: &mut TransferProgress) -> Result<()> {
+    let total = counters.total.context("peer sent data before Begin")?;
     ensure!(
-        reachable.len() == batch.ops.len(),
-        "batch contains {} ops unreachable from the wants",
-        batch.ops.len() - reachable.len(),
+        counters.current < total,
+        "peer sent more frames than announced"
     );
+    counters.current += 1;
     Ok(())
 }
 
@@ -608,8 +577,7 @@ fn write_git_chunk(
         let git = repo.git_backend().git_repo();
         let hash_kind = git.object_hash();
         for (id, kind, data) in chunk {
-            let data = decompress_payload(&data, MAX_GIT_OBJECT_SIZE)
-                .with_context(|| format!("object {id}"))?;
+            let data = decompress_payload(&data).with_context(|| format!("object {id}"))?;
             let computed = gix::objs::compute_hash(hash_kind, kind, &data)
                 .map_err(|err| anyhow!("cannot hash object: {err}"))?;
             ensure!(

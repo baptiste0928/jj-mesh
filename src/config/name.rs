@@ -8,7 +8,7 @@
 use anyhow::{Result, ensure};
 
 /// Maximum length of a peer or repo name, in bytes.
-pub const MAX_NAME_LEN: usize = 64;
+const MAX_NAME_LEN: usize = 64;
 
 /// Maximum length kept by [`sanitize_bounded`]. At least the daemon's
 /// per-repo error budget, so stored errors pass through uncut.

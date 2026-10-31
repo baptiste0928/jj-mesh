@@ -12,7 +12,7 @@ use clap_complete::ArgValueCandidates;
 
 use super::{complete, ui};
 use crate::{
-    config::{ConfigDir, MAX_MACHINE_WORKSPACES, RepoId, sanitize},
+    config::{ConfigDir, RepoId, sanitize},
     daemon::control::{
         self, ConnectionStatus, PathInfo, PeerReport, PeerStatus, RepoHealthState, RepoStatus,
         Route, Status, WatchStatus, WorkspacePlace, WorkspaceState, WorkspaceStatus,
@@ -417,8 +417,7 @@ fn workspace_issue(name: &str, place: &WorkspacePlace) -> Option<String> {
                 "workspace {name} was stale when found. Run `jj workspace update-stale` in it to sync it"
             ),
             WorkspaceState::Unclaimable => format!(
-                "workspace {name} cannot be synced because its name is not valid in the mesh, or this \
-                 machine syncs {MAX_MACHINE_WORKSPACES} workspaces already"
+                "workspace {name} cannot be synced because its name is not valid in the mesh"
             ),
         },
         WorkspacePlace::Missing => format!(

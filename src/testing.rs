@@ -20,8 +20,8 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use crate::{
     config::ObjectHash,
     net::{
-        fetch::{FetchRequest, MAX_OP_FRAME_SIZE},
-        wire::read_message,
+        fetch::FetchRequest,
+        wire::{MAX_FRAME_SIZE, read_message},
     },
     repo::{
         JjRepo, OpenRepo,
@@ -231,9 +231,7 @@ pub async fn try_sync(
 
     let server = server.clone();
     let serve_task = tokio::spawn(async move {
-        let request: FetchRequest = read_message(&mut server_rx, MAX_OP_FRAME_SIZE)
-            .await
-            .unwrap();
+        let request: FetchRequest = read_message(&mut server_rx, MAX_FRAME_SIZE).await.unwrap();
         serve(&server, request, &mut server_tx, &mut server_rx).await
     });
 

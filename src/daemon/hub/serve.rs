@@ -17,7 +17,7 @@ use tracing::debug;
 use super::SyncHub;
 use crate::{
     net::{
-        fetch::{FetchRequest, MAX_OP_FRAME_SIZE, OpFrame},
+        fetch::{FetchRequest, OpFrame},
         wire,
     },
     repo::{OpenRepo, transfer},
@@ -103,7 +103,7 @@ fn refuse_fetch(mut send: SendStream, message: &'static str) {
         let frame = OpFrame::Error {
             message: message.to_owned(),
         };
-        let _ = wire::write_message(&mut send, &frame, MAX_OP_FRAME_SIZE).await;
+        let _ = wire::write_message(&mut send, &frame, wire::MAX_FRAME_SIZE).await;
         let _ = send.finish();
     });
 }

@@ -23,11 +23,10 @@ use super::{pack, to_gix_id};
 use crate::{
     net::{
         fetch::{
-            FetchRequest, GitFrame, GitRequest, GitTransferFormat, MAX_GIT_FRAME_SIZE,
-            MAX_GIT_HAVES, MAX_GIT_REQUEST_SIZE, MAX_HAVES, MAX_OP_FRAME_SIZE, MAX_WANTS, OpFrame,
+            FetchRequest, GitFrame, GitRequest, GitTransferFormat, MAX_GIT_FRAME_SIZE, OpFrame,
             WireObjectKind, compress_payload,
         },
-        wire::{read_message, write_message},
+        wire::{MAX_FRAME_SIZE, read_message, write_message},
     },
     repo::OpenRepo,
 };
@@ -54,7 +53,7 @@ pub async fn serve(
     recv: &mut (impl AsyncRead + Unpin),
 ) -> Result<()> {
     if let Err(message) = validate_request(repo, &request) {
-        write_message(send, &OpFrame::Error { message }, MAX_OP_FRAME_SIZE).await?;
+        write_message(send, &OpFrame::Error { message }, MAX_FRAME_SIZE).await?;
         return Ok(());
     }
     let wants: Vec<OperationId> = request.wants.into_iter().map(OperationId::new).collect();
@@ -63,7 +62,7 @@ pub async fn serve(
     for want in &wants {
         if !repo.has_operation(want).await? {
             let message = format!("unknown operation {}", want.hex());
-            write_message(send, &OpFrame::Error { message }, MAX_OP_FRAME_SIZE).await?;
+            write_message(send, &OpFrame::Error { message }, MAX_FRAME_SIZE).await?;
             return Ok(());
         }
     }
@@ -134,8 +133,6 @@ pub async fn serve(
 fn validate_request(repo: &OpenRepo, request: &FetchRequest) -> Result<(), String> {
     let id_len = repo.root_operation_id().as_bytes().len();
     let ok = !request.wants.is_empty()
-        && request.wants.len() <= MAX_WANTS
-        && request.haves.len() <= MAX_HAVES
         && request
             .wants
             .iter()
@@ -156,15 +153,14 @@ async fn serve_git_phase(
     send: &mut (impl AsyncWrite + Unpin),
     recv: &mut (impl AsyncRead + Unpin),
 ) -> Result<()> {
-    let request: GitRequest = read_message(recv, MAX_GIT_REQUEST_SIZE).await?;
+    let request: GitRequest = read_message(recv, MAX_FRAME_SIZE).await?;
 
     let hash_len = repo.git_backend().git_repo().object_hash().len_in_bytes();
-    let ok = request.haves.len() <= MAX_GIT_HAVES
-        && request
-            .wants
-            .iter()
-            .chain(&request.haves)
-            .all(|id| id.len() == hash_len);
+    let ok = request
+        .wants
+        .iter()
+        .chain(&request.haves)
+        .all(|id| id.len() == hash_len);
     if !ok {
         let message = "malformed git request".to_owned();
         write_message(send, &GitFrame::Error { message }, MAX_GIT_FRAME_SIZE).await?;
@@ -265,7 +261,7 @@ trait PhaseFrame: serde::Serialize {
 }
 
 impl PhaseFrame for OpFrame {
-    const MAX_SIZE: u32 = MAX_OP_FRAME_SIZE;
+    const MAX_SIZE: u32 = MAX_FRAME_SIZE;
     fn done() -> Self {
         OpFrame::Done
     }

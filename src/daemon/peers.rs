@@ -38,10 +38,6 @@ const MAX_UNI_STREAMS: usize = 16;
 /// stream cannot hold its permit indefinitely.
 const STREAM_READ_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Maximum fetch streams accepted concurrently per peer connection,
-/// pending their routing to repo tasks.
-const MAX_FETCH_STREAMS: usize = 4;
-
 /// Budget for one dial. iroh only gives up on its own after its handshake
 /// idle timeout, and a peer with a stale discovery record hangs until then.
 const DIAL_TIMEOUT: Duration = Duration::from_secs(15);
@@ -424,9 +420,7 @@ impl PeerTask {
     /// hub's registration current. Returns why the connection ended.
     async fn connected(&mut self, mut conn: Connection, mut outbound: bool) -> ConnectionError {
         let mut since = SystemTime::now();
-        // The peer is authenticated but must not spawn unbounded work.
         let announce_permits = Arc::new(Semaphore::new(MAX_UNI_STREAMS));
-        let fetch_permits = Arc::new(Semaphore::new(MAX_FETCH_STREAMS));
 
         self.hub.peer_connected(self.peer_id, &conn);
         let reason = loop {
@@ -464,7 +458,7 @@ impl PeerTask {
                         Ok(stream) => stream,
                         Err(err) => break err,
                     };
-                    self.accept_fetch(send, recv, &fetch_permits);
+                    self.accept_fetch(send, recv);
                 }
             }
         };
@@ -474,20 +468,15 @@ impl PeerTask {
     }
 
     /// Reads a fetch request from a fresh bi stream and routes it to the
-    /// owning repo task; refused fetches get an error frame back.
-    fn accept_fetch(&self, send: SendStream, mut recv: RecvStream, permits: &Arc<Semaphore>) {
-        let Ok(permit) = permits.clone().try_acquire_owned() else {
-            debug!(peer = %self.name(), "dropping fetch: too many open streams");
-            return;
-        };
-
+    /// owning repo task; refused fetches get an error frame back. QUIC
+    /// stream credit bounds how many are read at once.
+    fn accept_fetch(&self, send: SendStream, mut recv: RecvStream) {
         let hub = self.hub.clone();
         let peer = self.peer_id;
         tokio::spawn(async move {
-            let _permit = permit;
             let request = tokio::time::timeout(
                 STREAM_READ_TIMEOUT,
-                wire::read_message(&mut recv, fetch::MAX_OP_FRAME_SIZE),
+                wire::read_message(&mut recv, wire::MAX_FRAME_SIZE),
             )
             .await;
             let request: fetch::FetchRequest = match request {

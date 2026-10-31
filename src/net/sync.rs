@@ -12,25 +12,15 @@
 //! and git object transfer run on bidirectional streams (see
 //! [`super::fetch`]).
 
-use anyhow::{Result, ensure};
+use anyhow::Result;
 use iroh::endpoint::{Connection, RecvStream};
 use serde::{Deserialize, Serialize};
 
-use super::wire::{read_message, write_message};
-use crate::config::{
-    MAX_MESH_CLAIMED_REPOS, MAX_MESH_PEERS, MAX_MESH_REPO_RECORDS, MAX_MESH_REPOS,
-    MAX_MESH_WORKSPACES, Membership, RepoId, WorkspaceClaims,
-};
+use super::wire::{MAX_FRAME_SIZE, read_message, write_message};
+use crate::config::{Membership, RepoId};
 
 /// ALPN of the sync protocol, opening with a [`super::hello`].
 pub const ALPN: &[u8] = b"jj-mesh/sync/3";
-
-/// Cap on uni-stream messages. Sized for the largest legitimate message, a
-/// full membership (peer records are ~100 bytes, live repo records and
-/// workspace claims ~100, repo tombstones and empty repo claims ~40), with
-/// headroom; the peer, while authenticated, is not trusted with our
-/// memory, and every byte here is decoded before we can check anything.
-const MAX_UNI_SIZE: u32 = 512 * 1024;
 
 /// A message carried by a one-shot uni stream.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -74,9 +64,8 @@ pub struct RepoHealth {
 }
 
 /// Condensed repo state for peer consumption. Deliberately carries no
-/// detail strings: local error messages embed filesystem paths (which
-/// never leave the machine) and would make a full report outgrow the wire
-/// cap; the owning machine's own `jj-mesh status` has the details.
+/// detail strings: local error messages embed filesystem paths, which
+/// never leave the machine; its own `jj-mesh status` has the details.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RepoHealthState {
     /// Open and syncing.
@@ -90,160 +79,12 @@ pub enum RepoHealthState {
 /// Sends one message on a fresh uni stream.
 pub async fn send_uni(conn: &Connection, message: &UniMessage) -> Result<()> {
     let mut stream = conn.open_uni().await?;
-    write_message(&mut stream, message, MAX_UNI_SIZE).await?;
+    write_message(&mut stream, message, MAX_FRAME_SIZE).await?;
     stream.finish()?;
     Ok(())
 }
 
-/// Reads the message from an accepted uni stream, rejecting memberships
-/// and status reports too big to be legitimate before they reach the
-/// daemon: later handling caps what is stored, but a bounded message keeps
-/// the flood off the queue.
+/// Reads the message from an accepted uni stream.
 pub async fn recv_uni(stream: &mut RecvStream) -> Result<UniMessage> {
-    let message: UniMessage = read_message(stream, MAX_UNI_SIZE).await?;
-    check_bounds(&message)?;
-    Ok(message)
-}
-
-/// Rejects messages carrying more entries than the mesh caps allow.
-fn check_bounds(message: &UniMessage) -> Result<()> {
-    match message {
-        UniMessage::Membership(membership) => {
-            // Claimed repos are counted apart from names: an empty claim
-            // costs no name but still takes wire space.
-            let (names, repos) = WorkspaceClaims::tally(membership.claims.values());
-            ensure!(
-                membership.peers.len() <= MAX_MESH_PEERS
-                    && membership.repos.len() <= MAX_MESH_REPO_RECORDS
-                    && membership
-                        .repos
-                        .values()
-                        .filter(|r| r.name().is_some())
-                        .count()
-                        <= MAX_MESH_REPOS
-                    && membership.claims.len() <= MAX_MESH_PEERS
-                    && repos <= MAX_MESH_CLAIMED_REPOS
-                    && names <= MAX_MESH_WORKSPACES,
-                "membership too large",
-            );
-        }
-        UniMessage::Status(report) => {
-            ensure!(report.repos.len() <= MAX_MESH_REPOS, "status too large");
-        }
-        UniMessage::Announce(_) => {}
-    }
-    Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use std::collections::{BTreeMap, BTreeSet};
-
-    use crate::config::{
-        MAX_MESH_CLAIMED_REPOS, MAX_MESH_PEERS, MAX_MESH_REPO_RECORDS, MAX_MESH_REPOS,
-        MAX_MESH_WORKSPACES, MAX_NAME_LEN, Membership, MeshRepo, MeshRepoStatus, ObjectHash, Peer,
-        RepoId, WorkspaceClaims,
-    };
-
-    /// A membership carrying the largest state we accept must stay inside
-    /// the wire cap: if it did not, a machine at the caps could no longer
-    /// gossip at all, and its sender task would die on every reconnect.
-    #[test]
-    fn a_full_membership_fits_on_the_wire() {
-        let peers: BTreeMap<_, _> = (0..MAX_MESH_PEERS)
-            .map(|_| {
-                (
-                    iroh::SecretKey::generate().public(),
-                    Peer {
-                        version: u64::from(u32::MAX),
-                        status: crate::config::PeerStatus::Alive {
-                            name: "n".repeat(MAX_NAME_LEN),
-                            server: true,
-                        },
-                    },
-                )
-            })
-            .collect();
-        // The live repos at their cap, tombstones filling the records.
-        let repos: BTreeMap<RepoId, MeshRepo> = (0..MAX_MESH_REPO_RECORDS)
-            .map(|n| {
-                let status = if n < MAX_MESH_REPOS {
-                    MeshRepoStatus::Present {
-                        name: format!("{n:0>64}"),
-                        object_hash: ObjectHash::Sha256,
-                    }
-                } else {
-                    MeshRepoStatus::Removed
-                };
-                let record = MeshRepo {
-                    version: u64::from(u32::MAX),
-                    status,
-                };
-                (RepoId::generate(), record)
-            })
-            .collect();
-
-        // Every machine holding a record, the mesh-wide names spread one
-        // per repo and the remaining repos claimed empty (the costliest
-        // layout).
-        let claims = peers
-            .keys()
-            .map(|endpoint| {
-                let named = (0..MAX_MESH_WORKSPACES / MAX_MESH_PEERS).map(|n| {
-                    let name = format!("{n:0>64}");
-                    (RepoId::generate(), BTreeSet::from([name]))
-                });
-                let empty = (0..(MAX_MESH_CLAIMED_REPOS - MAX_MESH_WORKSPACES) / MAX_MESH_PEERS)
-                    .map(|_| (RepoId::generate(), BTreeSet::new()));
-                let repos = named.chain(empty).collect();
-                let claims = WorkspaceClaims {
-                    version: u64::from(u32::MAX),
-                    repos,
-                };
-                (*endpoint, claims)
-            })
-            .collect();
-
-        let membership = Membership {
-            peers,
-            repos,
-            claims,
-        };
-        let message = super::UniMessage::Membership(membership);
-        super::check_bounds(&message).unwrap();
-        let encoded = postcard::to_stdvec(&message).unwrap();
-        assert!(
-            encoded.len() <= super::MAX_UNI_SIZE as usize,
-            "a full membership is {} bytes, over the {} byte cap",
-            encoded.len(),
-            super::MAX_UNI_SIZE,
-        );
-    }
-
-    /// Same guarantee for the status report: a machine at the repo cap with
-    /// every repo failing must still fit its report on the wire, or its
-    /// sender tasks would die and stop all announcements.
-    #[test]
-    fn a_full_status_report_fits_on_the_wire() {
-        let report = super::StatusReport {
-            daemon_version: "9".repeat(MAX_NAME_LEN),
-            jj_version: Some("9".repeat(MAX_NAME_LEN)),
-            repos: (0..MAX_MESH_REPOS)
-                .map(|_| super::RepoHealth {
-                    id: RepoId::generate(),
-                    state: super::RepoHealthState::Failed,
-                })
-                .collect(),
-        };
-
-        let message = super::UniMessage::Status(report);
-        super::check_bounds(&message).unwrap();
-        let encoded = postcard::to_stdvec(&message).unwrap();
-        assert!(
-            encoded.len() <= super::MAX_UNI_SIZE as usize,
-            "a full status report is {} bytes, over the {} byte cap",
-            encoded.len(),
-            super::MAX_UNI_SIZE,
-        );
-    }
+    read_message(stream, MAX_FRAME_SIZE).await
 }

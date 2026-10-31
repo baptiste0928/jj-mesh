@@ -4,8 +4,8 @@
 //! Peers replay all their repos on connect, so the [`HubState::orphans`]
 //! map is how `clone` and server mode learn a repo's heads and who serves
 //! it; [`SyncHub::clone_sources`] resolves that into
-//! [`CloneSource`]s to pull from (see [`super::pull`]). The map is bounded
-//! per peer and pruned on disconnect.
+//! [`CloneSource`]s to pull from (see [`super::pull`]). The map is pruned
+//! on disconnect.
 
 use std::collections::BTreeMap;
 
@@ -13,10 +13,7 @@ use anyhow::{Result, ensure};
 use iroh::EndpointId;
 
 use super::{CloneSource, HubState, SyncHub};
-use crate::{
-    config::{MAX_MESH_REPOS, RepoId},
-    hint::hinted,
-};
+use crate::{config::RepoId, hint::hinted};
 
 /// The latest announcement one peer made for an unregistered repo.
 #[derive(Debug, Clone)]
@@ -27,23 +24,14 @@ pub(super) struct OrphanAnnounce {
 
 impl HubState {
     /// Records `announce` as `peer`'s latest for the unregistered repo
-    /// `id`. Refuses (returning `false`) a new repo that would put the peer
-    /// over [`MAX_MESH_REPOS`]; a known one always updates.
+    /// `id`.
     pub(super) fn remember_orphan(
         &mut self,
         peer: EndpointId,
         id: RepoId,
         announce: OrphanAnnounce,
-    ) -> bool {
-        let known = self
-            .orphans
-            .get(&id)
-            .is_some_and(|peers| peers.contains_key(&peer));
-        if !known && self.orphans_held_by(&peer) >= MAX_MESH_REPOS {
-            return false;
-        }
+    ) {
         self.orphans.entry(id).or_default().insert(peer, announce);
-        true
     }
 
     /// Drops `peer`'s entry for `id` (it retracted the repo).
@@ -67,15 +55,6 @@ impl HubState {
     /// Takes every announcement for `id`, which is being registered.
     pub(super) fn take_orphans(&mut self, id: &RepoId) -> BTreeMap<EndpointId, OrphanAnnounce> {
         self.orphans.remove(id).unwrap_or_default()
-    }
-
-    /// How many orphan repos hold an entry for `peer`, against
-    /// [`MAX_MESH_REPOS`].
-    fn orphans_held_by(&self, peer: &EndpointId) -> usize {
-        self.orphans
-            .values()
-            .filter(|peers| peers.contains_key(peer))
-            .count()
     }
 }
 

@@ -31,7 +31,6 @@ use std::{
 
 use iroh::{EndpointId, endpoint::Connection};
 use tokio::sync::Notify;
-use tracing::debug;
 
 pub use self::inbox::{Inbox, PeerAnnounce};
 pub use self::pull::CloneSource;
@@ -45,14 +44,6 @@ use crate::{
     net::sync::{Announce, StatusReport},
     repo::OpenRepo,
 };
-
-/// Cap on head ids accepted in one announcement; legitimate divergence is
-/// a few heads, anything more is a hostile or broken peer.
-const MAX_ANNOUNCED_HEADS: usize = 64;
-
-/// Cap on the length of an announced head id: jj's op ids are 64 bytes.
-/// Repo tasks check the exact length against their store.
-const MAX_HEAD_LEN: usize = 64;
 
 /// The router between peer connections and repo tasks.
 #[derive(Debug, Default)]
@@ -335,15 +326,6 @@ impl SyncHub {
     /// everything attributed to the peer for the repo, like a disconnect
     /// scoped to one repo.
     pub fn route(&self, peer: EndpointId, announce: Announce) {
-        // Bounds what an announcement holds, kept as an orphan or in an
-        // inbox.
-        if announce.heads.len() > MAX_ANNOUNCED_HEADS
-            || announce.heads.iter().any(|head| head.len() > MAX_HEAD_LEN)
-        {
-            let peer = self.peer_name(&peer);
-            debug!(%peer, "dropping malformed announcement");
-            return;
-        }
         let retraction = announce.heads.is_empty();
 
         let mut guard = self.state.lock().unwrap();
@@ -357,12 +339,8 @@ impl SyncHub {
                 seq: announce.seq,
                 heads: announce.heads,
             };
-            if state.remember_orphan(peer, announce.id, orphan) {
-                self.orphaned.notify_one();
-            } else {
-                let peer = peer_name(&state.names, &peer);
-                debug!(%peer, "dropping announcement: too many unregistered repos");
-            }
+            state.remember_orphan(peer, announce.id, orphan);
+            self.orphaned.notify_one();
             return;
         };
 
@@ -373,9 +351,8 @@ impl SyncHub {
         }
     }
 
-    /// Stores a peer's status report for `jj-mesh status`. The peer is
-    /// authenticated but its strings reach the user's terminal, so the
-    /// free-form fields are sanitized.
+    /// Stores a peer's status report for `jj-mesh status`. Its strings
+    /// reach the user's terminal, so the free-form fields are sanitized.
     pub fn route_status(&self, peer: EndpointId, mut report: StatusReport) {
         report.daemon_version = sanitize(&report.daemon_version);
         report.jj_version = report.jj_version.as_deref().map(sanitize);

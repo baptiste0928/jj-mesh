@@ -15,11 +15,8 @@ use super::*;
 use crate::{
     config::ObjectHash,
     net::{
-        fetch::{
-            FetchRequest, GitFrame, GitRequest, MAX_GIT_FRAME_SIZE, MAX_OP_FRAME_SIZE, OpFrame,
-            WireObjectKind,
-        },
-        wire::{read_message, write_message},
+        fetch::{FetchRequest, GitFrame, GitRequest, MAX_GIT_FRAME_SIZE, OpFrame, WireObjectKind},
+        wire::{MAX_FRAME_SIZE, read_message, write_message},
     },
     repo::OpenRepo,
     testing::*,
@@ -640,88 +637,6 @@ async fn mirror_keeps_head_unborn_when_creating_its_branch() {
     );
 }
 
-/// A hostile batch op naming a local head as its parent, without being
-/// on the want's ancestry, must be rejected: accepting it would let a
-/// peer unlist that head (op-log rollback).
-#[tokio::test]
-async fn rejects_ops_unreachable_from_wants() {
-    let fx = Fixture::new();
-    let dir = fx.init_repo("a");
-    let repo = open(&dir);
-    let local_head = repo.op_heads().await.unwrap().remove(0);
-
-    let want = OperationId::new(vec![1; 64]);
-    let make_op = move |parents: Vec<OperationId>| {
-        use prost::Message as _;
-        jj_lib::protos::simple_op_store::Operation {
-            view_id: vec![9; 64],
-            parents: parents.iter().map(|id| id.as_bytes().to_vec()).collect(),
-            metadata: Some(jj_lib::protos::simple_op_store::OperationMetadata {
-                description: "crafted".to_owned(),
-                hostname: "evil".to_owned(),
-                username: "evil".to_owned(),
-                ..Default::default()
-            }),
-            ..Default::default()
-        }
-        .encode_to_vec()
-    };
-
-    let (client, remote) = tokio::io::duplex(1 << 20);
-    let (mut client_rx, mut client_tx) = tokio::io::split(client);
-    let (mut server_rx, mut server_tx) = tokio::io::split(remote);
-
-    let head_bytes = local_head.clone();
-    let server = tokio::spawn(async move {
-        use prost::Message as _;
-
-        use crate::net::fetch::compress_payload;
-        let _request: FetchRequest = read_message(&mut server_rx, MAX_OP_FRAME_SIZE)
-            .await
-            .unwrap();
-        let view = jj_lib::protos::simple_op_store::View::default().encode_to_vec();
-        let frames = [
-            OpFrame::View {
-                id: vec![9; 64],
-                view: compress_payload(&view).unwrap(),
-            },
-            // The wanted op, legitimately parented on the local head.
-            OpFrame::Op {
-                id: vec![1; 64],
-                op: compress_payload(&make_op(vec![head_bytes.clone()])).unwrap(),
-            },
-            // The poison: parented on the local head, but nothing
-            // connects it to the want.
-            OpFrame::Op {
-                id: vec![2; 64],
-                op: compress_payload(&make_op(vec![head_bytes])).unwrap(),
-            },
-            OpFrame::Done,
-        ];
-        for frame in frames {
-            write_message(&mut server_tx, &frame, MAX_OP_FRAME_SIZE)
-                .await
-                .unwrap();
-        }
-    });
-
-    let err = fetch_from(
-        &repo,
-        &[want],
-        GitTransferFormat::Loose,
-        &mut client_tx,
-        &mut client_rx,
-        ProgressSink::default(),
-    )
-    .await
-    .unwrap_err();
-    assert!(err.to_string().contains("unreachable"), "{err:#}");
-    server.await.unwrap();
-
-    // Nothing was published: the local head is untouched.
-    assert_eq!(repo.op_heads().await.unwrap(), vec![local_head]);
-}
-
 /// A peer that omits git objects its views reference must fail the fetch
 /// before anything is staged: published, such a head could never be
 /// loaded or indexed.
@@ -741,9 +656,7 @@ async fn rejects_fetch_when_referenced_git_objects_are_missing() {
         use prost::Message as _;
 
         use crate::net::fetch::compress_payload;
-        let _request: FetchRequest = read_message(&mut server_rx, MAX_OP_FRAME_SIZE)
-            .await
-            .unwrap();
+        let _request: FetchRequest = read_message(&mut server_rx, MAX_FRAME_SIZE).await.unwrap();
         // A view whose head names a commit the git phase never delivers.
         let view = jj_lib::protos::simple_op_store::View {
             head_ids: vec![vec![0xAB; 20]],
@@ -763,6 +676,7 @@ async fn rejects_fetch_when_referenced_git_objects_are_missing() {
         }
         .encode_to_vec();
         let frames = [
+            OpFrame::Begin { ops: 1, views: 1 },
             OpFrame::View {
                 id: vec![9; 64],
                 view: compress_payload(&view).unwrap(),
@@ -774,7 +688,7 @@ async fn rejects_fetch_when_referenced_git_objects_are_missing() {
             OpFrame::Done,
         ];
         for frame in frames {
-            write_message(&mut server_tx, &frame, MAX_OP_FRAME_SIZE)
+            write_message(&mut server_tx, &frame, MAX_FRAME_SIZE)
                 .await
                 .unwrap();
         }
@@ -974,27 +888,6 @@ async fn ancestor_rewrite_syncs_without_divergence() {
     assert!(!sync_missing(&rb, &ra).await, "unexpected op churn on a");
 }
 
-/// A pack header's object count must be rejected before gix sizes its
-/// delta tree from it: unchecked, the twelve bytes below name a
-/// multi-gigabyte allocation, and running out of memory aborts the
-/// process instead of failing the fetch.
-#[test]
-fn rejects_pack_header_declaring_absurd_object_count() {
-    let fx = Fixture::new();
-    let dir = fx.init_repo("a");
-    let git = open(&dir).git_backend().git_repo();
-
-    let mut header = Vec::from(*b"PACK");
-    header.extend_from_slice(&2u32.to_be_bytes());
-    header.extend_from_slice(&u32::MAX.to_be_bytes());
-
-    let indexed = pack::SharedObjectCount::default();
-    let Err(err) = pack::ingest_pack(&git, std::io::Cursor::new(header), &indexed) else {
-        panic!("an absurd object count must be refused");
-    };
-    assert!(err.to_string().contains("over the"), "{err:#}");
-}
-
 /// A pack-format fetch with a progress sink must report the phases in
 /// order with exact totals: the op counts the server announced, and
 /// the git object count read from the pack header, both fully reached.
@@ -1014,9 +907,7 @@ async fn progress_reports_phases_and_exact_totals() {
     let (mut client_rx, mut client_tx) = tokio::io::split(client);
     let (mut server_rx, mut server_tx) = tokio::io::split(remote);
     let serve_task = tokio::spawn(async move {
-        let request: FetchRequest = read_message(&mut server_rx, MAX_OP_FRAME_SIZE)
-            .await
-            .unwrap();
+        let request: FetchRequest = read_message(&mut server_rx, MAX_FRAME_SIZE).await.unwrap();
         serve(&ra, request, &mut server_tx, &mut server_rx)
             .await
             .unwrap();

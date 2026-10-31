@@ -8,10 +8,6 @@
 //! every object while building the index, and persists `.pack` and `.idx`
 //! atomically: a partially received pack never becomes visible.
 //!
-//! A received pack is peer-supplied data: its header is bounded here
-//! before gix allocates from it (see [`MAX_PACK_OBJECTS`]), and every
-//! decoded object is capped like a loose one ([`MAX_GIT_OBJECT_SIZE`]).
-//!
 //! Both directions run blocking gix I/O and bridge to the async frame
 //! stream through the caller's channels, via [`ChunkReader`] and the chunk
 //! emit callback.
@@ -22,23 +18,13 @@ use std::{
     sync::atomic::{AtomicBool, Ordering},
 };
 
-use anyhow::{Context as _, Result, anyhow, ensure};
+use anyhow::{Context as _, Result, anyhow};
 use gix::progress::{Count, Id, MessageLevel, NestedProgress, Progress, Step, StepShared, UNKNOWN};
 use tokio::sync::mpsc;
-
-use crate::net::fetch::MAX_GIT_OBJECT_SIZE;
 
 /// Pack bytes are buffered into chunks of this size before each emit, so
 /// the wire sees few large frames instead of one per written entry.
 const PACK_CHUNK_SIZE: usize = 1 << 20;
-
-/// Cap on the object count a received pack may declare in its header.
-///
-/// gix sizes its delta tree from this count before reading a single entry,
-/// so it bounds an allocation a peer names for free. Generous next to any
-/// history a mesh repo replicates; a legitimate pack past it fails with a
-/// clear error instead of the fetcher dying.
-const MAX_PACK_OBJECTS: u32 = 1 << 22;
 
 /// Generates a pack containing exactly `ids` and hands its bytes to `emit`
 /// in chunks. Blocking.
@@ -278,24 +264,9 @@ impl Drop for PackKeep {
 /// `indexed` is stepped once per object as the index is built.
 pub(super) fn ingest_pack(
     git: &gix::Repository,
-    mut read: impl io::Read,
+    read: impl io::Read,
     indexed: &SharedObjectCount,
 ) -> Result<IngestOutcome> {
-    // The header's object count is checked before gix-pack sees it: gix
-    // preallocates its delta tree from that count, so an unchecked u32
-    // turns a 12-byte header into a multi-gigabyte reservation, and an
-    // allocation failure aborts the process rather than failing the fetch.
-    let mut header = [0u8; 12];
-    read.read_exact(&mut header)
-        .context("cannot read pack header")?;
-    let (_version, objects) =
-        gix::odb::pack::data::header::decode(&header).map_err(|err| anyhow!("bad pack: {err}"))?;
-    ensure!(
-        objects <= MAX_PACK_OBJECTS,
-        "pack declares {objects} objects, over the {MAX_PACK_OBJECTS} cap",
-    );
-    let read = io::Read::chain(io::Cursor::new(header), read);
-
     let pack_dir = git.objects.store_ref().path().join("pack");
     let no_interrupt = AtomicBool::new(false);
     let mut progress = IndexCountProgress::root(indexed.0.clone());
@@ -312,10 +283,7 @@ pub(super) fn ingest_pack(
             thread_limit: None,
             iteration_mode: gix_pack::data::input::Mode::Verify,
             index_version: gix_pack::index::Version::default(),
-            // Bounds the buffers gix allocates while resolving deltas: a
-            // pack cannot name a larger decoded object than a loose frame
-            // may.
-            alloc_limit_bytes: Some(usize::try_from(MAX_GIT_OBJECT_SIZE).unwrap_or(usize::MAX)),
+            alloc_limit_bytes: None,
             compression: gix::zlib::Compression::BEST_SPEED,
         },
     )

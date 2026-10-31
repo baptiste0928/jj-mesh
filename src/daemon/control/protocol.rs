@@ -20,7 +20,7 @@ use crate::{
 };
 
 /// Maximum accepted size of a control message.
-pub(super) const MAX_MESSAGE_SIZE: u32 = 1 << 20;
+pub(super) const MAX_MESSAGE_SIZE: u32 = crate::net::wire::MAX_FRAME_SIZE;
 
 /// Time budget for the quick parts of an exchange (request, status answer).
 pub const CLIENT_TIMEOUT: Duration = Duration::from_secs(2);

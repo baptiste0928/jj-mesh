@@ -16,7 +16,7 @@
 //! forgetting and renaming a workspace are operations), when the claims
 //! change and on idle liveness checks. Only claimed workspaces get a task,
 //! once the store has recorded the claim. A workspace is claimed when:
-//! - its name is valid, no peer claims it, and the machine's cap allows;
+//! - its name is valid and no peer claims it;
 //! - it is the main workspace, or a fresh one (its working copy reflects
 //!   the op head): a stale one may be a forgotten workspace that a peer
 //!   reusing its name brought back into the view (jj keeps forgotten
@@ -85,7 +85,7 @@ const LIVENESS_INTERVAL: Duration = Duration::from_mins(1);
 const MAX_ERROR_LEN: usize = 256;
 
 /// Deadline for the network-facing work of one fetch from a peer: a
-/// stalled or hostile server must not pin the repo task forever
+/// stalled server must not pin the repo task forever
 /// (announcement handling and local change publication pause while a
 /// fetch runs). The fetch's local apply and index work runs unbounded.
 const FETCH_NET_TIMEOUT: Duration = Duration::from_mins(30);
@@ -714,11 +714,7 @@ async fn find_workspaces(
                     machines: machines.clone(),
                 },
                 None if claimed.contains(&name) => WorkspaceState::Claimed,
-                None if validate_name("workspace", &name).is_err()
-                    || claimed.len() >= claims.limit =>
-                {
-                    WorkspaceState::Unclaimable
-                }
+                None if validate_name("workspace", &name).is_err() => WorkspaceState::Unclaimable,
                 None if workspace.is_main() || fresh(&workspace) => {
                     claimed.insert(name.clone());
                     WorkspaceState::Claimed

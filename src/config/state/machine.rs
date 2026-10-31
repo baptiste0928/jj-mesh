@@ -4,7 +4,7 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
 use super::{
-    membership::{MAX_RECORD_VERSION, Peer, PeerStatus, next_version},
+    membership::{Peer, PeerStatus, next_version},
     validate_name,
 };
 
@@ -64,18 +64,14 @@ impl Machine {
     /// A tombstone is only matched, not outranked here; a later rename
     /// still bumps past it (an accepted risk: renaming is as trusted as
     /// the machines themselves).
-    ///
-    /// Clamped below [`MAX_RECORD_VERSION`]: a peer must not be able to
-    /// park us on the ceiling, where renames fail and every machine
-    /// discards our record.
     pub(super) fn observe(&mut self, copy: &Peer) {
         let outranking = match &copy.status {
             PeerStatus::Alive { name, server } if *name != self.name || *server != self.server => {
-                copy.version + 1
+                copy.version.saturating_add(1)
             }
             _ => copy.version,
         };
-        self.version = self.version.max(outranking).min(MAX_RECORD_VERSION - 1);
+        self.version = self.version.max(outranking);
     }
 }
 

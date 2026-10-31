@@ -1,8 +1,5 @@
 use super::*;
-use crate::{
-    config::MAX_MESH_REPOS,
-    net::sync::{self, UniMessage},
-};
+use crate::net::sync::{self, UniMessage};
 
 fn announce(id: &RepoId, seq: u64, heads: Vec<Vec<u8>>) -> Announce {
     Announce {
@@ -34,12 +31,6 @@ async fn routes_to_registered_repo() {
     assert_eq!(drained.len(), 1);
     assert_eq!(drained[0].peer, peer);
     assert_eq!(drained[0].heads, vec![vec![1; 64]]);
-    assert!(inbox.drain().is_empty());
-
-    // Malformed announcements are dropped.
-    hub.route(peer, announce(&id, 2, vec![vec![1; MAX_HEAD_LEN + 1]]));
-    let heads = vec![vec![1; 64]; MAX_ANNOUNCED_HEADS + 1];
-    hub.route(peer, announce(&id, 3, heads));
     assert!(inbox.drain().is_empty());
 }
 
@@ -128,31 +119,6 @@ async fn register_seeds_the_inbox_from_orphans() {
     hub.route(peer, announce(&id, 1, vec![vec![1; 64]]));
     let inbox = hub.register_repo(id);
     assert_eq!(inbox.drain().len(), 1);
-}
-
-#[tokio::test]
-async fn orphans_are_bounded_per_peer() {
-    let hub = SyncHub::new();
-    let flooder = iroh::SecretKey::generate().public();
-    let honest = iroh::SecretKey::generate().public();
-
-    for _ in 0..MAX_MESH_REPOS {
-        hub.route(flooder, announce(&RepoId::generate(), 1, vec![vec![1; 64]]));
-    }
-    let over = RepoId::generate();
-    hub.route(flooder, announce(&over, 1, vec![vec![1; 64]]));
-    let work = RepoId::generate();
-    hub.route(honest, announce(&work, 1, vec![vec![2; 64]]));
-
-    // The honest orphan survived the flood, the one over the cap did not.
-    assert_eq!(hub.register_repo(work).drain().len(), 1);
-    assert!(hub.register_repo(over).drain().is_empty());
-
-    // Disconnecting the flooder frees its slots for new repos.
-    hub.peer_disconnected(&flooder);
-    let fresh = RepoId::generate();
-    hub.route(flooder, announce(&fresh, 1, vec![vec![3; 64]]));
-    assert_eq!(hub.register_repo(fresh).drain().len(), 1);
 }
 
 /// A repo unregistered locally keeps its peers' last announcements as

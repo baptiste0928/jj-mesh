@@ -89,8 +89,7 @@ pub enum WorkspaceState {
     Foreign { machines: Vec<String> },
     /// Stale when found: claimed once its working copy is updated.
     Stale,
-    /// Not claimable: its name is not valid in the mesh, or the machine
-    /// reached its claim cap.
+    /// Not claimable: its name is not valid in the mesh.
     Unclaimable,
 }
 
