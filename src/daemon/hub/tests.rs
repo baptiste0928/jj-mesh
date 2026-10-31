@@ -1,11 +1,10 @@
 use super::*;
 use crate::net::sync::{self, UniMessage};
 
-fn announce(id: &RepoId, seq: u64, heads: Vec<Vec<u8>>) -> Announce {
+fn announce(id: &RepoId, seq: u64, ids: Vec<Vec<u8>>) -> Announce {
     Announce {
         id: id.clone(),
-        seq,
-        heads,
+        heads: Heads { seq, ids },
     }
 }
 
@@ -30,7 +29,7 @@ async fn routes_to_registered_repo() {
     let drained = inbox.drain();
     assert_eq!(drained.len(), 1);
     assert_eq!(drained[0].peer, peer);
-    assert_eq!(drained[0].heads, vec![vec![1; 64]]);
+    assert_eq!(drained[0].heads.ids, vec![vec![1; 64]]);
     assert!(inbox.drain().is_empty());
 }
 
@@ -46,7 +45,7 @@ async fn discards_reordered_announcements() {
 
     let drained = inbox.drain();
     assert_eq!(drained.len(), 1);
-    assert_eq!(drained[0].heads, vec![vec![2; 64]]);
+    assert_eq!(drained[0].heads.ids, vec![vec![2; 64]]);
 
     // The watermark survives draining: the stale announcement stays
     // rejected even when it arrives afterwards.
@@ -66,17 +65,17 @@ async fn requeue_retries_failed_heads_until_superseded() {
     assert_eq!(drained.len(), 1);
 
     // A failed fetch requeues the drained heads; the next drain retries.
-    inbox.requeue(peer, drained[0].seq, drained[0].heads.clone());
+    inbox.requeue(&drained[0]);
     let retried = inbox.drain();
     assert_eq!(retried.len(), 1);
-    assert_eq!(retried[0].heads, vec![vec![1; 64]]);
+    assert_eq!(retried[0].heads.ids, vec![vec![1; 64]]);
 
     // A newer announcement supersedes a stale requeue.
     hub.route(peer, announce(&id, 2, vec![vec![2; 64]]));
-    inbox.requeue(peer, 1, vec![vec![1; 64]]);
+    inbox.requeue(&retried[0]);
     let latest = inbox.drain();
     assert_eq!(latest.len(), 1);
-    assert_eq!(latest[0].heads, vec![vec![2; 64]]);
+    assert_eq!(latest[0].heads.ids, vec![vec![2; 64]]);
 }
 
 #[tokio::test]
@@ -186,7 +185,7 @@ async fn reconnection_resets_sequence_tracking() {
     hub.route(peer, announce(&id, 1, vec![vec![2; 64]]));
     let drained = inbox.drain();
     assert_eq!(drained.len(), 1);
-    assert_eq!(drained[0].heads, vec![vec![2; 64]]);
+    assert_eq!(drained[0].heads.ids, vec![vec![2; 64]]);
 }
 
 #[test]
@@ -195,11 +194,12 @@ fn outbox_coalesces_per_repo_with_membership_first() {
     let id = RepoId::generate();
     let other = RepoId::generate();
 
-    outbox.push_announce(announce(&id, 1, vec![vec![1; 64]]));
-    outbox.push_membership(Membership::default());
-    outbox.push_announce(announce(&other, 1, vec![vec![3; 64]]));
-    outbox.push_announce(announce(&id, 2, vec![vec![2; 64]]));
-    outbox.push_membership(Membership::default());
+    let membership = || UniMessage::Membership(Membership::default());
+    outbox.push(UniMessage::Announce(announce(&id, 1, vec![vec![1; 64]])));
+    outbox.push(membership());
+    outbox.push(UniMessage::Announce(announce(&other, 1, vec![vec![3; 64]])));
+    outbox.push(UniMessage::Announce(announce(&id, 2, vec![vec![2; 64]])));
+    outbox.push(membership());
 
     let sent: Vec<UniMessage> = std::iter::from_fn(|| outbox.pop()).collect();
     assert_eq!(sent.len(), 3);
@@ -207,7 +207,7 @@ fn outbox_coalesces_per_repo_with_membership_first() {
     let seqs: Vec<(&RepoId, u64)> = sent
         .iter()
         .filter_map(|message| match message {
-            UniMessage::Announce(a) => Some((&a.id, a.seq)),
+            UniMessage::Announce(a) => Some((&a.id, a.heads.seq)),
             UniMessage::Membership(_) | UniMessage::Status(_) => None,
         })
         .collect();

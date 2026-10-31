@@ -7,9 +7,14 @@
 //!
 //! One-shot uni streams carry a [`UniMessage`]: op-head announcements,
 //! membership gossip and daemon status reports. All are idempotent
-//! latest-wins state, re-sent on every change and on peer (re)connect, so a
-//! lost or dropped message is always healed by a later one. Op negotiation
-//! and git object transfer run on bidirectional streams (see
+//! latest-wins state, re-sent on every change and on peer (re)connect, and
+//! a failed send or read closes the connection, so a lost message is
+//! healed by the reconnect replay. A connection delivers them in send order. Receivers
+//! read at most [`MAX_UNI_STREAMS`] at once and leave the rest unaccepted:
+//! QUIC stream credit then holds the sender back, which coalesces its
+//! queue meanwhile.
+//!
+//! Op negotiation and git object transfer run on bidirectional streams (see
 //! [`super::fetch`]).
 
 use anyhow::Result;
@@ -21,6 +26,9 @@ use crate::config::{Membership, RepoId};
 
 /// ALPN of the sync protocol, opening with a [`super::hello`].
 pub const ALPN: &[u8] = b"jj-mesh/sync/3";
+
+/// Uni streams a peer may have open at once, read concurrently.
+pub const MAX_UNI_STREAMS: u32 = 64;
 
 /// A message carried by a one-shot uni stream.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -34,12 +42,27 @@ pub enum UniMessage {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Announce {
     pub id: RepoId,
+    pub heads: Heads,
+}
+
+/// A repo's op heads as one machine published them. No ids retract the
+/// repo: the machine forgot it, as a held repo always has an op head.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Heads {
     /// Publish sequence, sender-wide: monotonic across all repos for the
-    /// sender's daemon run. Streams have no cross-stream ordering, so the
-    /// receiver uses it to discard reordered announcements.
+    /// sender's daemon run. Identifies the announcement, so a retried fetch
+    /// never replaces a newer one, and a stale one never replaces a newer
+    /// one held for the repo.
     pub seq: u64,
-    /// Current op head ids, as raw id bytes; the receiver validates them.
-    pub heads: Vec<Vec<u8>>,
+    /// Op head ids, as raw id bytes; the receiver validates them.
+    pub ids: Vec<Vec<u8>>,
+}
+
+impl Heads {
+    /// Whether these heads retract the repo.
+    pub fn is_retraction(&self) -> bool {
+        self.ids.is_empty()
+    }
 }
 
 /// One machine's self-reported health, shown by `jj-mesh status` on its

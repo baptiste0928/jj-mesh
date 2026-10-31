@@ -33,8 +33,7 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
-use anyhow::{Context as _, Result, anyhow, ensure};
-use iroh::EndpointId;
+use anyhow::{Context as _, Result, ensure};
 use jj_lib::{object_id::ObjectId as _, op_store::OperationId};
 use pollster::FutureExt as _;
 use tokio::sync::{Notify, mpsc, watch};
@@ -83,16 +82,6 @@ const LIVENESS_INTERVAL: Duration = Duration::from_mins(1);
 /// their length is not ours to trust, and they are cloned into every
 /// status response.
 const MAX_ERROR_LEN: usize = 256;
-
-/// Deadline for the network-facing work of one fetch from a peer: a
-/// stalled server must not pin the repo task forever
-/// (announcement handling and local change publication pause while a
-/// fetch runs). The fetch's local apply and index work runs unbounded.
-const FETCH_NET_TIMEOUT: Duration = Duration::from_mins(30);
-
-/// Budget for opening the fetch stream on an established connection: a
-/// peer that never grants stream credit must not hang the task.
-const OPEN_STREAM_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Delay before retrying a fetch that failed. The announcement was already
 /// consumed, so without this a transient failure (a peer momentarily busy,
@@ -451,8 +440,7 @@ impl RepoTask {
             match self.handle_announce(repo, &announce).await? {
                 Handled::Fetched => drained.synced = true,
                 Handled::Failed => {
-                    self.announcements
-                        .requeue(announce.peer, announce.seq, announce.heads);
+                    self.announcements.requeue(&announce);
                     drained.retry = true;
                 }
                 Handled::Idle => {}
@@ -470,16 +458,13 @@ impl RepoTask {
     ) -> Result<Handled> {
         let peer = self.hub.peer_name(&announce.peer);
         let id_len = repo.root_operation_id().as_bytes().len();
-        if announce.heads.iter().any(|head| head.len() != id_len) {
+        let ids = &announce.heads.ids;
+        if ids.iter().any(|id| id.len() != id_len) {
             debug!(%peer, "ignoring malformed announcement");
             return Ok(Handled::Idle);
         }
         // Runs on a blocking thread: the check may walk the op log.
-        let heads: Vec<OperationId> = announce
-            .heads
-            .iter()
-            .map(|head| OperationId::new(head.clone()))
-            .collect();
+        let heads: Vec<OperationId> = ids.iter().cloned().map(OperationId::new).collect();
         let missing = {
             let repo = repo.clone();
             crate::spawn_blocking(move || repo.missing_heads(&heads))
@@ -501,7 +486,17 @@ impl RepoTask {
 
         // Sync failures must not kill the watch: the repo is fine, the peer
         // or network is not. The caller requeues for a later retry.
-        match self.fetch_missing(repo, announce.peer, &missing).await {
+        // Announcement handling and local change publication pause while
+        // the fetch runs, bounded by its network deadline.
+        let fetch = self.hub.fetch(
+            &announce.peer,
+            repo,
+            &self.id,
+            &missing,
+            GitTransferFormat::Loose,
+            transfer::ProgressSink::default(),
+        );
+        match fetch.await {
             Ok(outcome) => {
                 info!(
                     %peer,
@@ -515,38 +510,6 @@ impl RepoTask {
                 Ok(Handled::Failed)
             }
         }
-    }
-
-    /// Fetches missing op heads from the announcing peer over a fresh
-    /// bidirectional stream.
-    async fn fetch_missing(
-        &self,
-        repo: &Arc<OpenRepo>,
-        peer: EndpointId,
-        wants: &[OperationId],
-    ) -> Result<transfer::FetchOutcome> {
-        let conn = self
-            .hub
-            .connection(&peer)
-            .ok_or_else(|| anyhow!("peer is no longer connected"))?;
-        let (mut send, mut recv) = tokio::time::timeout(OPEN_STREAM_TIMEOUT, conn.open_bi())
-            .await
-            .map_err(|_| anyhow!("timed out opening the fetch stream"))??;
-        let outcome = transfer::fetch(
-            repo,
-            &self.id,
-            wants,
-            transfer::FetchOptions {
-                format: GitTransferFormat::Loose,
-                net_timeout: FETCH_NET_TIMEOUT,
-            },
-            &mut send,
-            &mut recv,
-            transfer::ProgressSink::default(),
-        )
-        .await?;
-        let _ = send.finish();
-        Ok(outcome)
     }
 
     /// Builds the commit index for any op head missing one, on a blocking

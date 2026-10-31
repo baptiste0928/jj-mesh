@@ -47,7 +47,7 @@ use self::{
 };
 use crate::{
     config::{ConfigDir, MachineKey, Membership, MeshState},
-    net::{EndpointOptions, bind_endpoint, pair, sync},
+    net::{EndpointOptions, bind_endpoint, hello, pair, sync},
     repo,
 };
 
@@ -73,8 +73,7 @@ const STATUS_DEBOUNCE: Duration = Duration::from_secs(1);
 /// The ALPNs the daemon serves. The pairing ALPN is always among them:
 /// pairing is gated by the one-time ticket, not by ALPN exposure, and
 /// unknown endpoints can complete handshakes on the sync ALPN anyway
-/// (they are refused post-handshake by the peer allowlist). Replaced ALPNs
-/// stay served with their hello alone (see [`crate::net::hello`]).
+/// (they are refused right after by the peer allowlist).
 fn alpns() -> Vec<Vec<u8>> {
     vec![sync::ALPN.to_vec(), pair::ALPN.to_vec()]
 }
@@ -85,6 +84,8 @@ fn alpns() -> Vec<Vec<u8>> {
 /// The binary drives it through [`run`]; tests start and stop it directly.
 pub struct Daemon {
     tasks: tokio::task::JoinSet<()>,
+    peers: Arc<PeerSet>,
+    repos: Arc<RepoSet>,
     endpoint: Endpoint,
 }
 
@@ -163,14 +164,19 @@ impl Daemon {
             jj_version: jj_version.clone(),
         })));
 
-        tasks.spawn(accept_loop(endpoint.clone(), peers, pairing));
+        tasks.spawn(accept_loop(endpoint.clone(), peers.clone(), pairing));
         tasks.spawn(membership_loop(gossip_rx, store.clone()));
         tasks.spawn(update_loop(update_rx, store.clone()));
         tasks.spawn(bare::run(store.clone(), hub.clone(), bare.clone()));
-        tasks.spawn(status_loop(repos, hub, jj_version));
+        tasks.spawn(status_loop(repos.clone(), hub, jj_version));
         tasks.spawn(gossip_loop(store));
 
-        Ok(Daemon { tasks, endpoint })
+        Ok(Daemon {
+            tasks,
+            peers,
+            repos,
+            endpoint,
+        })
     }
 
     /// Resolves when a subsystem terminates on its own. That is always
@@ -181,13 +187,17 @@ impl Daemon {
         anyhow!("a daemon subsystem terminated unexpectedly: {res:?}")
     }
 
-    /// Stops all subsystems and closes the endpoint. Waits for the aborted
-    /// tasks to finish, so the control socket is released (its file
-    /// removed, its lock dropped) before returning.
+    /// Stops all subsystems, closes the endpoint, then stops the peer and
+    /// repo tasks. Waits for the aborted tasks to finish, so the
+    /// control socket is released (its file removed, its lock dropped)
+    /// before returning; blocking work already started still completes.
     pub async fn shutdown(mut self) {
         self.tasks.abort_all();
         while self.tasks.join_next().await.is_some() {}
+        // Before the peer tasks, which would tell peers they were removed.
         self.endpoint.close().await;
+        self.peers.shutdown().await;
+        self.repos.shutdown().await;
     }
 }
 
@@ -207,10 +217,10 @@ pub async fn run(dir: &ConfigDir, logs: LogBuffer) -> Result<()> {
     outcome
 }
 
-/// Accepts incoming connections and routes them by ALPN: sync connections
-/// to their peer task (the `PeerSet` refuses unpaired endpoints), pairing
-/// connections to a pairing exchange (refused unless a ticket is
-/// outstanding).
+/// Accepts incoming connections, runs their hello and routes them by ALPN:
+/// sync connections to their peer task (the `PeerSet` refuses unpaired
+/// endpoints), pairing connections to a pairing exchange (refused unless a
+/// ticket is outstanding).
 async fn accept_loop(endpoint: Endpoint, peers: Arc<PeerSet>, pairing: Arc<Pairing>) {
     // Identity is only known after the handshake, so anyone can start one:
     // bound how many run concurrently.
@@ -230,30 +240,48 @@ async fn accept_loop(endpoint: Endpoint, peers: Arc<PeerSet>, pairing: Arc<Pairi
         let peers = peers.clone();
         let pairing = pairing.clone();
         tokio::spawn(async move {
-            // The permit is captured by the task and released when it
-            // ends, covering the whole handshake (and the sync hello).
-            match tokio::time::timeout(HANDSHAKE_TIMEOUT, connecting).await {
-                Ok(Ok(conn)) if conn.alpn() == sync::ALPN => peers.route_inbound(conn).await,
-                Ok(Ok(conn)) if conn.alpn() == pair::ALPN => {
-                    // The exchange outlives the handshake phase; release
-                    // the permit and let pairing bound its own work.
-                    drop(permit);
-                    pairing.serve_inbound(conn).await;
+            // The permit is captured by the task, covering the handshake
+            // and the hello.
+            let conn = match tokio::time::timeout(HANDSHAKE_TIMEOUT, connecting).await {
+                Ok(Ok(conn)) => conn,
+                Ok(Err(err)) => return debug!("incoming connection failed: {err}"),
+                Err(_) => return debug!("incoming handshake timed out"),
+            };
+            // Kept at debug: anyone can connect, and peers log their own
+            // dial failing the same way.
+            let id = conn.remote_id().fmt_short();
+            match conn.alpn() {
+                // Refused before the hello, so their dial fails at once.
+                sync::ALPN if !peers.allows(&conn.remote_id()) => {
+                    debug!(%id, "refusing connection from unpaired endpoint");
+                    return conn.close(0u32.into(), b"unauthorized");
                 }
-                Ok(Ok(conn)) => {
+                sync::ALPN | pair::ALPN => {}
+                _ => {
                     debug!("closing connection with unexpected ALPN");
-                    conn.close(0u32.into(), b"unexpected alpn");
+                    return conn.close(0u32.into(), b"unexpected alpn");
                 }
-                Ok(Err(err)) => debug!("incoming connection failed: {err}"),
-                Err(_) => debug!("incoming handshake timed out"),
+            }
+            match hello::accept(&conn).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => return debug!(%id, %error, "refusing connection"),
+                Err(err) => return debug!(%id, "bad hello: {err:#}"),
+            }
+            // A pairing exchange outlives the handshake phase and bounds
+            // its own work.
+            drop(permit);
+            if conn.alpn() == sync::ALPN {
+                peers.route_inbound(conn);
+            } else {
+                pairing.serve_inbound(conn).await;
             }
         });
     }
 }
 
 /// Broadcasts this machine's health to the peers on repo state changes,
-/// publishing only when it changed: an idle mesh stays silent. A report
-/// lost with its connection is replayed on reconnect.
+/// publishing only when it changed. A report lost with its connection is
+/// replayed on reconnect.
 async fn status_loop(repos: Arc<RepoSet>, hub: Arc<SyncHub>, jj_version: Option<String>) {
     let mut published: Option<sync::StatusReport> = None;
     loop {

@@ -5,16 +5,13 @@ use std::{collections::BTreeMap, sync::Mutex};
 use iroh::EndpointId;
 use tokio::sync::Notify;
 
+use crate::net::sync::Heads;
+
 /// An announcement received from a peer, drained by a repo task.
 #[derive(Debug)]
 pub struct PeerAnnounce {
     pub peer: EndpointId,
-    /// Sequence it was drained at, so a failed fetch can [requeue] the
-    /// heads without clobbering a newer announcement.
-    ///
-    /// [requeue]: Inbox::requeue
-    pub seq: u64,
-    pub heads: Vec<Vec<u8>>,
+    pub heads: Heads,
 }
 
 /// Inbound announcements for one repo: the latest per peer, drained by
@@ -25,29 +22,34 @@ pub struct Inbox {
     notify: Notify,
 }
 
-/// One peer's slot: the highest announcement sequence seen and its heads.
-/// The heads survive draining (marked `drained`), so the peer's last known
+/// One peer's slot: the announcement with the highest sequence seen. The
+/// heads survive draining (marked `drained`), so the peer's last known
 /// state can be demoted to an orphan announcement when the repo is
-/// unregistered, and the watermark fends off reordered stale
-/// announcements arriving after a drain.
+/// unregistered, and the watermark keeps a requeued fetch from replacing
+/// a newer announcement.
 #[derive(Debug)]
 struct Slot {
-    seq: u64,
-    heads: Vec<Vec<u8>>,
+    heads: Heads,
     drained: bool,
 }
 
 impl Inbox {
-    /// Stores an announcement unless a newer one was already seen.
-    pub(super) fn offer(&self, peer: EndpointId, seq: u64, heads: Vec<Vec<u8>>) {
-        if self.advance(
-            peer,
-            Slot {
-                seq,
-                heads,
-                drained: false,
-            },
-        ) {
+    /// Stores an announcement unless a newer one was already seen. A
+    /// retraction advances the watermark and clears the heads, so a
+    /// reordered pre-retraction announcement stays rejected while a later
+    /// re-registration's announcements come through.
+    pub(super) fn offer(&self, peer: EndpointId, heads: Heads) {
+        let drained = heads.is_retraction();
+        let mut slots = self.slots.lock().unwrap();
+        if slots
+            .get(&peer)
+            .is_some_and(|held| held.heads.seq >= heads.seq)
+        {
+            return;
+        }
+        slots.insert(peer, Slot { heads, drained });
+        drop(slots);
+        if !drained {
             self.notify.notify_one();
         }
     }
@@ -57,42 +59,16 @@ impl Inbox {
         self.slots.lock().unwrap().remove(peer);
     }
 
-    /// Records a retraction: the watermark advances and the heads clear,
-    /// so a reordered pre-retraction announcement stays rejected while a
-    /// later re-registration's announcements come through.
-    pub(super) fn retract(&self, peer: EndpointId, seq: u64) {
-        self.advance(
-            peer,
-            Slot {
-                seq,
-                heads: Vec::new(),
-                drained: true,
-            },
-        );
-    }
-
-    /// Installs a peer's slot unless one at or past its sequence is held;
-    /// returns whether the watermark advanced.
-    fn advance(&self, peer: EndpointId, slot: Slot) -> bool {
-        let mut slots = self.slots.lock().unwrap();
-        if slots.get(&peer).is_some_and(|held| held.seq >= slot.seq) {
-            return false;
-        }
-        slots.insert(peer, slot);
-        true
-    }
-
     /// The last announcement of every peer, drained or not, for demotion
     /// to orphan announcements on unregistration. Peers that retracted the
-    /// repo (no heads) are not included.
+    /// repo are not included.
     pub(super) fn snapshot(&self) -> Vec<PeerAnnounce> {
         let slots = self.slots.lock().unwrap();
         slots
             .iter()
-            .filter(|(_, slot)| !slot.heads.is_empty())
+            .filter(|(_, slot)| !slot.heads.is_retraction())
             .map(|(peer, slot)| PeerAnnounce {
                 peer: *peer,
-                seq: slot.seq,
                 heads: slot.heads.clone(),
             })
             .collect()
@@ -116,7 +92,6 @@ impl Inbox {
                 slot.drained = true;
                 PeerAnnounce {
                     peer: *peer,
-                    seq: slot.seq,
                     heads: slot.heads.clone(),
                 }
             })
@@ -125,17 +100,15 @@ impl Inbox {
 
     /// Restores heads a fetch failed to apply, so the next drain retries
     /// them. A newer announcement arriving meanwhile supersedes them (it
-    /// bumps the slot past `seq`), and a fresh connection drops the slot
-    /// entirely, so the retry never resurrects stale or revoked state. Does
-    /// not notify: the retry is driven by the repo task's own timer, which
-    /// avoids hot-looping against a peer that keeps failing.
-    pub fn requeue(&self, peer: EndpointId, seq: u64, heads: Vec<Vec<u8>>) {
+    /// bumps the slot past their sequence), and a fresh connection drops
+    /// the slot entirely, so the retry never resurrects stale or revoked
+    /// state. Does not notify: the retry is driven by the repo task's own
+    /// timer, which avoids hot-looping against a peer that keeps failing.
+    pub fn requeue(&self, announce: &PeerAnnounce) {
         let mut slots = self.slots.lock().unwrap();
-        if let Some(slot) = slots.get_mut(&peer)
-            && slot.seq == seq
-            && slot.drained
+        if let Some(slot) = slots.get_mut(&announce.peer)
+            && slot.heads.seq == announce.heads.seq
         {
-            slot.heads = heads;
             slot.drained = false;
         }
     }

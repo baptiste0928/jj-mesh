@@ -4,34 +4,22 @@
 //! Peers replay all their repos on connect, so the [`HubState::orphans`]
 //! map is how `clone` and server mode learn a repo's heads and who serves
 //! it; [`SyncHub::clone_sources`] resolves that into
-//! [`CloneSource`]s to pull from (see [`super::pull`]). The map is pruned
+//! [`CloneSource`]s to pull from (see [`super::fetch`]). The map is pruned
 //! on disconnect.
 
 use std::collections::BTreeMap;
 
 use anyhow::{Result, ensure};
 use iroh::EndpointId;
+use jj_lib::op_store::OperationId;
 
 use super::{CloneSource, HubState, SyncHub};
-use crate::{config::RepoId, hint::hinted};
-
-/// The latest announcement one peer made for an unregistered repo.
-#[derive(Debug, Clone)]
-pub(super) struct OrphanAnnounce {
-    pub(super) seq: u64,
-    pub(super) heads: Vec<Vec<u8>>,
-}
+use crate::{config::RepoId, hint::hinted, net::sync::Heads};
 
 impl HubState {
-    /// Records `announce` as `peer`'s latest for the unregistered repo
-    /// `id`.
-    pub(super) fn remember_orphan(
-        &mut self,
-        peer: EndpointId,
-        id: RepoId,
-        announce: OrphanAnnounce,
-    ) {
-        self.orphans.entry(id).or_default().insert(peer, announce);
+    /// Records `heads` as `peer`'s latest for the unregistered repo `id`.
+    pub(super) fn remember_orphan(&mut self, peer: EndpointId, id: RepoId, heads: Heads) {
+        self.orphans.entry(id).or_default().insert(peer, heads);
     }
 
     /// Drops `peer`'s entry for `id` (it retracted the repo).
@@ -53,7 +41,7 @@ impl HubState {
     }
 
     /// Takes every announcement for `id`, which is being registered.
-    pub(super) fn take_orphans(&mut self, id: &RepoId) -> BTreeMap<EndpointId, OrphanAnnounce> {
+    pub(super) fn take_orphans(&mut self, id: &RepoId) -> BTreeMap<EndpointId, Heads> {
         self.orphans.remove(id).unwrap_or_default()
     }
 }
@@ -75,9 +63,9 @@ impl SyncHub {
             .into_iter()
             .flatten()
             .filter(|(peer, _)| state.peers.contains_key(*peer))
-            .map(|(peer, announce)| CloneSource {
+            .map(|(peer, heads)| CloneSource {
                 peer: *peer,
-                heads: announce.heads.clone(),
+                heads: heads.ids.iter().cloned().map(OperationId::new).collect(),
             })
             .collect();
         ensure!(

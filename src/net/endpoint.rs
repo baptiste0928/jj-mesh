@@ -1,8 +1,13 @@
 //! Iroh endpoint construction.
 
 use anyhow::Result;
-use iroh::{Endpoint, endpoint::presets, tls::CaTlsConfig};
+use iroh::{
+    Endpoint,
+    endpoint::{QuicTransportConfig, presets},
+    tls::CaTlsConfig,
+};
 
+use super::sync::MAX_UNI_STREAMS;
 use crate::config::MachineKey;
 
 /// How the iroh endpoint reaches the network.
@@ -47,6 +52,7 @@ pub async fn bind_endpoint(
                 .ca_tls_config(CaTlsConfig::system())
                 .secret_key(key.secret().clone())
                 .alpns(alpns)
+                .transport_config(transport())
                 .bind()
                 .await?;
             Ok(endpoint)
@@ -60,6 +66,7 @@ pub async fn bind_endpoint(
                 .bind_addr("127.0.0.1:0")?
                 .secret_key(key.secret().clone())
                 .alpns(alpns)
+                .transport_config(transport())
                 .bind()
                 .await?;
             endpoint
@@ -70,4 +77,12 @@ pub async fn bind_endpoint(
             Ok(endpoint)
         }
     }
+}
+
+/// The QUIC transport: iroh's defaults, with the peer's uni streams capped
+/// so stream credit, not dropped messages, holds back a bursting sender.
+fn transport() -> QuicTransportConfig {
+    QuicTransportConfig::builder()
+        .max_concurrent_uni_streams(MAX_UNI_STREAMS.into())
+        .build()
 }

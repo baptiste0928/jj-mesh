@@ -23,6 +23,11 @@ use crate::{
 /// Fetches served concurrently per repo (read-only on the repo).
 const MAX_SERVES: usize = 2;
 
+/// How long a fetch waits for a busy repo before being refused: with more
+/// than [`MAX_SERVES`] peers syncing one change at once, queueing briefly
+/// beats sending the surplus back to their retry timer.
+const QUEUE_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Hard budget on serving one fetch; QUIC flow control means a stalled
 /// fetcher could otherwise pin a serve task and its permit forever.
 const SERVE_TIMEOUT: Duration = Duration::from_mins(30);
@@ -43,11 +48,16 @@ impl Serving {
             permits: Arc::new(tokio::sync::Semaphore::new(MAX_SERVES)),
         }
     }
+
+    /// Refuses the fetches still queued on this handle.
+    pub(super) fn close(&self) {
+        self.permits.close();
+    }
 }
 
 impl SyncHub {
     /// Serves an inbound fetch on a detached task, or refuses it when the
-    /// repo is not open here or too busy.
+    /// repo is not open here or stays too busy.
     pub fn serve_fetch(
         &self,
         peer: EndpointId,
@@ -55,17 +65,18 @@ impl SyncHub {
         mut send: SendStream,
         mut recv: RecvStream,
     ) {
-        let Some(serving) = self.lookup_serving(&request) else {
-            return refuse_fetch(send, "repo not available");
-        };
-        let Ok(permit) = serving.permits.clone().try_acquire_owned() else {
-            debug!(repo = %request.id, "refusing fetch: too many being served");
-            return refuse_fetch(send, "busy, retry later");
-        };
-
+        let serving = self.lookup_serving(&request);
         let peer = self.peer_name(&peer);
         tokio::spawn(async move {
-            let _permit = permit;
+            let Some(serving) = serving else {
+                return refuse_and_close(send, "repo not available").await;
+            };
+            let queued = tokio::time::timeout(QUEUE_TIMEOUT, serving.permits.acquire_owned());
+            let Ok(Ok(_permit)) = queued.await else {
+                debug!(repo = %request.id, "refusing fetch: too many being served");
+                return refuse_and_close(send, "busy, retry later").await;
+            };
+
             let serve = transfer::serve(&serving.repo, request, &mut send, &mut recv);
             match tokio::time::timeout(SERVE_TIMEOUT, serve).await {
                 Ok(Ok(())) => {
@@ -94,10 +105,8 @@ impl SyncHub {
     }
 }
 
-/// Refuses a fetch on a detached task, telling the peer why before closing.
-fn refuse_fetch(mut send: SendStream, message: &'static str) {
-    tokio::spawn(async move {
-        let _ = transfer::refuse(&mut send, message.to_owned()).await;
-        let _ = send.finish();
-    });
+/// Refuses a fetch, telling the peer why before closing.
+async fn refuse_and_close(mut send: SendStream, message: &str) {
+    let _ = transfer::refuse(&mut send, message.to_owned()).await;
+    let _ = send.finish();
 }

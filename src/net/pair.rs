@@ -52,10 +52,10 @@ const TICKET_PREFIX: &str = "jjmesh-pair-";
 const MAX_MESSAGE_SIZE: u32 = 4096;
 
 /// Host-side budget for a connection to open its stream and present its
-/// `Join`. This pre-secret phase is the only part an attacker without the
-/// ticket can stretch, and one stalled connection occupies one of the few
-/// exchange slots, so it gets a much shorter deadline than the exchange.
-const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
+/// `Join`. An attacker without the ticket can stretch this phase, and one
+/// stalled connection occupies one of the few exchange slots, so it gets a
+/// much shorter deadline than the exchange.
+const JOIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How long a rejecting side waits for the peer to close before giving up.
 const REJECT_LINGER: Duration = Duration::from_secs(5);
@@ -188,7 +188,7 @@ pub async fn pair_with(
     ticket: &PairTicket,
     state: &MeshState,
 ) -> Result<Outcome> {
-    let opening = tokio::time::timeout(HELLO_TIMEOUT, async {
+    let opening = tokio::time::timeout(JOIN_TIMEOUT, async {
         let (send, mut recv) = conn.accept_bi().await.ok()?;
         let join = read_message(&mut recv, MAX_MESSAGE_SIZE).await;
         Some((send, recv, join))
@@ -210,7 +210,7 @@ pub async fn pair_with(
             secret: proof,
             name,
         }) if ticket.secret.verify(&proof) => name,
-        Ok(_) | Err(_) => {
+        _ => {
             send_reject(
                 conn,
                 &mut send,
@@ -256,7 +256,7 @@ pub async fn reject_attempt(conn: &Connection, reason: &str) {
     // The joiner's Join is left unread but its stream is kept open until
     // the linger, so the joiner's write cannot fail before it reads the
     // rejection.
-    match tokio::time::timeout(HELLO_TIMEOUT, conn.accept_bi()).await {
+    match tokio::time::timeout(JOIN_TIMEOUT, conn.accept_bi()).await {
         Ok(Ok((mut send, _recv))) => {
             send_reject(conn, &mut send, reason, REJECT_LINGER_BRIEF).await;
         }

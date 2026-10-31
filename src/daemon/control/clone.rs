@@ -93,8 +93,11 @@ async fn clone_pull_and_register(
             transfer,
         });
     };
-    let (ops, git_objects) = ctx.hub.pull(&id, sources, path, &sink).await?;
+    let outcome = ctx.hub.pull(&id, sources, path, &sink).await?;
 
     ctx.store.update(|state| state.add_clone(id, repo))?;
-    Ok(Response::Cloned { ops, git_objects })
+    Ok(Response::Cloned {
+        ops: outcome.ops as u64,
+        git_objects: outcome.git_objects as u64,
+    })
 }

@@ -357,7 +357,7 @@ impl Task {
             .context("bare repo init task failed")??;
         }
 
-        let (ops, git_objects) = self.hub.pull(id, sources, &partial, &|_, _| {}).await?;
+        let outcome = self.hub.pull(id, sources, &partial, &|_, _| {}).await?;
 
         fs::rename(&partial, &repo.path)
             .with_context(|| format!("cannot move the repo to {}", repo.path.display()))?;
@@ -365,7 +365,7 @@ impl Task {
             ensure!(state.machine.server, "server mode is off");
             state.add_clone(id.clone(), repo)
         })?;
-        info!(repo = %name, ops, objects = git_objects, "pulled bare repo");
+        info!(repo = %name, ops = outcome.ops, objects = outcome.git_objects, "pulled bare repo");
         Ok(())
     }
 }

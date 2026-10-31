@@ -26,6 +26,7 @@ mod workspace;
 
 use std::{
     collections::{BTreeMap, BTreeSet},
+    mem,
     path::PathBuf,
     sync::{Arc, Mutex},
     time::{Instant, SystemTime},
@@ -202,6 +203,15 @@ impl RepoSet {
             holds: self.holds.clone(),
             key,
         })
+    }
+
+    /// Stops every repo task, and with them their workspace tasks.
+    pub async fn shutdown(&self) {
+        let repos = mem::take(&mut *self.repos.lock().unwrap());
+        for handle in repos.into_values() {
+            handle.task.abort();
+            let _ = handle.task.await;
+        }
     }
 
     /// Aligns the managed repos with the mesh state: spawns tasks for new

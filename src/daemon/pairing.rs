@@ -16,10 +16,7 @@ use tokio::sync::Semaphore;
 use tracing::{debug, info, warn};
 
 use super::{control::PAIR_TICKET_TTL, store::MeshStore};
-use crate::{
-    hint::hinted,
-    net::{hello, pair},
-};
+use crate::{hint::hinted, net::pair};
 
 /// How long to wait for a relay connection when issuing a ticket.
 const ONLINE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -91,23 +88,17 @@ impl Pairing {
         Ok(ticket)
     }
 
-    /// Serves one accepted pair-ALPN connection: refused outright unless a
-    /// ticket is outstanding, otherwise one exchange attempt runs against
-    /// it. A failed attempt leaves the ticket valid (the joiner was told
-    /// why and can retry); only a successful one redeems it.
+    /// Serves one accepted pair-ALPN connection, past its hello: refused
+    /// outright unless a ticket is outstanding, otherwise one exchange
+    /// attempt runs against it. A failed attempt leaves the ticket valid
+    /// (the joiner was told why and can retry); only a successful one
+    /// redeems it.
     pub async fn serve_inbound(&self, conn: Connection) {
         let Ok(_permit) = self.exchanges.try_acquire() else {
             debug!("dropping surplus pairing connection");
             conn.close(0u32.into(), b"busy");
             return;
         };
-        // Kept at debug: anyone can attempt pairing. The joiner is told.
-        match hello::accept(&conn).await {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => return debug!(%error, "refusing pairing connection"),
-            Err(err) => return debug!("bad pairing hello: {err:#}"),
-        }
-
         let Some(ticket) = self.issued_ticket() else {
             debug!("refusing pairing connection: no valid ticket");
             pair::reject_attempt(&conn, "no pairing in progress on this machine").await;

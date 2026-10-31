@@ -3,7 +3,6 @@
 use std::{
     collections::BTreeMap,
     sync::{Arc, Mutex},
-    time::Duration,
 };
 
 use iroh::endpoint::Connection;
@@ -14,10 +13,6 @@ use crate::{
     config::{Membership, RepoId},
     net::sync::{self, Announce, StatusReport, UniMessage},
 };
-
-/// Budget for sending one message; a stalled peer connection kills its
-/// sender task (the reconnect replay recovers the state).
-const SEND_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Pending messages for one peer, coalesced latest-wins: one slot for the
 /// membership, one for the status report and one per repo for
@@ -36,22 +31,17 @@ struct OutboxState {
 }
 
 impl Outbox {
-    pub(super) fn push_announce(&self, announce: Announce) {
-        self.pending
-            .lock()
-            .unwrap()
-            .announces
-            .insert(announce.id.clone(), announce);
-        self.notify.notify_one();
-    }
-
-    pub(super) fn push_membership(&self, membership: Membership) {
-        self.pending.lock().unwrap().membership = Some(membership);
-        self.notify.notify_one();
-    }
-
-    pub(super) fn push_status(&self, report: StatusReport) {
-        self.pending.lock().unwrap().status = Some(report);
+    /// Queues a message, replacing any pending one it supersedes.
+    pub(super) fn push(&self, message: UniMessage) {
+        let mut pending = self.pending.lock().unwrap();
+        match message {
+            UniMessage::Announce(announce) => {
+                pending.announces.insert(announce.id.clone(), announce);
+            }
+            UniMessage::Membership(membership) => pending.membership = Some(membership),
+            UniMessage::Status(report) => pending.status = Some(report),
+        }
+        drop(pending);
         self.notify.notify_one();
     }
 
@@ -81,10 +71,9 @@ pub(super) async fn run_sender(conn: Connection, outbox: Arc<Outbox>) {
             outbox.notify.notified().await;
             continue;
         };
-        match tokio::time::timeout(SEND_TIMEOUT, sync::send_uni(&conn, &message)).await {
-            Ok(Ok(())) => {}
-            Ok(Err(err)) => return debug!("send failed: {err:#}"),
-            Err(_) => return debug!("send timed out"),
+        if let Err(err) = sync::send_uni(&conn, &message).await {
+            debug!("send failed: {err:#}");
+            return conn.close(0u32.into(), b"send failed");
         }
     }
 }

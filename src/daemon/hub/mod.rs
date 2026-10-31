@@ -12,14 +12,14 @@
 //!
 //! Owning the outboxes, the hub also carries the membership and status
 //! reports to peers, remembers announcements for unregistered repos (see
-//! [`orphans`]), pulls whole repos from them (see [`pull`]), serves inbound
-//! fetches (see [`serve`]), and holds the peers' paired names (see
+//! [`orphans`]), fetches from peers (see [`fetch`]), serves their fetches
+//! (see [`serve`]), and holds the peers' paired names (see
 //! [`SyncHub::peer_name`]).
 
+mod fetch;
 mod inbox;
 mod orphans;
 mod outbox;
-mod pull;
 mod serve;
 #[cfg(test)]
 mod tests;
@@ -32,16 +32,15 @@ use std::{
 use iroh::{EndpointId, endpoint::Connection};
 use tokio::sync::Notify;
 
+pub use self::fetch::CloneSource;
 pub use self::inbox::{Inbox, PeerAnnounce};
-pub use self::pull::CloneSource;
 use self::{
-    orphans::OrphanAnnounce,
     outbox::{Outbox, run_sender},
     serve::Serving,
 };
 use crate::{
     config::{Membership, RepoId, sanitize},
-    net::sync::{Announce, StatusReport},
+    net::sync::{Announce, Heads, StatusReport, UniMessage},
     repo::OpenRepo,
 };
 
@@ -64,7 +63,7 @@ struct HubState {
     /// reset their per-repo watermark on a new connection.
     announce_seq: u64,
     /// See [`orphans`].
-    orphans: BTreeMap<RepoId, BTreeMap<EndpointId, OrphanAnnounce>>,
+    orphans: BTreeMap<RepoId, BTreeMap<EndpointId, Heads>>,
     /// This machine's latest membership, replayed to connecting peers and
     /// broadcast on every change (see [`SyncHub::publish_membership`]).
     membership: Membership,
@@ -88,9 +87,35 @@ fn peer_name(names: &BTreeMap<EndpointId, String>, peer: &EndpointId) -> String 
 
 impl HubState {
     /// Queues a message to every connected peer's outbox.
-    fn broadcast(&self, push: impl Fn(&Outbox)) {
+    fn broadcast(&self, message: &UniMessage) {
         for sender in self.peers.values() {
-            push(&sender.outbox);
+            sender.outbox.push(message.clone());
+        }
+    }
+
+    /// Stamps a repo's op heads with the next publish sequence and queues
+    /// them to every peer.
+    fn announce(&mut self, id: &RepoId, ids: Vec<Vec<u8>>) -> Heads {
+        self.announce_seq += 1;
+        let heads = Heads {
+            seq: self.announce_seq,
+            ids,
+        };
+        self.broadcast(&UniMessage::Announce(Announce {
+            id: id.clone(),
+            heads: heads.clone(),
+        }));
+        heads
+    }
+
+    /// Announces a registered repo's op heads, recording them for replay.
+    fn publish(&mut self, id: &RepoId, ids: Vec<Vec<u8>>) {
+        if !self.repos.contains_key(id) {
+            return;
+        }
+        let heads = self.announce(id, ids);
+        if let Some(entry) = self.repos.get_mut(id) {
+            entry.published = Some(heads);
         }
     }
 
@@ -110,12 +135,9 @@ impl HubState {
 /// Hub-side state of one registered repo.
 #[derive(Debug)]
 struct RepoEntry {
-    /// Sequence of the latest publish (drawn from [`HubState::announce_seq`]),
-    /// stamped into announcements so receivers can discard reordered ones.
-    seq: u64,
     /// Latest published op heads, replayed to connecting peers. `None`
     /// until the repo task first publishes (repo not opened yet).
-    published: Option<Vec<Vec<u8>>>,
+    published: Option<Heads>,
     inbox: Arc<Inbox>,
     /// Serve handle, present while the repo task has the repo open (see
     /// [`serve`] for why the hub dispatches fetches itself).
@@ -143,14 +165,13 @@ impl SyncHub {
     pub fn register_repo(&self, id: RepoId) -> Arc<Inbox> {
         let inbox = Arc::new(Inbox::default());
         let mut state = self.state.lock().unwrap();
-        for (peer, announce) in state.take_orphans(&id) {
-            inbox.offer(peer, announce.seq, announce.heads);
+        for (peer, heads) in state.take_orphans(&id) {
+            inbox.offer(peer, heads);
         }
 
         state.repos.insert(
             id,
             RepoEntry {
-                seq: 0,
                 published: None,
                 inbox: inbox.clone(),
                 serving: None,
@@ -162,22 +183,20 @@ impl SyncHub {
     /// Makes an opened repo servable. Called by the repo task once its
     /// stores are open; replaces the handle from a previous open.
     pub fn repo_opened(&self, id: &RepoId, repo: Arc<OpenRepo>) {
-        if let Some(entry) = self.state.lock().unwrap().repos.get_mut(id) {
-            entry.serving = Some(Serving::new(repo));
+        if let Some(entry) = self.state.lock().unwrap().repos.get_mut(id)
+            && let Some(old) = entry.serving.replace(Serving::new(repo))
+        {
+            old.close();
         }
     }
 
     /// Stops serving a repo (its watch failed; the stores may be stale).
     pub fn repo_closed(&self, id: &RepoId) {
-        if let Some(entry) = self.state.lock().unwrap().repos.get_mut(id) {
-            entry.serving = None;
+        if let Some(entry) = self.state.lock().unwrap().repos.get_mut(id)
+            && let Some(serving) = entry.serving.take()
+        {
+            serving.close();
         }
-    }
-
-    /// The live connection to a peer, for opening fetch streams.
-    pub fn connection(&self, peer: &EndpointId) -> Option<Connection> {
-        let state = self.state.lock().unwrap();
-        state.peers.get(peer).map(|sender| sender.conn.clone())
     }
 
     /// Removes a repo registration (a local forget, a mesh-wide removal,
@@ -193,42 +212,25 @@ impl SyncHub {
         let Some(entry) = state.repos.remove(id) else {
             return;
         };
+        if let Some(serving) = &entry.serving {
+            serving.close();
+        }
 
-        for PeerAnnounce { peer, seq, heads } in entry.inbox.snapshot() {
-            state.remember_orphan(peer, id.clone(), OrphanAnnounce { seq, heads });
+        for PeerAnnounce { peer, heads } in entry.inbox.snapshot() {
+            state.remember_orphan(peer, id.clone(), heads);
         }
         self.orphaned.notify_one();
 
         if entry.published.is_some() {
-            state.announce_seq += 1;
-            let announce = Announce {
-                id: id.clone(),
-                seq: state.announce_seq,
-                heads: Vec::new(),
-            };
-            state.broadcast(|outbox| outbox.push_announce(announce.clone()));
+            state.announce(id, Vec::new());
         }
     }
 
     /// Publishes a repo's current op heads: cached for peers that connect
     /// later and queued to every connected peer's outbox, coalescing with
     /// any announcement still pending there.
-    pub fn publish(&self, id: &RepoId, heads: Vec<Vec<u8>>) {
-        let mut guard = self.state.lock().unwrap();
-        let state = &mut *guard;
-        let Some(entry) = state.repos.get_mut(id) else {
-            return;
-        };
-        state.announce_seq += 1;
-        entry.seq = state.announce_seq;
-        entry.published = Some(heads.clone());
-
-        let announce = Announce {
-            id: id.clone(),
-            seq: entry.seq,
-            heads,
-        };
-        state.broadcast(|outbox| outbox.push_announce(announce.clone()));
+    pub fn publish(&self, id: &RepoId, ids: Vec<Vec<u8>>) {
+        self.state.lock().unwrap().publish(id, ids);
     }
 
     /// Publishes this machine's status report: cached for peers that
@@ -236,7 +238,7 @@ impl SyncHub {
     /// any report still pending there.
     pub fn publish_status(&self, report: StatusReport) {
         let mut state = self.state.lock().unwrap();
-        state.broadcast(|outbox| outbox.push_status(report.clone()));
+        state.broadcast(&UniMessage::Status(report.clone()));
         state.status = Some(report);
     }
 
@@ -247,7 +249,7 @@ impl SyncHub {
     /// propagation transitive.
     pub fn publish_membership(&self, membership: Membership) {
         let mut state = self.state.lock().unwrap();
-        state.broadcast(|outbox| outbox.push_membership(membership.clone()));
+        state.broadcast(&UniMessage::Membership(membership.clone()));
         state.membership = membership;
     }
 
@@ -263,27 +265,26 @@ impl SyncHub {
     }
 
     /// Marks a peer connected: spawns its sender task and seeds the outbox
-    /// with the membership, the status report and every published repo, so a (re)connecting
-    /// peer learns state it missed while away. Resets per-peer state (see
-    /// [`HubState::forget_peer`]): the connection may replace one whose
-    /// loss went unnoticed.
+    /// with the membership, the status report and every published repo, so
+    /// a (re)connecting peer learns state it missed while away. Resets
+    /// per-peer state (see [`HubState::forget_peer`]): the connection may
+    /// replace one whose loss went unnoticed.
     pub fn peer_connected(&self, peer: EndpointId, conn: &Connection) {
         let outbox = Arc::new(Outbox::default());
         let task = tokio::spawn(run_sender(conn.clone(), outbox.clone()));
 
         let mut state = self.state.lock().unwrap();
         state.forget_peer(&peer);
-        outbox.push_membership(state.membership.clone());
+        outbox.push(UniMessage::Membership(state.membership.clone()));
         if let Some(report) = &state.status {
-            outbox.push_status(report.clone());
+            outbox.push(UniMessage::Status(report.clone()));
         }
         for (id, entry) in &state.repos {
             if let Some(heads) = &entry.published {
-                outbox.push_announce(Announce {
+                outbox.push(UniMessage::Announce(Announce {
                     id: id.clone(),
-                    seq: entry.seq,
                     heads: heads.clone(),
-                });
+                }));
             }
         }
         let previous = state.peers.insert(
@@ -321,33 +322,18 @@ impl SyncHub {
     /// Routes an inbound announcement to its repo's inbox; announcements
     /// for unregistered repos are remembered for `clone`.
     ///
-    /// An announcement without heads is a retraction (the peer forgot its
-    /// instance; a held repo always has at least one op head): it releases
-    /// everything attributed to the peer for the repo, like a disconnect
-    /// scoped to one repo.
+    /// A retraction (see [`Heads`]) releases everything attributed to the
+    /// peer for the repo, like a disconnect scoped to one repo.
     pub fn route(&self, peer: EndpointId, announce: Announce) {
-        let retraction = announce.heads.is_empty();
-
-        let mut guard = self.state.lock().unwrap();
-        let state = &mut *guard;
-        let Some(entry) = state.repos.get_mut(&announce.id) else {
-            if retraction {
-                state.forget_orphan(&announce.id, &peer);
-                return;
-            }
-            let orphan = OrphanAnnounce {
-                seq: announce.seq,
-                heads: announce.heads,
-            };
-            state.remember_orphan(peer, announce.id, orphan);
-            self.orphaned.notify_one();
-            return;
-        };
-
-        if retraction {
-            entry.inbox.retract(peer, announce.seq);
+        let mut state = self.state.lock().unwrap();
+        if let Some(entry) = state.repos.get(&announce.id) {
+            return entry.inbox.offer(peer, announce.heads);
+        }
+        if announce.heads.is_retraction() {
+            state.forget_orphan(&announce.id, &peer);
         } else {
-            entry.inbox.offer(peer, announce.seq, announce.heads);
+            state.remember_orphan(peer, announce.id, announce.heads);
+            self.orphaned.notify_one();
         }
     }
 
