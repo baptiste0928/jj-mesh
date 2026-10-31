@@ -267,20 +267,68 @@ async fn large_incremental_sync_switches_to_a_pack() {
     fx.jj(&a, &["commit", "-m", "many files"]);
 
     let (ra, rb) = (open(&a), open(&b));
-    let pack_dir = rb.git_backend().git_repo().path().join("objects/pack");
-    let count = |ext: &str| {
-        let ext = Some(std::ffi::OsStr::new(ext));
-        let entries = fs::read_dir(&pack_dir).unwrap();
-        entries
-            .filter(|e| e.as_ref().unwrap().path().extension() == ext)
-            .count()
-    };
-    let packs = count("pack");
+    let git_dir = rb.git_backend().git_repo().path().to_owned();
+    let packs = pack_files(&git_dir, "pack");
     let wants = ra.op_heads().await.unwrap();
     let outcome = sync_exact(&rb, &ra, &wants, GitTransferFormat::Loose).await;
     assert!(outcome.git_objects >= serve::PACK_MIN_OBJECTS);
-    assert_eq!(count("pack"), packs + 1);
-    assert_eq!(count("keep"), 0);
+    assert_eq!(pack_files(&git_dir, "pack"), packs + 1);
+    assert_eq!(pack_files(&git_dir, "keep"), 0);
+}
+
+/// A clone receives the server's object store as it is: each of its pack
+/// files, then its loose objects packed, and ends complete.
+#[tokio::test]
+async fn clone_receives_the_object_store() {
+    let fx = Fixture::new();
+    let a = fx.init_repo("a");
+    for n in 0..5 {
+        fx.commit_file(&a, &format!("file{n}.txt"), &format!("commit {n}"));
+    }
+    let server_git = open(&a).git_backend().git_repo().path().to_owned();
+    git(&server_git, &["gc", "--quiet"]);
+    fx.commit_file(&a, "packed.txt", "after gc");
+    git(&server_git, &["repack", "-q", "-d"]);
+    fx.commit_file(&a, "loose.txt", "after repack");
+    let packs = pack_files(&server_git, "pack");
+    assert!(packs > 1);
+
+    let b = fx.init_pull_target("b", "machine-b");
+    let (ra, rb) = (open(&a), open(&b));
+    let wants = ra.op_heads().await.unwrap();
+    try_sync(&rb, &ra, &wants, GitTransferFormat::Store)
+        .await
+        .unwrap();
+    assert_complete(&rb);
+    let git_dir = rb.git_backend().git_repo().path().to_owned();
+    assert_eq!(pack_files(&git_dir, "pack"), packs + 1);
+    assert_eq!(pack_files(&git_dir, "keep"), 0);
+}
+
+/// A store transfer cut short can leave the fetcher every commit but not
+/// their trees: the retry still receives the whole store.
+#[tokio::test]
+async fn store_retry_after_a_partial_transfer_is_complete() {
+    let fx = Fixture::new();
+    let a = fx.init_repo("a");
+    for n in 0..3 {
+        fx.commit_file(&a, &format!("file{n}.txt"), &format!("commit {n}"));
+    }
+    let b = fx.init_pull_target("b", "machine-b");
+    let (ra, rb) = (open(&a), open(&b));
+    let server = ra.git_backend().git_repo();
+    let fetcher = rb.git_backend().git_repo();
+    for id in object_ids(server.path(), Some("commit")) {
+        let object = server.find_object(gix::ObjectId::from_hex(id.as_bytes()).unwrap());
+        let data = &object.unwrap().data;
+        gix::prelude::Write::write_buf(&fetcher.objects, gix::object::Kind::Commit, data).unwrap();
+    }
+
+    let wants = ra.op_heads().await.unwrap();
+    try_sync(&rb, &ra, &wants, GitTransferFormat::Store)
+        .await
+        .unwrap();
+    assert_complete(&rb);
 }
 
 /// The closure is emitted parents first, each commit after its whole
@@ -827,7 +875,7 @@ async fn mirror_preserves_user_branches_and_propagates_deletions() {
 }
 
 /// The clone flow: a freshly initialized non-colocated repo with a
-/// renamed workspace pulls the full mesh state as a pack; jj then
+/// renamed workspace pulls the server's object store; jj then
 /// merges the fresh workspace into the replicated history on the next
 /// command.
 #[tokio::test]
@@ -845,7 +893,7 @@ async fn clone_pull_into_fresh_repo() {
     let (ra, rb) = (open(&a), open(&b));
     let wants = ra.op_heads().await.unwrap();
     let init_heads = rb.op_heads().await.unwrap();
-    let outcome = try_sync(&rb, &ra, &wants, GitTransferFormat::Pack)
+    let outcome = try_sync(&rb, &ra, &wants, GitTransferFormat::Store)
         .await
         .unwrap();
     assert!(outcome.git_objects > 0);
@@ -952,16 +1000,17 @@ async fn ancestor_rewrite_syncs_without_divergence() {
     assert!(!sync_missing(&rb, &ra).await, "unexpected op churn on a");
 }
 
-/// A pack-format fetch with a progress sink must report the phases in
-/// order with exact totals: the op and git object counts the server
-/// announced, both fully reached.
-/// The clone scenario is the one the progress display exists for.
+/// A clone with a progress sink must report the phases in order with
+/// exact totals: the op and git object counts the server announced, both
+/// fully reached across the store's packs.
 #[tokio::test]
 async fn progress_reports_phases_and_exact_totals() {
     let fx = Fixture::new();
     let a = fx.init_repo("a");
     fs::write(a.join("file.txt"), "mesh content\n").unwrap();
     fx.jj(&a, &["commit", "-m", "add file"]);
+    git(open(&a).git_backend().git_repo().path(), &["gc", "--quiet"]);
+    fx.commit_file(&a, "loose.txt", "after gc");
     let b = fx.init_pull_target("b", "machine-b");
 
     let (ra, rb) = (open(&a), open(&b));
@@ -982,7 +1031,7 @@ async fn progress_reports_phases_and_exact_totals() {
     let outcome = fetch_from(
         &rb,
         &wants,
-        GitTransferFormat::Pack,
+        GitTransferFormat::Store,
         &mut client_tx,
         &mut client_rx,
         ProgressSink::new(&sink),
@@ -1001,6 +1050,7 @@ async fn progress_reports_phases_and_exact_totals() {
         [
             TransferPhase::Ops,
             TransferPhase::Git,
+            TransferPhase::Resolve,
             TransferPhase::Apply,
             TransferPhase::Index,
         ],
@@ -1024,18 +1074,21 @@ async fn progress_reports_phases_and_exact_totals() {
     assert!(last_ops.current >= outcome.ops as u64);
     assert!(last_ops.bytes > 0);
 
-    // Git phase: the total comes with the phase's Begin, and the indexed
-    // count reaches it once the pack landed.
+    // Git phase: the total comes with the phase's Begin.
     let git: Vec<&TransferProgress> = samples
         .iter()
         .filter(|p| p.phase == TransferPhase::Git)
         .collect();
     let announced = git.iter().find(|p| p.total.is_some()).unwrap();
     assert_eq!(announced.total, Some(outcome.git_objects as u64));
-    let last_git = git.last().unwrap();
-    assert_eq!(last_git.total, Some(last_git.current));
-    assert!(last_git.current > 0);
-    assert!(last_git.bytes > 0);
+    assert!(git.last().unwrap().bytes > 0);
+
+    // Resolve phase: the resolved count reaches the total.
+    let resolved = samples
+        .iter()
+        .rfind(|p| p.phase == TransferPhase::Resolve)
+        .unwrap();
+    assert_eq!(resolved.current, outcome.git_objects as u64);
 }
 
 /// Repos containing gitlink (submodule) tree entries must sync: the
@@ -1450,6 +1503,16 @@ fn assert_complete(repo: &OpenRepo) {
         .map(str::to_owned)
         .collect();
     assert!(missing.is_empty(), "missing objects: {missing:?}");
+}
+
+/// The number of files with extension `ext` in a git store's pack
+/// directory.
+fn pack_files(git_dir: &Path, ext: &str) -> usize {
+    let ext = Some(std::ffi::OsStr::new(ext));
+    let entries = fs::read_dir(git_dir.join("objects/pack")).unwrap();
+    entries
+        .filter(|entry| entry.as_ref().unwrap().path().extension() == ext)
+        .count()
 }
 
 /// The ids of every object in a git store, of `kind` when given.

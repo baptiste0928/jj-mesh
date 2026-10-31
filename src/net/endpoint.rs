@@ -10,6 +10,20 @@ use iroh::{
 use super::sync::MAX_UNI_STREAMS;
 use crate::config::MachineKey;
 
+/// Bytes a peer may send on one stream ahead of our reads: 2 MiB, about
+/// 20 MB/s at 100 ms of latency. noq-proto 1.4 closes the connection when
+/// a stream buffers more than about 2048 packets, 2.4 MB at the minimum
+/// MTU.
+// TODO: raise back to 16 MiB once a noq-proto release includes
+// https://github.com/n0-computer/noq/pull/866.
+const STREAM_WINDOW: u32 = 2 << 20;
+
+/// Bytes a peer may send across all streams of a connection ahead of our
+/// reads, and that we send ahead of acknowledgments: room for a few
+/// fetches at full speed, bounding what any endpoint that completes a
+/// handshake can make us buffer.
+const CONNECTION_WINDOW: u32 = 4 * STREAM_WINDOW;
+
 /// How the iroh endpoint reaches the network.
 #[derive(Debug, Clone, Default)]
 pub enum EndpointOptions {
@@ -80,9 +94,14 @@ pub async fn bind_endpoint(
 }
 
 /// The QUIC transport: iroh's defaults, with the peer's uni streams capped
-/// so stream credit, not dropped messages, holds back a bursting sender.
+/// so stream credit, not dropped messages, holds back a bursting sender,
+/// and windows letting one fetch fill a long link (the defaults cap it
+/// near 1 MiB per round trip).
 fn transport() -> QuicTransportConfig {
     QuicTransportConfig::builder()
         .max_concurrent_uni_streams(MAX_UNI_STREAMS.into())
+        .stream_receive_window(STREAM_WINDOW.into())
+        .receive_window(CONNECTION_WINDOW.into())
+        .send_window(CONNECTION_WINDOW.into())
         .build()
 }

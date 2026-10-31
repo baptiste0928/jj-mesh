@@ -25,7 +25,8 @@
 //!
 //! The engine splits along its two sides and the apply step:
 //! - [`serve`] answers a fetch (read-only): the op-log delta, then the git
-//!   object closure the fetcher lacks, loose or as one packfile (see
+//!   object closure the fetcher lacks, loose or as one packfile, or for a
+//!   clone the whole object store (see
 //!   [`crate::net::fetch::GitTransferFormat`]).
 //! - [`fetch`] pulls and validates that delta, then writes it through
 //!   [`apply`], in crash-safe order.
@@ -78,11 +79,13 @@ pub struct FetchOptions {
 pub struct TransferProgress {
     pub phase: TransferPhase,
     /// Progress in the phase's unit: op and view frames in [`Ops`]; in
-    /// [`Git`], objects indexed from the pack (pack format) or objects
-    /// received (loose format). Unused in [`Apply`] and [`Index`].
+    /// [`Git`], objects indexed from the packs (pack and store formats) or
+    /// objects received (loose format); objects resolved in [`Resolve`].
+    /// Unused in [`Apply`] and [`Index`].
     ///
     /// [`Ops`]: TransferPhase::Ops
     /// [`Git`]: TransferPhase::Git
+    /// [`Resolve`]: TransferPhase::Resolve
     /// [`Apply`]: TransferPhase::Apply
     /// [`Index`]: TransferPhase::Index
     pub current: u64,
@@ -104,8 +107,9 @@ impl TransferProgress {
     }
 }
 
-/// The sequential stages of a fetch, in order (`Index` is skipped when
-/// the incoming heads are already indexed).
+/// The sequential stages of a fetch: `Ops`, `Git`, `Resolve` (pack and
+/// store formats only), `Apply`, then `Index` (skipped when the incoming
+/// heads are already indexed).
 ///
 /// Postcard encodes variants by position (this enum travels in the
 /// control protocol): existing ones must keep their position, new ones
@@ -122,6 +126,9 @@ pub enum TransferPhase {
     /// published. Indeterminate; after a clone it can rival the transfer
     /// for large histories.
     Index,
+    /// Resolving the deltas of the received packs, after their last byte
+    /// arrived. Uses every core; for large repos it can rival the download.
+    Resolve,
 }
 
 /// Sink for [`TransferProgress`] updates, called inline from the transfer

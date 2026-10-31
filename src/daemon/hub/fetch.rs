@@ -88,10 +88,10 @@ impl SyncHub {
             let sink = |transfer| progress(&peer_name, transfer);
             sink(TransferProgress::start(TransferPhase::Ops));
 
-            // A pull fetches a whole history: the pack format reuses the
-            // serving peer's on-disk deltas and lands as one pack file
-            // here, instead of writing every object loose.
-            let format = GitTransferFormat::Pack;
+            // A pull fetches a whole history into an empty repo: the
+            // serving peer sends its object store as it is, without
+            // walking it.
+            let format = GitTransferFormat::Store;
             match self
                 .fetch(&peer, &repo, id, &heads, format, ProgressSink::new(&sink))
                 .await

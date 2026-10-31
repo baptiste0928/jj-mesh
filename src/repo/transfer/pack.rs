@@ -1,20 +1,24 @@
-//! Packfile generation and ingestion for the pack transfer format.
+//! Packfile generation and ingestion for the pack and store transfer
+//! formats.
 //!
 //! Generation runs gix-pack's entries -> bytes pipeline over the object ids
 //! the closure walk collected. Deltas already stored in the server's
 //! on-disk packs are copied as-is; other objects are recompressed as base
-//! objects (gix-pack does not create new deltas). Ingestion streams the
-//! pack into `objects/pack`, verifying the trailer checksum and hashing
-//! every object while building the index, and persists `.pack` and `.idx`
-//! atomically: a partially received pack never becomes visible.
+//! objects (gix-pack does not create new deltas). A whole-store transfer
+//! instead copies the server's pack files byte for byte (see [`Store`]).
+//! Ingestion streams a pack into `objects/pack`, verifying the trailer
+//! checksum and hashing every object while building the index, and
+//! persists `.pack` and `.idx` atomically: a partially received pack never
+//! becomes visible.
 //!
 //! Both directions run blocking gix I/O and bridge to the async frame
 //! stream through the caller's channels, via [`ChunkReader`] and the chunk
 //! emit callback.
 
 use std::{
-    io,
-    path::PathBuf,
+    fs,
+    io::{self, Read as _},
+    path::{Path, PathBuf},
     sync::atomic::{AtomicBool, Ordering},
 };
 
@@ -25,6 +29,79 @@ use tokio::sync::mpsc;
 /// Pack bytes are buffered into chunks of this size before each emit, so
 /// the wire sees few large frames instead of one per written entry.
 const PACK_CHUNK_SIZE: usize = 1 << 20;
+
+/// A repo's whole object store, as a store transfer sends it: its pack
+/// files as they are, then its loose objects packed.
+pub(super) struct Store {
+    pub(super) packs: Vec<StoredPack>,
+    pub(super) loose: Vec<gix::ObjectId>,
+}
+
+/// One pack file of a [`Store`]. Only opened while sent, so a store of
+/// many packs holds one file at a time; a pack a concurrent gc removed
+/// meanwhile fails the transfer, which the fetcher retries.
+pub(super) struct StoredPack {
+    path: PathBuf,
+    objects: u32,
+}
+
+impl Store {
+    /// Lists the repo's packs (those with an index) and loose objects.
+    /// Blocking.
+    pub(super) fn open(git: &gix::Repository) -> Result<Self> {
+        let objects_dir = git.objects.store_ref().path().to_owned();
+        // Loose objects first: a concurrent gc only moves them into a new
+        // pack, which the pack listing then sees, or which serves them
+        // through the object database once listed.
+        let loose = gix::odb::loose::Store::at(&objects_dir, git.object_hash())
+            .iter()
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|err| anyhow!("cannot list loose objects: {err}"))?;
+        let mut packs = Vec::new();
+        for entry in fs::read_dir(objects_dir.join("pack")).context("cannot list packs")? {
+            let path = entry?.path();
+            if path.extension().is_none_or(|ext| ext != "pack")
+                || !path.with_extension("idx").exists()
+            {
+                continue;
+            }
+            let mut header = [0u8; 12];
+            open_pack(&path)?.read_exact(&mut header)?;
+            let (_version, objects) = gix::odb::pack::data::header::decode(&header)
+                .map_err(|err| anyhow!("bad pack {}: {err}", path.display()))?;
+            packs.push(StoredPack { path, objects });
+        }
+        Ok(Store { packs, loose })
+    }
+
+    /// The number of objects the transfer carries.
+    pub(super) fn objects(&self) -> u64 {
+        let packed: u64 = self.packs.iter().map(|pack| u64::from(pack.objects)).sum();
+        packed + self.loose.len() as u64
+    }
+}
+
+impl StoredPack {
+    /// Hands the pack's bytes to `emit` in chunks. Blocking.
+    pub(super) fn write(self, mut emit: impl FnMut(Vec<u8>) -> Result<()>) -> Result<()> {
+        let mut file = open_pack(&self.path)?;
+        loop {
+            let mut chunk = Vec::with_capacity(PACK_CHUNK_SIZE);
+            (&mut file)
+                .take(PACK_CHUNK_SIZE as u64)
+                .read_to_end(&mut chunk)?;
+            if chunk.is_empty() {
+                return Ok(());
+            }
+            emit(chunk)?;
+        }
+    }
+}
+
+/// Opens a stored pack file.
+fn open_pack(path: &Path) -> Result<fs::File> {
+    fs::File::open(path).with_context(|| format!("cannot open {}", path.display()))
+}
 
 /// Generates a pack containing exactly `ids` and hands its bytes to `emit`
 /// in chunks. Blocking.
@@ -138,68 +215,62 @@ impl<F: FnMut(Vec<u8>) -> Result<()>> io::Write for ChunkWriter<F> {
     }
 }
 
-/// Objects-indexed count shared between [`ingest_pack`]'s gix pipeline and
-/// the async receive loop, which samples it for progress display.
+/// Object counts of one [`ingest_pack`], shared with the async receive
+/// loop, which samples them for progress display.
 #[derive(Clone, Default)]
-pub(super) struct SharedObjectCount(StepShared);
+pub(super) struct IngestCounts {
+    indexed: StepShared,
+    resolved: StepShared,
+}
 
-impl SharedObjectCount {
-    /// The count so far.
-    pub(super) fn get(&self) -> u64 {
-        self.0.load(Ordering::Relaxed) as u64
+impl IngestCounts {
+    /// Objects indexed so far, as the pack streams in.
+    pub(super) fn indexed(&self) -> u64 {
+        self.indexed.load(Ordering::Relaxed) as u64
+    }
+
+    /// Objects resolved so far, once the pack is in.
+    pub(super) fn resolved(&self) -> u64 {
+        self.resolved.load(Ordering::Relaxed) as u64
     }
 }
 
-/// Minimal prodash progress handed to the gix ingest pipeline: the child
-/// counting indexed objects steps the shared count, every other node and
-/// signal is discarded. Progress is display-only, so an id drift in a gix
-/// upgrade would freeze the counter, never break the ingest.
-struct IndexCountProgress {
-    objects: StepShared,
-    /// Whether this node is the objects counter.
-    active: bool,
+/// Minimal prodash progress handed to the gix ingest pipeline: the nodes
+/// counting indexed and resolved objects step the matching shared count,
+/// every other node and signal is discarded. Progress is display-only, so
+/// an id drift in a gix upgrade would freeze a counter, never break the
+/// ingest.
+struct CountProgress {
+    counts: IngestCounts,
+    /// The count this node steps, if any.
+    counter: Option<StepShared>,
 }
 
-impl IndexCountProgress {
-    fn root(objects: StepShared) -> Self {
-        IndexCountProgress {
-            objects,
-            active: false,
-        }
-    }
-}
-
-impl Count for IndexCountProgress {
+impl Count for CountProgress {
     fn set(&self, step: Step) {
-        if self.active {
-            self.objects.store(step, Ordering::Relaxed);
+        if let Some(counter) = &self.counter {
+            counter.store(step, Ordering::Relaxed);
         }
     }
 
     fn step(&self) -> Step {
-        if self.active {
-            self.objects.load(Ordering::Relaxed)
-        } else {
-            0
-        }
+        self.counter
+            .as_ref()
+            .map_or(0, |counter| counter.load(Ordering::Relaxed))
     }
 
     fn inc_by(&self, step: Step) {
-        if self.active {
-            self.objects.fetch_add(step, Ordering::Relaxed);
+        if let Some(counter) = &self.counter {
+            counter.fetch_add(step, Ordering::Relaxed);
         }
     }
 
     fn counter(&self) -> StepShared {
-        if self.active {
-            self.objects.clone()
-        } else {
-            StepShared::default()
-        }
+        self.counter.clone().unwrap_or_default()
     }
 }
 
-impl Progress for IndexCountProgress {
+impl Progress for CountProgress {
     fn init(&mut self, _max: Option<Step>, _unit: Option<gix::progress::Unit>) {}
 
     fn set_name(&mut self, _name: String) {}
@@ -215,7 +286,7 @@ impl Progress for IndexCountProgress {
     fn message(&self, _level: MessageLevel, _message: String) {}
 }
 
-impl NestedProgress for IndexCountProgress {
+impl NestedProgress for CountProgress {
     type SubProgress = Self;
 
     fn add_child(&mut self, name: impl Into<String>) -> Self {
@@ -223,10 +294,17 @@ impl NestedProgress for IndexCountProgress {
     }
 
     fn add_child_with_id(&mut self, _name: impl Into<String>, id: Id) -> Self {
-        let objects_id: Id = gix_pack::index::write::ProgressId::IndexObjects.into();
-        IndexCountProgress {
-            objects: self.objects.clone(),
-            active: id == objects_id,
+        use gix_pack::index::write::ProgressId;
+        let counter = if id == Id::from(ProgressId::IndexObjects) {
+            Some(self.counts.indexed.clone())
+        } else if id == Id::from(ProgressId::ResolveObjects) {
+            Some(self.counts.resolved.clone())
+        } else {
+            None
+        };
+        CountProgress {
+            counts: self.counts.clone(),
+            counter,
         }
     }
 }
@@ -261,15 +339,18 @@ impl Drop for PackKeep {
 
 /// Streams a pack from `read` into the repo's `objects/pack`, building its
 /// index. Blocking; nothing becomes visible unless the whole pack verifies.
-/// `indexed` is stepped once per object as the index is built.
+/// `counts` follow the objects as they are indexed, then resolved.
 pub(super) fn ingest_pack(
     git: &gix::Repository,
     read: impl io::Read,
-    indexed: &SharedObjectCount,
+    counts: &IngestCounts,
 ) -> Result<IngestOutcome> {
     let pack_dir = git.objects.store_ref().path().join("pack");
     let no_interrupt = AtomicBool::new(false);
-    let mut progress = IndexCountProgress::root(indexed.0.clone());
+    let mut progress = CountProgress {
+        counts: counts.clone(),
+        counter: None,
+    };
     let outcome = gix_pack::Bundle::write_to_directory(
         &mut io::BufReader::new(read),
         Some(&pack_dir),

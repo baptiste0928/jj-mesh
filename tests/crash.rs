@@ -112,8 +112,8 @@ impl Scenario {
         }
     }
 
-    fn pack(mut self) -> Self {
-        self.format = GitTransferFormat::Pack;
+    fn store(mut self) -> Self {
+        self.format = GitTransferFormat::Store;
         self
     }
 
@@ -156,15 +156,18 @@ async fn divergent() -> Scenario {
     Scenario::new(fx, a, b).union()
 }
 
-/// Clone into a fresh non-colocated repo, as a pack.
-async fn clone_pack() -> Scenario {
+/// Clone into a fresh non-colocated repo: the server's pack, then its
+/// loose objects as a second one.
+async fn clone_store() -> Scenario {
     let fx = Fixture::new();
     let a = fx.init_repo("a");
+    fx.commit_file(&a, "packed.txt", "packed");
+    git(open(&a).git_repo_path(), &["gc", "--quiet"]);
     fx.commit_file(&a, "file.txt", "add file");
     fx.jj(&a, &["bookmark", "create", "main", "-r", "@-"]);
     fx.jj(&a, &["new", "-m", "export"]);
     let b = fx.init_pull_target("b", "machine-b");
-    Scenario::new(fx, a, b).mirrored("main").pack().union()
+    Scenario::new(fx, a, b).mirrored("main").store().union()
 }
 
 /// Two wants: the local head is kept after both.
@@ -490,7 +493,7 @@ macro_rules! cases {
 cases! {
     fast_forward: AFTER_OP_RENAME after_op_rename;
     divergent;
-    clone_pack: AFTER_OP_RENAME after_op_rename;
+    clone_store: AFTER_OP_RENAME after_op_rename;
     multi_want: AFTER_HEAD after_head;
     colocated_user_branch: AFTER_OP_RENAME after_op_rename;
     non_colocated: AFTER_OP_RENAME after_op_rename;

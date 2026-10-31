@@ -16,13 +16,13 @@
 
 use std::{
     path::{Component, Path, PathBuf},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context as _, Error, Result, bail, ensure};
 use clap::{Args, ValueHint};
 use clap_complete::ArgValueCandidates;
-use indicatif::{HumanBytes, ProgressBar, ProgressStyle};
+use indicatif::{HumanBytes, HumanDuration, ProgressBar, ProgressStyle};
 use pollster::FutureExt as _;
 
 use super::{
@@ -166,6 +166,7 @@ fn clone(
     colocate: &[&str],
     settings: &SettingsArgs,
 ) -> Result<()> {
+    let started = Instant::now();
     // The daemon must be up: it is only contacted once the local repo
     // exists.
     control::ensure_daemon_blocking(dir)?;
@@ -214,7 +215,11 @@ fn clone(
         }
     }
 
-    ui::success(format_args!("Cloned repo {name} at {}", ui::path(path)));
+    ui::success(format_args!(
+        "Cloned repo {name} at {} in {}",
+        ui::path(path),
+        HumanDuration(started.elapsed()),
+    ));
     Ok(())
 }
 
@@ -522,6 +527,11 @@ fn show_progress(bar: &ProgressBar, progress: &CloneProgress) {
                 bar.set_message(format!("objects ({})", HumanBytes(transfer.bytes)));
             }
         },
+        TransferPhase::Resolve => {
+            counted(transfer.total.unwrap_or_default());
+            bar.set_prefix("Resolving files");
+            bar.set_message("objects");
+        }
         TransferPhase::Apply => spin("Writing the repo...".to_owned()),
         TransferPhase::Index => {
             spin("Indexing commits...".to_owned());

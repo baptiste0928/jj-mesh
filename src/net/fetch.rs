@@ -2,15 +2,16 @@
 //! fetching side:
 //!
 //! ```text
-//! fetcher                                             server
-//!    |  FetchRequest { wants, haves }                      |
-//!    |---------------------------------------------------->|
-//!    |  OpFrame: Begin, (View | Op)*, Done | Error          |
-//!    |<----------------------------------------------------|
-//!    |  GitRequest { wants, haves, format }                |
-//!    |---------------------------------------------------->|
-//!    |  GitFrame: [Begin, (Object* | Pack*)], Done | Error  |
-//!    |<----------------------------------------------------|
+//! fetcher                                                    server
+//!    |  FetchRequest { wants, haves }                             |
+//!    |----------------------------------------------------------->|
+//!    |  OpFrame: Begin, (View | Op)*, Done | Error                 |
+//!    |<-----------------------------------------------------------|
+//!    |  GitRequest { wants, haves, format }                       |
+//!    |----------------------------------------------------------->|
+//!    |  GitFrame: [Begin, (Object* | Pack* (NextPack Pack*)*)],    |
+//!    |            Done | Error                                     |
+//!    |<-----------------------------------------------------------|
 //! ```
 //!
 //! Op and view payloads travel as one zstd stream per op phase (see
@@ -87,14 +88,17 @@ pub struct GitRequest {
 ///
 /// Loose sends one hash-verified object per frame and suits incremental
 /// syncs, whose few objects exist only loose on the server anyway. Pack
-/// streams one packfile, letting the server reuse the deltas of its
-/// on-disk packs and the fetcher index the objects into a single pack
-/// instead of thousands of loose files. Clones ask for it, and servers
-/// switch large loose transfers to it.
+/// streams one packfile of the wanted closure, letting the server reuse
+/// the deltas of its on-disk packs and the fetcher index the objects into
+/// a single pack instead of thousands of loose files; servers switch large
+/// loose transfers to it. Store sends the server's whole object store
+/// without walking it: its pack files as they are, then its loose objects
+/// packed. Clones ask for it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GitTransferFormat {
     Loose,
     Pack,
+    Store,
 }
 
 /// Server-to-fetcher frame of the git phase.
@@ -114,13 +118,15 @@ pub enum GitFrame {
         #[serde(with = "serde_bytes")]
         data: Vec<u8>,
     },
-    /// One chunk of the packfile stream. Only sent in the pack format; the
-    /// pack's own trailer checksum and the per-object hashing done while
-    /// indexing verify the content.
+    /// One chunk of a packfile stream. Only sent in the pack and store
+    /// formats; the pack's own trailer checksum and the per-object hashing
+    /// done while indexing verify the content.
     Pack {
         #[serde(with = "serde_bytes")]
         chunk: Vec<u8>,
     },
+    /// Ends one pack and starts the next. Only sent in the store format.
+    NextPack,
     /// End of the git phase.
     Done,
     /// The server cannot serve the git phase.

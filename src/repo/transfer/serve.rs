@@ -1,5 +1,6 @@
 //! Server side of a fetch: streaming the op-log delta, then the git object
-//! closure the fetcher lacks. Every phase runs through [`serve_phase`].
+//! closure the fetcher lacks, or the whole object store for a clone. Every
+//! phase runs through [`serve_phase`].
 
 use std::{
     collections::{HashMap, HashSet},
@@ -147,7 +148,8 @@ fn validate_request(repo: &OpenRepo, request: &FetchRequest) -> Result<(), Strin
 
 /// Serves the git phase: answers the fetcher's commit wants with the raw
 /// object closure it lacks (see [`walk_git_closure`]), in the requested
-/// format, or as a pack past [`PACK_MIN_OBJECTS`].
+/// format or as a pack past [`PACK_MIN_OBJECTS`], or with the whole store
+/// when asked for it.
 async fn serve_git_phase(
     repo: &Arc<OpenRepo>,
     send: &mut (impl AsyncWrite + Unpin),
@@ -165,7 +167,9 @@ async fn serve_git_phase(
         write_message(send, &GitFrame::Error { message }, MAX_GIT_FRAME_SIZE).await?;
         return Ok(());
     }
-    if request.wants.is_empty() {
+    // A store transfer ignores the wants: the fetcher may hold every commit
+    // from a cut-short store transfer, yet lack the rest of the store.
+    if request.wants.is_empty() && request.format != GitTransferFormat::Store {
         write_message(send, &GitFrame::Done, MAX_GIT_FRAME_SIZE).await?;
         return Ok(());
     }
@@ -179,35 +183,66 @@ async fn serve_git_phase(
         "cannot send git objects",
         move |tx| {
             let git = repo.git_backend().git_repo();
+            if request.format == GitTransferFormat::Store {
+                return send_store(&git, tx);
+            }
             let objects = walk_git_closure(&repo, &haves, &wants)?;
             if objects.is_empty() {
                 return Ok(());
             }
-            let format = if objects.len() >= PACK_MIN_OBJECTS {
-                GitTransferFormat::Pack
-            } else {
-                request.format
-            };
-            let count = objects.len();
+            let format =
+                if request.format == GitTransferFormat::Loose && objects.len() < PACK_MIN_OBJECTS {
+                    GitTransferFormat::Loose
+                } else {
+                    GitTransferFormat::Pack
+                };
+            let count = objects.len() as u64;
             produce(
                 tx,
                 GitFrame::Begin {
                     format,
-                    objects: count as u64,
+                    objects: count,
                 },
             )?;
-            match format {
-                GitTransferFormat::Loose => send_loose(&git, objects, tx)?,
-                GitTransferFormat::Pack => {
-                    let ids = objects.into_iter().map(|(id, _)| id).collect();
-                    pack::write_pack(&git, ids, |chunk| produce(tx, GitFrame::Pack { chunk }))?;
-                }
+            if format == GitTransferFormat::Loose {
+                send_loose(&git, objects, tx)?;
+            } else {
+                let ids = objects.into_iter().map(|(id, _)| id).collect();
+                pack::write_pack(&git, ids, |chunk| produce(tx, GitFrame::Pack { chunk }))?;
             }
             debug!(?format, objects = count, "served git phase");
             Ok(())
         },
     )
     .await?;
+    Ok(())
+}
+
+/// Sends the whole object store (see [`pack::Store`]), from a phase
+/// producer.
+fn send_store(git: &gix::Repository, tx: &mpsc::Sender<GitFrame>) -> Result<()> {
+    let store = pack::Store::open(git)?;
+    let objects = store.objects();
+    if objects == 0 {
+        return Ok(());
+    }
+    let format = GitTransferFormat::Store;
+    produce(tx, GitFrame::Begin { format, objects })?;
+    let chunk = |chunk| produce(tx, GitFrame::Pack { chunk });
+    let packed = !store.packs.is_empty();
+    for (n, pack) in store.packs.into_iter().enumerate() {
+        if n > 0 {
+            produce(tx, GitFrame::NextPack)?;
+        }
+        pack.write(chunk)?;
+    }
+    if !store.loose.is_empty() {
+        if packed {
+            produce(tx, GitFrame::NextPack)?;
+        }
+        pack::write_pack(git, store.loose, chunk)?;
+    }
+    debug!(?format, objects, "served git phase");
     Ok(())
 }
 

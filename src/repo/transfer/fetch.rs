@@ -2,7 +2,11 @@
 //! pulling the git objects it references, then staging it, indexing the
 //! incoming heads and publishing them (see [`super::apply`]).
 
-use std::{collections::HashSet, sync::Arc, time::Duration};
+use std::{
+    collections::{HashSet, VecDeque},
+    sync::Arc,
+    time::Duration,
+};
 
 use anyhow::{Context as _, Result, anyhow, bail, ensure};
 use jj_lib::{
@@ -11,7 +15,10 @@ use jj_lib::{
     op_store::{OperationId, ViewId},
 };
 use pollster::FutureExt as _;
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::{
+    io::{AsyncRead, AsyncWrite},
+    sync::mpsc,
+};
 
 use super::{
     FetchOptions, FetchOutcome, OpBatch, ProgressSink, StoredOp, StoredView, TransferPhase,
@@ -52,7 +59,7 @@ const INGEST_SAMPLE_INTERVAL: Duration = Duration::from_millis(200);
 
 /// Fetches the given op heads from a peer over the stream pair and applies
 /// them locally in crash-safe order. `options.format` asks how git objects
-/// travel (clones ask for a pack, incremental syncs for loose objects, see
+/// travel (clones ask for the store, incremental syncs for loose objects, see
 /// [`GitTransferFormat`]); `progress` receives live counters as the phases
 /// advance.
 ///
@@ -107,10 +114,10 @@ pub async fn fetch(
         write_message(send, &git_request, MAX_FRAME_SIZE),
     )
     .await?;
-    // The keep guard holds a received pack against git GC until the stage
-    // writes the keep refs that take over; it is released below, and on any
-    // early return or abandoned fetch by its own drop.
-    let (git_objects, pack_keep) = receive_git(repo, deadline, recv, progress).await?;
+    // The keep guards hold received packs against git GC until the stage
+    // writes the keep refs that take over; they are released below, and on
+    // any early return or abandoned fetch by their own drop.
+    let (git_objects, pack_keeps) = receive_git(repo, deadline, recv, progress).await?;
 
     ensure_git_wants_arrived(repo, missing).await?;
 
@@ -146,8 +153,8 @@ pub async fn fetch(
             .await
             .context("apply task failed")??;
     }
-    // The stage's keep refs now protect the pack's commits.
-    drop(pack_keep);
+    // The stage's keep refs now protect the packs' commits.
+    drop(pack_keeps);
 
     Ok(FetchOutcome {
         ops: ops_received,
@@ -389,42 +396,39 @@ fn referenced_commits(batch: &OpBatch) -> Vec<CommitId> {
 }
 
 /// Receives the git phase in the format the server announces. Returns how
-/// many objects the peer sent, and the `.keep` file protecting a received
-/// pack.
+/// many objects the peer sent, and the `.keep` files protecting the
+/// received packs.
 async fn receive_git(
     repo: &Arc<OpenRepo>,
     deadline: tokio::time::Instant,
     recv: &mut (impl AsyncRead + Unpin),
     progress: ProgressSink<'_>,
-) -> Result<(usize, Option<pack::PackKeep>)> {
+) -> Result<(usize, Vec<pack::PackKeep>)> {
     let first = bounded(deadline, "git", read_message(recv, MAX_GIT_FRAME_SIZE)).await?;
     let (format, objects) = match first {
         GitFrame::Begin { format, objects } => (format, objects),
-        GitFrame::Done => return Ok((0, None)),
+        GitFrame::Done => return Ok((0, Vec::new())),
         GitFrame::Error { message } => {
             bail!("peer failed git phase: {}", sanitize(&message))
         }
-        GitFrame::Object { .. } | GitFrame::Pack { .. } => bail!("peer sent objects before Begin"),
+        GitFrame::Object { .. } | GitFrame::Pack { .. } | GitFrame::NextPack => {
+            bail!("peer sent objects before Begin")
+        }
     };
     let mut counters = TransferProgress::start(TransferPhase::Git);
     counters.total = Some(objects);
     progress.report(counters);
-    match format {
-        GitTransferFormat::Loose => {
-            let received = bounded(
-                deadline,
-                "git",
-                receive_git_loose(repo, recv, counters, progress),
-            )
-            .await?;
-            Ok((received, None))
-        }
-        GitTransferFormat::Pack => {
-            let (received, keep) =
-                receive_git_pack(repo, deadline, recv, counters, progress).await?;
-            Ok((received, Some(keep)))
-        }
+    if format == GitTransferFormat::Loose {
+        let received = bounded(
+            deadline,
+            "git",
+            receive_git_loose(repo, recv, counters, progress),
+        )
+        .await?;
+        return Ok((received, Vec::new()));
     }
+    let store = format == GitTransferFormat::Store;
+    receive_git_packs(repo, deadline, recv, counters, progress, store).await
 }
 
 /// Receives the git phase, decompressing and hash-verifying every object
@@ -474,7 +478,9 @@ async fn receive_git_loose(
                 return Ok(usize::try_from(counters.current)?);
             }
             GitFrame::Begin { .. } => bail!("peer sent Begin twice"),
-            GitFrame::Pack { .. } => bail!("peer sent a pack chunk in a loose transfer"),
+            GitFrame::Pack { .. } | GitFrame::NextPack => {
+                bail!("peer sent a pack chunk in a loose transfer")
+            }
             GitFrame::Error { message } => {
                 bail!("peer failed git phase: {}", sanitize(&message))
             }
@@ -482,89 +488,131 @@ async fn receive_git_loose(
     }
 }
 
-/// Receives the git phase in the pack format: frames stream one packfile
-/// into a blocking ingest task, which indexes it into `objects/pack` (see
-/// [`pack::ingest_pack`] for the verification done there). Returns how many
-/// objects the pack carried and the `.keep` file protecting it.
+/// Receives the git phase in the pack format, or the store format when
+/// `store` (several packs, separated by `NextPack`). Frames stream each
+/// packfile into its blocking ingest task, which indexes it into
+/// `objects/pack` (see [`pack::ingest_pack`] for the verification done
+/// there), while the next pack keeps streaming: the server waits on our
+/// delta resolution only when two packs are already resolving. Returns how
+/// many objects the packs carried and the `.keep` files protecting them.
 ///
-/// Only the frame streaming runs under the fetch's network `deadline`; the
-/// delta resolution left once the stream ends is local work, and timing it
-/// out would throw away a fully received pack.
+/// Only the frame reads run under the fetch's network `deadline`: delta
+/// resolution is local work, and timing it out would throw away fully
+/// received packs.
 ///
-/// Progress: `current` tracks the ingest's objects-indexed counter,
-/// sampled on every received chunk and, once the stream ends, on a timer
-/// while the ingest finishes resolving.
-async fn receive_git_pack(
+/// Progress: `current` sums the ingests' indexed objects, then their
+/// resolved objects in the [`TransferPhase::Resolve`] that follows the last
+/// pack byte. It is sampled on every received chunk and on a timer while
+/// waiting on an ingest.
+async fn receive_git_packs(
     repo: &Arc<OpenRepo>,
     deadline: tokio::time::Instant,
     recv: &mut (impl AsyncRead + Unpin),
     mut counters: TransferProgress,
     progress: ProgressSink<'_>,
-) -> Result<(usize, pack::PackKeep)> {
-    let indexed = pack::SharedObjectCount::default();
-    let (tx, rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
-    let mut ingest = {
-        let repo = repo.clone();
-        let indexed = indexed.clone();
-        crate::spawn_blocking(move || {
-            let git = repo.git_backend().git_repo();
-            pack::ingest_pack(&git, pack::ChunkReader::new(rx), &indexed)
-        })
-    };
-
-    let streamed = bounded(deadline, "git", async {
-        loop {
-            match read_message(recv, MAX_GIT_FRAME_SIZE).await? {
-                GitFrame::Pack { chunk } => {
-                    counters.bytes += chunk.len() as u64;
-                    counters.current = indexed.get();
-                    progress.report(counters);
-                    // A closed channel means the ingest died; its own error
-                    // is reported after the join below.
-                    if tx.send(chunk).await.is_err() {
-                        break Ok(None);
-                    }
-                }
-                GitFrame::Done => break Ok(None),
-                GitFrame::Error { message } => {
-                    break Ok(Some(format!(
-                        "peer failed git phase: {}",
-                        sanitize(&message)
-                    )));
-                }
-                GitFrame::Begin { .. } => break Ok(Some("peer sent Begin twice".to_owned())),
-                GitFrame::Object { .. } => {
-                    break Ok(Some(
-                        "peer sent a loose object in a pack transfer".to_owned(),
-                    ));
-                }
-            }
-        }
-    })
-    .await;
-
-    // Closing the channel ends the ingest's stream; on a clean `Done` it
-    // finishes the pack, otherwise it fails on the truncation. Indexing
-    // (delta resolution most of all) keeps running after the last byte
-    // arrived, so keep sampling its object count while waiting.
-    drop(tx);
-    let failed = streamed?;
-    let outcome = loop {
-        tokio::select! {
-            outcome = &mut ingest => break outcome.context("pack ingest task failed")?,
-            () = tokio::time::sleep(INGEST_SAMPLE_INTERVAL) => {
-                counters.current = indexed.get();
+    store: bool,
+) -> Result<(usize, Vec<pack::PackKeep>)> {
+    let mut counts: Vec<pack::IngestCounts> = Vec::new();
+    let mut running: VecDeque<Ingest> = VecDeque::new();
+    let mut outcomes: Vec<pack::IngestOutcome> = Vec::new();
+    let mut tx = start_ingest(repo, &mut counts, &mut running);
+    loop {
+        match bounded(deadline, "git", read_message(recv, MAX_GIT_FRAME_SIZE)).await? {
+            GitFrame::Pack { chunk } => {
+                counters.bytes += chunk.len() as u64;
+                sample(&counts, &mut counters);
                 progress.report(counters);
+                // A closed channel means the ingest died: report its error.
+                if tx.send(chunk).await.is_err() {
+                    let ingest = running.pop_back().expect("the ingest fed by `tx`");
+                    join_ingest(ingest, &counts, &mut counters, progress).await?;
+                    bail!("pack ingest stopped early");
+                }
+            }
+            GitFrame::NextPack if store => {
+                // Replacing `tx` ends the previous pack's stream.
+                tx = start_ingest(repo, &mut counts, &mut running);
+                if running.len() > 2 {
+                    let ingest = running.pop_front().expect("several ingests");
+                    outcomes.push(join_ingest(ingest, &counts, &mut counters, progress).await?);
+                }
+            }
+            GitFrame::NextPack => bail!("peer sent several packs in a pack transfer"),
+            GitFrame::Done => break,
+            GitFrame::Error { message } => {
+                bail!("peer failed git phase: {}", sanitize(&message))
+            }
+            GitFrame::Begin { .. } => bail!("peer sent Begin twice"),
+            GitFrame::Object { .. } => bail!("peer sent a loose object in a pack transfer"),
+        }
+    }
+    drop(tx);
+    counters = TransferProgress {
+        total: counters.total,
+        ..TransferProgress::start(TransferPhase::Resolve)
+    };
+    sample(&counts, &mut counters);
+    progress.report(counters);
+    for ingest in running {
+        outcomes.push(join_ingest(ingest, &counts, &mut counters, progress).await?);
+    }
+    sample(&counts, &mut counters);
+    progress.report(counters);
+    let received = outcomes.iter().map(|outcome| outcome.objects).sum();
+    let keeps = outcomes.into_iter().map(|outcome| outcome.keep).collect();
+    Ok((received, keeps))
+}
+
+/// A received pack being indexed.
+type Ingest = tokio::task::JoinHandle<Result<pack::IngestOutcome>>;
+
+/// Starts indexing a pack on a blocking thread, tracking its object counts
+/// in `counts`. Returns the sender of its chunks; dropping it ends the
+/// pack.
+fn start_ingest(
+    repo: &Arc<OpenRepo>,
+    counts: &mut Vec<pack::IngestCounts>,
+    running: &mut VecDeque<Ingest>,
+) -> mpsc::Sender<Vec<u8>> {
+    let (tx, rx) = mpsc::channel(8);
+    let ingest_counts = pack::IngestCounts::default();
+    counts.push(ingest_counts.clone());
+    let repo = repo.clone();
+    running.push_back(crate::spawn_blocking(move || {
+        let git = repo.git_backend().git_repo();
+        pack::ingest_pack(&git, pack::ChunkReader::new(rx), &ingest_counts)
+    }));
+    tx
+}
+
+/// Waits for an ingest, sampling its progress: delta resolution keeps
+/// running after the pack's last byte arrived.
+async fn join_ingest(
+    mut ingest: Ingest,
+    counts: &[pack::IngestCounts],
+    counters: &mut TransferProgress,
+    progress: ProgressSink<'_>,
+) -> Result<pack::IngestOutcome> {
+    loop {
+        tokio::select! {
+            outcome = &mut ingest => return outcome.context("pack ingest task failed")?,
+            () = tokio::time::sleep(INGEST_SAMPLE_INTERVAL) => {
+                sample(counts, counters);
+                progress.report(*counters);
             }
         }
-    };
-    if let Some(message) = failed {
-        bail!("{message}");
     }
-    let outcome = outcome?;
-    counters.current = indexed.get();
-    progress.report(counters);
-    Ok((outcome.objects, outcome.keep))
+}
+
+/// Sets `counters.current` from the ingests: objects indexed while the
+/// packs stream in, resolved after.
+fn sample(counts: &[pack::IngestCounts], counters: &mut TransferProgress) {
+    let count = if counters.phase == TransferPhase::Resolve {
+        pack::IngestCounts::resolved
+    } else {
+        pack::IngestCounts::indexed
+    };
+    counters.current = counts.iter().map(count).sum();
 }
 
 /// Decompresses, hash-verifies and writes a chunk of received objects into
