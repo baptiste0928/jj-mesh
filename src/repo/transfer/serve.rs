@@ -156,7 +156,7 @@ async fn serve_git_phase(
     recv: &mut (impl AsyncRead + Unpin),
 ) -> Result<()> {
     let request: GitRequest = read_message(recv, MAX_FRAME_SIZE).await?;
-    let hash_len = repo.git_backend().git_repo().object_hash().len_in_bytes();
+    let hash_len = repo.git().object_hash().len_in_bytes();
     let ok = request
         .wants
         .iter()
@@ -182,7 +182,7 @@ async fn serve_git_phase(
         GIT_STREAM_BUFFER,
         "cannot send git objects",
         move |tx| {
-            let git = repo.git_backend().git_repo();
+            let git = repo.git();
             if request.format == GitTransferFormat::Store {
                 return send_store(&git, tx);
             }
@@ -366,7 +366,7 @@ pub(super) fn walk_git_closure(
         .collect::<Result<Vec<_>>>()?;
     let commits = repo.commit_range(&heads, haves, wants)?;
 
-    let git = repo.git_backend().git_repo();
+    let git = repo.git();
     // The trees of each change's versions the fetcher holds or received.
     let mut versions: HashMap<Vec<u8>, Vec<gix::ObjectId>> = HashMap::new();
     for have in haves.iter().filter(|have| !repo.is_root_commit(have)) {

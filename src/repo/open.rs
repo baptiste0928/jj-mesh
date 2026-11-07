@@ -490,9 +490,9 @@ impl OpenRepo {
     /// Shallow and partial git clones are refused: syncing assumes a
     /// stored commit has its whole closure, which they cut.
     pub async fn self_check(&self) -> Result<()> {
-        let git = self.git_backend().git_repo();
+        let git = self.git();
         ensure!(
-            !git.is_shallow(),
+            !git.is_shallow()?,
             "the git repo is shallow, which syncing does not support. Fetch \
              its full history with `git --git-dir {} fetch --unshallow`",
             self.git_repo_path().display(),
@@ -537,7 +537,7 @@ impl OpenRepo {
             return Ok(());
         }
 
-        let git = self.git_backend().git_repo();
+        let git = self.git();
         let object = git
             .find_object(to_gix_id(id)?)
             .map_err(|err| anyhow!("cannot read working-copy commit {}: {err}", id.hex()))?;
@@ -563,8 +563,16 @@ impl OpenRepo {
 
     /// The git object hash of the repo.
     pub fn object_hash(&self) -> Result<ObjectHash> {
-        ObjectHash::try_from(self.git_backend().git_repo().object_hash())
-            .map_err(|err| anyhow!(err))
+        ObjectHash::try_from(self.git().object_hash()).map_err(|err| anyhow!(err))
+    }
+
+    /// The git repo, reading objects raw: gix honors replacement refs by
+    /// default, which would yield another object's bytes under a replaced
+    /// id, while peers replicate objects by id.
+    pub fn git(&self) -> gix::Repository {
+        let mut git = self.git_backend().git_repo();
+        git.objects.ignore_replacements = true;
+        git
     }
 
     pub fn git_backend(&self) -> &GitBackend {

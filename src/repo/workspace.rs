@@ -257,7 +257,7 @@ impl JjRepo {
         let repo_dir = self.repo_dir();
         let repo =
             RepoLoader::init_from_file_system(&settings, &repo_dir, &default_backend_factories())?
-                .load_at_head()
+                .load_at_head(None)
                 .block_on()?;
         let names = repo.view().wc_commit_ids();
         ensure!(
@@ -272,6 +272,7 @@ impl JjRepo {
             &repo,
             &*default_working_copy_factory(),
             WorkspaceNameBuf::from(name),
+            None,
         )
         .block_on()
         .with_context(|| format!("cannot add a workspace in {}", root.display()))?;

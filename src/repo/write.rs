@@ -7,6 +7,7 @@ use std::{
 
 use anyhow::{Context as _, Result};
 use jj_lib::{
+    file_util,
     object_id::ObjectId,
     op_store::{OperationId, ViewId},
 };
@@ -64,7 +65,7 @@ impl<'a> RawWriteBatch<'a> {
         if path.exists() {
             return Ok(());
         }
-        let temp = tempfile::NamedTempFile::new_in(dir)
+        let temp = file_util::new_temp_file_with_default_permissions(dir)
             .with_context(|| format!("cannot create temp file in {}", dir.display()))?;
         temp.as_file().write_all(bytes)?;
         self.staged.push((temp.into_temp_path(), path));

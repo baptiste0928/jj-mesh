@@ -16,8 +16,7 @@
 //! a ref along one line). Each ref then moves in git from a "before" value,
 //! the merged view of the heads before the publication, to the merged
 //! "after" value by compare-and-swap. A ref moved meanwhile, by the user
-//! or a running jj command (`jj git fetch` writes refs before recording
-//! them), fails its swap and stays for jj to import.
+//! or a running jj command, fails its swap and stays for jj to import.
 //!
 //! [`heal`] runs on watch start for git repos inside `.jj` with no
 //! worktree: only jj writes there, so its "before" is what the repo
@@ -199,7 +198,7 @@ fn is_imported(name: &GitRefName) -> bool {
 /// tags) otherwise; refs not reaching a commit are skipped, as jj's
 /// import skips them.
 fn stored_refs(repo: &OpenRepo, hint: &GitRefs) -> Result<GitRefs> {
-    let git = repo.git_backend().git_repo();
+    let git = repo.git();
     let platform = git.references()?;
     let mut refs = GitRefs::new();
     for namespace in NAMESPACES {
@@ -237,7 +236,7 @@ fn target<'a>(refs: &'a GitRefs, name: &GitRefName) -> &'a RefTarget {
 fn swap(repo: &OpenRepo, before: &GitRefs, after: &GitRefs) -> Result<()> {
     use gix::refs::transaction::{Change, LogChange, PreviousValue, RefEdit, RefLog};
 
-    let git = repo.git_backend().git_repo();
+    let git = repo.git();
     let heads = head_names(&git)?;
     let names: BTreeSet<&GitRefName> = [before, after]
         .into_iter()
@@ -334,7 +333,10 @@ const UNBORN_HEAD: &str = "refs/jj/root";
 fn head_names(git: &gix::Repository) -> Result<Vec<gix::refs::FullName>> {
     let main = gix::refs::FullName::try_from("HEAD").expect("valid ref name");
     let worktrees = git.worktrees()?.into_iter().filter_map(|worktree| {
-        gix::refs::FullName::try_from(format!("worktrees/{}/HEAD", worktree.id())).ok()
+        let name = worktree.id().ok()?;
+        gix::refs::Category::LinkedPseudoRef { name }
+            .to_full_name("HEAD")
+            .ok()
     });
     Ok(std::iter::once(main).chain(worktrees).collect())
 }

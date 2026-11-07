@@ -146,7 +146,7 @@ pub(super) fn write_pack(
             version: gix_pack::data::Version::V2,
             compression: gix::zlib::Compression::DEFAULT,
         },
-    ));
+    )?);
 
     let mut writer = ChunkWriter {
         emit,

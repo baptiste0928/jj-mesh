@@ -22,7 +22,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The flake now exposes a NixOS module, for systems without Home Manager.
 
 ### Changed
-- **`jj` 0.46 is required.** Older versions are no longer supported.
+- **`jj` 0.46 or 0.47 is required.** Older versions are no longer supported.
 - **Auto-snapshot and update-stale now run on secondary workspaces**, which are listed in
   `jj-mesh status <repo>`.
 - **Settings moved to the `[jj-mesh]` table of your jj config**, and can now be set per user, repo

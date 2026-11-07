@@ -200,6 +200,32 @@ async fn sync_on_top_of_an_older_commit_transfers_only_new_objects() {
     }
 }
 
+/// A replacement ref on the server does not leak into the transfer: the
+/// commits travel as their raw objects, with their own closures.
+#[tokio::test]
+async fn sync_ignores_replacement_refs() {
+    let fx = Fixture::new();
+    let a = fx.init_repo("a");
+    fx.commit_file(&a, "base.txt", "base");
+    fork(&a, &fx.path().join("loose"));
+    fork(&a, &fx.path().join("pack"));
+    fx.commit_file(&a, "old.txt", "old");
+    fx.commit_file(&a, "new.txt", "new");
+
+    let commit = |rev| fx.jj_output(&a, &["log", "-r", rev, "--no-graph", "-T", "commit_id"]);
+    git(
+        open(&a).git().path(),
+        &["replace", &commit("@-"), &commit("@--")],
+    );
+    let ra = open(&a);
+    let wants = ra.op_heads().await.unwrap();
+    for format in [GitTransferFormat::Loose, GitTransferFormat::Pack] {
+        let fetcher = open(&fx.path().join(format!("{format:?}").to_lowercase()));
+        sync_exact(&fetcher, &ra, &wants, format).await;
+        assert_eq!(fetcher.op_heads().await.unwrap(), wants);
+    }
+}
+
 /// A fetcher with commits of its own, unknown to the server, still gets
 /// only what it lacks: its haves are the commits the fetched views share
 /// with it, not its own heads.
@@ -267,7 +293,7 @@ async fn large_incremental_sync_switches_to_a_pack() {
     fx.jj(&a, &["commit", "-m", "many files"]);
 
     let (ra, rb) = (open(&a), open(&b));
-    let git_dir = rb.git_backend().git_repo().path().to_owned();
+    let git_dir = rb.git().path().to_owned();
     let packs = pack_files(&git_dir, "pack");
     let wants = ra.op_heads().await.unwrap();
     let outcome = sync_exact(&rb, &ra, &wants, GitTransferFormat::Loose).await;
@@ -285,7 +311,7 @@ async fn clone_receives_the_object_store() {
     for n in 0..5 {
         fx.commit_file(&a, &format!("file{n}.txt"), &format!("commit {n}"));
     }
-    let server_git = open(&a).git_backend().git_repo().path().to_owned();
+    let server_git = open(&a).git().path().to_owned();
     git(&server_git, &["gc", "--quiet"]);
     fx.commit_file(&a, "packed.txt", "after gc");
     git(&server_git, &["repack", "-q", "-d"]);
@@ -300,7 +326,7 @@ async fn clone_receives_the_object_store() {
         .await
         .unwrap();
     assert_complete(&rb);
-    let git_dir = rb.git_backend().git_repo().path().to_owned();
+    let git_dir = rb.git().path().to_owned();
     assert_eq!(pack_files(&git_dir, "pack"), packs + 1);
     assert_eq!(pack_files(&git_dir, "keep"), 0);
 }
@@ -316,8 +342,8 @@ async fn store_retry_after_a_partial_transfer_is_complete() {
     }
     let b = fx.init_pull_target("b", "machine-b");
     let (ra, rb) = (open(&a), open(&b));
-    let server = ra.git_backend().git_repo();
-    let fetcher = rb.git_backend().git_repo();
+    let server = ra.git();
+    let fetcher = rb.git();
     for id in object_ids(server.path(), Some("commit")) {
         let object = server.find_object(gix::ObjectId::from_hex(id.as_bytes()).unwrap());
         let data = &object.unwrap().data;
@@ -357,7 +383,7 @@ async fn closure_is_emitted_parents_first() {
 
     let ra = open(&a);
     let emitted = closure(&ra, &view_heads(&ra).await, &[]);
-    let git_dir = ra.git_backend().git_repo().path().to_owned();
+    let git_dir = ra.git().path().to_owned();
     for (n, (id, kind)) in emitted.iter().enumerate() {
         assert!(
             !emitted[..n].iter().any(|(other, _)| other == id),
@@ -541,7 +567,7 @@ async fn closure_refuses_wants_outside_the_op_log() {
     let fx = Fixture::new();
     let a = fx.init_repo("a");
     let ra = open(&a);
-    let git_dir = ra.git_backend().git_repo().path().to_owned();
+    let git_dir = ra.git().path().to_owned();
     let tree = git_output(&git_dir, &["hash-object", "-t", "tree", "-w", "/dev/null"]);
     let stray = git_output(&git_dir, &["commit-tree", &tree, "-m", "stray"]);
 
@@ -945,7 +971,10 @@ async fn clone_pull_into_fresh_repo() {
     // mesh history is visible from the fresh machine.
     fx.jj(&b, &["status"]);
     let list = fx.jj_output(&b, &["workspace", "list"]);
-    assert!(list.contains("machine-b:"), "{list}");
+    assert!(
+        list.lines().any(|line| line.starts_with("machine-b")),
+        "{list}"
+    );
     assert!(list.contains("default:"), "{list}");
     assert_eq!(rb.op_heads().await.unwrap().len(), 1, "merged");
 }
@@ -1009,7 +1038,7 @@ async fn progress_reports_phases_and_exact_totals() {
     let a = fx.init_repo("a");
     fs::write(a.join("file.txt"), "mesh content\n").unwrap();
     fx.jj(&a, &["commit", "-m", "add file"]);
-    git(open(&a).git_backend().git_repo().path(), &["gc", "--quiet"]);
+    git(open(&a).git().path(), &["gc", "--quiet"]);
     fx.commit_file(&a, "loose.txt", "after gc");
     let b = fx.init_pull_target("b", "machine-b");
 
@@ -1481,7 +1510,7 @@ async fn sync_exact(
     wants: &[OperationId],
     format: GitTransferFormat,
 ) -> FetchOutcome {
-    let git_dir = fetcher.git_backend().git_repo().path().to_owned();
+    let git_dir = fetcher.git().path().to_owned();
     let before = object_ids(&git_dir, None);
     let outcome = try_sync(fetcher, server, wants, format).await.unwrap();
     assert_complete(fetcher);
@@ -1493,7 +1522,7 @@ async fn sync_exact(
 /// Asserts every commit in the repo's git store has its whole closure
 /// stored, whether a ref reaches it or not.
 fn assert_complete(repo: &OpenRepo) {
-    let git_dir = repo.git_backend().git_repo().path().to_owned();
+    let git_dir = repo.git().path().to_owned();
     let commits: Vec<String> = object_ids(&git_dir, Some("commit")).into_iter().collect();
     let mut args = vec!["rev-list", "--objects", "--missing=print"];
     args.extend(commits.iter().map(String::as_str));

@@ -29,7 +29,7 @@ use std::{
 
 use anyhow::{Context as _, Error, Result, bail, ensure};
 use jj_lib::{
-    file_util::{normalize_path, relative_path},
+    file_util::{self, normalize_path, relative_path},
     lock::FileLock,
 };
 use prost::Message as _;
@@ -139,7 +139,7 @@ impl JjRepo {
         }
 
         let dir = path.parent().expect("the index is in a directory");
-        let temp = tempfile::NamedTempFile::new_in(dir)
+        let temp = file_util::new_temp_file_with_default_permissions(dir)
             .with_context(|| format!("cannot write in {}", dir.display()))?;
         fs::write(temp.path(), index.encode_to_vec())
             .with_context(|| format!("cannot write {}", temp.path().display()))?;

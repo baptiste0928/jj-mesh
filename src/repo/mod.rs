@@ -28,7 +28,16 @@ use std::{
 };
 
 use anyhow::{Context as _, Result, ensure};
-use jj_lib::{git_backend::GitBackend, repo::ReadonlyRepo, signing_factory::signer_from_settings};
+use jj_lib::{
+    default_backend_factories::{
+        default_index_store_initializer, default_op_heads_store_initializer,
+        default_op_store_initializer, default_submodule_store_initializer,
+        default_workspace_store_initializer,
+    },
+    git_backend::GitBackend,
+    repo::ReadonlyRepo,
+    signing_factory::signer_from_settings,
+};
 use pollster::FutureExt as _;
 
 use crate::config::ObjectHash;
@@ -44,7 +53,7 @@ pub use self::{
 
 /// The jj release series this build accepts, as minors of `0.<minor>.<patch>`
 /// versions.
-const SUPPORTED_JJ_MINORS: std::ops::RangeInclusive<u32> = 46..=46;
+const SUPPORTED_JJ_MINORS: std::ops::RangeInclusive<u32> = 46..=47;
 
 /// Store backends supported by jj-mesh, as `(<store dir>, <expected type>)`
 /// pairs relative to `.jj/repo`.
@@ -100,19 +109,21 @@ impl JjRepo {
         fs::create_dir_all(&repo_dir)
             .with_context(|| format!("cannot create {}", repo_dir.display()))?;
         let settings = open::settings()?;
+        let git_settings = settings.git_backend_settings()?;
         ReadonlyRepo::init(
             settings,
             &repo_dir,
-            &|settings, store_path| {
-                let backend = GitBackend::init_internal(settings, store_path, object_hash.kind())?;
+            &|_, store_path| {
+                let backend =
+                    GitBackend::init_internal(&git_settings, store_path, object_hash.kind())?;
                 Ok(Box::new(backend))
             },
             signer_from_settings(settings)?,
-            ReadonlyRepo::default_workspace_store_initializer(),
-            ReadonlyRepo::default_op_store_initializer(),
-            ReadonlyRepo::default_op_heads_store_initializer(),
-            ReadonlyRepo::default_index_store_initializer(),
-            ReadonlyRepo::default_submodule_store_initializer(),
+            default_workspace_store_initializer(),
+            default_op_store_initializer(),
+            default_op_heads_store_initializer(),
+            default_index_store_initializer(),
+            default_submodule_store_initializer(),
         )
         .block_on()
         .with_context(|| format!("cannot create a repo in {}", root.display()))?;

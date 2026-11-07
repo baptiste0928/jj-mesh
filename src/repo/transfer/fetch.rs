@@ -176,7 +176,7 @@ async fn ensure_git_wants_arrived(repo: &Arc<OpenRepo>, requested: Vec<CommitId>
     }
     let repo = repo.clone();
     let absent = crate::spawn_blocking(move || -> Result<Vec<CommitId>> {
-        let git = repo.git_backend().git_repo();
+        let git = repo.git();
         let mut absent = Vec::new();
         for id in requested {
             if !git.has_object(to_gix_id(&id)?) {
@@ -321,7 +321,7 @@ fn git_wants(
     local_heads: &[OperationId],
     referenced: Vec<CommitId>,
 ) -> Result<(Vec<CommitId>, Vec<CommitId>)> {
-    let git = repo.git_backend().git_repo();
+    let git = repo.git();
     // Repos of different object hashes cannot share commits; the ids alone
     // tell, before anything is requested.
     let hash = git.object_hash();
@@ -546,7 +546,7 @@ fn start_ingest(
     counts.push(ingest_counts.clone());
     let repo = repo.clone();
     running.push_back(crate::spawn_blocking(move || {
-        let git = repo.git_backend().git_repo();
+        let git = repo.git();
         pack::ingest_pack(&git, pack::ChunkReader::new(rx), &ingest_counts)
     }));
     tx
@@ -596,7 +596,7 @@ fn write_git_chunk(
     let repo = repo.clone();
     crate::spawn_blocking(move || -> Result<()> {
         use gix::prelude::Write as _;
-        let git = repo.git_backend().git_repo();
+        let git = repo.git();
         let hash_kind = git.object_hash();
         for (id, kind, data) in chunk {
             let data = decompress_object(&data).with_context(|| format!("object {id}"))?;
@@ -606,7 +606,9 @@ fn write_git_chunk(
                 computed == id,
                 "object {id} does not match its content (hashes to {computed})",
             );
-            if git.has_object(id) {
+            // Received objects are almost always new: a refreshing lookup
+            // would rescan the pack directory for each.
+            if git.objects.exists_without_refresh(&id) {
                 continue;
             }
             git.objects
