@@ -64,6 +64,7 @@
             cargoHash = "sha256-GWdnHg2Jpl7tfrJZ4pB/+oiUwhiHllmJHWVXb7/Rsio=";
 
             doCheck = false; # Don't run tests on the flake
+            dontCargoUseSystemLibs = true; # Keep vendored C libraries
             env.JJ_MESH_COMMIT = self.shortRev or self.dirtyShortRev or "unknown";
 
             nativeBuildInputs = [ pkgs.installShellFiles ];
