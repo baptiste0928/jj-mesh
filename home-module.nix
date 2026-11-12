@@ -1,4 +1,17 @@
 # Home Manager module running the jj-mesh daemon as a user service
+#
+# Add the flake as an input:
+#
+#   inputs.jj-mesh.url = "github:baptiste0928/jj-mesh";
+#
+# Then enable the service in your Home Manager configuration:
+#
+#   { inputs, ... }:
+#   {
+#     imports = [ inputs.jj-mesh.homeModules.default ];
+#
+#     services.jj-mesh.enable = true;
+#   }
 
 self:
 {

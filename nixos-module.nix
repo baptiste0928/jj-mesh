@@ -1,4 +1,20 @@
 # NixOS module running the jj-mesh daemon as a user service
+#
+# Add the flake as an input:
+#
+#   inputs.jj-mesh.url = "github:baptiste0928/jj-mesh";
+#
+# Then enable the service in your NixOS configuration:
+#
+#   { inputs, ... }:
+#   {
+#     imports = [ inputs.jj-mesh.nixosModules.default ];
+#
+#     services.jj-mesh = {
+#       enable = true;
+#       users = [ "alice" ];
+#     };
+#   }
 
 self:
 {
