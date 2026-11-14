@@ -7,11 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+**All machines of the mesh must be updated together**, as this version cannot sync with older ones.
+
 ### Added
 - **Machines can be set in "server mode"** and keep a bare repo of every mesh repo, without having
   a workspace for each. Enable it with `jj-mesh setup --server` or `jj-mesh server enable`.
-- **Added `jj-mesh setup` command to setup a new machine** in a single step. It setups the service
-  and pairs the machine with the mesh.
+- **Added the `jj-mesh setup` command to set up a new machine** in a single step. It installs the
+  service and pairs the machine with the mesh.
+- **Pre-built binaries** for Linux (x86_64, aarch64) and macOS (Apple Silicon) are now attached to
+  each release.
 - Recent daemon logs can be viewed with the new `jj-mesh logs` command. Existing logs have been
   made less noisy.
 - New `jj-mesh clone` and `jj-mesh add` top-level aliases for `jj-mesh repo clone` and
@@ -19,6 +23,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Cloning a repo already on the current machine adds a new workspace to it, so a repo can be cloned
   several times.
 - Repos can be renamed across the mesh with `jj-mesh repo rename`.
+- `jj-mesh status <repo>` shows the details of a repo, and `jj-mesh status` now shows when offline
+  peers were last seen.
 - The flake now exposes a NixOS module, for systems without Home Manager.
 
 ### Changed
@@ -28,14 +34,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Settings moved to the `[jj-mesh]` table of your jj config**, and can now be set per user, repo
   or workspace.
 - Syncing is now paused for a workspace if it is claimed by multiple machines in the mesh.
+- `jj-mesh repo forget` and `jj-mesh repo remove` accept several repos and can delete the local
+  files with `--delete-files`.
+- `jj-mesh repo forget` now asks for confirmation, and refuses when no other machine
+  holds the repo.
+- The snapshot interval can be set with `--snapshot-interval` when adding or cloning a repo.
+- TLS certificates are now verified against the system CA store instead of a built-in one.
 
 ### Fixed
 - **Syncs use less data.** Missing objects are now computed much more accurately, we could
   previously sometimes re-send hundreds of objects for a single-line change.
-- Peers changes were sometimes rejected after a restart when the local machine did not
+- **Large repos can be cloned.** Clones send the existing object store instead of computing new
+  packs, which largely improves performance of large clones. Long transfers no longer timeout after
+  30 minutes.
+- Peer changes were sometimes rejected after a restart when the local machine did not
   notice the old connection drop (e.g. while suspended).
-- Shallow and partial git clones are now explicitely refused.
+- Shallow and partial git clones are now explicitly refused.
 - SHA-256 repos are now supported.
+- Watching large repos is faster on macOS.
 - The daemon installed on macOS now logs to `~/Library/Logs/jj-mesh.log`.
 
 ## [0.2.0] - 2026-09-06
