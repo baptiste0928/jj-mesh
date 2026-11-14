@@ -61,7 +61,7 @@
             version = (nixpkgs.lib.importTOML ./Cargo.toml).package.version;
 
             src = self;
-            cargoHash = "sha256-GWdnHg2Jpl7tfrJZ4pB/+oiUwhiHllmJHWVXb7/Rsio=";
+            cargoHash = "sha256-h44RmGhk5h1ZpBUbAE5iB05hNaU9I01PWmIT5AKayCo=";
 
             doCheck = false; # Don't run tests on the flake
             dontCargoUseSystemLibs = true; # Keep vendored C libraries
