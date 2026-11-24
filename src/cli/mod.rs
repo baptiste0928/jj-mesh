@@ -70,9 +70,6 @@ enum Command {
     Service(service::ServiceArgs),
     Status(status::StatusArgs),
     Logs(logs::LogsArgs),
-    // Hidden: this is what the installed service runs; users manage the
-    // daemon through `jj-mesh service`.
-    #[command(hide = true)]
     RunDaemon(run_daemon::RunDaemonArgs),
 }
 
@@ -98,7 +95,7 @@ pub fn run() -> Result<()> {
         Command::Service(args) => service::run(args, &dir),
         Command::Status(args) => status::run(&args, &dir),
         Command::Logs(args) => logs::run(&args, &dir),
-        Command::RunDaemon(args) => run_daemon::run(args, &dir),
+        Command::RunDaemon(args) => run_daemon::run(&args, &dir),
     }
 }
 

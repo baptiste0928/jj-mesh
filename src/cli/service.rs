@@ -5,13 +5,13 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::{Context as _, Result, anyhow, bail, ensure};
+use anyhow::{Context as _, Result, anyhow, ensure};
 use clap::{Args, Subcommand};
 
 use super::ui;
 use crate::{
     config::ConfigDir,
-    daemon::control::{self, ControlClient, Request, Response},
+    daemon::control::{self, ControlClient},
     hint::hinted,
     repo::jj_bin,
     service::{Service, Spec, Status, which},
@@ -34,7 +34,8 @@ const START_SETTLE: Duration = Duration::from_secs(1);
 /// a user service (with systemd on Linux, launchd on macOS).
 ///
 /// If you wish to manage the service manually, you should run the daemon with
-/// `jj-mesh run-daemon`.
+/// `jj-mesh run-daemon`. Without a service manager, start it in the
+/// background with `jj-mesh run-daemon --detach`.
 #[derive(Debug, Args)]
 pub struct ServiceArgs {
     #[command(subcommand)]
@@ -104,7 +105,7 @@ pub fn run(args: ServiceArgs, dir: &ConfigDir) -> Result<()> {
 /// Makes sure a daemon is running, installing or starting the service
 /// once the user agrees, and returns its status.
 pub(super) fn ensure_running(dir: &ConfigDir) -> Result<control::Status> {
-    if let Some(status) = status(dir, START_WAIT)? {
+    if let Some(status) = control::try_status_blocking(dir, START_WAIT)? {
         return Ok(status);
     }
     match Service::find()? {
@@ -258,7 +259,7 @@ fn wait_ready(dir: &ConfigDir) -> Result<control::Status> {
     let deadline = Instant::now() + START_WAIT;
     loop {
         let left = deadline.saturating_duration_since(Instant::now());
-        if let Some(status) = status(dir, left)? {
+        if let Some(status) = control::try_status_blocking(dir, left)? {
             return Ok(status);
         }
         if left.is_zero() {
@@ -269,21 +270,6 @@ fn wait_ready(dir: &ConfigDir) -> Result<control::Status> {
         }
         std::thread::sleep(Duration::from_millis(200));
     }
-}
-
-/// Asks the daemon for its status, waiting up to `limit` for the answer;
-/// `None` when no daemon runs.
-fn status(dir: &ConfigDir, limit: Duration) -> Result<Option<control::Status>> {
-    control::block_on(async {
-        let Some(mut client) = ControlClient::connect(dir).await? else {
-            return Ok(None);
-        };
-        client.send(&Request::Status).await?;
-        match client.recv(Some(limit)).await?.into_result()? {
-            Response::Status(status) => Ok(Some(status)),
-            response => bail!("unexpected response from the daemon: {response:?}"),
-        }
-    })
 }
 
 /// A path as written into the service definition: absolute, since the

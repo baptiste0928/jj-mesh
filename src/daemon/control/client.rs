@@ -132,13 +132,27 @@ pub fn block_on<T>(future: impl Future<Output = Result<T>>) -> Result<T> {
 pub fn query_status_blocking(dir: &ConfigDir) -> Result<Status> {
     block_on(async {
         let mut client = ControlClient::connect_required(dir).await?;
-
-        client.send(&Request::Status).await?;
-        match client.recv(Some(CLIENT_TIMEOUT)).await?.into_result()? {
-            Response::Status(status) => Ok(status),
-            other => bail!("unexpected response from the daemon: {other:?}"),
-        }
+        status(&mut client, CLIENT_TIMEOUT).await
     })
+}
+
+/// Like [`query_status_blocking`], waiting up to `limit` for the answer;
+/// `None` when no daemon runs. A starting daemon answers once started.
+pub fn try_status_blocking(dir: &ConfigDir, limit: Duration) -> Result<Option<Status>> {
+    block_on(async {
+        let Some(mut client) = ControlClient::connect(dir).await? else {
+            return Ok(None);
+        };
+        status(&mut client, limit).await.map(Some)
+    })
+}
+
+async fn status(client: &mut ControlClient, limit: Duration) -> Result<Status> {
+    client.send(&Request::Status).await?;
+    match client.recv(Some(limit)).await?.into_result()? {
+        Response::Status(status) => Ok(status),
+        other => bail!("unexpected response from the daemon: {other:?}"),
+    }
 }
 
 /// Checks that a daemon is running, erroring otherwise: for commands that want to fail fast before doing local work
