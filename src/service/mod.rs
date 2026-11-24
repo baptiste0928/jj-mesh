@@ -11,7 +11,8 @@
 //! Definitions are rendered from a [`Spec`] by the platform module, which
 //! also drives the service manager (`systemctl --user`, `launchctl`). The
 //! programs a spec runs are found with [`which`], since the service's own
-//! PATH is minimal.
+//! PATH is minimal. Without a supported service manager, [`Service::find`]
+//! fails with a hint to set up the daemon by hand.
 
 #[cfg(target_os = "macos")]
 #[path = "launchd.rs"]
@@ -30,6 +31,8 @@ use std::{
 };
 
 use anyhow::{Context as _, Result, ensure};
+
+use crate::hint::hinted;
 
 /// What the service runs.
 #[derive(Debug)]
@@ -57,8 +60,16 @@ impl Service {
     /// The installed service: the last label whose definition exists, so
     /// a leftover install of ours never hides an external manager's.
     /// System-wide definitions (NixOS) come last, since the service
-    /// manager also prefers the user's own.
+    /// manager also prefers the user's own. Fails without a supported service
+    /// manager.
     pub fn find() -> Result<Option<Self>> {
+        ensure!(
+            platform::available(),
+            hinted(
+                "no supported service manager found",
+                "Set up a service running `jj-mesh run-daemon` yourself",
+            )
+        );
         let labels = || platform::LABELS.iter().rev();
         let user = labels()
             .map(|label| Self::new(label))

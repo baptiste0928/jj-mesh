@@ -16,6 +16,11 @@ pub(super) const LABELS: &[&str] = &["jj-mesh", "org.nix-community.home.jj-mesh"
 /// module uses the same.
 const LOG_FILE: &str = "Library/Logs/jj-mesh.log";
 
+/// launchd always runs on macOS.
+pub(super) fn available() -> bool {
+    true
+}
+
 /// `~/Library/LaunchAgents/<label>.plist`.
 pub(super) fn path(label: &str) -> Result<PathBuf> {
     Ok(home()?

@@ -1,6 +1,6 @@
 //! systemd user units, driven through `systemctl --user`.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, Result};
 use etcetera::BaseStrategy as _;
@@ -12,6 +12,11 @@ pub(super) const LABELS: &[&str] = &["jj-mesh"];
 
 /// Seconds systemd waits before restarting a failed daemon.
 const RESTART_DELAY_SECS: u32 = 5;
+
+/// Whether systemd runs this machine, as `sd_booted(3)` checks.
+pub(super) fn available() -> bool {
+    Path::new("/run/systemd/system").is_dir()
+}
 
 /// `$XDG_CONFIG_HOME/systemd/user/<label>.service`.
 pub(super) fn path(label: &str) -> Result<PathBuf> {
