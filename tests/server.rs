@@ -8,7 +8,7 @@ use harness::{Machine, TestMesh, add_and_clone, descriptions, wait_converged, wa
 use jj_mesh::{
     config::ObjectHash,
     daemon::control::{Request, Response, Status},
-    repo::{Identity, JjRepo},
+    testing::git_output,
 };
 
 /// A server announces its role, pulls a bare repo of every mesh repo, the
@@ -65,9 +65,9 @@ async fn server_keeps_every_repo() {
     assert!(early_bare.exists());
 }
 
-/// A workspace added to a bare repo syncs like any other, and keeps its
-/// bare repo when server mode is disabled and the repo removed from the
-/// mesh, unlike the bare repos no workspace uses.
+/// A workspace added to a bare repo, colocated with a git worktree, syncs
+/// like any other, and keeps its bare repo when server mode is disabled and
+/// the repo removed from the mesh, unlike the bare repos no workspace uses.
 #[tokio::test]
 async fn disabling_server_mode_keeps_bare_repos_in_use() {
     let mesh = TestMesh::new();
@@ -81,16 +81,20 @@ async fn disabling_server_mode_keeps_bare_repos_in_use() {
     let unused_bare = server.wait_repo("unused").await;
     wait_converged(&used, &used_bare).await;
 
-    // A workspace of the bare repo, as `jj-mesh clone` adds on a server.
+    // Colocated as jj's default `git.colocate` says.
+    mesh.cli(&server, &["clone", "used", "used-on-server"])
+        .await;
     let workspace = mesh.jj.path().join("used-on-server");
-    JjRepo::at(&used_bare)
-        .unwrap()
-        .add_workspace(&workspace, "machine-b", &Identity::default())
-        .unwrap();
     mesh.jj
         .commit_file(&workspace, "file.txt", "from the server");
     wait_converged(&used, &used_bare).await;
     assert!(descriptions(&mesh, &used).contains("from the server"));
+    let head = git_output(&workspace.join(".git"), &["log", "-1", "--format=%s"]);
+    assert_eq!(head, "from the server");
+    let other = mesh.jj.path().join("used-other");
+    mesh.cli(&server, &["clone", "used", "used-other", "--no-colocate"])
+        .await;
+    assert!(!other.join(".git").exists());
 
     server.set_server(false).await;
     a.wait("machine-b as regular machine", |s| {

@@ -42,7 +42,7 @@ pub struct Workspace {
 
 /// The user a workspace is added for: jj records it on the operation and
 /// the working-copy commit.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct Identity {
     pub name: String,
     pub email: String,

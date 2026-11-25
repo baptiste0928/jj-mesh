@@ -52,6 +52,27 @@ impl TestMesh {
         }
     }
 
+    /// Runs the `jj-mesh` CLI of `machine` with `args` from the scratch
+    /// dir, failing on error.
+    pub async fn cli(&self, machine: &Machine, args: &[&str]) {
+        let mut cli = std::process::Command::new(env!("CARGO_BIN_EXE_jj-mesh"));
+        self.jj
+            .env(&mut cli)
+            .current_dir(self.jj.path())
+            .arg("-C")
+            .arg(machine.config.path())
+            .args(args);
+        #[expect(clippy::disallowed_methods, reason = "no span to keep in tests")]
+        let out = tokio::task::spawn_blocking(move || cli.output().unwrap())
+            .await
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
     /// Starts a fresh machine: a tempdir config with a running daemon.
     pub async fn machine(&self, name: &str) -> Machine {
         let mut machine = Machine {

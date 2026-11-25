@@ -11,6 +11,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `jj-mesh run-daemon --detach` runs the daemon in the background, for systems without a service
   manager.
 
+### Fixed
+- `jj-mesh repo clone` on a server now colocates the workspace like other clones.
+
 ## [0.3.0] - 2026-11-14
 
 **All machines of the mesh must be updated together**, as this version cannot sync with older ones.

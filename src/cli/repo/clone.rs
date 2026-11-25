@@ -8,7 +8,8 @@
 //! A repo already registered here gets a new workspace instead, which the
 //! daemon syncs like the others. On a server, the workspace of a bare repo
 //! is added through jj_lib (see [`JjRepo::add_workspace`]), since the jj CLI
-//! needs a workspace to run in.
+//! needs a workspace to run in. The jj CLI then colocates it with a git
+//! worktree when the colocate flags or `git.colocate` ask for it.
 //!
 //! Settings flags go to the repo config of a fresh clone or of a bare repo
 //! without workspaces, and to the workspace config otherwise (see the
@@ -26,7 +27,7 @@ use indicatif::{HumanBytes, HumanDuration, ProgressBar, ProgressStyle};
 use pollster::FutureExt as _;
 
 use super::{
-    jj,
+    config, jj,
     settings::{Scope, SettingsArgs},
 };
 use crate::{
@@ -63,11 +64,11 @@ pub struct CloneArgs {
     #[arg(long)]
     workspace: Option<String>,
 
-    /// Colocate the repo with a `.git` usable by plain git tools
+    /// Colocate the Jujutsu repo with the git repo
     #[arg(long, conflicts_with = "no_colocate")]
     colocate: bool,
 
-    /// Keep the git store inside `.jj`, hidden from git tools
+    /// Disable colocation of the Jujutsu repo with the git repo
     #[arg(long)]
     no_colocate: bool,
 
@@ -98,24 +99,20 @@ pub fn run(args: CloneArgs, dir: &ConfigDir) -> Result<()> {
                 .unwrap_or(&name),
         )?,
     };
-    let colocate: &[&str] = match (args.colocate, args.no_colocate) {
-        (true, _) => &["--colocate"],
-        (_, true) => &["--no-colocate"],
-        _ => &[],
+    let colocate = match (args.colocate, args.no_colocate) {
+        (true, _) => Some(true),
+        (_, true) => Some(false),
+        _ => None,
     };
     let settings = &args.settings;
     match id.as_ref().and_then(|id| state.repos.get(id)) {
         Some(repo) if repo.bare => {
-            ensure!(
-                colocate.is_empty(),
-                "{name} is a bare repo kept by server mode, whose git store cannot be colocated",
-            );
             let bare = JjRepo::at(&repo.path)?;
             let workspace = match args.workspace {
                 Some(workspace) => workspace,
                 None => bare_workspace_name(&bare, &state.machine.name, &path)?,
             };
-            add_bare_workspace(dir, &name, &bare, &path, &workspace, settings)
+            add_bare_workspace(dir, &name, &bare, &path, &workspace, colocate, settings)
         }
         Some(repo) => {
             let workspace = match args.workspace {
@@ -155,6 +152,15 @@ pub fn run(args: CloneArgs, dir: &ConfigDir) -> Result<()> {
     }
 }
 
+/// The jj flag forcing `colocate`, none to follow `git.colocate`.
+fn colocate_flag(colocate: Option<bool>) -> &'static [&'static str] {
+    match colocate {
+        Some(true) => &["--colocate"],
+        Some(false) => &["--no-colocate"],
+        None => &[],
+    }
+}
+
 /// Clones the mesh repo `name` in `path`, with its git `object_hash`,
 /// which the user's jj config must not override.
 fn clone(
@@ -163,7 +169,7 @@ fn clone(
     path: &Path,
     workspace: &str,
     object_hash: ObjectHash,
-    colocate: &[&str],
+    colocate: Option<bool>,
     settings: &SettingsArgs,
 ) -> Result<()> {
     let started = Instant::now();
@@ -184,7 +190,7 @@ fn clone(
         None,
         &[
             &["git", "init", "--object-hash", &object_hash],
-            colocate,
+            colocate_flag(colocate),
             &["--", &path_arg],
         ]
         .concat(),
@@ -230,7 +236,7 @@ fn add_workspace(
     repo: &Path,
     path: &Path,
     workspace: &str,
-    colocate: &[&str],
+    colocate: Option<bool>,
     settings: &SettingsArgs,
 ) -> Result<()> {
     ensure!(
@@ -256,7 +262,7 @@ fn add_workspace(
             Some(repo),
             &[
                 &["workspace", "add", "--name", workspace],
-                colocate,
+                colocate_flag(colocate),
                 &["--", &path_arg],
             ]
             .concat(),
@@ -280,6 +286,7 @@ fn add_bare_workspace(
     bare: &JjRepo,
     path: &Path,
     workspace: &str,
+    colocate: Option<bool>,
     settings: &SettingsArgs,
 ) -> Result<()> {
     ensure!(
@@ -290,23 +297,22 @@ fn add_bare_workspace(
     validate_name("workspace", workspace)?;
 
     // jj_lib records the identity the user's jj config holds.
-    let config = |key| {
-        jj(None, &["config", "get", key])
-            .map_or_else(|_| String::new(), |value| value.trim().to_owned())
-    };
     let user = Identity {
-        name: config("user.name"),
-        email: config("user.email"),
+        name: config(None, "user.name").unwrap_or_default(),
+        email: config(None, "user.email").unwrap_or_default(),
+    };
+    let create = || {
+        bare.add_workspace(path, workspace, &user)?;
+        colocate_bare_workspace(path, colocate);
+        Ok(())
     };
     if bare.has_workspaces()? {
-        create_workspace(dir, name, workspace, path, settings, || {
-            bare.add_workspace(path, workspace, &user)
-        })?;
+        create_workspace(dir, name, workspace, path, settings, create)?;
     } else {
         // The first workspace: the settings go to the repo config, where
         // the next ones also find them.
         settings.write(bare.root(), Scope::Repo)?;
-        bare.add_workspace(path, workspace, &user)?;
+        create()?;
     }
     start_on_trunk(path);
 
@@ -315,6 +321,19 @@ fn add_bare_workspace(
         ui::path(path),
     ));
     Ok(())
+}
+
+/// Gives the fresh workspace of a bare repo at `path` a git worktree when
+/// `colocate`, or else `git.colocate` read from it, says so. A failure
+/// leaves it non-colocated rather than failing the clone.
+fn colocate_bare_workspace(path: &Path, colocate: Option<bool>) {
+    let colocate =
+        colocate.unwrap_or_else(|| config(Some(path), "git.colocate").as_deref() == Some("true"));
+    if colocate && let Err(err) = jj(Some(path), &["git", "colocation", "enable"]) {
+        let path = ui::path(path);
+        ui::warning(format_args!("{path} could not be colocated: {err:#}"));
+        ui::hint(format_args!("Run `jj git colocation enable` in {path}"));
+    }
 }
 
 /// Runs `create`, which adds the workspace `workspace` of the registered

@@ -50,6 +50,13 @@ pub fn run(args: RepoArgs, dir: &ConfigDir) -> Result<()> {
     }
 }
 
+/// The value of the jj config `key` as seen from `dir`, `None` when unset.
+fn config(dir: Option<&Path>, key: &str) -> Option<String> {
+    jj(dir, &["config", "get", key])
+        .ok()
+        .map(|value| value.trim().to_owned())
+}
+
 /// Runs a jj command, surfacing its stderr on failure. Returns its stdout.
 fn jj(dir: Option<&Path>, args: &[&str]) -> Result<String> {
     let mut command = std::process::Command::new(crate::repo::jj_bin());

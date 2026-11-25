@@ -2,8 +2,6 @@
 
 mod harness;
 
-use std::process::Command;
-
 use harness::{Machine, TestMesh, wait_until};
 use jj_mesh::{config::ConfigDir, daemon::control::WorkspaceHold};
 use tracing_subscriber::layer::SubscriberExt as _;
@@ -47,23 +45,11 @@ async fn clone_writes_workspace_settings() {
     let dir = mesh.jj.init_repo("proj");
     machine.add_repo("proj", &dir).await;
 
-    let config = machine.config_dir().path().to_owned();
-    let mut clone = Command::new(env!("CARGO_BIN_EXE_jj-mesh"));
-    mesh.jj
-        .env(&mut clone)
-        .current_dir(mesh.jj.path())
-        .arg("-C")
-        .arg(&config)
-        .args(["clone", "proj", "extra", "--snapshot-interval", "5m"]);
-    #[expect(clippy::disallowed_methods, reason = "no span to keep in tests")]
-    let out = tokio::task::spawn_blocking(move || clone.output().unwrap())
-        .await
-        .unwrap();
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+    mesh.cli(
+        &machine,
+        &["clone", "proj", "extra", "--snapshot-interval", "5m"],
+    )
+    .await;
 
     let extra = mesh.jj.path().join("extra");
     let list = |dir, level| {
